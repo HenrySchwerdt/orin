@@ -81,7 +81,7 @@ take an aggregate where noted in "Unboxed aggregates" below. The verifier treats
 
 v2.6 (ADR-0038 lever 2, T2) **unchecked array access**: two new instructions, `IArrayGetU(d, a, i)` (`d = arraygetu a[i]`) and
 `IArraySetU(x, i, v)` (`arraysetu x[i] = v`). Each means exactly `IArrayGet` / `IArraySet` **without the kind check and without the
-bounds check**: the C backend reads and writes `items[i]` directly (`orin_array_at_u`, `orin_mir_array_put_u` / `orin_mir_array_replace_u`),
+bounds check**: the C backend reads and writes `items[i]` directly (`orinc_array_at_u`, `orinc_mir_array_put_u` / `orinc_mir_array_replace_u`),
 the LLVM backend emits the `getelementptr inbounds` and no compare. Unlike `IForward` this is a **memory-safety** fact, so the verifier
 rejects an unchecked access it cannot justify (rule **U1**, `compiler/verify/unchecked.or` and `compiler/verify/range.or`, section "Unchecked array
 access" below, error text `unchecked array access without a dominating check or a range fact`). U1 has two fact sources: a **dominating
@@ -366,7 +366,7 @@ Verifier: an aggregate local is `Init` once defined (parameters start `Init`); e
 else: no leak, no borrow, no uniqueness. Soundness: an aggregate contains no reference, so no rule about references depends on it; every
 operation on it is a pure function of its words. The optimiser converts a value only when every instruction that touches it is one of the
 above (default deny), so the program does the same calls in the same order and the retains / releases it drops are exactly those of the
-heap object that no longer exists. Backends: C `OrinV<n>` (`typedef struct { uint64_t w[n + 1]; }`, `orin_runtime_mir.h`), compound
+heap object that no longer exists. Backends: C `OrinV<n>` (`typedef struct { uint64_t w[n + 1]; }`, `compiler/backends/c/preamble.or`), compound
 literals, by-value parameters and results; LLVM `[n+1 x i64]` with `insertvalue` / `extractvalue`, by-value parameters and results. Unwrap
 traps call `orin_v_unwrap(tag, word, what)`, pop calls `orin_array_pop_v(arr, out)` (both in `orin_runtime.c`). Cases:
 `compiler/tests/unbox_test.or`.

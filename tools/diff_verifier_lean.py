@@ -40,7 +40,9 @@ def build_driver(orinc, out_dir):
     c = os.path.join(out_dir, "verify_text.c")
     exe = os.path.join(out_dir, "verify_text")
     subprocess.run([orinc, "compile", "compiler/tests/verify_text.or", "-o", c], cwd=ROOT, check=True)
-    subprocess.run(["cc", "-O1", "-w", *rt_inc(), c, *rt_src(), "-lm", "-o", exe], cwd=ROOT, check=True)
+    # C from the seed compilers (orin0, orin1: logic that predates R3d) links the frozen snapshot, as in tools/bootstrap.sh
+    world = "legacy" if os.path.basename(orinc) in ("orin0", "orin1") else "core"
+    subprocess.run(["cc", "-O1", "-w", *rt_inc(world), c, *rt_src(world), "-lm", "-o", exe], cwd=ROOT, check=True)
     return exe
 
 

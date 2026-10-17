@@ -1,0 +1,140 @@
+// $rt/stats -- the ORIN_STATS report and the live-object count, written in Orin (ADR-0052 Addendum A, step R3d.5).
+//
+// `statsReport` runs at process exit (the C `orin_init` registers the wrapper `orin_stats_report` with the platform's at-exit list):
+// with ORIN_STATS=1 it prints the one-line JSON report of the counters on stderr, with ORIN_STATS=sites (census builds) it prints
+// the census table first. The counters are the ones of the heap block (heap.or, `OrinStats`, 18 words from byte 192) of the exiting
+// thread plus the totals of the finished tasks, which the C runtime keeps in `g_fold` / `g_fold_live` and which Orin reaches through
+// the hooks HK_FOLD_STATS / HK_FOLD_LIVE under the runtime lock. The report is assembled by hand in a raw buffer (no Orin string is
+// allocated: the counters must not change while they are read) and is byte for byte the one the C `stats_report` printed.
+// `liveCount` is `orin_live_count`: the balance of this thread's heap plus the finished tasks'. The census itself (the per-site
+// tables, their fold and report) stays C in runtime/core/orin_runtime.c and is reached through hooks (heap.or).
+
+import { load8, load64, store8, store64, memAlloc, memFree, memCopy, heapBase, cfg, hook, addrOf, wadd, wsub, shl } from "std:core";
+import { HK_GETENV, HK_LOCK, HK_UNLOCK, HK_WRITE_LINE, HK_FOLD_STATS, HK_FOLD_LIVE, HK_STATS_ON, HK_SITE_REPORT, LIVE } from "./heap";
+
+const STATS: usize = 192;             // OrinStats in the heap block
+const SIGN: usize = 9223372036854775808;
+
+// True when the C string at `p` (0: none) is exactly the text of `s`.
+function cstrIs(p: usize, s: string): bool {
+  if (p == 0) {
+    return false;
+  }
+  const a = addrOf(s);
+  const n = load64(wadd(a, 16));
+  let i: usize = 0;
+  while (i < n) {
+    if (load8(wadd(p, i)) != load8(wadd(wadd(a, 32), i))) {
+      return false;
+    }
+    i = wadd(i, 1);
+  }
+  return load8(wadd(p, n)) == 0;
+}
+
+// Append the text of `s` to the buffer `buf` holding `n` bytes; returns the new length.
+function putStr(buf: usize, n: usize, s: string): usize {
+  const a = addrOf(s);
+  const k = load64(wadd(a, 16));
+  memCopy(wadd(buf, n), wadd(a, 32), k);
+  return wadd(n, k);
+}
+
+// Append the decimal digits of `v`; returns the new length.
+function putU(buf: usize, n: usize, v: usize): usize {
+  let digits: usize = 1;
+  let t = v / 10;
+  while (t != 0) {
+    digits = wadd(digits, 1);
+    t = t / 10;
+  }
+  let p = wadd(wadd(buf, n), digits);
+  let w = v;
+  store8(wsub(p, 1), wadd(48, w % 10));
+  p = wsub(p, 1);
+  w = w / 10;
+  while (w != 0) {
+    store8(wsub(p, 1), wadd(48, w % 10));
+    p = wsub(p, 1);
+    w = w / 10;
+  }
+  return wadd(n, digits);
+}
+
+// Append `,"key":` and the decimal value; `key` includes the leading comma and the colon.
+function putField(buf: usize, n: usize, key: string, v: usize): usize {
+  return putU(buf, putStr(buf, n, key), v);
+}
+
+// The balance of live objects: this thread's heap plus the finished tasks' (signed, as a word).
+export function liveCount(): usize {
+  hook(HK_LOCK, 0, 0, 0);
+  const folded = load64(hook(HK_FOLD_LIVE, 0, 0, 0));
+  hook(HK_UNLOCK, 0, 0, 0);
+  return wadd(load64(wadd(heapBase(), LIVE)), folded);
+}
+
+// The report. `t` holds the 18 counters of the exiting thread, to which the finished tasks' totals are added under the runtime lock
+// (the sums, and the larger of the two peaks).
+export function statsReport(): void {
+  const name = "ORIN_STATS";
+  const e = hook(HK_GETENV, wadd(addrOf(name), 32), 0, 0);
+  let sites = false;
+  if (cfg(2) == 1 && cstrIs(e, "sites")) {
+    sites = true;
+    hook(HK_SITE_REPORT, 0, 0, 0);
+  }
+  if (!sites && !cstrIs(e, "1")) {
+    return;
+  }
+  const t = memAlloc(144);
+  memCopy(t, wadd(heapBase(), STATS), 144);
+  hook(HK_LOCK, 0, 0, 0);
+  const g = hook(HK_FOLD_STATS, 0, 0, 0);
+  let i: usize = 0;
+  while (i < 18) {
+    const o = shl(i, 3);
+    const a = load64(wadd(t, o));
+    const b = load64(wadd(g, o));
+    if (i == 10 || i == 11) {
+      store64(wadd(t, o), b > a ? b : a);
+    } else {
+      store64(wadd(t, o), wadd(a, b));
+    }
+    i = wadd(i, 1);
+  }
+  hook(HK_UNLOCK, 0, 0, 0);
+  const r = memAlloc(1024);
+  let n = putStr(r, 0, "{\"orin_stats\":");
+  n = putStr(r, n, hook(HK_STATS_ON, 0, 0, 0) == 1 ? "{\"counters\":\"all\"" : "{\"counters\":\"cold\"");
+  n = putField(r, n, ",\"alloc_string\":", load64(t));
+  n = putField(r, n, ",\"alloc_array\":", load64(wadd(t, 8)));
+  n = putField(r, n, ",\"alloc_struct\":", load64(wadd(t, 16)));
+  n = putField(r, n, ",\"alloc_total\":", wadd(wadd(load64(t), load64(wadd(t, 8))), load64(wadd(t, 16))));
+  n = putField(r, n, ",\"frees\":", load64(wadd(t, 24)));
+  n = putField(r, n, ",\"retains\":", load64(wadd(t, 32)));
+  n = putField(r, n, ",\"releases\":", load64(wadd(t, 40)));
+  n = putField(r, n, ",\"cow_copies\":", load64(wadd(t, 48)));
+  n = putField(r, n, ",\"cow_inplace\":", load64(wadd(t, 56)));
+  n = putField(r, n, ",\"array_grows\":", load64(wadd(t, 64)));
+  n = putField(r, n, ",\"string_grows\":", load64(wadd(t, 72)));
+  n = putField(r, n, ",\"peak_live_objs\":", load64(wadd(t, 80)));
+  n = putField(r, n, ",\"peak_live_bytes\":", load64(wadd(t, 88)));
+  n = putField(r, n, ",\"file_opens\":", load64(wadd(t, 104)));
+  n = putField(r, n, ",\"file_closes\":", load64(wadd(t, 112)));
+  n = putField(r, n, ",\"transfer_moves\":", load64(wadd(t, 120)));
+  n = putField(r, n, ",\"transfer_copies\":", load64(wadd(t, 128)));
+  n = putField(r, n, ",\"tasks_spawned\":", load64(wadd(t, 136)));
+  n = putStr(r, n, ",\"live_objs_at_exit\":");
+  const live = liveCount();
+  if (live >= SIGN) {
+    store8(wadd(r, n), 45);
+    n = putU(r, wadd(n, 1), wsub(0, live));
+  } else {
+    n = putU(r, n, live);
+  }
+  n = putStr(r, n, "}}");
+  hook(HK_WRITE_LINE, r, n, 0);
+  memFree(r);
+  memFree(t);
+}

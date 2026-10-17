@@ -1,0 +1,1 @@
+- The frozen seed runtime gains `orin_cap_adopt_net`/`orin_cap_adopt_stream` and accepts void boxes in `orin_rt_transfer_put`, verbatim from #175 and #184.

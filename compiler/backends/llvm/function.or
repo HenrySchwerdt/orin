@@ -9,7 +9,9 @@
 import { BinOp, UnOp, Builtin, taskOpC, taskOpRet } from "../../hir";
 import {
   MType, MLocal, Operand, Instr, SwitchCase, Terminator, MBlock, MFunction, MProgram, isInlineFn,
-  slotWords,
+  slotWords, RT_OPT_UNWRAP, RT_RES_UNWRAP, RT_RES_UNWRAP_ERR, RT_V_UNWRAP, RT_ASSERT_FACT, RT_ASSERT_ARRAY,
+  RT_STRUCT_NEW, RT_ARRAY_NEW, RT_STR_APPEND, RT_STR_APPEND_SUB, RT_STR_APPEND_USIZE, RT_STR_APPEND_INT, RT_STR_PREPEND,
+  RT_ARRAY_EXTEND, rtSig, rtCold, l1Builtin,
 } from "../../mir";
 import { refMask, inoutArgOk, targetsBelow, linesOfBlocks } from "../c";
 import { u, isRefT, isUsizeT, isFloatT, isAggT, zeroOf, lty, attrTy, paramTy } from "./text";
@@ -178,11 +180,7 @@ function bname(op: Builtin): string {
     BStrTrim => "orin_str_trim",
     BStrWithCapacity => "orin_str_with_capacity",
     BArrGet => "orin_array_get",
-    BArrSlice => "orin_array_slice",
-    BArrConcat => "orin_array_concat",
     BArrJoin => "orin_array_join",
-    BBytesToString => "orin_bytes_to_string",
-    BStringToBytes => "orin_string_to_bytes",
     BIntToString => "orin_int_to_string",
     BUsizeToString => "orin_usize_to_string",
     BBoolToString => "orin_bool_to_string",
@@ -275,8 +273,11 @@ function tagIs(p: string, a0: string, k: usize): R {
   };
 }
 
-function unwrapR(p: string, fn: string, a0: string, rt: MType): R {
-  const call = "  " + p + "r = call i64 @" + fn + "(ptr " + a0 + ")\n";
+// `fn` is the C runtime function (takes the pointer) or, with `l1`, the Orin function of `$rt` (takes the address as i64).
+function unwrapR(p: string, fn: string, a0: string, rt: MType, l1: bool): R {
+  const call = l1
+      ? "  " + p + "a = ptrtoint ptr " + a0 + " to i64\n  " + p + "r = call i64 @" + fn + "(i64 " + p + "a)\n"
+      : "  " + p + "r = call i64 @" + fn + "(ptr " + a0 + ")\n";
   if (isFloatT(rt)) {
     return R { text: call + "  " + p + "f = bitcast i64 " + p + "r to double\n", val: p + "f" };
   }
@@ -512,8 +513,8 @@ export class LlvmFunctionEmitter {
         s += "  " + p + "c = icmp eq i64 " + p + "t, 0\n";
       },
       _ => {
-        s += "  " + p + "u = call i64 @orin_v_unwrap(i64 " + p + "t, i64 " + p + "w, i64 "
-            + unwrapWhat(b) + ")\n";
+        s += "  " + p + "u = call i64 @" + (this.syms.l1(RT_V_UNWRAP) != "" ? this.syms.l1(RT_V_UNWRAP) : "orin_v_unwrap")
+            + "(i64 " + p + "t, i64 " + p + "w, i64 " + unwrapWhat(b) + ")\n";
         word = p + "u";
       },
     }
@@ -530,6 +531,12 @@ export class LlvmFunctionEmitter {
       _ => {},
     }
     return R { text: s, val: word };
+  }
+
+  // An unwrap builtin: the Orin function of `$rt` (entry `k`) when the program has it, else the C runtime function `cfn`.
+  private unwrapL1(p: string, k: usize, cfn: string, a0: string, rt: MType): R {
+    const sym = this.syms.l1(k);
+    return sym != "" ? unwrapR(p, sym, a0, rt, true) : unwrapR(p, cfn, a0, rt, false);
   }
 
   private maskOf(os: Operand[]): usize {
@@ -673,7 +680,12 @@ export class LlvmFunctionEmitter {
 
   // `--assert-facts`: the checks an unchecked access omits, run before it (the operands %<p>o0 / %<p>o1 are loaded).
   private assertArrayI(p: string, a: string, i: string): string {
-    return this.facts ? "  call void @orin_assert_array(ptr " + a + ", i64 " + i + ")\n" : "";
+    const sym = this.syms.l1(RT_ASSERT_ARRAY);
+    return this.facts
+        ? (sym != ""
+            ? "  " + p + "aa = ptrtoint ptr " + a + " to i64\n  call void @" + sym + "(i64 " + p + "aa, i64 " + i + ")\n"
+            : "  call void @orin_assert_array(ptr " + a + ", i64 " + i + ")\n")
+        : "";
   }
 
   private binaryI(p: string, d: usize, op: BinOp, a: Operand, b: Operand): string {
@@ -768,9 +780,49 @@ export class LlvmFunctionEmitter {
     };
   }
 
+  // The call of the string / array function that the L1 entry `k` replaces, on the loaded values `vals`: the Orin function of `$rt`
+  // (objects converted to address words and the result back) when the module has it, else the C runtime function. The result is a ptr.
+  private rtCallL(p: string, k: usize, vals: string[]): R {
+    const sym = this.syms.l1(k);
+    const w = rtSig(k).unwrap();
+    let pre = "";
+    let args: string[] = [];
+    let i: usize = 0;
+    while (i < w.params.length) {
+      const isObj = w.params[i] == "o";
+      if (sym != "" && isObj) {
+        pre += "  " + p + "pw" + u(i) + " = ptrtoint ptr " + vals[i] + " to i64\n";
+        args.push("i64 " + p + "pw" + u(i));
+      } else {
+        args.push((isObj ? "ptr " : "i64 ") + vals[i]);
+      }
+      i += 1;
+    }
+    if (sym == "") {
+      return R { text: pre + "  " + p + "r = call ptr @" + w.name + "(" + args.join(", ") + ")\n", val: p + "r" };
+    }
+    return R {
+      text: pre + "  " + p + "rw = call i64 @" + sym + "(" + args.join(", ") + ")\n  " + p + "r = inttoptr i64 " + p
+          + "rw to ptr\n",
+      val: p + "r",
+    };
+  }
+
   private builtinR(p: string, b: Builtin, args: Operand[], rt: MType): R {
     const a0 = args.length > 0 ? ov(p, 0, args[0]) : "";
     const r = p + "r";
+    match (l1Builtin(b)) {
+      Some(k) => {
+        let vals: string[] = [];
+        let n: usize = 0;
+        while (n < args.length) {
+          vals.push(ov(p, n, args[n]));
+          n += 1;
+        }
+        return this.rtCallL(p, k, vals);
+      },
+      None => {},
+    }
     const name = bname(b);
     if (name != "") {
       const ret = bret(b);
@@ -810,9 +862,9 @@ export class LlvmFunctionEmitter {
       BOptIsNone => tagIs(p, a0, 1),
       BResIsOk => tagIs(p, a0, 0),
       BResIsErr => tagIs(p, a0, 1),
-      BOptUnwrap => unwrapR(p, "orin_opt_unwrap", a0, rt),
-      BResUnwrap => unwrapR(p, "orin_res_unwrap", a0, rt),
-      BResUnwrapErr => unwrapR(p, "orin_res_unwrap_err", a0, rt),
+      BOptUnwrap => this.unwrapL1(p, RT_OPT_UNWRAP, "orin_opt_unwrap", a0, rt),
+      BResUnwrap => this.unwrapL1(p, RT_RES_UNWRAP, "orin_res_unwrap", a0, rt),
+      BResUnwrapErr => this.unwrapL1(p, RT_RES_UNWRAP_ERR, "orin_res_unwrap_err", a0, rt),
       BIntToFloat => R { text: "  " + r + " = sitofp i64 " + a0 + " to double\n", val: r },
       BUsizeToFloat => R { text: "  " + r + " = uitofp i64 " + a0 + " to double\n", val: r },
       BF32Round => R {
@@ -942,7 +994,7 @@ export class LlvmFunctionEmitter {
         + ":\n  call void @orin_oom()\n  unreachable\n" + lk + ":\n";
   }
 
-  // Core operations 13..23 (hir/coreops.or): the bit operations, expect, cfg, heapBase, realloc, memmove and memcmp.
+  // Core operations 13..27 (hir/coreops.or): the bit operations, expect, cfg, heapBase, realloc, memmove, memcmp, the wrapping arithmetic and the C hook.
   private coreExtraR(p: string, k: usize, a0: string, args: Operand[]): R {
     const r = p + "r";
     const q = p + "q";
@@ -959,6 +1011,20 @@ export class LlvmFunctionEmitter {
             + a1 + "\n  " + r + " = select i1 " + p + "c, i64 " + p + "s, i64 0\n",
         val: r,
       };
+    }
+    if (k == 27) {
+      // the C runtime hook (orin_core_hook in runtime/core/orin_runtime.c)
+      return R {
+        text: "  " + r + " = call i64 @orin_core_hook(i64 " + a0 + ", i64 " + ov(p, 1, args[1]) + ", i64 " + ov(p, 2, args[2]) + ", i64 "
+            + ov(p, 3, args[3]) + ")\n",
+        val: r,
+      };
+    }
+    if (k >= 24 && k <= 26) {
+      // wrapping arithmetic: plain add / sub / mul (no nuw / nsw)
+      const a1 = ov(p, 1, args[1]);
+      const ins = k == 24 ? "add" : k == 25 ? "sub" : "mul";
+      return R { text: "  " + r + " = " + ins + " i64 " + a0 + ", " + a1 + "\n", val: r };
     }
     if (k == 18) {
       // identity on the bool; the hint applies when `likely` is a literal
@@ -1066,6 +1132,17 @@ export class LlvmFunctionEmitter {
         };
   }
 
+  // `n = orin_struct_new(tag, nslots, mask)`: the Orin function of `$rt` when the program has it (its words converted from and to
+  // a pointer; `alwaysinline`), else the C runtime's.
+  private newStruct(n: string, tag: string, nslots: string, mask: string): string {
+    const sym = this.syms.l1(RT_STRUCT_NEW);
+    if (sym == "") {
+      return "  " + n + " = call ptr @orin_struct_new(i32 " + tag + ", i32 " + nslots + ", i64 " + mask + ")\n";
+    }
+    return "  " + n + "w = call i64 @" + sym + "(i64 " + tag + ", i64 " + nslots + ", i64 " + mask + ")\n  " + n
+        + " = inttoptr i64 " + n + "w to ptr\n";
+  }
+
   private structNewI(p: string, d: usize, tag: usize, slots: Operand[]): string {
     if (isAggT(this.f.locals[d].ty)) {
       return this.aggNewI(p, d, tag, slots);
@@ -1073,8 +1150,7 @@ export class LlvmFunctionEmitter {
     let s = this.loadsOf(p, slots);
 
     const n = p + "n";
-    s += "  " + n + " = call ptr @orin_struct_new(i32 " + u(tag) + ", i32 " + u(slots.length)
-        + ", i64 " + u(this.maskOf(slots)) + ")\n";
+    s += this.newStruct(n, u(tag), u(slots.length), u(this.maskOf(slots)));
     let k: usize = 0;
     while (k < slots.length) {
       s += slotGep(p + "g" + u(k), n, k);
@@ -1091,8 +1167,7 @@ export class LlvmFunctionEmitter {
     let s = this.loadsOf(p, caps);
     let env = p + "e";
     if (caps.length > 0) {
-      s += "  " + env + " = call ptr @orin_struct_new(i32 0, i32 " + u(caps.length) + ", i64 "
-          + u(this.maskOf(caps)) + ")\n";
+      s += this.newStruct(env, "0", u(caps.length), u(this.maskOf(caps)));
       let k: usize = 0;
       while (k < caps.length) {
         s += slotGep(p + "g" + u(k), env, k);
@@ -1100,10 +1175,13 @@ export class LlvmFunctionEmitter {
         k += 1;
       }
     } else {
-      s += "  " + env + " = call ptr @orin_nullary(i32 0)\n";
+      s += this.syms.l1Loaded() ? "" : "  " + env + " = call ptr @orin_nullary(i32 0)\n";
+      if (this.syms.l1Loaded()) {
+        env = "@orin_nz0";
+      }
     }
     const n = p + "n";
-    s += "  " + n + " = call ptr @orin_struct_new(i32 0, i32 2, i64 2)\n";
+    s += this.newStruct(n, "0", "2", "2");
     s += slotGep(p + "c0", n, 0) + "  store ptr @" + this.syms.name(f) + ", ptr " + p + "c0\n";
     s += slotGep(p + "c1", n, 1) + "  store ptr " + env + ", ptr " + p + "c1\n";
     return s + this.st(d, n);
@@ -1144,7 +1222,7 @@ export class LlvmFunctionEmitter {
   private ifaceI(p: string, d: usize, vt: usize, v: Operand): string {
     let s = this.loadsOf(p, [v]);
     const n = p + "n";
-    s += "  " + n + " = call ptr @orin_struct_new(i32 0, i32 2, i64 2)\n";
+    s += this.newStruct(n, "0", "2", "2");
     s += slotGep(p + "c0", n, 0) + "  store ptr @orin_vt" + u(vt) + ", ptr " + p + "c0\n";
     s += slotGep(p + "c1", n, 1) + "  store " + this.targ(p, 0, v) + ", ptr " + p + "c1\n";
     return s + this.st(d, n);
@@ -1191,8 +1269,11 @@ export class LlvmFunctionEmitter {
   private arrayNewI(p: string, d: usize, isRef: bool, es: Operand[]): string {
     let s = this.loadsOf(p, es);
     const n = p + "n";
-    s += "  " + n + " = call ptr @orin_array_new(i64 " + u(es.length) + ", i64 "
-        + (isRef ? "1" : "0") + ")\n";
+    const asym = this.syms.l1(RT_ARRAY_NEW);
+    s += asym != ""
+        ? "  " + n + "w = call i64 @" + asym + "(i64 " + u(es.length) + ", i64 " + (isRef ? "1" : "0") + ")\n  " + n
+            + " = inttoptr i64 " + n + "w to ptr\n"
+        : "  " + n + " = call ptr @orin_array_new(i64 " + u(es.length) + ", i64 " + (isRef ? "1" : "0") + ")\n";
     let k: usize = 0;
     while (k < es.length) {
       s += this.asSlot(p, k, es[k]);
@@ -1211,6 +1292,20 @@ export class LlvmFunctionEmitter {
     return "  store " + lty(this.opTy(v)) + " " + ov(p, n, v) + ", ptr " + slot + "\n";
   }
 
+  // `x = f(x, os..)` for the string / array function of the L1 entry `k` (the first argument is the local `x`, which the call consumes).
+  private rtStmt(p: string, x: usize, k: usize, os: Operand[]): string {
+    let s = "  " + p + "x = load ptr, ptr %l" + u(x) + "\n";
+    let vals: string[] = [p + "x"];
+    let n: usize = 0;
+    while (n < os.length) {
+      n += 1;
+      s += this.ld(p, n, os[n - 1]);
+      vals.push(ov(p, n, os[n - 1]));
+    }
+    const r = this.rtCallL(p, k, vals);
+    return s + r.text + this.st(x, r.val);
+  }
+
   private instrI(p: string, i: Instr): string {
     return match (i) {
       ICopy(d, o) => this.ld(p, 0, o) + this.st(d, ov(p, 0, o)),
@@ -1224,25 +1319,17 @@ export class LlvmFunctionEmitter {
       IBinary(d, op, a, b) => this.binaryI(p, d, op, a, b),
       ICall(d, f, args) => this.callI(p, d, f, args),
       IBuiltin(d, b, args) => this.builtinInstr(p, d, b, args),
-      IStrAppend(x, y) => "  " + p + "x = load ptr, ptr %l" + u(x) + "\n" + this.ld(p, 1, y) + "  "
-          + p + "r = call ptr @orin_str_append(ptr " + p + "x, ptr " + ov(p, 1, y) + ")\n"
-          + this.st(x, p + "r"),
-      IStrAppendSub(x, y, a, b) => "  " + p + "x = load ptr, ptr %l" + u(x) + "\n" + this.ld(p, 1, y) + this.ld(p, 2, a)
-          + this.ld(p, 3, b) + "  " + p + "r = call ptr @orin_str_append_sub(ptr " + p + "x, ptr " + ov(p, 1, y) + ", i64 "
-          + ov(p, 2, a) + ", i64 " + ov(p, 3, b) + ")\n" + this.st(x, p + "r"),
-      IStrAppendNum(x, y, uns) => "  " + p + "x = load ptr, ptr %l" + u(x) + "\n" + this.ld(p, 1, y) + "  "
-          + p + "r = call ptr @" + (uns ? "orin_str_append_usize" : "orin_str_append_int") + "(ptr " + p + "x, i64 "
-          + ov(p, 1, y) + ")\n" + this.st(x, p + "r"),
-      IStrPrepend(x, y) => "  " + p + "x = load ptr, ptr %l" + u(x) + "\n" + this.ld(p, 1, y) + "  "
-          + p + "r = call ptr @orin_str_prepend(ptr " + p + "x, ptr " + ov(p, 1, y) + ")\n"
-          + this.st(x, p + "r"),
-      IArrayExtend(x, y) => "  " + p + "x = load ptr, ptr %l" + u(x) + "\n" + this.ld(p, 1, y)
-          + "  " + p + "r = call ptr @orin_array_extend(ptr " + p + "x, ptr " + ov(p, 1, y) + ")\n"
-          + this.st(x, p + "r"),
+      IStrAppend(x, y) => this.rtStmt(p, x, RT_STR_APPEND, [y]),
+      IStrAppendSub(x, y, a, b) => this.rtStmt(p, x, RT_STR_APPEND_SUB, [y, a, b]),
+      IStrAppendNum(x, y, uns) => this.rtStmt(p, x, uns ? RT_STR_APPEND_USIZE : RT_STR_APPEND_INT, [y]),
+      IStrPrepend(x, y) => this.rtStmt(p, x, RT_STR_PREPEND, [y]),
+      IArrayExtend(x, y) => this.rtStmt(p, x, RT_ARRAY_EXTEND, [y]),
       IStructNew(d, tag, slots) => this.structNewI(p, d, tag, slots),
       INullary(d, t) => isAggT(this.f.locals[d].ty)
           ? this.aggNewI(p, d, t, [])
-          : "  " + p + "r = call ptr @orin_nullary(i32 " + u(t) + ")\n" + this.st(d, p + "r"),
+          : this.syms.l1Loaded()
+              ? this.st(d, "@orin_nz" + u(t))
+              : "  " + p + "r = call ptr @orin_nullary(i32 " + u(t) + ")\n" + this.st(d, p + "r"),
       ITag(d, o) => match (this.aggLocal(o)) {
         Some(l) => this.ld(p, 0, o) + extractW(p + "r", lty(this.f.locals[l].ty), ov(p, 0, o), 0)
             + this.st(d, p + "r"),
@@ -1332,9 +1419,12 @@ export class LlvmFunctionEmitter {
   // `--assert-facts`: check the pre-instruction slot before IForward writes its destination (which can be key).
   // The caller already loaded s into %<p>o0; operands 1/2 and the optional slot conversion use distinct names.
   private assertFactI(p: string, s: usize, o: Operand, k: Operand): string {
+    const sym = this.syms.l1(RT_ASSERT_FACT);
     return this.ld(p, 1, o) + this.ld(p, 2, k) + this.asSlot(p, 0, OLocal(s))
-        + "  call void @orin_assert_fact(ptr " + ov(p, 1, o) + ", i64 " + ov(p, 2, k) + ", i64 "
-        + this.slotVal(p, 0, OLocal(s)) + ")\n";
+        + (sym != ""
+            ? "  " + p + "fa = ptrtoint ptr " + ov(p, 1, o) + " to i64\n  call void @" + sym + "(i64 " + p + "fa, i64 "
+            : "  call void @orin_assert_fact(ptr " + ov(p, 1, o) + ", i64 ")
+        + ov(p, 2, k) + ", i64 " + this.slotVal(p, 0, OLocal(s)) + ")\n";
   }
 
   private switchI(p: string, o: Operand, cases: SwitchCase[], d: usize): string {
@@ -1443,9 +1533,11 @@ export class LlvmFunctionEmitter {
     if (f.inout) {
       sig += ", ptr noundef nonnull %pout";
     }
+    // `arrayPushGrow` is the slow path of every inlined push: kept out of line, as the C function was, so that clang does not
+    // fold its body (and its register pressure) into the fast path of the callers.
     sig += isInlineFn(this.prog, f.name)
         ? ") alwaysinline nounwind {\nentry:\n"
-        : ") nounwind {\nentry:\n";
+        : (f.name == "$rt/object.arrayPushGrow" || rtCold(f.name) ? ") noinline nounwind {\nentry:\n" : ") nounwind {\nentry:\n");
     out.push(sig);
     i = 0;
     while (i < f.locals.length) {

@@ -1,0 +1,224 @@
+// $rt/array -- array slice, concatenation and extension and the byte conversions, written in Orin (ADR-0052 Addendum A, step R3d.4).
+//
+// The backends call these functions by name (compiler/mir/rt.or lists them; opt/prune.or keeps them) in place of the C runtime
+// functions `orin_array_slice`, `orin_array_concat`, `orin_array_extend`, `orin_bytes_to_string` and `orin_string_to_bytes`; the C
+// unit tests of the runtime reach them through the wrappers of the same C names. An object is its address as a `usize`; the layout
+// is the frozen one (heap.or): array len@16 cap@24 is_ref@32 items@40, the items 8-byte slots; string len@16 cap@24 data@32.
+// A reference array (`is_ref` != 0) owns one count of each element: copying it retains every element (a loop over the slots), a
+// scalar array is copied as bytes. Counters are updated exactly as the C versions did (the ORIN_STATS=1 report is the oracle).
+
+import { load8, load32, load64, store8, store64, memCopy, heapBase, cfg, wadd, wsub, wmul, shl, and, or } from "std:core";
+import { taskTrap } from "std:fsraw";
+import { sbRealloc, addAt, statGrow, siteGrow, S_ARRAY_GROWS } from "./heap";
+import { arrayNew, strAlloc } from "./object";
+import { retain, release } from "./rc";
+import { trapShape } from "./leaf";
+
+// Copy `n` slots from `src` to `dst` (ranges that do not overlap); a reference array retains each element.
+@Inline
+function copySlots(dst: usize, src: usize, n: usize, isRef: usize): void {
+  if (n == 0) {
+    return;
+  }
+  if (isRef != 0) {
+    let i: usize = 0;
+    while (i < n) {
+      const v = load64(wadd(src, shl(i, 3)));
+      store64(wadd(dst, shl(i, 3)), v);
+      retain(v);
+      i = wadd(i, 1);
+    }
+  } else {
+    memCopy(dst, src, shl(n, 3));
+  }
+}
+
+// The slots `lo .. hi` of `o` as a new array of the same element kind; traps "slice out of range" unless lo <= hi <= len.
+export function arraySlice(o: usize, lo: usize, hi: usize): usize {
+  if (lo > hi || hi > load64(wadd(o, 16))) {
+    taskTrap("slice out of range");
+  }
+  const isRef = load64(wadd(o, 32));
+  const k = wsub(hi, lo);
+  const r = arrayNew(k, isRef);
+  if (k != 0) {
+    copySlots(load64(wadd(r, 40)), wadd(load64(wadd(o, 40)), shl(lo, 3)), k, isRef);
+    store64(wadd(r, 16), k);
+  }
+  return r;
+}
+
+// x ++ y as a new array (a reference array when either is).
+export function arrayConcat(x: usize, y: usize): usize {
+  const la = load64(wadd(x, 16));
+  const lb = load64(wadd(y, 16));
+  const n = wadd(la, lb);
+  const r = arrayNew(n, or(load64(wadd(x, 32)), load64(wadd(y, 32))));
+  if (n != 0) {
+    const dst = load64(wadd(r, 40));
+    copySlots(dst, load64(wadd(x, 40)), la, load64(wadd(x, 32)));
+    copySlots(wadd(dst, shl(la, 3)), load64(wadd(y, 40)), lb, load64(wadd(y, 32)));
+    store64(wadd(r, 16), n);
+  }
+  return r;
+}
+
+// The item buffer of the unique array `x` grown to hold at least `n` slots: at least twice the capacity, 4 slots at the least. Out of
+// line: the in-place path of `arrayExtend` stays small.
+function growItems(x: usize, n: usize): void {
+  const cap = load64(wadd(x, 24));
+  let ncap = wmul(cap, 2);
+  if (ncap < n) {
+    ncap = n;
+  }
+  if (ncap < 4) {
+    ncap = 4;
+  }
+  if (ncap > 1099511627776) {
+    taskTrap("array too large");
+  }
+  store64(wadd(x, 40), sbRealloc(load64(wadd(x, 40)), shl(cap, 3), shl(ncap, 3)));
+  statGrow(shl(wsub(ncap, cap), 3));
+  if (cfg(1) == 1) {
+    addAt(wadd(heapBase(), S_ARRAY_GROWS), 1);
+  }
+  siteGrow(x, shl(wsub(ncap, cap), 3));
+  store64(wadd(x, 24), ncap);
+}
+
+// x ++ y as a new array and one count of `x` released (the copying path of `arrayExtend`).
+function extendCopy(x: usize, y: usize): usize {
+  const r = arrayConcat(x, y);
+  release(x);
+  return r;
+}
+
+// x = x ++ y. Consumes `x`; `y` is only read. In place only when `x` is unique, is not `y` and the element kinds agree (or `x` is
+// empty); else a new array and one count of `x` released.
+export function arrayExtend(x: usize, y: usize): usize {
+  if (load32(wadd(x, 8)) != 2 || load32(wadd(y, 8)) != 2) {
+    trapShape();
+  }
+  const lb = load64(wadd(y, 16));
+  if (lb == 0) {
+    return x;
+  }
+  const la = load64(wadd(x, 16));
+  const xRef = load64(wadd(x, 32));
+  const yRef = load64(wadd(y, 32));
+  if (load64(x) == 1 && x != y && (xRef == yRef || la == 0)) {
+    const n = wadd(la, lb);
+    if (n > load64(wadd(x, 24))) {
+      growItems(x, n);
+    }
+    store64(wadd(x, 32), yRef);
+    copySlots(wadd(load64(wadd(x, 40)), shl(la, 3)), load64(wadd(y, 40)), lb, yRef);
+    store64(wadd(x, 16), n);
+    return x;
+  }
+  return extendCopy(x, y);
+}
+
+// Narrow `n` 8-byte slots at `src` to bytes at `dst`. The slots of a u8 array hold 0..255, but the runtime does not trust that: the
+// result is the OR of all slots, so a value above 255 shows as a result above 255. Eight elements per step.
+function narrow(dst: usize, src: usize, n: usize): usize {
+  let bad: usize = 0;
+  let i: usize = 0;
+  const n8 = wsub(n, and(n, 7));
+  let p = src;
+  let q = dst;
+  while (i < n8) {
+    const a = load64(p);
+    const b = load64(wadd(p, 8));
+    const c = load64(wadd(p, 16));
+    const d = load64(wadd(p, 24));
+    const e = load64(wadd(p, 32));
+    const f = load64(wadd(p, 40));
+    const g = load64(wadd(p, 48));
+    const h = load64(wadd(p, 56));
+    bad = or(bad, or(or(or(a, b), or(c, d)), or(or(e, f), or(g, h))));
+    store8(q, a);
+    store8(wadd(q, 1), b);
+    store8(wadd(q, 2), c);
+    store8(wadd(q, 3), d);
+    store8(wadd(q, 4), e);
+    store8(wadd(q, 5), f);
+    store8(wadd(q, 6), g);
+    store8(wadd(q, 7), h);
+    p = wadd(p, 64);
+    q = wadd(q, 8);
+    i = wadd(i, 8);
+  }
+  while (i < n) {
+    const v = load64(p);
+    bad = or(bad, v);
+    store8(q, v);
+    p = wadd(p, 8);
+    q = wadd(q, 1);
+    i = wadd(i, 1);
+  }
+  return bad;
+}
+
+// Widen `n` bytes at `src` to 8-byte slots at `dst`. Eight elements per step.
+function widen(dst: usize, src: usize, n: usize): void {
+  let i: usize = 0;
+  const n8 = wsub(n, and(n, 7));
+  let p = src;
+  let q = dst;
+  while (i < n8) {
+    store64(q, load8(p));
+    store64(wadd(q, 8), load8(wadd(p, 1)));
+    store64(wadd(q, 16), load8(wadd(p, 2)));
+    store64(wadd(q, 24), load8(wadd(p, 3)));
+    store64(wadd(q, 32), load8(wadd(p, 4)));
+    store64(wadd(q, 40), load8(wadd(p, 5)));
+    store64(wadd(q, 48), load8(wadd(p, 6)));
+    store64(wadd(q, 56), load8(wadd(p, 7)));
+    p = wadd(p, 8);
+    q = wadd(q, 64);
+    i = wadd(i, 8);
+  }
+  while (i < n) {
+    store64(q, load8(p));
+    p = wadd(p, 1);
+    q = wadd(q, 8);
+    i = wadd(i, 1);
+  }
+}
+
+// The bytes `o[start .. start + len)` of a u8 array as a string. Traps on a value that is not an array of scalars, on a range outside
+// the array ("slice out of range") and on an element above 255 ("byte out of range").
+export function bytesToString(o: usize, start: usize, len: usize): usize {
+  if (load32(wadd(o, 8)) != 2 || load64(wadd(o, 32)) != 0) {
+    trapShape();
+  }
+  const alen = load64(wadd(o, 16));
+  if (start > alen || len > wsub(alen, start)) {
+    taskTrap("slice out of range");
+  }
+  const s = strAlloc(len, len);
+  // an empty array may have no item buffer: form an element address only when len > 0
+  if (len != 0) {
+    const bad = narrow(wadd(s, 32), wadd(load64(wadd(o, 40)), shl(start, 3)), len);
+    if (bad > 255) {
+      release(s);
+      taskTrap("byte out of range");
+    }
+  }
+  return s;
+}
+
+// The bytes of a string as a u8 array.
+export function stringToBytes(o: usize): usize {
+  if (load32(wadd(o, 8)) != 1) {
+    trapShape();
+  }
+  const len = load64(wadd(o, 16));
+  const r = arrayNew(len, 0);
+  if (len != 0) {
+    widen(load64(wadd(r, 40)), wadd(o, 32), len);
+    store64(wadd(r, 16), len);
+  }
+  return r;
+}
