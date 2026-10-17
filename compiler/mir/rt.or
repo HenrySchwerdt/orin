@@ -18,13 +18,41 @@ export const RT_V_UNWRAP: usize = 3;
 export const RT_TRAP_SHAPE: usize = 4;
 export const RT_ASSERT_FACT: usize = 5;
 export const RT_ASSERT_ARRAY: usize = 6;
+export const RT_STRUCT_NEW: usize = 7;
+export const RT_VARIANT1: usize = 8;
+export const RT_ARRAY_NEW: usize = 9;
 
-// The qualified names of the entries, by number (the module `$rt/leaf.or`).
+// The qualified names of the entries, by number (the modules `$rt/leaf.or` and `$rt/object.or`).
 export function rtNames(): string[] {
   return [
     "$rt/leaf.optUnwrap", "$rt/leaf.resUnwrap", "$rt/leaf.resUnwrapErr", "$rt/leaf.vUnwrap", "$rt/leaf.trapShape",
-    "$rt/leaf.assertFact", "$rt/leaf.assertArray"
+    "$rt/leaf.assertFact", "$rt/leaf.assertArray", "$rt/object.structNew", "$rt/object.variant1", "$rt/object.arrayNew"
   ];
+}
+
+// An entry that the C shells of the runtime call under its C name (`orin_struct_new` ...): the emitted code defines a wrapper
+// of that name (a C function, an LLVM function) that casts the C types to words and calls the entry. `ret` and `params` are
+// the C types: "o" an `OrinObj *`, "p" a `void *`, "u32", "u64", "i64", "v" (no result). The prototypes stay in
+// runtime/core/orin_runtime.h; a program without the L1 entries (`--c-builtins`) links the frozen C runtime that defines them.
+export type RtWrap = { entry: usize; name: string; ret: string; params: string[]; };
+
+// The wrappers, in the order they are emitted. Every one of these entries is kept alive by `opt/prune.or` (`rtAlways`).
+export function rtWraps(): RtWrap[] {
+  return [
+    RtWrap { entry: RT_STRUCT_NEW, name: "orin_struct_new", ret: "o", params: ["u32", "u32", "u64"] },
+    RtWrap { entry: RT_VARIANT1, name: "orin_variant1", ret: "o", params: ["u32", "u64", "u64"] },
+    RtWrap { entry: RT_ARRAY_NEW, name: "orin_array_new", ret: "o", params: ["u64", "i64"] },
+  ];
+}
+
+// The entries a live program always needs when `$rt` is loaded: the shape trap (the LLVM helpers and the C inlines call it) and
+// every entry with a wrapper (the C shells call those).
+export function rtAlways(): usize[] {
+  let out: usize[] = [RT_TRAP_SHAPE];
+  for (const w of rtWraps()) {
+    out.push(w.entry);
+  }
+  return out;
 }
 
 // The function index of every entry in `prog`, -1 when the program has none: `ids[RT_*]`.
@@ -38,7 +66,7 @@ export function rtIds(prog: MProgram): int[] {
   let i: usize = 0;
   while (i < prog.functions.length) {
     const fname = prog.functions[i].name;
-    if (fname.startsWith("$rt/leaf.")) {
+    if (fname.startsWith("$rt/")) {
       let k: usize = 0;
       while (k < names.length) {
         if (names[k] == fname) {
@@ -48,6 +76,19 @@ export function rtIds(prog: MProgram): int[] {
       }
     }
     i += 1;
+  }
+  return ids;
+}
+
+// `rtIds`, and for the allocation-site census build (`--stats-sites`) without the entries that replace C runtime functions of the
+// object model (`rtWraps`): the census hooks live in the C runtime, so a census build keeps calling its C allocator (compiled in
+// under -DORIN_SITE_STATS until the census moves, R3d.5).
+export function rtIdsFor(prog: MProgram, sites: bool): int[] {
+  let ids = rtIds(prog);
+  if (sites) {
+    for (const w of rtWraps()) {
+      ids[w.entry] = -1;
+    }
   }
   return ids;
 }

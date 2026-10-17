@@ -1,4 +1,6 @@
 /* Runtime-only tests. Build: cc -I runtime/core runtime/core/tests/runtime_test.c runtime/core/orin_runtime.c runtime/platform/orin_platform.c
+ *     $(tools/rt_stub.sh build/rt_stub.o)
+ * (the object model is Orin code, ADR-0052 R3d.3; the stub object defines orin_struct_new, orin_destroy, ... for the C shells).
  * Optionally with -fsanitize=address,undefined. Exits 0 and prints "ok" on success. */
 #define _GNU_SOURCE
 #include "orin_runtime.h"

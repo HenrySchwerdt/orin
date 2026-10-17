@@ -10,6 +10,7 @@ import { BinOp, UnOp, Builtin, taskOpC, taskOpRet } from "../../hir";
 import {
   MType, MLocal, Operand, Instr, SwitchCase, Terminator, MBlock, MFunction, MProgram, isInlineFn,
   slotWords, RT_OPT_UNWRAP, RT_RES_UNWRAP, RT_RES_UNWRAP_ERR, RT_V_UNWRAP, RT_ASSERT_FACT, RT_ASSERT_ARRAY,
+  RT_STRUCT_NEW, RT_ARRAY_NEW,
 } from "../../mir";
 import { refMask, inoutArgOk, targetsBelow, linesOfBlocks } from "../c";
 import { u, isRefT, isUsizeT, isFloatT, isAggT, zeroOf, lty, attrTy, paramTy } from "./text";
@@ -956,7 +957,7 @@ export class LlvmFunctionEmitter {
         + ":\n  call void @orin_oom()\n  unreachable\n" + lk + ":\n";
   }
 
-  // Core operations 13..23 (hir/coreops.or): the bit operations, expect, cfg, heapBase, realloc, memmove and memcmp.
+  // Core operations 13..26 (hir/coreops.or): the bit operations, expect, cfg, heapBase, realloc, memmove, memcmp and the wrapping arithmetic.
   private coreExtraR(p: string, k: usize, a0: string, args: Operand[]): R {
     const r = p + "r";
     const q = p + "q";
@@ -973,6 +974,12 @@ export class LlvmFunctionEmitter {
             + a1 + "\n  " + r + " = select i1 " + p + "c, i64 " + p + "s, i64 0\n",
         val: r,
       };
+    }
+    if (k >= 24 && k <= 26) {
+      // wrapping arithmetic: plain add / sub / mul (no nuw / nsw)
+      const a1 = ov(p, 1, args[1]);
+      const ins = k == 24 ? "add" : k == 25 ? "sub" : "mul";
+      return R { text: "  " + r + " = " + ins + " i64 " + a0 + ", " + a1 + "\n", val: r };
     }
     if (k == 18) {
       // identity on the bool; the hint applies when `likely` is a literal
@@ -1080,6 +1087,17 @@ export class LlvmFunctionEmitter {
         };
   }
 
+  // `n = orin_struct_new(tag, nslots, mask)`: the Orin function of `$rt` when the program has it (its words converted from and to
+  // a pointer; `alwaysinline`), else the C runtime's.
+  private newStruct(n: string, tag: string, nslots: string, mask: string): string {
+    const sym = this.syms.l1(RT_STRUCT_NEW);
+    if (sym == "") {
+      return "  " + n + " = call ptr @orin_struct_new(i32 " + tag + ", i32 " + nslots + ", i64 " + mask + ")\n";
+    }
+    return "  " + n + "w = call i64 @" + sym + "(i64 " + tag + ", i64 " + nslots + ", i64 " + mask + ")\n  " + n
+        + " = inttoptr i64 " + n + "w to ptr\n";
+  }
+
   private structNewI(p: string, d: usize, tag: usize, slots: Operand[]): string {
     if (isAggT(this.f.locals[d].ty)) {
       return this.aggNewI(p, d, tag, slots);
@@ -1087,8 +1105,7 @@ export class LlvmFunctionEmitter {
     let s = this.loadsOf(p, slots);
 
     const n = p + "n";
-    s += "  " + n + " = call ptr @orin_struct_new(i32 " + u(tag) + ", i32 " + u(slots.length)
-        + ", i64 " + u(this.maskOf(slots)) + ")\n";
+    s += this.newStruct(n, u(tag), u(slots.length), u(this.maskOf(slots)));
     let k: usize = 0;
     while (k < slots.length) {
       s += slotGep(p + "g" + u(k), n, k);
@@ -1105,8 +1122,7 @@ export class LlvmFunctionEmitter {
     let s = this.loadsOf(p, caps);
     let env = p + "e";
     if (caps.length > 0) {
-      s += "  " + env + " = call ptr @orin_struct_new(i32 0, i32 " + u(caps.length) + ", i64 "
-          + u(this.maskOf(caps)) + ")\n";
+      s += this.newStruct(env, "0", u(caps.length), u(this.maskOf(caps)));
       let k: usize = 0;
       while (k < caps.length) {
         s += slotGep(p + "g" + u(k), env, k);
@@ -1120,7 +1136,7 @@ export class LlvmFunctionEmitter {
       }
     }
     const n = p + "n";
-    s += "  " + n + " = call ptr @orin_struct_new(i32 0, i32 2, i64 2)\n";
+    s += this.newStruct(n, "0", "2", "2");
     s += slotGep(p + "c0", n, 0) + "  store ptr @" + this.syms.name(f) + ", ptr " + p + "c0\n";
     s += slotGep(p + "c1", n, 1) + "  store ptr " + env + ", ptr " + p + "c1\n";
     return s + this.st(d, n);
@@ -1161,7 +1177,7 @@ export class LlvmFunctionEmitter {
   private ifaceI(p: string, d: usize, vt: usize, v: Operand): string {
     let s = this.loadsOf(p, [v]);
     const n = p + "n";
-    s += "  " + n + " = call ptr @orin_struct_new(i32 0, i32 2, i64 2)\n";
+    s += this.newStruct(n, "0", "2", "2");
     s += slotGep(p + "c0", n, 0) + "  store ptr @orin_vt" + u(vt) + ", ptr " + p + "c0\n";
     s += slotGep(p + "c1", n, 1) + "  store " + this.targ(p, 0, v) + ", ptr " + p + "c1\n";
     return s + this.st(d, n);
@@ -1208,8 +1224,11 @@ export class LlvmFunctionEmitter {
   private arrayNewI(p: string, d: usize, isRef: bool, es: Operand[]): string {
     let s = this.loadsOf(p, es);
     const n = p + "n";
-    s += "  " + n + " = call ptr @orin_array_new(i64 " + u(es.length) + ", i64 "
-        + (isRef ? "1" : "0") + ")\n";
+    const asym = this.syms.l1(RT_ARRAY_NEW);
+    s += asym != ""
+        ? "  " + n + "w = call i64 @" + asym + "(i64 " + u(es.length) + ", i64 " + (isRef ? "1" : "0") + ")\n  " + n
+            + " = inttoptr i64 " + n + "w to ptr\n"
+        : "  " + n + " = call ptr @orin_array_new(i64 " + u(es.length) + ", i64 " + (isRef ? "1" : "0") + ")\n";
     let k: usize = 0;
     while (k < es.length) {
       s += this.asSlot(p, k, es[k]);

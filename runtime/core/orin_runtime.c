@@ -523,6 +523,10 @@ void orin_destroy(OrinObj *o) {
 
 /* ---------------------------------------------------------------- structs */
 
+/* orin_struct_new, orin_variant1 and orin_array_new are Orin functions of $rt/object.or now (ADR-0052 R3d.3 (a)); the code the program is
+ * compiled to defines them under these names for the C shells below. A census build (-DORIN_SITE_STATS, `orin2 compile --stats-sites`)
+ * keeps the C versions, because the census hooks (SITE_ALLOC) are C: they go with the census in R3d.5. */
+#ifdef ORIN_SITE_STATS
 OrinObj *orin_struct_new(uint32_t tag, uint32_t nslots, uint64_t refmask) {
     if (nslots > 64) orin_trap("struct has more than 64 slots");
     OrinStruct *s;
@@ -555,17 +559,20 @@ OrinObj *orin_struct_new(uint32_t tag, uint32_t nslots, uint64_t refmask) {
     SITE_ALLOC(&s->h, 3, sizeof(OrinStruct) + (uint64_t)nslots * 8);
     return &s->h;
 }
+#endif
 
 /* orin_nullary, orin_assert_fact, orin_assert_array, orin_struct_copy_slot, orin_opt_unwrap, orin_res_unwrap, orin_res_unwrap_err and
  * orin_v_unwrap are written in Orin now ($rt/leaf.or, ADR-0052 R3d.2); the frozen runtime in bootstrap/seed/runtime/ keeps the C versions
  * for the seed and --c-builtins. orin_trap_shape stays: the header inlines and the functions below call it. */
 void orin_trap_shape(void) { orin_trap("field access on a value of the wrong shape (compiler bug)"); }
 
+#ifdef ORIN_SITE_STATS
 OrinObj *orin_variant1(uint32_t tag, uint64_t refmask, uint64_t slot) {
     OrinObj *o = orin_struct_new(tag, 1, refmask & 1);
     ((OrinStruct *)o)->slots[0] = slot;
     return o;
 }
+#endif
 
 /* ---------------------------------------------------------------- make_unique */
 
@@ -1085,6 +1092,7 @@ OrinObj *orin_parse_float(OrinObj *s) {
 
 /* ---------------------------------------------------------------- arrays */
 
+#ifdef ORIN_SITE_STATS
 OrinObj *orin_array_new(uint64_t cap, int64_t is_ref) {
     if (cap > ((uint64_t)1 << 40)) orin_trap("array too large");
     OrinArray *a;
@@ -1108,6 +1116,7 @@ OrinObj *orin_array_new(uint64_t cap, int64_t is_ref) {
     SITE_ALLOC(&a->h, is_ref ? 2 : 1, sizeof(OrinArray) + cap * 8);
     return &a->h;
 }
+#endif
 
 void orin_array_push_grow(OrinObj *o, uint64_t slot) {
     OrinArray *a = (OrinArray *)o;

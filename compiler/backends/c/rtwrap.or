@@ -1,0 +1,66 @@
+// The C-named wrappers of the L1 entries (ADR-0052 Addendum A section 3, step R3d.3): the C shells of the runtime (strings,
+// arrays, files, tasks) still allocate with `orin_struct_new`, `orin_variant1`, `orin_array_new` ..., which are Orin functions of
+// `$rt` now. The unit defines each of them under its C name (the prototypes stay in runtime/core/orin_runtime.h); the wrapper casts
+// the C types to the words of the entry and calls it. Generated code does not use them: it calls the entry directly
+// (`CSymbols.l1`), so the C compiler can inline it. A program without the L1 entries (`--c-builtins`), and a census build
+// (`--stats-sites`, the entries are switched off in `rtIdsFor`), has none: it links the C implementation.
+
+import { RtWrap, rtWraps } from "../../mir";
+import { CSymbols } from "./symbols";
+
+function ctype(k: string): string {
+  if (k == "o") {
+    return "OrinObj *";
+  }
+  if (k == "p") {
+    return "void *";
+  }
+  if (k == "u32") {
+    return "uint32_t";
+  }
+  if (k == "u64") {
+    return "uint64_t";
+  }
+  if (k == "i64") {
+    return "int64_t";
+  }
+  return "void";
+}
+
+function isPtr(k: string): bool {
+  return k == "o" || k == "p";
+}
+
+// The definition of one wrapper, one line.
+function wrapper(w: RtWrap, sym: string): string {
+  let ps = "";
+  let args = "";
+  let i: usize = 0;
+  while (i < w.params.length) {
+    const k = w.params[i];
+    ps += (i > 0 ? ", " : "") + ctype(k) + " a" + i.toString();
+    args += (i > 0 ? ", " : "") + (isPtr(k) ? "(uint64_t)(uintptr_t)a" : "(uint64_t)a") + i.toString();
+    i += 1;
+  }
+  if (w.params.length == 0) {
+    ps = "void";
+  }
+  const call = sym + "(" + args + ")";
+  const body = w.ret == "v" ? call + ";" : "return (" + ctype(w.ret) + ")" + (isPtr(w.ret) ? "(uintptr_t)" : "") + call + ";";
+  return ctype(w.ret) + " " + w.name + "(" + ps + ") { " + body + " }\n";
+}
+
+// The definitions of all wrappers of the program ("" when it has no L1 entries).
+export function rtWrapDecls(syms: CSymbols): string {
+  if (!syms.l1Loaded()) {
+    return "";
+  }
+  let out = "";
+  for (const w of rtWraps()) {
+    const sym = syms.l1(w.entry);
+    if (sym != "") {
+      out += wrapper(w, sym);
+    }
+  }
+  return out;
+}

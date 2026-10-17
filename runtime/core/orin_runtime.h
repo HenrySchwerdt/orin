@@ -443,7 +443,10 @@ OrinObj *orin_parse_int_k(OrinObj *s, int64_t kind);                      /* Opt
 /* ---------------------------------------------------------------- structs / variants */
 /* Records use tag 0. Option: Some=0 (1 slot), None=1. Result: Ok=0 (1 slot, 0 for void), Err=1. */
 
-/* New struct with all slots zero (null refs). Fill with orin_struct_init (init only). */
+/* New struct with all slots zero (null refs). Fill with orin_struct_init (init only).
+ * orin_struct_new, orin_variant1 and orin_array_new are Orin functions of runtime/core/object.or ($rt, ADR-0052 R3d.3 (a)): the code a
+ * program is compiled to defines these C names (compiler/backends/{c,llvm}/rtwrap.or) and calls the Orin functions directly; a test that links
+ * only the C files of the runtime links tools/rt_stub.sh's object. -DORIN_SITE_STATS builds keep the C versions (census hooks). */
 OrinObj *orin_struct_new(uint32_t tag, uint32_t nslots, uint64_t refmask);
 /* Immortal singleton for a payload-less variant, for the C shells: tag 0 (Ok of void) or 1 (None, Err), one static object per
  * translation unit. Generated code has its own static objects per tag (`orin_nz<tag>`, ADR-0052 R3d.2). */

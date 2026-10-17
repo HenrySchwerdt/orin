@@ -30,8 +30,9 @@ for mode in plain asan; do
     [ "$mode" != asan ] || flags="-g -fsanitize=address,undefined -fno-sanitize-recover=undefined"
     $CC -Wall -Wextra $flags -Dorin_platform_dir_list=orin_platform_dir_list_real \
         -c runtime/platform/orin_platform.c -o $B/dir_adapter_platform_$mode.o
+    stub=$(ORIN2=${ORIN2:-build/bootstrap/orin2} CC=$CC tools/rt_stub.sh $B/dir_adapter_stub_$mode.o $flags)   # the object model: runtime/core/tests/rt_stub.or
     $CC -Wall -Wextra $flags -I runtime/core runtime/core/tests/dir_fault_test.c runtime/core/orin_runtime.c \
-        $B/dir_adapter_platform_$mode.o -lm -o $B/dir_adapter_$mode
+        $B/dir_adapter_platform_$mode.o $stub -lm -o $B/dir_adapter_$mode
     $B/dir_adapter_$mode
 done
 # the thread and monitor primitives (ADR-0017) are tested only: ThreadSanitizer is the evidence that they are race free
