@@ -52,13 +52,13 @@ assertEqString(e.actual,"null","fixed actual category");
 
 BENCHMARK = '''import { Host, useProcess } from "std:host";
 import { args } from "std:process";
-import { JsonValue, JsonMember, defaultJsonLimits } from "std:jsonvalue";
-import { decodeRoot, requiredField, decodeArray, cursorPath } from "std:jsondecode";
+import { JsonValue, JsonMember, defaultLimits } from "std:json";
+import { decodeRoot, requiredField, decodeArray, cursorPath } from "std:json/decode";
 import { assertEqUsize } from "std:test";
 function main(host: Host): void {
   useProcess(host, proc => {
     const a=args(proc); const n=parseInt(a[0]).unwrap().toUsize(); const mode=a[1];
-    let l=defaultJsonLimits(); l.maxNodes=n*4+1000; l.maxContainerItems=n+1000;
+    let l=defaultLimits(); l.maxNodes=n*4+1000; l.maxContainerItems=n+1000;
     l.maxDecodedStringBytes=n*32+1000; l.maxDepth=200;
     let checksum:usize=0;
     if (mode == "root") {

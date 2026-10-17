@@ -141,7 +141,7 @@ function main(): void {
         source = OUT / f"benchmark_{size}.or"
         source.write_text('''import { ByteBuilder } from "std:bytes";
 import { assert } from "std:test";
-import { jsonNumber, numberAsInt } from "std:jsonnumber";
+import { jsonNumber, numberAsInt } from "std:json/number";
 function main(): void {
   let z = new ByteBuilder(); let e = new ByteBuilder();
   let i: usize = 0;

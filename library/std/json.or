@@ -1,675 +1,650 @@
-// std:json -- JSON values, parser and printers (spec 08, ADR-0016).
+// std:json -- exact, bounded JSON documents (ADR-0048 section 7.1; formerly std:jsonvalue).
 //
-// Data model: `Json` is a plain union (no classes), so values copy like any other value and are
-// inspected with `match`. Numbers are INTEGERS ONLY (`JNum(int)`) until floats land; see the
-// TODO(after floats/map) notes. Objects are ordered field lists (`JField[]`), not maps.
-//
-//   * parse accepts RFC 8259 JSON with these restrictions: numbers must be integers in the
-//     range -9223372036854775807 .. 9223372036854775807; a fraction or exponent (`1.5`, `1e3`)
-//     is a JsonError ("floats are not supported yet"). Nesting deeper than 200 levels is an error.
-//   * Strings are Orin byte strings holding UTF-8. `\uXXXX` escapes decode to UTF-8; a surrogate
-//     pair gives one 4-byte sequence, a lone surrogate gives U+FFFD. Raw control characters
-//     (< 0x20) inside strings are rejected. Bytes >= 0x80 are copied through unchanged (the
-//     input is not validated as UTF-8).
-//   * Duplicate object keys are kept (in order); `get` returns the LAST occurrence (JS semantics).
-//   * Errors carry the byte offset plus a 1-based line and column (column counts bytes after the
-//     last "\n"; "\r\n" ends a line at "\n").
-//   * stringify is compact and deterministic; `pretty` indents with spaces. Object field order is
-//     insertion order. Strings escape `"`, `\`, \b \f \n \r \t and other control characters as
-//     \u00XX; all other bytes pass through unchanged.
-//
-// TODO(after floats/map): JNum(float) / separate JFloat, `parse<T>` is post-1.0 (ADR-0016).
+// Data model: `JsonValue` is a plain union; numbers are exact validated lexemes (`JsonNumber`, see
+// std:json/number), objects are ordered member lists. Parsing and writing are bounded by `JsonLimits`.
+// Application decoding with field paths lives in std:json/decode. The integer-only legacy model is
+// std:json/legacy (deprecated), with `toValue` / `fromValue` to cross over.
+// Policies, error precedence, allocation and complexity: docs/std-json.md.
+import { JsonNumber, jsonNumber } from "std:json/number";
+import { checkUtf8, encodeCodePoint } from "std:utf8";
 
-export type Json = JNull | JBool(bool) | JNum(int) | JStr(string) | JArr(Json[]) | JObj(JField[]);
+// JsonValue -- a JSON value: ValueNull | ValueBool | ValueNumber (exact lexeme) | ValueString (UTF-8) |
+// ValueArray | ValueObject (ordered members, duplicates only with PreserveDuplicates).
+export type JsonValue =
+  ValueNull
+  | ValueBool(bool)
+  | ValueNumber(JsonNumber)
+  | ValueString(string)
+  | ValueArray(JsonValue[])
+  | ValueObject(JsonMember[]);
+// JsonMember -- one object member in source order.
+export type JsonMember = { key: string; value: JsonValue; };
+// JsonDuplicatePolicy -- RejectDuplicates fails with JsonDuplicateKey, PreserveDuplicates keeps every member.
+export type JsonDuplicatePolicy = RejectDuplicates | PreserveDuplicates;
+// JsonLimits -- the budgets of one parse or write; every field must be positive, maxDepth at most 200.
+export type JsonLimits = {
+  maxInputBytes: usize;
+  maxDepth: usize;
+  maxNodes: usize;
+  maxContainerItems: usize;
+  maxStringBytes: usize;
+  maxDecodedStringBytes: usize;
+  maxNumberBytes: usize;
+  maxOutputBytes: usize;
+};
+// JsonReadOptions -- limits plus the duplicate-key policy for parseDocument.
+export type JsonReadOptions = { limits: JsonLimits; duplicates: JsonDuplicatePolicy; };
+// JsonValueErrorKind -- why a parse or write failed.
+export type JsonValueErrorKind =
+  JsonSyntax
+  | JsonInvalidUtf8
+  | JsonInvalidSurrogate
+  | JsonDuplicateKey
+  | JsonLimitExceeded
+  | JsonInvalidLimits;
+// JsonParseError -- `offset` is the 0-based byte offset where the problem was detected (<= text length),
+// `line`/`column` are 1-based (column counts bytes), `limit` names the exceeded budget for JsonLimitExceeded.
+export type JsonParseError = {
+  kind: JsonValueErrorKind;
+  offset: usize;
+  line: usize;
+  column: usize;
+  limit: Option<string>;
+};
+// JsonWriteError -- writer errors have no source position: values may have been built by the caller.
+export type JsonWriteError = { kind: JsonValueErrorKind; limit: Option<string>; };
 
-export type JField = { key: string; value: Json; };
-
-// Parse failure: `message` describes the problem, `offset` is the 0-based byte offset where it was
-// detected (== text length for "unexpected end of input"), `line`/`column` are 1-based.
-export type JsonError = { message: string; offset: usize; line: usize; column: usize; };
-
-// ---- constructors -------------------------------------------------------------------------
-
-// field(key: string, value: Json): JField -- builds an object field. O(1).
-export function field(key: string, value: Json): JField {
-  return JField { key: key, value: value };
+function kindText(kind: JsonValueErrorKind, limit: Option<string>): string {
+  const why = match (kind) {
+    JsonSyntax => "invalid JSON syntax",
+    JsonInvalidUtf8 => "invalid UTF-8",
+    JsonInvalidSurrogate => "invalid surrogate escape",
+    JsonDuplicateKey => "duplicate object key",
+    JsonLimitExceeded => "limit exceeded",
+    JsonInvalidLimits => "invalid limits",
+  };
+  if (limit.isSome()) {
+    return why + " (" + limit.unwrap() + ")";
+  }
+  return why;
 }
 
-// ---- parser -------------------------------------------------------------------------------
-
-type PErr = { msg: string; at: usize; };
-type PRes = { v: Json; pos: usize; };
-type SRes = { text: string; pos: usize; };
-type NRes = { n: int; pos: usize; };
-
-const MAX_DEPTH: int = 200;
-
-function fail(msg: string, at: usize): PErr {
-  return PErr { msg: msg, at: at };
+// jsonParseErrorMessage(e: JsonParseError): string -- "line L, column C: <cause>[ (limit)]". Never fails. O(1).
+@Ensures(result.length > 0)
+export function jsonParseErrorMessage(e: JsonParseError): string {
+  return "line " + e.line.toString() + ", column " + e.column.toString() + ": "
+      + kindText(e.kind, e.limit);
 }
 
-function isWs(c: int): bool {
-  return c == 32 || c == 9 || c == 10 || c == 13;
+// jsonWriteErrorMessage(e: JsonWriteError): string -- "<cause>[ (limit)]". Never fails. O(1).
+@Ensures(result.length > 0)
+export function jsonWriteErrorMessage(e: JsonWriteError): string {
+  return kindText(e.kind, e.limit);
 }
 
-function skipWs(s: string, start: usize): usize {
-  let i = start;
-  while (i < s.length && isWs(s.charCodeAt(i))) {
+// defaultLimits(): JsonLimits -- 1 MiB input, depth 64, 100000 nodes, 4 MiB output. Never fails. O(1).
+@Ensures(result.maxDepth == 64 && result.maxInputBytes == 1048576)
+export function defaultLimits(): JsonLimits {
+  return JsonLimits {
+    maxInputBytes: 1048576,
+    maxDepth: 64,
+    maxNodes: 100000,
+    maxContainerItems: 10000,
+    maxStringBytes: 262144,
+    maxDecodedStringBytes: 1048576,
+    maxNumberBytes: 1024,
+    maxOutputBytes: 4194304,
+  };
+}
+
+// defaultReadOptions(): JsonReadOptions -- defaultLimits() and RejectDuplicates. Never fails. O(1).
+export function defaultReadOptions(): JsonReadOptions {
+  return JsonReadOptions { limits: defaultLimits(), duplicates: RejectDuplicates };
+}
+
+// defaultJsonLimits(): JsonLimits -- deprecated spelling of defaultLimits().
+@Deprecated("use defaultLimits()")
+export function defaultJsonLimits(): JsonLimits {
+  return defaultLimits();
+}
+
+// defaultJsonOptions(): JsonReadOptions -- deprecated spelling of defaultReadOptions().
+@Deprecated("use defaultReadOptions()")
+export function defaultJsonOptions(): JsonReadOptions {
+  return defaultReadOptions();
+}
+
+function validLimits(l: JsonLimits): bool {
+  return l.maxInputBytes > 0
+      && l.maxDepth > 0
+      && l.maxDepth <= 200
+      && l.maxNodes > 0
+      && l.maxContainerItems > 0
+      && l.maxStringBytes > 0
+      && l.maxDecodedStringBytes > 0
+      && l.maxNumberBytes > 0
+      && l.maxOutputBytes > 0;
+}
+
+function parseError(
+  s: string,
+  kind: JsonValueErrorKind,
+  at: usize,
+  limit: Option<string>,
+): JsonParseError {
+  let line: usize = 1;
+  let start: usize = 0;
+  let i: usize = 0;
+  while (i < at) {
+    if (s.charCodeAt(i) == 10) {
+      line += 1;
+      start = i + 1;
+    }
     i += 1;
   }
-  return i;
+  return JsonParseError {
+    kind: kind,
+    offset: at,
+    line: line,
+    column: at - start + 1,
+    limit: limit,
+  };
 }
 
-function hexVal(c: int): int {
-  if (c >= 48 && c <= 57) {
+function digit(c: int): bool {
+  return c >= 48 && c <= 57;
+}
+function hex(c: int): int {
+  if (digit(c)) {
     return c - 48;
-  }
-  if (c >= 97 && c <= 102) {
-    return c - 87;
   }
   if (c >= 65 && c <= 70) {
     return c - 55;
   }
+  if (c >= 97 && c <= 102) {
+    return c - 87;
+  }
   return -1;
 }
 
-// Four hex digits at `at`, or -1.
-function hex4(s: string, at: usize): int {
-  if (at + 4 > s.length) {
-    return -1;
-  }
-  let v = 0;
-  let k: usize = 0;
-  while (k < 4) {
-    const h = hexVal(s.charCodeAt(at + k));
-    if (h < 0) {
-      return -1;
-    }
-    v = v * 16 + h;
-    k += 1;
-  }
-  return v;
-}
+@Invariant(this.pos <= this.text.length
+    && this.nodes <= this.limits.maxNodes
+    && this.decoded <= this.limits.maxDecodedStringBytes)
+class DocumentParser {
+  private text: string;
+  private limits: JsonLimits;
+  private reject: bool;
+  private pos: usize = 0;
+  private nodes: usize = 0;
+  private decoded: usize = 0;
 
-function utf8(cp: int): string {
-  if (cp < 128) {
-    return String.fromCharCode(cp);
+  constructor(text: string, options: JsonReadOptions) {
+    this.text = text;
+    this.limits = options.limits;
+    this.reject = match (options.duplicates) {
+      RejectDuplicates => true,
+      PreserveDuplicates => false,
+    };
   }
-  if (cp < 2048) {
-    return String.fromCharCode(192 + cp / 64) + String.fromCharCode(128 + cp % 64);
-  }
-  if (cp < 65536) {
-    return String.fromCharCode(224 + cp / 4096) + String.fromCharCode(128 + (cp / 64) % 64)
-      + String.fromCharCode(128 + cp % 64);
-  }
-  return String.fromCharCode(240 + cp / 262144) + String.fromCharCode(128 + (cp / 4096) % 64)
-    + String.fromCharCode(128 + (cp / 64) % 64) + String.fromCharCode(128 + cp % 64);
-}
 
-// `s[start]` is the opening quote.
-function parseString(s: string, start: usize): Result<SRes, PErr> {
-  let out = "";
-  let i = start + 1;
-  let runStart = i;
-  while (true) {
-    if (i >= s.length) {
-      return Err(fail("unterminated string", start));
-    }
-    const c = s.charCodeAt(i);
-    if (c == 34) {
-      if (i > runStart) {
-        out += s.substring(runStart, i);
+  private fail(kind: JsonValueErrorKind, at: usize, limit: Option<string>): JsonParseError {
+    return parseError(this.text, kind, at, limit);
+  }
+  private peek(): int {
+    return this.pos < this.text.length ? this.text.charCodeAt(this.pos) : -1;
+  }
+  private ws(): void {
+    while (this.pos < this.text.length) {
+      const c = this.peek();
+      if (c != 32 && c != 9 && c != 10 && c != 13) {
+        break;
       }
-      return Ok(SRes { text: out, pos: i + 1 });
+      this.pos += 1;
     }
-    if (c < 32) {
-      return Err(fail("control character in string", i));
+  }
+
+  private stringBudget(current: usize, count: usize, at: usize): Result<void, JsonParseError> {
+    if (count > this.limits.maxStringBytes - current) {
+      return Err(this.fail(JsonLimitExceeded, at, Some("maxStringBytes")));
     }
-    if (c != 92) {
-      i += 1;
-      continue;
+    if (count > this.limits.maxDecodedStringBytes - this.decoded) {
+      return Err(this.fail(JsonLimitExceeded, at, Some("maxDecodedStringBytes")));
     }
-    if (i > runStart) {
-      out += s.substring(runStart, i);
-    }
-    if (i + 1 >= s.length) {
-      return Err(fail("unterminated escape", i));
-    }
-    const e = s.charCodeAt(i + 1);
-    i += 2;
-    if (e == 34) {
-      out += "\"";
-    } else if (e == 92) {
-      out += "\\";
-    } else if (e == 47) {
-      out += "/";
-    } else if (e == 98) {
-      out += String.fromCharCode(8);
-    } else if (e == 102) {
-      out += String.fromCharCode(12);
-    } else if (e == 110) {
-      out += "\n";
-    } else if (e == 114) {
-      out += "\r";
-    } else if (e == 116) {
-      out += "\t";
-    } else if (e == 117) {
-      const u = hex4(s, i);
-      if (u < 0) {
-        return Err(fail("invalid \\u escape", i - 2));
+    this.decoded += count;
+    return Ok();
+  }
+
+  private hex4(): Result<int, JsonParseError> {
+    let n = 0;
+    let k = 0;
+    while (k < 4) {
+      const h = hex(this.peek());
+      if (h < 0) {
+        return Err(this.fail(JsonSyntax, this.pos, None));
       }
-      i += 4;
-      let cp = u;
-      if (u >= 55296 && u <= 56319) {
-        // High surrogate: needs a following \uDC00..\uDFFF.
-        let lo = -1;
-        if (i + 1 < s.length && s.charCodeAt(i) == 92 && s.charCodeAt(i + 1) == 117) {
-          lo = hex4(s, i + 2);
-        }
-        if (lo >= 56320 && lo <= 57343) {
-          cp = 65536 + (u - 55296) * 1024 + (lo - 56320);
-          i += 6;
-        } else {
-          cp = 65533;
-        }
-      } else if (u >= 56320 && u <= 57343) {
-        cp = 65533;
-      }
-      out += utf8(cp);
-    } else {
-      return Err(fail("invalid escape", i - 2));
+      n = n * 16 + h;
+      this.pos += 1;
+      k += 1;
     }
-    runStart = i;
+    return Ok(n);
   }
-  return Err(fail("unreachable", i));
-}
 
-function isDigit(c: int): bool {
-  return c >= 48 && c <= 57;
-}
-
-const INT_MAX: int = 9223372036854775807;
-
-function parseNumber(s: string, start: usize): Result<NRes, PErr> {
-  let i = start;
-  let neg = false;
-  if (s.charCodeAt(i) == 45) {
-    neg = true;
-    i += 1;
-  }
-  const ds = i;
-  while (i < s.length && isDigit(s.charCodeAt(i))) {
-    i += 1;
-  }
-  if (i == ds) {
-    return Err(fail("invalid number", start));
-  }
-  if (i - ds > 1 && s.charCodeAt(ds) == 48) {
-    return Err(fail("leading zero in number", ds));
-  }
-  let v = 0;
-  let k = ds;
-  while (k < i) {
-    const d = s.charCodeAt(k) - 48;
-    if (v > (INT_MAX - d) / 10) {
-      return Err(fail("integer out of range", start));
-    }
-    v = v * 10 + d;
-    k += 1;
-  }
-  if (i < s.length && (s.charCodeAt(i) == 46 || s.charCodeAt(i) == 101 || s.charCodeAt(i) == 69)) {
-    return Err(fail("floats are not supported yet (integers only)", i));
-  }
-  if (neg) {
-    v = 0 - v;
-  }
-  return Ok(NRes { n: v, pos: i });
-}
-
-function expectLit(s: string, at: usize, lit: string): bool {
-  if (at + lit.length > s.length) {
-    return false;
-  }
-  return s.substring(at, at + lit.length) == lit;
-}
-
-function parseValue(s: string, start: usize, depth: int): Result<PRes, PErr> {
-  const i = skipWs(s, start);
-  if (i >= s.length) {
-    return Err(fail("unexpected end of input", i));
-  }
-  if (depth > MAX_DEPTH) {
-    return Err(fail("nesting too deep", i));
-  }
-  const c = s.charCodeAt(i);
-  if (c == 34) {
-    const r = parseString(s, i)?;
-    return Ok(PRes { v: JStr(r.text), pos: r.pos });
-  }
-  if (c == 123) {
-    return parseObject(s, i, depth);
-  }
-  if (c == 91) {
-    return parseArray(s, i, depth);
-  }
-  if (c == 45 || isDigit(c)) {
-    const r = parseNumber(s, i)?;
-    return Ok(PRes { v: JNum(r.n), pos: r.pos });
-  }
-  if (expectLit(s, i, "true")) {
-    return Ok(PRes { v: JBool(true), pos: i + 4 });
-  }
-  if (expectLit(s, i, "false")) {
-    return Ok(PRes { v: JBool(false), pos: i + 5 });
-  }
-  if (expectLit(s, i, "null")) {
-    return Ok(PRes { v: JNull, pos: i + 4 });
-  }
-  return Err(fail("unexpected character", i));
-}
-
-function parseArray(s: string, start: usize, depth: int): Result<PRes, PErr> {
-  let items: Json[] = [];
-  let i = skipWs(s, start + 1);
-  if (i < s.length && s.charCodeAt(i) == 93) {
-    return Ok(PRes { v: JArr(items), pos: i + 1 });
-  }
-  while (true) {
-    const r = parseValue(s, i, depth + 1)?;
-    items.push(r.v);
-    i = skipWs(s, r.pos);
-    if (i >= s.length) {
-      return Err(fail("unexpected end of input, expected `,` or `]`", i));
-    }
-    const c = s.charCodeAt(i);
-    if (c == 93) {
-      return Ok(PRes { v: JArr(items), pos: i + 1 });
-    }
-    if (c != 44) {
-      return Err(fail("expected `,` or `]`", i));
-    }
-    i += 1;
-  }
-  return Err(fail("unreachable", i));
-}
-
-function parseObject(s: string, start: usize, depth: int): Result<PRes, PErr> {
-  let fields: JField[] = [];
-  let i = skipWs(s, start + 1);
-  if (i < s.length && s.charCodeAt(i) == 125) {
-    return Ok(PRes { v: JObj(fields), pos: i + 1 });
-  }
-  while (true) {
-    i = skipWs(s, i);
-    if (i >= s.length) {
-      return Err(fail("unexpected end of input, expected string key", i));
-    }
-    if (s.charCodeAt(i) != 34) {
-      return Err(fail("expected string key", i));
-    }
-    const k = parseString(s, i)?;
-    i = skipWs(s, k.pos);
-    if (i >= s.length) {
-      return Err(fail("unexpected end of input, expected `:`", i));
-    }
-    if (s.charCodeAt(i) != 58) {
-      return Err(fail("expected `:`", i));
-    }
-    const r = parseValue(s, i + 1, depth + 1)?;
-    fields.push(JField { key: k.text, value: r.v });
-    i = skipWs(s, r.pos);
-    if (i >= s.length) {
-      return Err(fail("unexpected end of input, expected `,` or `}`", i));
-    }
-    const c = s.charCodeAt(i);
-    if (c == 125) {
-      return Ok(PRes { v: JObj(fields), pos: i + 1 });
-    }
-    if (c != 44) {
-      return Err(fail("expected `,` or `}`", i));
-    }
-    i += 1;
-  }
-  return Err(fail("unreachable", i));
-}
-
-// 1-based line and column of byte `offset` in `s`.
-function locate(s: string, offset: usize): JsonError {
-  let line: usize = 1;
-  let lineStart: usize = 0;
-  let i: usize = 0;
-  while (i < offset && i < s.length) {
-    if (s.charCodeAt(i) == 10) {
-      line += 1;
-      lineStart = i + 1;
-    }
-    i += 1;
-  }
-  return JsonError { message: "", offset: offset, line: line, column: offset - lineStart + 1 };
-}
-
-function toError(s: string, e: PErr): JsonError {
-  const l = locate(s, e.at);
-  return JsonError { message: e.msg, offset: e.at, line: l.line, column: l.column };
-}
-
-// parse(text: string): Result<Json, JsonError>
-// Parses one JSON document (surrounding whitespace allowed, trailing characters are an error:
-// "trailing characters"). Errors: syntax errors, unsupported floats, integer overflow, nesting
-// deeper than 200, each with offset/line/column. Complexity: O(n) time and allocation (plus
-// O(n) to locate the line/column of an error).
-export function parse(text: string): Result<Json, JsonError> {
-  const r = parseValue(text, 0, 0);
-  if (r.isErr()) {
-    return Err(toError(text, r.unwrapErr()));
-  }
-  const ok = r.unwrap();
-  const end = skipWs(text, ok.pos);
-  if (end < text.length) {
-    return Err(toError(text, fail("trailing characters", end)));
-  }
-  return Ok(ok.v);
-}
-
-// formatError(e: JsonError): string -- "line L, column C: message". O(1).
-export function formatError(e: JsonError): string {
-  return "line " + e.line.toString() + ", column " + e.column.toString() + ": " + e.message;
-}
-
-// ---- printers -----------------------------------------------------------------------------
-
-function hexDigit(n: int): string {
-  if (n < 10) {
-    return String.fromCharCode(48 + n);
-  }
-  return String.fromCharCode(87 + n);
-}
-
-// quote(s: string): string -- `s` as a JSON string literal with escapes. O(n).
-export function quote(s: string): string {
-  let out = "\"";
-  let runStart: usize = 0;
-  let i: usize = 0;
-  while (i < s.length) {
-    const c = s.charCodeAt(i);
-    if (c == 34 || c == 92 || c < 32) {
-      if (i > runStart) {
-        out += s.substring(runStart, i);
-      }
+  // Caller has consumed no part of the opening quote. No old(this) snapshots
+  // or ByteBuilder per-byte contracts: the local byte buffer stays unique.
+  private stringValue(): Result<string, JsonParseError> {
+    this.pos += 1;
+    let out: u8[] = [];
+    while (this.pos < this.text.length) {
+      const at = this.pos;
+      const c = this.peek();
       if (c == 34) {
-        out += "\\\"";
+        this.pos += 1;
+        // Empty arrays have no backing storage; avoid null+0 in bytesToString.
+        if (out.length == 0) {
+          return Ok("");
+        }
+        return Ok(bytesToString(out, 0, out.length));
+      }
+      if (c < 32) {
+        return Err(this.fail(JsonSyntax, at, None));
+      }
+      if (c != 92) {
+        this.stringBudget(out.length, 1, at)?;
+        out.push(c.toU8());
+        this.pos += 1;
+        continue;
+      }
+      this.pos += 1;
+      const e = this.peek();
+      if (e < 0) {
+        return Err(this.fail(JsonSyntax, this.pos, None));
+      }
+      this.pos += 1;
+      let encoded = "";
+      if (e == 34 || e == 92 || e == 47) {
+        encoded = String.fromCharCode(e);
+      } else if (e == 98) {
+        encoded = "\x08";
+      } else if (e == 102) {
+        encoded = "\x0c";
+      } else if (e == 110) {
+        encoded = "\n";
+      } else if (e == 114) {
+        encoded = "\r";
+      } else if (e == 116) {
+        encoded = "\t";
+      } else if (e == 117) {
+        let cp = this.hex4()?;
+        if (cp >= 55296 && cp <= 56319) {
+          if (this.peek() != 92
+              || this.pos + 1 >= this.text.length
+              || this.text.charCodeAt(this.pos + 1) != 117) {
+            return Err(this.fail(JsonInvalidSurrogate, at, None));
+          }
+          this.pos += 2;
+          const low = this.hex4()?;
+          if (low < 56320 || low > 57343) {
+            return Err(this.fail(JsonInvalidSurrogate, at, None));
+          }
+          cp = 65536 + (cp - 55296) * 1024 + low - 56320;
+        } else if (cp >= 56320 && cp <= 57343) {
+          return Err(this.fail(JsonInvalidSurrogate, at, None));
+        }
+        encoded = encodeCodePoint(cp).unwrap();
+      } else {
+        return Err(this.fail(JsonSyntax, this.pos - 1, None));
+      }
+      this.stringBudget(out.length, encoded.length, at)?;
+      let j: usize = 0;
+      while (j < encoded.length) {
+        out.push(encoded.charCodeAt(j).toU8());
+        j += 1;
+      }
+    }
+    return Err(this.fail(JsonSyntax, this.pos, None));
+  }
+
+  private numberValue(): Result<JsonValue, JsonParseError> {
+    const start = this.pos;
+    while (this.pos < this.text.length) {
+      const c = this.peek();
+      if (!digit(c) && c != 45 && c != 43 && c != 46 && c != 101 && c != 69) {
+        break;
+      }
+      if (this.pos - start == this.limits.maxNumberBytes) {
+        return Err(this.fail(JsonLimitExceeded, this.pos, Some("maxNumberBytes")));
+      }
+      this.pos += 1;
+    }
+    const token = this.text.substring(start, this.pos);
+    const n = jsonNumber(token, this.limits.maxNumberBytes);
+    if (n.isErr()) {
+      return Err(this.fail(JsonSyntax, start + n.unwrapErr().offset.unwrapOr(0), None));
+    }
+    return Ok(ValueNumber(n.unwrap()));
+  }
+
+  private literal(word: string): Result<void, JsonParseError> {
+    let i: usize = 0;
+    while (i < word.length) {
+      if (this.peek() != word.charCodeAt(i)) {
+        return Err(this.fail(JsonSyntax, this.pos, None));
+      }
+      this.pos += 1;
+      i += 1;
+    }
+    return Ok();
+  }
+
+  private arrayValue(depth: usize): Result<JsonValue, JsonParseError> {
+    this.pos += 1;
+    this.ws();
+    let values: JsonValue[] = [];
+    if (this.peek() == 93) {
+      this.pos += 1;
+      return Ok(ValueArray(values));
+    }
+    while (true) {
+      this.ws();
+      if (this.peek() < 0 || this.peek() == 93) {
+        return Err(this.fail(JsonSyntax, this.pos, None));
+      }
+      if (values.length == this.limits.maxContainerItems) {
+        return Err(this.fail(JsonLimitExceeded, this.pos, Some("maxContainerItems")));
+      }
+      const v = this.value(depth)?;
+      values.push(v);
+      this.ws();
+      if (this.peek() == 93) {
+        this.pos += 1;
+        return Ok(ValueArray(values));
+      }
+      if (this.peek() != 44) {
+        return Err(this.fail(JsonSyntax, this.pos, None));
+      }
+      this.pos += 1;
+    }
+    return Err(this.fail(JsonSyntax, this.pos, None));
+  }
+
+  private objectValue(depth: usize): Result<JsonValue, JsonParseError> {
+    this.pos += 1;
+    this.ws();
+    let members: JsonMember[] = [];
+    let seen = new Map<string, bool>();
+    if (this.peek() == 125) {
+      this.pos += 1;
+      return Ok(ValueObject(members));
+    }
+    while (true) {
+      this.ws();
+      const at = this.pos;
+      if (this.peek() != 34) {
+        return Err(this.fail(JsonSyntax, at, None));
+      }
+      if (members.length == this.limits.maxContainerItems) {
+        return Err(this.fail(JsonLimitExceeded, at, Some("maxContainerItems")));
+      }
+      const key = this.stringValue()?;
+      if (this.reject) {
+        if (seen.has(key)) {
+          return Err(this.fail(JsonDuplicateKey, at, None));
+        }
+        seen.set(key, true);
+      }
+      this.ws();
+      if (this.peek() != 58) {
+        return Err(this.fail(JsonSyntax, this.pos, None));
+      }
+      this.pos += 1;
+      const v = this.value(depth)?;
+      members.push(JsonMember { key: key, value: v });
+      this.ws();
+      if (this.peek() == 125) {
+        this.pos += 1;
+        return Ok(ValueObject(members));
+      }
+      if (this.peek() != 44) {
+        return Err(this.fail(JsonSyntax, this.pos, None));
+      }
+      this.pos += 1;
+    }
+    return Err(this.fail(JsonSyntax, this.pos, None));
+  }
+
+  private value(depth: usize): Result<JsonValue, JsonParseError> {
+    this.ws();
+    const at = this.pos;
+    const c = this.peek();
+    if (c < 0) {
+      return Err(this.fail(JsonSyntax, at, None));
+    }
+    if (this.nodes == this.limits.maxNodes) {
+      return Err(this.fail(JsonLimitExceeded, at, Some("maxNodes")));
+    }
+    this.nodes += 1;
+    if ((c == 91 || c == 123) && depth == this.limits.maxDepth) {
+      return Err(this.fail(JsonLimitExceeded, at, Some("maxDepth")));
+    }
+    if (c == 34) {
+      return Ok(ValueString(this.stringValue()?));
+    }
+    if (c == 91) {
+      return this.arrayValue(depth + 1);
+    }
+    if (c == 123) {
+      return this.objectValue(depth + 1);
+    }
+    if (c == 45 || digit(c)) {
+      return this.numberValue();
+    }
+    if (c == 116) {
+      this.literal("true")?;
+      return Ok(ValueBool(true));
+    }
+    if (c == 102) {
+      this.literal("false")?;
+      return Ok(ValueBool(false));
+    }
+    if (c == 110) {
+      this.literal("null")?;
+      return Ok(ValueNull);
+    }
+    return Err(this.fail(JsonSyntax, at, None));
+  }
+
+  @Ensures(result.isErr() ==> result.unwrapErr().offset <= this.text.length)
+  document(): Result<JsonValue, JsonParseError> {
+    const v = this.value(0)?;
+    this.ws();
+    if (this.pos != this.text.length) {
+      return Err(this.fail(JsonSyntax, this.pos, None));
+    }
+    return Ok(v);
+  }
+}
+
+// parseDocument(text, options): Result<JsonValue, JsonParseError> -- parses one strict JSON document.
+// Errors, checked in this order: JsonInvalidLimits, input over maxInputBytes (JsonLimitExceeded), invalid
+// UTF-8, then syntax, surrogates, duplicates (RejectDuplicates) and budgets while scanning; `offset` is
+// always <= text.length. Never traps. O(n) time, O(n) allocation.
+@Ensures(result.isErr() ==> result.unwrapErr().offset <= text.length)
+export function parseDocument(
+  text: string,
+  options: JsonReadOptions,
+): Result<JsonValue, JsonParseError> {
+  if (!validLimits(options.limits)) {
+    return Err(parseError(text, JsonInvalidLimits, 0, None));
+  }
+  if (text.length > options.limits.maxInputBytes) {
+    return Err(
+      parseError(text, JsonLimitExceeded, options.limits.maxInputBytes, Some("maxInputBytes")),
+    );
+  }
+  const utf8 = checkUtf8(text);
+  if (utf8.isErr()) {
+    return Err(parseError(text, JsonInvalidUtf8, utf8.unwrapErr().position, None));
+  }
+  let parser = new DocumentParser(text, options);
+  return parser.document();
+}
+
+function writeError(kind: JsonValueErrorKind, limit: Option<string>): JsonWriteError {
+  return JsonWriteError { kind: kind, limit: limit };
+}
+
+@Invariant(this.out.length <= this.limits.maxOutputBytes
+    && this.nodes <= this.limits.maxNodes
+    && this.decoded <= this.limits.maxDecodedStringBytes)
+class DocumentWriter {
+  private limits: JsonLimits;
+  private out: u8[] = [];
+  private nodes: usize = 0;
+  private decoded: usize = 0;
+  constructor(limits: JsonLimits) {
+    this.limits = limits;
+  }
+
+  private byte(b: u8): Result<void, JsonWriteError> {
+    if (this.out.length == this.limits.maxOutputBytes) {
+      return Err(writeError(JsonLimitExceeded, Some("maxOutputBytes")));
+    }
+    this.out.push(b);
+    return Ok();
+  }
+  private raw(s: string): Result<void, JsonWriteError> {
+    if (s.length > this.limits.maxOutputBytes - this.out.length) {
+      return Err(writeError(JsonLimitExceeded, Some("maxOutputBytes")));
+    }
+    let i: usize = 0;
+    while (i < s.length) {
+      this.out.push(s.charCodeAt(i).toU8());
+      i += 1;
+    }
+    return Ok();
+  }
+  private stringValue(s: string): Result<void, JsonWriteError> {
+    if (s.length > this.limits.maxStringBytes) {
+      return Err(writeError(JsonLimitExceeded, Some("maxStringBytes")));
+    }
+    if (s.length > this.limits.maxDecodedStringBytes - this.decoded) {
+      return Err(writeError(JsonLimitExceeded, Some("maxDecodedStringBytes")));
+    }
+    if (checkUtf8(s).isErr()) {
+      return Err(writeError(JsonInvalidUtf8, None));
+    }
+    this.decoded += s.length;
+    this.byte(34)?;
+    const digits = "0123456789abcdef";
+    let i: usize = 0;
+    while (i < s.length) {
+      const c = s.charCodeAt(i);
+      if (c == 34) {
+        this.raw("\\\"")?;
       } else if (c == 92) {
-        out += "\\\\";
-      } else if (c == 10) {
-        out += "\\n";
-      } else if (c == 13) {
-        out += "\\r";
-      } else if (c == 9) {
-        out += "\\t";
+        this.raw("\\\\")?;
       } else if (c == 8) {
-        out += "\\b";
+        this.raw("\\b")?;
       } else if (c == 12) {
-        out += "\\f";
+        this.raw("\\f")?;
+      } else if (c == 10) {
+        this.raw("\\n")?;
+      } else if (c == 13) {
+        this.raw("\\r")?;
+      } else if (c == 9) {
+        this.raw("\\t")?;
+      } else if (c < 32) {
+        this.raw("\\u00")?;
+        this.byte(digits.charCodeAt((c / 16).toUsize()).toU8())?;
+        this.byte(digits.charCodeAt((c % 16).toUsize()).toU8())?;
       } else {
-        out += "\\u00" + hexDigit(c / 16) + hexDigit(c % 16);
+        this.byte(c.toU8())?;
       }
-      runStart = i + 1;
+      i += 1;
     }
-    i += 1;
+    this.byte(34)?;
+    return Ok();
   }
-  if (s.length > runStart) {
-    out += s.substring(runStart, s.length);
-  }
-  out += "\"";
-  return out;
-}
 
-function emit(j: Json, out: string[]): string[] {
-  let o = out;
-  match (j) {
-    JNull => { o.push("null"); },
-    JBool(b) => { o.push(b ? "true" : "false"); },
-    JNum(n) => { o.push(n.toString()); },
-    JStr(s) => { o.push(quote(s)); },
-    JArr(a) => {
-      o.push("[");
-      let i: usize = 0;
-      while (i < a.length) {
-        if (i > 0) {
-          o.push(",");
-        }
-        o = emit(a[i], o);
-        i += 1;
-      }
-      o.push("]");
-    },
-    JObj(fs) => {
-      o.push("{");
-      let i: usize = 0;
-      while (i < fs.length) {
-        if (i > 0) {
-          o.push(",");
-        }
-        o.push(quote(fs[i].key));
-        o.push(":");
-        o = emit(fs[i].value, o);
-        i += 1;
-      }
-      o.push("}");
+  private value(v: JsonValue, depth: usize): Result<void, JsonWriteError> {
+    if (this.nodes == this.limits.maxNodes) {
+      return Err(writeError(JsonLimitExceeded, Some("maxNodes")));
     }
-  }
-  return o;
-}
-
-// stringify(j: Json): string
-// Compact deterministic serialization (no whitespace). Never fails. O(n) in the size of `j`.
-// parse(stringify(j)) == j for every j whose integers are in range.
-export function stringify(j: Json): string {
-  const out: string[] = [];
-  return emit(j, out).join("");
-}
-
-function spaces(n: usize): string {
-  let out = "";
-  let i: usize = 0;
-  while (i < n) {
-    out += " ";
-    i += 1;
-  }
-  return out;
-}
-
-function emitPretty(j: Json, indent: usize, level: usize, out: string[]): string[] {
-  let o = out;
-  match (j) {
-    JArr(a) => {
-      if (a.length == 0) {
-        o.push("[]");
-      } else {
-        o.push("[\n");
+    this.nodes += 1;
+    match (v) {
+      ValueNull => {
+        this.raw("null")?;
+      },
+      ValueBool(b) => {
+        this.raw(b ? "true" : "false")?;
+      },
+      ValueNumber(n) => {
+        if (n.token.length > this.limits.maxNumberBytes) {
+          return Err(writeError(JsonLimitExceeded, Some("maxNumberBytes")));
+        }
+        this.raw(n.token)?;
+      },
+      ValueString(s) => {
+        this.stringValue(s)?;
+      },
+      ValueArray(values) => {
+        if (depth == this.limits.maxDepth) {
+          return Err(writeError(JsonLimitExceeded, Some("maxDepth")));
+        }
+        if (values.length > this.limits.maxContainerItems) {
+          return Err(writeError(JsonLimitExceeded, Some("maxContainerItems")));
+        }
+        this.byte(91)?;
         let i: usize = 0;
-        while (i < a.length) {
-          o.push(spaces(indent * (level + 1)));
-          o = emitPretty(a[i], indent, level + 1, o);
-          o.push(i + 1 < a.length ? ",\n" : "\n");
+        while (i < values.length) {
+          if (i > 0) {
+            this.byte(44)?;
+          }
+          this.value(values[i], depth + 1)?;
           i += 1;
         }
-        o.push(spaces(indent * level));
-        o.push("]");
-      }
-    },
-    JObj(fs) => {
-      if (fs.length == 0) {
-        o.push("{}");
-      } else {
-        o.push("{\n");
+        this.byte(93)?;
+      },
+      ValueObject(members) => {
+        if (depth == this.limits.maxDepth) {
+          return Err(writeError(JsonLimitExceeded, Some("maxDepth")));
+        }
+        if (members.length > this.limits.maxContainerItems) {
+          return Err(writeError(JsonLimitExceeded, Some("maxContainerItems")));
+        }
+        this.byte(123)?;
         let i: usize = 0;
-        while (i < fs.length) {
-          o.push(spaces(indent * (level + 1)));
-          o.push(quote(fs[i].key));
-          o.push(": ");
-          o = emitPretty(fs[i].value, indent, level + 1, o);
-          o.push(i + 1 < fs.length ? ",\n" : "\n");
+        while (i < members.length) {
+          if (i > 0) {
+            this.byte(44)?;
+          }
+          this.stringValue(members[i].key)?;
+          this.byte(58)?;
+          this.value(members[i].value, depth + 1)?;
           i += 1;
         }
-        o.push(spaces(indent * level));
-        o.push("}");
-      }
-    },
-    _ => { o = emit(j, o); }
-  }
-  return o;
-}
-
-// pretty(j: Json, indent: usize): string
-// Multi-line serialization: one array element / object field per line, `indent` spaces per
-// nesting level, ": " after keys, empty containers as `[]` / `{}`, no trailing newline.
-// `pretty(j, 0)` still puts every element on its own line (use `stringify` for compact output).
-// Never fails. O(n) in the size of `j` (plus the indentation written).
-export function pretty(j: Json, indent: usize): string {
-  const out: string[] = [];
-  return emitPretty(j, indent, 0, out).join("");
-}
-
-// ---- accessors ----------------------------------------------------------------------------
-// All accessors are total: a wrong kind or a missing key gives None. They never trap.
-
-// get(j: Json, key: string): Option<Json>
-// The value of field `key` when `j` is an object (the LAST field with that key), else None.
-// O(fields).
-export function get(j: Json, key: string): Option<Json> {
-  return match (j) {
-    JObj(fs) => lastField(fs, key),
-    _ => None
-  };
-}
-
-function lastField(fs: JField[], key: string): Option<Json> {
-  let i = fs.length;
-  while (i > 0) {
-    i -= 1;
-    if (fs[i].key == key) {
-      return Some(fs[i].value);
+        this.byte(125)?;
+      },
     }
+    return Ok();
   }
-  return None;
-}
 
-// at(j: Json, index: usize): Option<Json> -- element `index` of an array, else None. O(1).
-export function at(j: Json, index: usize): Option<Json> {
-  return match (j) {
-    JArr(a) => index < a.length ? Some(a[index]) : None,
-    _ => None
-  };
-}
-
-// path(j: Json, keys: string[]): Option<Json> -- follows object keys: path(j, ["a", "b"]) is
-// get(get(j, "a"), "b"); an empty `keys` gives Some(j). O(sum of fields visited).
-export function path(j: Json, keys: string[]): Option<Json> {
-  let cur = j;
-  for (const k of keys) {
-    const f = get(cur, k);
-    if (f.isNone()) {
-      return None;
-    }
-    cur = f.unwrap();
+  @Ensures(result.isOk() ==> result.unwrap().length <= this.limits.maxOutputBytes)
+  document(v: JsonValue): Result<string, JsonWriteError> {
+    this.value(v, 0)?;
+    return Ok(bytesToString(this.out, 0, this.out.length));
   }
-  return Some(cur);
 }
 
-// asString(j: Json): Option<string> -- Some for JStr. O(1).
-export function asString(j: Json): Option<string> {
-  return match (j) {
-    JStr(s) => Some(s),
-    _ => None
-  };
-}
-
-// asInt(j: Json): Option<int> -- Some for JNum. O(1).
-export function asInt(j: Json): Option<int> {
-  return match (j) {
-    JNum(n) => Some(n),
-    _ => None
-  };
-}
-
-// asBool(j: Json): Option<bool> -- Some for JBool. O(1).
-export function asBool(j: Json): Option<bool> {
-  return match (j) {
-    JBool(b) => Some(b),
-    _ => None
-  };
-}
-
-// asArray(j: Json): Option<Json[]> -- Some for JArr. O(1) (the array is copied lazily).
-export function asArray(j: Json): Option<Json[]> {
-  return match (j) {
-    JArr(a) => Some(a),
-    _ => None
-  };
-}
-
-// asObject(j: Json): Option<JField[]> -- Some for JObj, in insertion order. O(1).
-export function asObject(j: Json): Option<JField[]> {
-  return match (j) {
-    JObj(fs) => Some(fs),
-    _ => None
-  };
-}
-
-// isNull(j: Json): bool -- true for JNull. O(1).
-export function isNull(j: Json): bool {
-  return match (j) {
-    JNull => true,
-    _ => false
-  };
-}
-
-// keys(j: Json): string[] -- the field names of an object in order (duplicates included);
-// [] for any non-object. O(fields).
-export function keys(j: Json): string[] {
-  let out: string[] = [];
-  match (j) {
-    JObj(fs) => {
-      for (const f of fs) {
-        out.push(f.key);
-      }
-    },
-    _ => {}
+// writeDocument(v, limits): Result<string, JsonWriteError> -- compact deterministic text for a caller-built
+// tree. Errors: JsonInvalidLimits, JsonInvalidUtf8 (strings, keys), JsonLimitExceeded (depth, nodes,
+// items, string bytes, number bytes, output bytes). Duplicate members are written as given. Never traps.
+// O(size of v) time and allocation.
+@Ensures(result.isOk() ==> result.unwrap().length <= limits.maxOutputBytes)
+export function writeDocument(v: JsonValue, limits: JsonLimits): Result<string, JsonWriteError> {
+  if (!validLimits(limits)) {
+    return Err(writeError(JsonInvalidLimits, None));
   }
-  return out;
-}
-
-// getString / getInt / getBool / getArray: `get` followed by the matching `as*`; None when the
-// key is missing or has another kind. O(fields).
-export function getString(j: Json, key: string): Option<string> {
-  const f = get(j, key);
-  if (f.isNone()) {
-    return None;
-  }
-  return asString(f.unwrap());
-}
-
-export function getInt(j: Json, key: string): Option<int> {
-  const f = get(j, key);
-  if (f.isNone()) {
-    return None;
-  }
-  return asInt(f.unwrap());
-}
-
-export function getBool(j: Json, key: string): Option<bool> {
-  const f = get(j, key);
-  if (f.isNone()) {
-    return None;
-  }
-  return asBool(f.unwrap());
-}
-
-export function getArray(j: Json, key: string): Option<Json[]> {
-  const f = get(j, key);
-  if (f.isNone()) {
-    return None;
-  }
-  return asArray(f.unwrap());
+  let writer = new DocumentWriter(limits);
+  return writer.document(v);
 }

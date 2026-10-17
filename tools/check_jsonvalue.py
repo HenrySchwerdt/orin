@@ -126,7 +126,7 @@ def oracle_cases():
 BENCHMARK = '''import { Host, useProcess } from "std:host";
 import { args } from "std:process";
 import { assert, assertEqString, assertEqUsize } from "std:test";
-import { JsonReadOptions, JsonDuplicatePolicy, parseDocument, writeDocument, defaultJsonLimits } from "std:jsonvalue";
+import { JsonReadOptions, JsonDuplicatePolicy, parseDocument, writeDocument, defaultLimits } from "std:json";
 function source(n: usize, mode: string): string {
   if (mode == "string") {
     let s = "a"; while (s.length < n) { s = s + s; }
@@ -148,7 +148,7 @@ function source(n: usize, mode: string): string {
 }
 function measure(n: usize, mode: string): void {
   const s = source(n,mode);
-  let l = defaultJsonLimits(); l.maxInputBytes = n*2+64;
+  let l = defaultLimits(); l.maxInputBytes = n*2+64;
   l.maxStringBytes = n+64; l.maxDecodedStringBytes = n*2+64;
   l.maxNodes = n+64; l.maxContainerItems = n+64;
   const opt = JsonReadOptions { limits:l, duplicates: mode == "duplicate" ? PreserveDuplicates : RejectDuplicates };
@@ -201,7 +201,7 @@ function main(): void {
 ''' + "".join(f"  {name}();\n" for name in names) +
                       "  const cases = [\n" + ",\n".join(entries) + '''];
   for (const c of cases) {
-    let opt = defaultJsonOptions();
+    let opt = defaultReadOptions();
     if (c.preserve) { opt.duplicates = PreserveDuplicates; }
     const parsed = parseDocument(c.text,opt).unwrap();
     assert(equal(parsed,c.value),"independent Python source tree");
