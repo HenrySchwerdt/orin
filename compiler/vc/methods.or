@@ -12,7 +12,7 @@
 import { Expr, EArrow, EMember, ECall, AExpr, ABlock } from "../syntax";
 import { VT, VInt, VBool, VStr, VArr, VOpt, concrete, vtEq } from "./vt";
 import { Gen } from "./gen";
-import { Var, Chk, TR, Cx, lineOf, srcText, andAll, concatChk, mk, noExp, sortS, freshFree, arrLen, arrSel, inBounds, isSomeT, tfOf } from "./ctx";
+import { Var, Chk, TR, Cx, Fresh, lineOf, srcText, andAll, concatChk, mk, noExp, sortS, freshFree, arrLen, arrSel, inBounds, isSomeT, tfOf } from "./ctx";
 
 // `tr` of expr.or, handed in by the hook.
 export type TrFn = (g: Gen, vars: Var[], cx: Cx, e: Expr, exp: VT) => Result<TR, string>;
@@ -204,6 +204,36 @@ export function trArrayMethodX(g0: Gen, vars: Var[], cx: Cx, r: TR, el: VT, name
 }
 
 // ------------------------------------------------------------------------------------------------ strings
+
+// `s.startsWith(t)`, `s.endsWith(t)`, `s.includes(t)`: uninterpreted functions of the two strings (`strSw`, `strEw`,
+// `strIn`), so the same call gives the same answer everywhere (a test in the body and the same test in a contract
+// agree). Axioms, each a property of the runtime (orin_str_starts_with / ends_with / includes): for all a, b and each P
+//  - P(a, b) implies a is at least as long as b;
+//  - an empty b gives true, and so does b equal to a;
+//  - P(a, b) with a and b of the same length implies a == b (the whole of a is b);
+//  - a prefix or a suffix is also a substring: startsWith / endsWith imply includes.
+// Being functions of the strings, they need no fresh constant and work inside a quantifier body. The axioms are
+// declarations (always asserted), not lemmas: the bounded counterexample search drops lemmas, and these do not follow
+// from any definition.
+export function strPredTerm(g0: Gen, name: string, s: string, t: string): Fresh {
+  let g = g0;
+  if (!g.hasFun("strSw")) {
+    g.registerFun("strSw");
+    // only about well-formed strings (wfOf): the datatype also has values such as (mkStr 0 5) that no string is,
+    // and an axiom about every value of the sort would be inconsistent with them
+    const wf = "(and (>= (slen a) 0) (=> (= (slen a) 0) (= (sid a) 0)) (>= (slen b) 0) (=> (= (slen b) 0) (= (sid b) 0)))";
+    const fns = ["strSw", "strEw", "strIn"];
+    for (const f of fns) {
+      g.declare("(declare-fun " + f + " (Str Str) Bool)");
+      const app = "(" + f + " a b)";
+      g.declare("(assert (forall ((a Str) (b Str)) (! (=> " + wf + " (and (=> " + app + " (>= (slen a) (slen b))) (=> (or (= (slen b) 0) (= a b)) " + app + ") (=> (and " + app + " (= (slen a) (slen b))) (= a b)))) :pattern (" + app + "))))");
+    }
+    g.declare("(assert (forall ((a Str) (b Str)) (! (=> (strSw a b) (strIn a b)) :pattern ((strSw a b)))))");
+    g.declare("(assert (forall ((a Str) (b Str)) (! (=> (strEw a b) (strIn a b)) :pattern ((strEw a b)))))");
+  }
+  const f = name == "startsWith" ? "strSw" : (name == "endsWith" ? "strEw" : "strIn");
+  return Fresh { g: g, name: "(" + f + " " + s + " " + t + ")" };
+}
 
 // The string methods beyond `charCodeAt`, `charAt`, `substring`, `startsWith`, `endsWith`, `includes`, `trim`.
 // `r` is the receiver. The caller has noted the assumption A-STR.
