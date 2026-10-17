@@ -2,29 +2,36 @@
 
 Design note: pure byte codecs using existing `Bytes` and `ByteBuilder`, without
 new syntax or runtime primitives. Encoders produce ASCII strings; decoders consume
-`Bytes` (use `bytesFromString` for strings). This preserves byte offsets even for
-non-ASCII and invalid UTF-8 input. These are data encodings, with no encryption,
+`Bytes`, and every decoder has a `<codec>DecodeText` twin that takes a `string` (the
+same bytes, see ADR-0048 rule 7.2). This preserves byte offsets even for
+non-ASCII and invalid UTF-8 input. This module is the one home of hex:
+`Bytes.toHex()` is what `hexEncode` calls and the old `bytes.bytesFromHex` (an `Option`)
+is deprecated in favour of `hexDecodeText`. Import it as a namespace, `import * as encoding`. These are data encodings, with no encryption,
 authentication, constant-time or other cryptographic guarantees.
 
 | Public signature | Behavior |
 |---|---|
 | `hexEncode(src: Bytes): string` | Lowercase hex, two digits per byte |
 | `hexDecode(src: Bytes): Result<Bytes, EncodingError>` | Either case; no whitespace or prefix; even length required |
-| `base64Encode(src: Bytes, padded: bool): string` | RFC 4648 standard alphabet (`+/`) |
-| `base64Decode(src: Bytes, padded: bool): Result<Bytes, EncodingError>` | Strict standard alphabet |
-| `base64UrlEncode(src: Bytes, padded: bool): string` | RFC 4648 URL alphabet (`-_`) |
-| `base64UrlDecode(src: Bytes, padded: bool): Result<Bytes, EncodingError>` | Strict URL alphabet |
-| `encodingErrorMessage(e: EncodingError): string` | Human-readable error with byte position |
+| `hexDecodeText(s: string): Result<Bytes, EncodingError>` | `hexDecode` of the bytes of `s` |
+| `base64Encode(src: Bytes, padding: Padding): string` | RFC 4648 standard alphabet (`+/`) |
+| `base64Decode(src: Bytes, padding: Padding): Result<Bytes, EncodingError>` | Strict standard alphabet |
+| `base64DecodeText(s: string, padding: Padding): Result<Bytes, EncodingError>` | `base64Decode` of the bytes of `s` |
+| `base64UrlEncode(src: Bytes, padding: Padding): string` | RFC 4648 URL alphabet (`-_`) |
+| `base64UrlDecode(src: Bytes, padding: Padding): Result<Bytes, EncodingError>` | Strict URL alphabet |
+| `base64UrlDecodeText(s: string, padding: Padding): Result<Bytes, EncodingError>` | `base64UrlDecode` of the bytes of `s` |
+| `encodingErrorMessage(e: EncodingError): string` | Human-readable error with byte offset |
 
-`padded=true` requires the exact canonical `=` suffix, including length divisible
-by four. `padded=false` forbids every `=` and accepts final groups of two or three
+`Padding = Padded | Unpadded` (ADR-0048 rule 2.5; it replaces the `padded: bool` parameter).
+`Padded` requires the exact canonical `=` suffix, including length divisible
+by four. `Unpadded` forbids every `=` and accepts final groups of two or three
 digits. Complete groups need no suffix in either mode. All decoders reject spaces,
 line breaks, other non-alphabet bytes, mixed alphabets and nonzero unused pad bits.
 Empty input succeeds. No malformed input traps or returns partially decoded data.
 
-`EncodingError = { position: usize; kind: EncodingErrorKind }`, where kinds are
-`InvalidByte | InvalidLength | InvalidPadding | NonCanonical`.
-Positions are zero-based offsets into the supplied view, never backing storage:
+`EncodingError = { kind: EncodingErrorKind; offset: usize }`, where kinds are
+`InvalidByte | InvalidLength | InvalidPadding | NonCanonical` (`position` was renamed `offset`, ADR-0048 rule 3.1).
+Offsets are zero-based offsets into the supplied view, never backing storage:
 an invalid byte points to that byte; forbidden/misplaced padding points to `=`
 (or the first later data byte); noncanonical bits point to the last data digit;
 length/suffix errors point to end of input (`src.length()`). Hex validates bytes
@@ -60,13 +67,13 @@ disabled for that sanitizer run; it is not a leak-freedom claim.
 ## Example
 
 ```typescript
-import { bytesFromString } from "std:bytes";
-import { base64UrlEncode, base64UrlDecode, encodingErrorMessage } from "std:encoding";
+import { fromString } from "std:bytes";
+import { Unpadded, base64UrlEncode, base64UrlDecode, encodingErrorMessage } from "std:encoding";
 
 function main(): void {
-  const encoded = base64UrlEncode(bytesFromString("hello"), false);
+  const encoded = base64UrlEncode(fromString("hello"), Unpadded);
   console.log(encoded); // aGVsbG8
-  const decoded = base64UrlDecode(bytesFromString(encoded), false);
+  const decoded = base64UrlDecode(fromString(encoded), Unpadded);
   if (decoded.isOk()) {
     console.log(decoded.unwrap().toRawString()); // hello
   } else {

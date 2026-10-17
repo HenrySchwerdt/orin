@@ -1,0 +1,111 @@
+// $rt/leaf -- the leaves of the object model without allocator state, written in Orin (ADR-0052 Addendum A, step R3d.2).
+//
+// The backends call these functions by name (compiler/mir/rt.or lists them; opt/prune.or keeps them) in place of the C runtime
+// functions of the same name (`orin_opt_unwrap`, `orin_res_unwrap`, `orin_res_unwrap_err`, `orin_v_unwrap`, `orin_trap_shape`,
+// `orin_assert_fact`, `orin_assert_array`), which the frozen snapshot bootstrap/seed/runtime/ keeps for the seed and `--c-builtins`.
+// An object is its address as a `usize`: the emitted call casts the pointer (the language cannot forge a reference). The
+// layout is the frozen one (spec 19, rule 3 of Addendum A section 2): kind@8 tag@12; struct nslots@16 slots@32; array len@16
+// items@40; kinds string 1, array 2, struct 3. A trap is `taskTrap`: the message of the C `orin_trap` (stdout flushed,
+// `trap: <msg>` on stderr, exit 101, and a trap on a task ends that task only).
+
+import { load32, load64 } from "std:core";
+import { taskTrap } from "std:fsraw";
+import { exit } from "std:process";
+
+// The trap of every checked field or element access on an object of the wrong shape (docs/assurance.md "shape confusion").
+export function trapShape(): void {
+  taskTrap("field access on a value of the wrong shape (compiler bug)");
+}
+
+// Slot 0 of the struct at `o`: a struct with at least one slot, else the shape trap.
+@Inline
+function slot0(o: usize): usize {
+  if (load32(o + 8) != 3 || load32(o + 16) == 0) {
+    trapShape();
+  }
+  return load64(o + 32);
+}
+
+// `opt.unwrap()`: the payload slot of Some (tag 0).
+@Inline
+export function optUnwrap(o: usize): usize {
+  if (load32(o + 12) != 0) {
+    taskTrap("unwrap on None");
+  }
+  return slot0(o);
+}
+
+// `res.unwrap()`: the payload slot of Ok (tag 0), 0 for an Ok without payload.
+@Inline
+export function resUnwrap(o: usize): usize {
+  if (load32(o + 12) != 0) {
+    taskTrap("unwrap on Err");
+  }
+  if (load32(o + 8) == 3 && load32(o + 16) == 0) {
+    return 0;
+  }
+  return slot0(o);
+}
+
+// `res.unwrapErr()`: the payload slot of Err (tag 1).
+@Inline
+export function resUnwrapErr(o: usize): usize {
+  if (load32(o + 12) != 1) {
+    taskTrap("unwrapErr on Ok");
+  }
+  return slot0(o);
+}
+
+// The unboxed Option / Result (docs/mir.md v2.2): `word` when `tag` is the expected one, else the trap of the boxed builtin.
+// what: 0 = Option.unwrap (tag 0), 1 = Result.unwrap (tag 0), 2 = Result.unwrapErr (tag 1).
+@Inline
+export function vUnwrap(tag: usize, word: usize, what: int): usize {
+  if (what == 0 && tag != 0) {
+    taskTrap("unwrap on None");
+  }
+  if (what == 1 && tag != 0) {
+    taskTrap("unwrap on Err");
+  }
+  if (what == 2 && tag != 1) {
+    taskTrap("unwrapErr on Ok");
+  }
+  return word;
+}
+
+// `orin2 compile --assert-facts` (docs/mir.md v2.4): the dynamic check of a forwarded load. `got` is the value an IForward
+// claimed for slot `key` of `o` (a field index or an array index); the slot itself is read here, as the original getfield /
+// arrayget would have. A difference is an optimiser or verifier bug, not a program error: exit 70 (internal error).
+export function assertFact(o: usize, key: usize, got: usize): void {
+  const kind = load32(o + 8);
+  let want: usize = 0;
+  let why = "";
+  if (kind == 3 && key < load32(o + 16)) {
+    want = load64(o + 32 + key * 8);
+  } else if (kind == 2 && key < load64(o + 16)) {
+    want = load64(load64(o + 40) + key * 8);
+  } else {
+    why = "internal error: --assert-facts: a forwarded load names a slot that does not exist";
+  }
+  if (why == "" && want != got) {
+    why = "internal error: --assert-facts: a forwarded load differs from the slot it was forwarded from";
+  }
+  if (why != "") {
+    console.error(why);
+    exit(70);
+  }
+}
+
+// `orin2 compile --assert-facts` (docs/mir.md v2.6, rule U1): the kind check and the bounds check that an IArrayGetU /
+// IArraySetU leaves out, executed before it. A failure is a verifier or optimiser bug: exit 70 (internal error).
+export function assertArray(o: usize, i: usize): void {
+  let why = "";
+  if (load32(o + 8) != 2) {
+    why = "internal error: --assert-facts: an unchecked array access on an object that is not an array";
+  } else if (i >= load64(o + 16)) {
+    why = "internal error: --assert-facts: an unchecked array access is out of bounds";
+  }
+  if (why != "") {
+    console.error(why);
+    exit(70);
+  }
+}

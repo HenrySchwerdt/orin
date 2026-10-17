@@ -9,7 +9,7 @@
 import { BinOp, UnOp, Builtin, taskOpC, taskOpRet } from "../../hir";
 import {
   MType, MLocal, Operand, Instr, SwitchCase, Terminator, MBlock, MFunction, MProgram, isInlineFn,
-  slotWords,
+  slotWords, RT_OPT_UNWRAP, RT_RES_UNWRAP, RT_RES_UNWRAP_ERR, RT_V_UNWRAP, RT_ASSERT_FACT, RT_ASSERT_ARRAY,
 } from "../../mir";
 import { refMask, inoutArgOk, targetsBelow, linesOfBlocks } from "../c";
 import { u, isRefT, isUsizeT, isFloatT, isAggT, zeroOf, lty, attrTy, paramTy } from "./text";
@@ -275,8 +275,11 @@ function tagIs(p: string, a0: string, k: usize): R {
   };
 }
 
-function unwrapR(p: string, fn: string, a0: string, rt: MType): R {
-  const call = "  " + p + "r = call i64 @" + fn + "(ptr " + a0 + ")\n";
+// `fn` is the C runtime function (takes the pointer) or, with `l1`, the Orin function of `$rt` (takes the address as i64).
+function unwrapR(p: string, fn: string, a0: string, rt: MType, l1: bool): R {
+  const call = l1
+      ? "  " + p + "a = ptrtoint ptr " + a0 + " to i64\n  " + p + "r = call i64 @" + fn + "(i64 " + p + "a)\n"
+      : "  " + p + "r = call i64 @" + fn + "(ptr " + a0 + ")\n";
   if (isFloatT(rt)) {
     return R { text: call + "  " + p + "f = bitcast i64 " + p + "r to double\n", val: p + "f" };
   }
@@ -512,8 +515,8 @@ export class LlvmFunctionEmitter {
         s += "  " + p + "c = icmp eq i64 " + p + "t, 0\n";
       },
       _ => {
-        s += "  " + p + "u = call i64 @orin_v_unwrap(i64 " + p + "t, i64 " + p + "w, i64 "
-            + unwrapWhat(b) + ")\n";
+        s += "  " + p + "u = call i64 @" + (this.syms.l1(RT_V_UNWRAP) != "" ? this.syms.l1(RT_V_UNWRAP) : "orin_v_unwrap")
+            + "(i64 " + p + "t, i64 " + p + "w, i64 " + unwrapWhat(b) + ")\n";
         word = p + "u";
       },
     }
@@ -530,6 +533,12 @@ export class LlvmFunctionEmitter {
       _ => {},
     }
     return R { text: s, val: word };
+  }
+
+  // An unwrap builtin: the Orin function of `$rt` (entry `k`) when the program has it, else the C runtime function `cfn`.
+  private unwrapL1(p: string, k: usize, cfn: string, a0: string, rt: MType): R {
+    const sym = this.syms.l1(k);
+    return sym != "" ? unwrapR(p, sym, a0, rt, true) : unwrapR(p, cfn, a0, rt, false);
   }
 
   private maskOf(os: Operand[]): usize {
@@ -673,7 +682,12 @@ export class LlvmFunctionEmitter {
 
   // `--assert-facts`: the checks an unchecked access omits, run before it (the operands %<p>o0 / %<p>o1 are loaded).
   private assertArrayI(p: string, a: string, i: string): string {
-    return this.facts ? "  call void @orin_assert_array(ptr " + a + ", i64 " + i + ")\n" : "";
+    const sym = this.syms.l1(RT_ASSERT_ARRAY);
+    return this.facts
+        ? (sym != ""
+            ? "  " + p + "aa = ptrtoint ptr " + a + " to i64\n  call void @" + sym + "(i64 " + p + "aa, i64 " + i + ")\n"
+            : "  call void @orin_assert_array(ptr " + a + ", i64 " + i + ")\n")
+        : "";
   }
 
   private binaryI(p: string, d: usize, op: BinOp, a: Operand, b: Operand): string {
@@ -810,9 +824,9 @@ export class LlvmFunctionEmitter {
       BOptIsNone => tagIs(p, a0, 1),
       BResIsOk => tagIs(p, a0, 0),
       BResIsErr => tagIs(p, a0, 1),
-      BOptUnwrap => unwrapR(p, "orin_opt_unwrap", a0, rt),
-      BResUnwrap => unwrapR(p, "orin_res_unwrap", a0, rt),
-      BResUnwrapErr => unwrapR(p, "orin_res_unwrap_err", a0, rt),
+      BOptUnwrap => this.unwrapL1(p, RT_OPT_UNWRAP, "orin_opt_unwrap", a0, rt),
+      BResUnwrap => this.unwrapL1(p, RT_RES_UNWRAP, "orin_res_unwrap", a0, rt),
+      BResUnwrapErr => this.unwrapL1(p, RT_RES_UNWRAP_ERR, "orin_res_unwrap_err", a0, rt),
       BIntToFloat => R { text: "  " + r + " = sitofp i64 " + a0 + " to double\n", val: r },
       BUsizeToFloat => R { text: "  " + r + " = uitofp i64 " + a0 + " to double\n", val: r },
       BF32Round => R {
@@ -1100,7 +1114,10 @@ export class LlvmFunctionEmitter {
         k += 1;
       }
     } else {
-      s += "  " + env + " = call ptr @orin_nullary(i32 0)\n";
+      s += this.syms.l1Loaded() ? "" : "  " + env + " = call ptr @orin_nullary(i32 0)\n";
+      if (this.syms.l1Loaded()) {
+        env = "@orin_nz0";
+      }
     }
     const n = p + "n";
     s += "  " + n + " = call ptr @orin_struct_new(i32 0, i32 2, i64 2)\n";
@@ -1242,7 +1259,9 @@ export class LlvmFunctionEmitter {
       IStructNew(d, tag, slots) => this.structNewI(p, d, tag, slots),
       INullary(d, t) => isAggT(this.f.locals[d].ty)
           ? this.aggNewI(p, d, t, [])
-          : "  " + p + "r = call ptr @orin_nullary(i32 " + u(t) + ")\n" + this.st(d, p + "r"),
+          : this.syms.l1Loaded()
+              ? this.st(d, "@orin_nz" + u(t))
+              : "  " + p + "r = call ptr @orin_nullary(i32 " + u(t) + ")\n" + this.st(d, p + "r"),
       ITag(d, o) => match (this.aggLocal(o)) {
         Some(l) => this.ld(p, 0, o) + extractW(p + "r", lty(this.f.locals[l].ty), ov(p, 0, o), 0)
             + this.st(d, p + "r"),
@@ -1332,9 +1351,12 @@ export class LlvmFunctionEmitter {
   // `--assert-facts`: check the pre-instruction slot before IForward writes its destination (which can be key).
   // The caller already loaded s into %<p>o0; operands 1/2 and the optional slot conversion use distinct names.
   private assertFactI(p: string, s: usize, o: Operand, k: Operand): string {
+    const sym = this.syms.l1(RT_ASSERT_FACT);
     return this.ld(p, 1, o) + this.ld(p, 2, k) + this.asSlot(p, 0, OLocal(s))
-        + "  call void @orin_assert_fact(ptr " + ov(p, 1, o) + ", i64 " + ov(p, 2, k) + ", i64 "
-        + this.slotVal(p, 0, OLocal(s)) + ")\n";
+        + (sym != ""
+            ? "  " + p + "fa = ptrtoint ptr " + ov(p, 1, o) + " to i64\n  call void @" + sym + "(i64 " + p + "fa, i64 "
+            : "  call void @orin_assert_fact(ptr " + ov(p, 1, o) + ", i64 ")
+        + ov(p, 2, k) + ", i64 " + this.slotVal(p, 0, OLocal(s)) + ")\n";
   }
 
   private switchI(p: string, o: Operand, cases: SwitchCase[], d: usize): string {

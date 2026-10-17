@@ -71,7 +71,7 @@ get back equals the value you put in" in their contracts.
 ## Implementation status
 
 Slice 1 (language and compiler, 2026-10-17) delivers decisions 1, 2 (tiers 1 and 2), 4 and 5. Not part of the slice: tier 3
-(law obligations), the verifier axioms of decision 3, and the std collections.
+(law obligations), the verifier axioms of decision 3, and the std collections (slice 2, below).
 
 **What is implemented.**
 - **Constraints.** `Eq`, `Ord` and `Hash` are built-in interfaces (no import, no declaration; a user-declared interface of the same
@@ -102,10 +102,31 @@ Slice 1 (language and compiler, 2026-10-17) delivers decisions 1, 2 (tiers 1 and
   `equals`/`compare`/`hash` is unusable or inconsistent with the derivation). `==`/`<` on a type without the instance stays E0410,
   now with the reason. See `docs/bootstrap-subset.md`.
 
+**Slice 2 (std collections, 2026-10-17).** `std:collections` has the generic containers, in addition to the specialised ones (nothing removed or renamed):
+- `Set<T extends Hash>`: the algorithm of `IntSet` / `StringSet` (a `Map<T, bool>`), same operations and contracts; `Set<int>` and `Set<string>`
+  are tested against `IntSet` / `StringSet` on random operation sequences.
+- `OrderedMap<K extends Ord, V>` (`OrderedEntry<K, V>`, `isStrictlyIncreasingOrd`): the B-tree. `tools/sorted_map.tmpl` is generated three times now
+  (int, string, `Ord`), so all three have the same code and invariants (`tools/gen_sorted_map.py`). `put` also states `floorKey(k) == k`, an
+  equality of keys that the specialised ones could state only through macros. Tested against `SortedMap` / `SortedStringMap`, including the tree
+  height, and with record, `Option`, array, `bool` and class keys.
+- `MinHeap<T extends Ord>`: the 4-ary heap of `PriorityQueue<T>` with the value as the key, FIFO among equal values; `pop` returns a value equal to
+  `old(peek())`. Tested against `PriorityQueue<int>` and with record and class elements.
+- `std:test` `assertEqual<T extends Eq>(actual, expected, msg)`. It shows no values (no generic `toString`); `assertEq` for `int` is unchanged.
+- Names: ADR-0034 wrote `SortedMap<K extends Ord, V>` and `PriorityQueue<T extends Ord>`, but those names are the specialised classes (`SortedMap<V>`,
+  `PriorityQueue<T>` with an explicit priority), and renaming them is a std-freeze decision (ADR-0048). The generic ones are `OrderedMap` and `MinHeap`
+  for now; `Set` was free.
+- Aliases: `IntSet` / `StringSet` could become `type IntSet = Set<int>` (identical algorithm, the `Map` key functions are the same scalar ones, so no
+  slowdown expected), `SortedMap<V>` / `SortedStringMap<V>` could become `OrderedMap<int, V>` / `OrderedMap<string, V>` only if `Ord` on a scalar
+  compiles to the direct comparison and not to the derived `compare` dispatch (to be measured before the freeze), and `PriorityQueue<T>` stays because
+  its `int` priority is separate from the value. Not done: removal or aliasing is a std-freeze decision.
+- The contract of the value type `V` (`get` after `put` returns the value) is still not stated, because `V` is unbounded and one bound per type parameter
+  is the ADR-0026 limit; keys, set elements and heap elements are covered.
+- Mutation check: 15 mutants of the generic code (`tools/mutation.sh std --module collections`), all killed.
+
 **What remains.**
 - Tier 3: the law proofs for explicit instances (strict mode, `NEEDS_DECISION`) and the generated `@Property` tests for normal
   builds (ADR-0031 §17); the Z3 axioms for `Eq`/`Ord` on type parameters (decision 3).
-- The std collections of the Consequences section: `Set<T>`, `SortedMap<K extends Ord, V>` (B-tree), `PriorityQueue<T extends Ord>`, and
-  turning the int/string versions into aliases; generic `assertEq<T extends Eq>`.
+- Turning the int/string collections into aliases of the generic ones and the final names (`SortedMap`, `PriorityQueue`), before the std freeze; `V: Eq` in
+  `OrderedMap` contracts needs several bounds; `Array.indexOf/includes` for `T extends Eq` (ADR-0048).
 - Several bounds on one parameter (`T extends Ord & Hash`, ADR-0026 limit).
 - `Map` instances with a key class whose `hash` is slow or weak are the class author's responsibility (no law check yet).

@@ -68,13 +68,13 @@ def main():
         hx = raw.hex()
         std = base64.b64encode(raw).decode()
         url = base64.urlsafe_b64encode(raw).decode()
-        driver += f'  const b{n} = hexDecode(bytesFromString("{hx}")).unwrap();\n'
+        driver += f'  const b{n} = hexDecode(fromString("{hx}")).unwrap();\n'
         for name, padded, expected in [("hexEncode", None, hx),
                                       ("base64Encode", True, std),
                                       ("base64Encode", False, std.rstrip("=")),
                                       ("base64UrlEncode", True, url),
                                       ("base64UrlEncode", False, url.rstrip("="))]:
-            arg = f"b{n}" + (", " + str(padded).lower() if padded is not None else "")
+            arg = f"b{n}" + ((", Padded" if padded else ", Unpadded") if padded is not None else "")
             driver += f'  assertEqString({name}({arg}), "{expected}", "Python oracle");\n'
     driver += '  console.log("encoding parity passed");\n}\n'
     source = OUT / "parity.or"
@@ -88,8 +88,8 @@ def main():
         print(f"PASS {backend} contracts={contracts} sanitizers={san}", flush=True)
     if opts.skip_bench:
         return
-    imports = '''import { ByteBuilder, bytesFromString } from "std:bytes";
-import { hexEncode, hexDecode, base64Encode, base64Decode, base64UrlEncode, base64UrlDecode } from "std:encoding";
+    imports = '''import { ByteBuilder, fromString } from "std:bytes";
+import { Padded, Unpadded, hexEncode, hexDecode, base64Encode, base64Decode, base64UrlEncode, base64UrlDecode } from "std:encoding";
 import { assert } from "std:test";
 '''
     for n in [65536, 262144, 1048576]:
@@ -102,9 +102,9 @@ import { assert } from "std:test";
   let round = 0;
   let sum: usize = 0;
   while (round < 4) {{
-    const h = hexDecode(bytesFromString(hexEncode(b))).unwrap();
-    const s = base64Decode(bytesFromString(base64Encode(b, true)), true).unwrap();
-    const u = base64UrlDecode(bytesFromString(base64UrlEncode(b, false)), false).unwrap();
+    const h = hexDecode(fromString(hexEncode(b))).unwrap();
+    const s = base64Decode(fromString(base64Encode(b, Padded)), Padded).unwrap();
+    const u = base64UrlDecode(fromString(base64UrlEncode(b, Unpadded)), Unpadded).unwrap();
     assert(h.equals(b) && s.equals(b) && u.equals(b), "benchmark round trips");
     sum += h.length() + s.length() + u.length();
     round += 1;
