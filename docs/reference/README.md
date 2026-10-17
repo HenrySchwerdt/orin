@@ -56,9 +56,8 @@ Places where a guide, ADR or spec text disagrees with what the compiler does. Th
    in the tree. Chapter 6 describes what is implemented.
 6. **Privacy.** `private_by_default` does not stop a private type from appearing in an exported signature: an importer can read
    its fields through the exported function's result.
-7. **Orin-B wording in messages.** Nested patterns are rejected with a message saying "in Orin-B" (E0402) although the language
-   is beyond Orin-B; the diagnostic table in `docs/bootstrap-subset.md` still describes E0408 as "feature not supported in
-   Orin-B".
+7. **Orin-B wording in messages.** The E0402 message no longer says "in Orin-B"; the diagnostic table in
+   `docs/bootstrap-subset.md` still describes E0408 as "feature not supported in Orin-B".
 8. **`tests/parse_edge`** names (`err0100_bad_float`, `err0200_fn_arrow_expr`) are historical; the files no longer produce
    those codes, and the corpus asserts nothing by name.
 9. **Generic methods.** `docs/concurrency.md` and `docs/std.md` explain several API shapes (free functions, `Do` flavours) by

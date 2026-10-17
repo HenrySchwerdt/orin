@@ -19,6 +19,8 @@ int orin_platform_dir_list(const char *path, size_t plen,
     each(ctx, "a", 1, 0);
     return error_code;
 }
+/* The unwrap helpers are Orin functions now ($rt/leaf.or, ADR-0052 R3d.2); this test reads the payload slot directly. */
+static uint64_t orin_res_unwrap(OrinObj *r) { return orin_tag(r) == 0 ? orin_struct_get(r, 0) : 0; }
 static int failures;
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #c); failures++; } } while (0)
 static int cleanup_fd;
@@ -40,8 +42,10 @@ static void expect_failure(int64_t fs, OrinObj *path, int code, int64_t baseline
         CHECK(atexit(report_cleanup) == 0);
         error_code = code;
         (void)freopen("/dev/null", "w", stderr);
-        orin_release(orin_fs_list_dir(fs, path));
-        _exit(0);
+        OrinObj *r = orin_fs_list_dir(fs, path);
+        int bad = orin_tag(r) == 1; /* every enumeration failure is an Err; out of memory still traps (101) */
+        orin_release(r);
+        exit(bad ? 101 : 0); /* exit, not _exit: the atexit hook reports the leak check */
     }
     close(report[1]);
     if (child > 0) {
@@ -65,14 +69,16 @@ int main(int argc, char **argv) {
     }
     error_code = 0;
     const char *expected[] = {"a", "a-/", "a.", "\200", "\377"};
-    OrinObj *entries = orin_fs_list_dir(fs, path);
+    OrinObj *result = orin_fs_list_dir(fs, path);
+    CHECK(orin_tag(result) == 0);
+    OrinObj *entries = ORIN_REF(orin_res_unwrap(result));
     CHECK(orin_array_len(entries) == 5);
     for (size_t i = 0; i < orin_array_len(entries) && i < 5; i++) {
         OrinObj *entry = ORIN_REF(orin_array_at(entries, i));
         CHECK(orin_str_len(entry) == strlen(expected[i]));
         CHECK(memcmp(orin_str_data(entry), expected[i], strlen(expected[i])) == 0);
     }
-    orin_release(entries);
+    orin_release(result);
     CHECK(orin_live_count() == baseline);
     orin_release(path);
     orin_cap_revoke(fs); orin_cap_revoke(host);

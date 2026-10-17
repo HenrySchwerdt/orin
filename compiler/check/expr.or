@@ -26,7 +26,7 @@ import {
   EntAlias, EntGen, EntIface, EntBuiltin, typeEq, isBool, isString, isVoid, isIntish, isFloatTy,
   isArrayTy, isIface, isSignedInt, isFn, showType, mismatch, globalVal, findType, findVal, originOf,
   boundsOf, ifaceMethodIndex, IfaceSig, typeInRange, isWellFormedEnv, CmOld, CmEnsures, sameContractMode, inContract,
-  isEnsuresMode, isOldMode, isMutRetMode, isUnit, isRecordKind, isNamespaceName, nsShadowErr, nsValueErr,
+  isEnsuresMode, isOldMode, isClassMode, isStaticMode, isMutRetMode, isUnit, isRecordKind, isNamespaceName, nsShadowErr, nsValueErr,
 } from "./env";
 import { checkBounds, internVtable } from "./ifaces";
 import {
@@ -1502,7 +1502,7 @@ export class ExprChecker {
     if (id.name == "Some" || id.name == "Ok" || id.name == "Err") {
       return Err(diag("E0404", span, "`" + id.name + "` must be called with arguments"));
     }
-    return Err(unresolvedName(this.fx.selfName, id));
+    return Err(this.unresolved(id));
   }
 
   @Ensures(result.isOk() ==> isFn(result.unwrap().ty))
@@ -2430,7 +2430,7 @@ export class ExprChecker {
       if (id.name == "Some" || id.name == "Ok" || id.name == "Err") {
         return this.builtinCtor(span, id.name, args, exp);
       }
-      return Err(unresolvedName(this.fx.selfName, id));
+      return Err(this.unresolved(id));
     }
     match (g.unwrap()) {
       VNamespace(_) => {
@@ -2476,6 +2476,61 @@ export class ExprChecker {
   // ---------------------------------------------------------------------------
   // Generic calls (beyond Orin-B, ADR-0007)
   // ---------------------------------------------------------------------------
+
+  // Notes for E0405 on `string` and arrays: what exists, and `length` is a property.
+  private noMethodNote(d0: Diagnostic, ty: Type, n: string): Diagnostic {
+    let d = d0;
+    if (n == "length" && (isString(ty) || isArrayTy(ty))) {
+      d.notes.push("`length` is a property, write `xs.length`");
+    } else if (isString(ty)) {
+      d.notes.push("string has the methods charAt, charCodeAt, substring, indexOf, includes, startsWith, endsWith, split and trim, and the property length");
+      d.notes.push("build text with template literals or `+`");
+    }
+    return d;
+  }
+
+  // E0300 for an unknown name, with a note when the usual first-day mistake is recognisable.
+  private unresolved(id: Ident): Diagnostic {
+    const n = id.name;
+    let d = unresolvedName(this.fx.selfName, id);
+    if (this.fx.selfName != "" && n == this.fx.selfName) {
+      return d;
+    }
+    const m = this.fx.fmode;
+    if (isClassMode(m) && !isStaticMode(m)) {
+      const fs = this.fx.env.classes[this.fx.fcls].fields;
+      for (const f of fs) {
+        if (f.name == n) {
+          d.notes.push("did you mean `this." + n + "`?");
+          return d;
+        }
+      }
+    }
+    const found = findType(this.fx.env.units[this.fx.unit].scope, n);
+    if (found.isSome()) {
+      const co = match (found.unwrap()) {
+        EntRecord(r) => classOfRec(this.fx.env, r),
+        EntGen(g) => classOfGeneric(this.fx.env, g),
+        _ => None,
+      };
+      if (co.isSome()) {
+        d.notes.push("create instances with `new " + n + "(...)`");
+        return d;
+      }
+    }
+    if (n == "Math") {
+      d.notes.push("`Math` is not available in Orin; see `std:math` (`import { sqrt } from \"std:math\";`)");
+    } else if (n == "JSON") {
+      d.notes.push("`JSON` is not available in Orin; see `std:json`");
+    } else if (n == "fetch") {
+      d.notes.push("`fetch` is not available in Orin; see `std:http`");
+    } else if (n == "setTimeout" || n == "setInterval" || n == "Promise") {
+      d.notes.push("`" + n + "` is not available in Orin; see `std:task`");
+    } else if (n == "console" || n == "parseInt" || n == "parseFloat" || n == "require" || n == "process") {
+      d.notes.push("`" + n + "` is not available in Orin (there are no JavaScript globals other than `console.log`)");
+    }
+    return d;
+  }
 
   private callTyApp(
     span: Span,
@@ -3445,13 +3500,15 @@ export class ExprChecker {
     }
     const so = methodSig(b.ty, n);
     if (so.isNone()) {
-      return Err(
+      return Err(this.noMethodNote(
         diag(
           "E0405",
           name.span,
           "no method `" + n + "` on type `" + showType(this.fx.env, b.ty) + "`",
         ),
-      );
+        b.ty,
+        n,
+      ));
     }
     const s = so.unwrap();
     const a = this.argsExpect(span, "method `" + n + "`", args, s.params)?;
@@ -3526,13 +3583,15 @@ export class ExprChecker {
           return Ok(mk(XMutMethod(op, pi.place, a), ret, span));
         },
         _ => {
-          return Err(
+          return Err(this.noMethodNote(
             diag(
               "E0405",
               name.span,
               "no method `" + n + "` on type `" + showType(this.fx.env, pi.place.ty) + "`",
             ),
-          );
+            pi.place.ty,
+            n,
+          ));
         },
       }
     }
@@ -3540,13 +3599,15 @@ export class ExprChecker {
     if (isArrayTy(b.ty)) {
       return Err(diag("E0401", base.span, "receiver of `" + n + "` must be a mutable place"));
     }
-    return Err(
+    return Err(this.noMethodNote(
       diag(
         "E0405",
         name.span,
         "no method `" + n + "` on type `" + showType(this.fx.env, b.ty) + "`",
       ),
-    );
+      b.ty,
+      n,
+    ));
   }
 
   // ---------------------------------------------------------------------------
@@ -3573,7 +3634,7 @@ export class ExprChecker {
         if (globalVal(this.fx.env, this.fx.unit, id.name).isSome()) {
           return Err(diag("E0401", e.span, "cannot assign to `" + id.name + "`"));
         }
-        return Err(diag("E0300", id.span, "unresolved name `" + id.name + "`"));
+        return Err(this.unresolved(id));
       },
       EThis => {
         const lv = this.fx.lookupVar("this");
@@ -4413,11 +4474,11 @@ export class ExprChecker {
       }
       fname = n + suffix;
     }
-    const noMethod = diag(
+    const noMethod = this.noMethodNote(diag(
       "E0405",
       name.span,
       "no method `" + n + "` on type `" + showType(this.fx.env, TyArray(elem)) + "`",
-    );
+    ), TyArray(elem), n);
     if (this.fx.env.prelude.isNone()) {
       return Err(noMethod);
     }

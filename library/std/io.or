@@ -1,0 +1,71 @@
+// std:io -- standard input/output and child processes (ADR-0027, ADR-0045, ADR-0048).
+//
+// UNSTABLE (ADR-0016 two-stage freeze): std I/O stays unstable until the project owner confirms the freeze.
+//
+// Every function takes the grant of its family as its first argument: `StdioGrant` for `readBytes`, `readLine` and
+// `writeStdout`, `ProcessGrant` for `shell` and `shellTimeout` (both come from `main(host: Host)` through std:host:
+// `useStdio`, `useProcess`, `useHost`). `console.log` / `console.error` need no grant.
+//
+// `shell` and `shellTimeout` run a command to completion through `/bin/sh -c` and report how it ended as a
+// `Result<int, ProcessError>`: `Ok(status)` is the exit status 0..255 of the command, so a command that ran and failed is
+// still an `Ok` (compare the status); `Err` means no status exists (ADR-0048 rule 3.1 replaces the sentinels -1 and -2 of
+// ADR-0045). A process grant narrowed by `withArgsOnly` (std:host), or one denied by the host policy (ORIN_DENY names
+// `process`), cannot spawn: the call traps ("capability denied"), like every operation that does not return a `Result`
+// for a refused grant.
+
+import { StdioGrant, ProcessGrant, shellRaw, shellTimeoutRaw } from "std:fsraw";
+import { Duration } from "std:time";
+
+export { StdioGrant, ProcessGrant, readBytes, readLine, writeStdout } from "std:fsraw";
+
+// Why no exit status exists. Timeout: the command did not finish within the allowed time and its process group was
+// killed; InvalidDuration: the timeout is not positive (nothing was started); Failed: the command could not be run to
+// completion (spawn failure, killed by a signal, or an operating-system error).
+export type ProcessErrorKind = Timeout | InvalidDuration | Failed;
+
+// An error of this module: the `kind` and the command line that was (or would have been) run. Render it with
+// `processErrorMessage`.
+export type ProcessError = { kind: ProcessErrorKind; command: string; };
+
+// processErrorMessage(e: ProcessError): string -- "command timed out: <command>" and so on. Never empty. O(command).
+export function processErrorMessage(e: ProcessError): string {
+  return match (e.kind) {
+    Timeout => "command timed out: " + e.command,
+    InvalidDuration => "timeout must be positive: " + e.command,
+    Failed => "command could not be run to completion: " + e.command
+  };
+}
+
+// shell(proc: ProcessGrant, cmd: string): Result<int, ProcessError>
+// Runs `cmd` with `/bin/sh -c`, waits for it, and returns its exit status 0..255. Err(Failed) when the command could not
+// be run to completion. Traps with "capability denied" when `proc` cannot spawn. No time limit: use `shellTimeout` for
+// anything that might hang. O(command bytes) plus the run time of the command.
+export function shell(proc: ProcessGrant, cmd: string): Result<int, ProcessError> {
+  const status = shellRaw(proc, cmd);
+  if (status < 0) {
+    return Err(ProcessError { kind: Failed, command: cmd });
+  }
+  return Ok(status);
+}
+
+// shellTimeout(proc: ProcessGrant, cmd: string, timeout: Duration): Result<int, ProcessError>
+// Like `shell`, but the command and its process group are killed when `timeout` has passed (whole-second granularity:
+// the timeout is rounded up to the next second). Ok(0..255) is the exit status. Err(Timeout) when the time ran out,
+// Err(InvalidDuration) when `timeout` is not positive (nothing is started), Err(Failed) for a spawn failure, a signal
+// or an operating-system error. Traps with "capability denied" when `proc` cannot spawn.
+// O(command bytes + elapsed time / 10 ms); sleeps between checks.
+export function shellTimeout(proc: ProcessGrant, cmd: string, timeout: Duration): Result<int, ProcessError> {
+  if (timeout.millis <= 0) {
+    return Err(ProcessError { kind: InvalidDuration, command: cmd });
+  }
+  const whole = timeout.millis / 1000;
+  const seconds = timeout.millis % 1000 > 0 ? whole + 1 : whole;
+  const status = shellTimeoutRaw(proc, cmd, seconds);
+  if (status == 0 - 2) {
+    return Err(ProcessError { kind: Timeout, command: cmd });
+  }
+  if (status < 0) {
+    return Err(ProcessError { kind: Failed, command: cmd });
+  }
+  return Ok(status);
+}

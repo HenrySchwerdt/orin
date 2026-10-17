@@ -55,6 +55,15 @@ function sync(s: Session, fs: FsGrant, p: ProcessGrant, uri: string): Json {
   return s.diagnosticsFor(fs, uri);
 }
 
+function completionLabels(s: Session, fs: FsGrant, p: ProcessGrant, path: string, pos: Pos): string[] {
+  const r = s.lspRequest(fs, p, "textDocument/completion", td(path, pos));
+  let out: string[] = [];
+  for (const it of items(at(r, ["result", "items"]))) {
+    out.push(str(at(it, ["label"])));
+  }
+  return out;
+}
+
 function hoverAt(s: Session, fs: FsGrant, p: ProcessGrant, path: string, pos: Pos): string {
   const r = s.lspRequest(fs, p, "textDocument/hover", td(path, pos));
   return str(at(r, ["result", "contents", "value"]));
@@ -264,6 +273,31 @@ export function runLsp(fs: FsGrant, p: ProcessGrant, s: Session, exe: string, tm
   }
   s.check(fs, containsStr(nsLabels, "dist") && containsStr(nsLabels, "Point") && !containsStr(nsLabels, "main") && !containsStr(nsLabels, "function"),
     "namespace: completion after `lib.` offers the members only (got [" + nsLabels.join(", ") + "])");
+
+  // std namespaces: members come from the embedded std sources (also sub-directory modules); the file is being typed.
+  const stdTyping = "import * as bytes from \"std:bytes\";\nimport * as num from \"std:json/number\";\n\nfunction main(): void {\n  const n = 1;\n  bytes.\n  num.\n  n.\n  bytes.fromS\n}\n";
+  changeDoc(s, fs, p, nsMain, stdTyping, 3);
+  let stdLabels = completionLabels(s, fs, p, nsMain, posOf(stdTyping, "bytes.\n", 0, 6));
+  s.check(fs, containsStr(stdLabels, "fromString") && containsStr(stdLabels, "empty") && containsStr(stdLabels, "Bytes")
+      && !containsStr(stdLabels, "main") && !containsStr(stdLabels, "function"),
+    "std namespace: completion after `bytes.` lists std:bytes exports (got [" + stdLabels.join(", ") + "])");
+  r = s.lspRequest(fs, p, "textDocument/completion", td(nsMain, posOf(stdTyping, "bytes.\n", 0, 6)));
+  let fromStringDetail = "";
+  for (const it of items(at(r, ["result", "items"]))) {
+    if (isStrEq(at(it, ["label"]), "fromString")) {
+      fromStringDetail = str(at(it, ["detail"]));
+    }
+  }
+  s.check(fs, fromStringDetail.includes("function fromString("), "std namespace: signature detail (got " + reprStr(fromStringDetail) + ")");
+  stdLabels = completionLabels(s, fs, p, nsMain, posOf(stdTyping, "num.\n", 0, 4));
+  s.check(fs, containsStr(stdLabels, "jsonNumber") && !containsStr(stdLabels, "fromString") && !containsStr(stdLabels, "main") && !containsStr(stdLabels, "function"),
+    "std namespace: completion after `num.` lists std:json/number exports (got [" + stdLabels.join(", ") + "])");
+  stdLabels = completionLabels(s, fs, p, nsMain, posOf(stdTyping, "bytes.fromS", 0, 11));
+  s.check(fs, containsStr(stdLabels, "fromString") && containsStr(stdLabels, "empty"),
+    "std namespace: completion after `bytes.fromS` still lists the members (got [" + stdLabels.join(", ") + "])");
+  stdLabels = completionLabels(s, fs, p, nsMain, posOf(stdTyping, "n.\n", 0, 2));
+  s.check(fs, !containsStr(stdLabels, "fromString") && !containsStr(stdLabels, "empty"),
+    "std namespace: a non-namespace identifier gets no namespace members (got [" + stdLabels.join(", ") + "])");
 
   let locs = refsAt(s, fs, p, main, call, true);
   let uris = uriSet(locs);

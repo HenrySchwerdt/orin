@@ -56,8 +56,8 @@ echo "[seed] sha256 ok ($got)"
 echo "[stage0] cc $STAGE01_CFLAGS seed -> orin0"
 cc_link "$STAGE01_CFLAGS" legacy $B/seed.c $B/orin0
 if [ -n "$SEED_ONLY" ]; then echo "[seed-only] built $B/orin0"; exit 0; fi
-echo "[stage1] orin0 compiles compiler/main.or; cc $STAGE01_CFLAGS -> orin1 ($(elapsed))"
-$B/orin0 compile compiler/main.or -o $B/stage1.c && cc_link "$STAGE01_CFLAGS" legacy $B/stage1.c $B/orin1
+echo "[stage1] orin0 compiles compiler/main.or --c-builtins (the C runtime path the frozen snapshot implements); cc $STAGE01_CFLAGS -> orin1 ($(elapsed))"
+$B/orin0 compile --c-builtins compiler/main.or -o $B/stage1.c && cc_link "$STAGE01_CFLAGS" legacy $B/stage1.c $B/orin1
 if [ "$SPLIT" -gt 1 ]; then
   echo "[stage2] orin1 compiles compiler/main.or (--split $SPLIT); cc $CFLAGS in parallel -> orin2 ($(elapsed))"
   $B/orin1 compile compiler/main.or -o $B/stage2.c --split "$SPLIT"

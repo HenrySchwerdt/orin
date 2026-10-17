@@ -280,6 +280,42 @@ error (``error[E0410]: operands have different types `string` and `int` ``), and
 | String indexing and methods: `s[0]`, `s.toUpperCase()` | The `string` API is small (`s.length`, `+`, `==`); `s[0]` is E0400 and `toUpperCase` is E0405 (no such method). See `docs/std.md` and the prelude. |
 | Reflection, `eval`, prototype chain, `this` rebinding | None by design. |
 
+### 2.1 Common mistakes coming from TypeScript
+
+What the compiler says for the habits that come up on the first day, and what to write instead. Each row was checked with
+the compiler; `orin explain <code>` has a short description of the more common codes.
+
+| You wrote | The compiler says | Write instead |
+|---|---|---|
+| `for (let i = 0; i < n; i++)` | `` E0200 expected `const`, found `let` `` | `let i = 0; while (i < n) { ...; i += 1; }`, or `for (const x of xs)` over an array |
+| `i++`, `i--` | `` E0200 expected expression, found `+` `` | `i += 1`, `i -= 1` |
+| `a === b`, `a !== b` | `` E0200 expected expression, found `=` `` | `a == b`, `a != b` (structural, never reference equality) |
+| `let count = 0;` at file level | `` E0200 expected declaration, found `let` `` | `const` at file level; keep mutable state in `main` or in a class |
+| `const x = 5; x = 6;` | `` E0401 cannot assign to `x`: it is not declared with `let` `` | `let x = 5;` |
+| `x: number`, `x: any`, `Promise<T>` | `` E0300 unknown type `number` `` | `int` or `float`; a concrete type or a generic `T`; no promises yet |
+| `null`, `undefined` | `` E0200 expected expression, found `null` `` | `Option<T>`: `None` and `Some(x)` |
+| `a?.b` | `` E0406 `?` requires a `Result`, found `Option<string>` `` | `match (a) { Some(v) => ..., None => ... }` or `a.unwrapOr(d)` |
+| `return Ok(());` | `` E0200 expected expression, found `)` `` | `return Ok();` for `Result<void, E>` |
+| `console.log(5)` | `` E0400 expected `string`, found `int` `` | `` console.log(`${n}`) `` |
+| `"n=" + 5` | `` E0410 operands have different types `string` and `int` `` | `` `n=${5}` `` |
+| `"ab".repeat(3)`, `s.toUpperCase()`, `s.padStart(5)` | `` E0405 no method `repeat` on type `string` `` | Strings have `length`, `substring`, `indexOf`, `includes`, `startsWith`, `endsWith`, `split`, `trim`, `charAt` and `+`; the rest is not in the language yet. Write a small function. |
+| `xs.length()` | `` E0405 no method `length` on type `int[]` `` | `xs.length` (a property) |
+| `m["a"] = 1` on a `Map` | `` E0400 cannot index into type `Map<string, int>` `` | `m.set("a", 1)` (the map must be declared with `let`), `m.get("a")` (an `Option`) |
+| `s[0]` on a string | `` E0400 cannot index into type `string` `` | `s.charAt(0)` or `s.substring(0, 1)` |
+| `function f(x: int) { return x; }` | `` E0400 cannot return a value from a function returning `void` `` | declare the result: `function f(x: int): int` (omitting it means `void`) |
+| `if (a) {` / `while (n) {` with a non-`bool` | `` E0400 expected `bool`, found `int` `` | write the comparison: `n != 0` |
+| `function f(x: int = 3)`, `x?: int` | `` E0200 expected `,` or `)`, found `=` `` | no default or optional parameters: pass every argument, or take an `Option<int>` parameter |
+| `{ x: 1 }` object literal | `` E0200 expected expression, found `{` `` | declare `type P = { x: int; };` and write `P { x: 1 }`; fields end with `;` |
+| `const f = function (x: int) { }` | `` E0200 expected expression, found `function` `` | `(x: int): int => x + 1` |
+| `const p = P(1)` for a class | `` E0300 unresolved name `P` `` | `new P(1)` |
+| `n += 1` for a field inside a method | `` E0300 unresolved name `n` `` | `this.n += 1` |
+| `(x) => x + 1` | `` E0407 cannot infer the type of parameter `x` `` | `(x: int): int => x + 1` |
+| `foo(1)` for a function in another file | `` E0300 unresolved name `foo` `` | `import { foo } from "./other";` and `export function foo` there |
+| `import fs from "fs"` | `` E0200 expected `{`, found `fs` `` | named imports only: `import { readFile } from "std:fs";` (I/O needs a grant from `main(host: Host)`) |
+| `function main(args: string[])` | `` E0412 `main` must be declared as `function main(): void` or `function main(host: Host): void` `` | program arguments come from `std:process` (`args`) with the grant from `host` |
+| `const [a, b] = xs`, `const { x } = p`, `[...a, 1]` | `` E0200 expected identifier, found `[` `` | `xs[0]`, `p.x`, `a.concat([1])` |
+| `switch`, `enum` | `` E0200 expected `;`, found `{` `` / `` expected declaration, found `enum` `` | `match (x) { ... }`, `type Color = Red \| Green;` |
+
 ## 3. Cheat sheet
 
 | TypeScript | Orin |

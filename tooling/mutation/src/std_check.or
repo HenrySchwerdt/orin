@@ -14,10 +14,29 @@
 
 import { ProcessGrant } from "std:process";
 import { FsGrant, writeFile, readFile } from "std:fs";
-import { shellTimeout } from "std:io";
+import { shellTimeout, Timeout, shell } from "std:io";
+import { seconds } from "std:time";
 import { shq, replaceFirst, replaceAll, countOf, countLinePrefix, cutBytes, padEnd, padStart } from "./text";
 import { StdMutant } from "./mutants_std";
 import { NOT_RUN } from "./exec";
+
+// Exit status 0..255 of the command, -1 when it could not be run (the tool keeps statuses as data).
+export function shellStatus(p: ProcessGrant, cmd: string): int {
+  const r = shell(p, cmd);
+  return r.isOk() ? r.unwrap() : 0 - 1;
+}
+
+// Exit status 0..255 of the command, -2 when the time ran out, -1 when it could not be run: the tool keeps statuses as data.
+export function shellTimeoutStatus(p: ProcessGrant, cmd: string, limit: int): int {
+  return match (shellTimeout(p, cmd, seconds(limit))) {
+    Ok(status) => status,
+    Err(e) => match (e.kind) {
+      Timeout => 0 - 2,
+      _ => 0 - 1
+    }
+  };
+}
+
 
 export const OUT: string = "build/mutate_std";
 export const FAIL_TIMEOUT: int = -2;
@@ -176,14 +195,14 @@ export function runStd(p: ProcessGrant, j: StdJob): StdRun {
   for (const t of j.tests) {
     const f = j.dir + "/" + t + ".or";
     const o1 = j.dir + "/" + t + ".out1";
-    const c1 = shellTimeout(p, testCmd(j, f, "", o1), j.timeout);
-    const c2 = shellTimeout(p, testCmd(j, f, "--no-contracts", j.dir + "/" + t + ".out2"), j.timeout);
+    const c1 = shellTimeoutStatus(p, testCmd(j, f, "", o1), j.timeout);
+    const c2 = shellTimeoutStatus(p, testCmd(j, f, "--no-contracts", j.dir + "/" + t + ".out2"), j.timeout);
     rc1.push(c1);
     rc2.push(c2);
     files1.push(shq(o1));
     if (j.early) {
       // a timeout is a failing test; otherwise: does a line of the output start with `FAIL `?
-      if (c1 == FAIL_TIMEOUT || shellTimeout(p, cdRoot(j.root) + "grep -q '^FAIL ' " + shq(o1), 60) == 0) {
+      if (c1 == FAIL_TIMEOUT || shellTimeoutStatus(p, cdRoot(j.root) + "grep -q '^FAIL ' " + shq(o1), 60) == 0) {
         break;
       }
     }
@@ -198,10 +217,10 @@ export function runStd(p: ProcessGrant, j: StdJob): StdRun {
       }
     }
     if (!failed) {
-      failed = shellTimeout(p, cdRoot(j.root) + "grep -q -E '^FAIL |contract violated' " + files1.join(" "), 60) == 0;
+      failed = shellTimeoutStatus(p, cdRoot(j.root) + "grep -q -E '^FAIL |contract violated' " + files1.join(" "), 60) == 0;
     }
     if (!failed) {
-      xrc = shellTimeout(p, testCmd(j, j.dir + "/" + j.extra + ".or", "--no-contracts", j.dir + "/" + j.extra + ".out"), 900);
+      xrc = shellTimeoutStatus(p, testCmd(j, j.dir + "/" + j.extra + ".or", "--no-contracts", j.dir + "/" + j.extra + ".out"), 900);
     }
   }
   return StdRun { rc1: rc1, rc2: rc2, xrc: xrc };

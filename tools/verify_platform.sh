@@ -99,7 +99,7 @@ done
 # exhaust the solver's memory); the validation arithmetic does not depend on the table size. The source itself is untouched.
 mkdir -p "$B/l0"
 sed -e 's/THR_MAX = 1 << 16, MON_MAX = 1 << 18/THR_MAX = 8, MON_MAX = 8/' -e 's/WAKE_MAX = 1 << 16/WAKE_MAX = 8/' runtime/platform/orin_platform.c >"$B/l0/orin_platform.c"
-cp runtime/platform/orin_platform.h "$B/l0/"
+cp runtime/platform/orin_platform.h runtime/platform/orin_platform_pure.h "$B/l0/"
 grep -q 'THR_MAX = 8, MON_MAX = 8' "$B/l0/orin_platform.c" && grep -q 'WAKE_MAX = 8' "$B/l0/orin_platform.c" || { echo "table-size line of orin_platform.c changed: adapt the sed above" >&2; exit 1; }
 l0() { # harness:unwind extra-flags...
   fn=${1%%:*}; un=${1##*:}; shift

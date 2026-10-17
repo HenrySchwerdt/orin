@@ -1,0 +1,119 @@
+// The service logic: (store, request) -> (new store, response). Pure, so the whole API is unit-testable without a socket.
+import {
+  JsonValue, JsonMember, ValueString, ValueNumber, ValueArray, ValueObject, parseDocument,
+  writeDocument, defaultReadOptions, defaultLimits,
+} from "std:json";
+import { numberFromInt } from "std:json/number";
+import {
+  DecodeError, RejectUnknown, decodeRoot, checkFields, requiredField, decodeString,
+  decodeErrorMessage,
+} from "std:json/decode";
+import { Note, Store, addNote, findNote } from "./store";
+import {
+  Route, Health, ListNotes, CreateNote, GetNote, BadId, WrongMethod, NotFound, parseRoute,
+} from "./routes";
+
+// The answer: an HTTP status and a JSON text.
+export type Answer = { code: int; body: string; };
+export type Reply = { store: Store; answer: Answer; };
+
+const MAX_TITLE: usize = 100;
+const MAX_TEXT: usize = 4000;
+
+function render(v: JsonValue): string {
+  const text = writeDocument(v, defaultLimits());
+  return text.isOk() ? text.unwrap() : "{}";
+}
+
+function member(key: string, value: JsonValue): JsonMember {
+  return JsonMember { key: key, value: value };
+}
+
+export function noteJson(n: Note): JsonValue {
+  return ValueObject([
+    member("id", ValueNumber(numberFromInt(n.id))),
+    member("title", ValueString(n.title)),
+    member("text", ValueString(n.text)),
+  ]);
+}
+
+export function errorAnswer(code: int, message: string): Answer {
+  return Answer { code: code, body: render(ValueObject([member("error", ValueString(message))])) };
+}
+
+type NewNote = { title: string; text: string; };
+
+// A request body {"title": "...", "text": "..."} (both required, no other members) to a NewNote, or a message for the client.
+export function parseNewNote(body: string): Result<NewNote, string> {
+  const doc = parseDocument(body, defaultReadOptions());
+  if (doc.isErr()) {
+    return Err("body is not valid JSON");
+  }
+  const decoded = decodeNewNote(doc.unwrap());
+  if (decoded.isErr()) {
+    return Err(decodeErrorMessage(decoded.unwrapErr()));
+  }
+  const n = decoded.unwrap();
+  if (n.title.length == 0 || n.title.length > MAX_TITLE) {
+    return Err("title must be 1 to 100 bytes");
+  }
+  if (n.text.length > MAX_TEXT) {
+    return Err("text must be at most 4000 bytes");
+  }
+  return Ok(n);
+}
+
+function decodeNewNote(v: JsonValue): Result<NewNote, DecodeError> {
+  const root = decodeRoot(v, defaultLimits())?;
+  checkFields(root, ["title", "text"], RejectUnknown)?;
+  const title = decodeString(requiredField(root, "title")?)?;
+  const text = decodeString(requiredField(root, "text")?)?;
+  return Ok(NewNote { title: title, text: text });
+}
+
+function reply(store: Store, code: int, body: string): Reply {
+  return Reply { store: store, answer: Answer { code: code, body: body } };
+}
+
+function listNotes(store: Store): Reply {
+  let items: JsonValue[] = [];
+  for (const n of store.notes) {
+    items.push(noteJson(n));
+  }
+  return reply(store, 200, render(ValueArray(items)));
+}
+
+function getNote(store: Store, id: int): Reply {
+  const found = findNote(store, id);
+  if (found.isNone()) {
+    return reply(store, 404, errorAnswer(404, "no such note").body);
+  }
+  return reply(store, 200, render(noteJson(found.unwrap())));
+}
+
+// Handles one request. The store passes through unchanged unless a note is created.
+export function handle(store: Store, method: string, target: string, body: string): Reply {
+  return match (parseRoute(method, target)) {
+    Health => reply(store, 200, "{\"status\":\"ok\"}"),
+    ListNotes => listNotes(store),
+    CreateNote => create(store, body),
+    GetNote(id) => getNote(store, id),
+    BadId => Reply { store: store, answer: errorAnswer(400, "note ids are decimal numbers") },
+    WrongMethod(allow) => Reply { store: store, answer: errorAnswer(405, "allowed: " + allow) },
+    NotFound => Reply { store: store, answer: errorAnswer(404, "not found") },
+  };
+}
+
+function create(store: Store, body: string): Reply {
+  const parsed = parseNewNote(body);
+  if (parsed.isErr()) {
+    return Reply { store: store, answer: errorAnswer(400, parsed.unwrapErr()) };
+  }
+  const n = parsed.unwrap();
+  const added = addNote(store, n.title, n.text);
+  if (added.isErr()) {
+    return Reply { store: store, answer: errorAnswer(507, added.unwrapErr()) };
+  }
+  const a = added.unwrap();
+  return Reply { store: a.store, answer: Answer { code: 201, body: render(noteJson(a.note)) } };
+}

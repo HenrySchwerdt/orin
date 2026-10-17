@@ -64,13 +64,24 @@ def native_tests():
 def direct_tests(orinc):
     source = OUT / "bounded.or"
     source.write_text('''import { Host, useProcess } from "std:host";
-import { shellTimeout } from "std:io";
+import { ProcessGrant } from "std:process";
+import { shellTimeout, ProcessError, Timeout } from "std:io";
+import { seconds } from "std:time";
+function status(r: Result<int, ProcessError>): int {
+  return match (r) {
+    Ok(code) => code,
+    Err(e) => match (e.kind) {
+      Timeout => 0 - 2,
+      _ => 0 - 1
+    }
+  };
+}
 function main(host: Host): void {
   useProcess(host, proc => {
-    console.log(shellTimeout(proc, "printf 'hello\\n'; exit 7", 1).toString());
-    console.log(shellTimeout(proc, "exit 124", 1).toString());
-    console.log(shellTimeout(proc, "sleep 30 & wait", 1).toString());
-    console.log(shellTimeout(proc, "echo MUST_NOT_RUN", 0).toString());
+    console.log(status(shellTimeout(proc, "printf 'hello\\n'; exit 7", seconds(1))).toString());
+    console.log(status(shellTimeout(proc, "exit 124", seconds(1))).toString());
+    console.log(status(shellTimeout(proc, "sleep 30 & wait", seconds(1))).toString());
+    console.log(status(shellTimeout(proc, "echo MUST_NOT_RUN", seconds(0))).toString());
   });
 }
 ''')
@@ -89,8 +100,9 @@ function main(host: Host): void {
         print(f"PASS {backend} direct runtime status and process denial", flush=True)
     source.write_text('''import { Host, useStdio } from "std:host";
 import { shellTimeout } from "std:io";
+import { seconds } from "std:time";
 function main(host: Host): void {
-  useStdio(host, io => { shellTimeout(io, "true", 1); });
+  useStdio(host, io => { shellTimeout(io, "true", seconds(1)); });
 }
 ''')
     bad = run([orinc, "check", source], expected=1)
@@ -99,15 +111,16 @@ function main(host: Host): void {
     source.write_text('''import { Host, useProcess } from "std:host";
 import { ProcessGrant } from "std:process";
 import { shellTimeout } from "std:io";
-@Requires(shellTimeout(proc, "true", 1) == 0)
+import { seconds } from "std:time";
+@Requires(shellTimeout(proc, "true", seconds(1)).isOk())
 function impure(proc: ProcessGrant): void {}
 function main(host: Host): void { useProcess(host, proc => { impure(proc); }); }
 ''')
     bad = run([orinc, "check", source], expected=1)
     assert "E0416" in bad.stderr, bad
-    source.write_text(source.read_text().replace('@Requires(shellTimeout(proc, "true", 1) == 0)\n', '')
+    source.write_text(source.read_text().replace('@Requires(shellTimeout(proc, "true", seconds(1)).isOk())\n', '')
                       .replace('function impure(proc: ProcessGrant): void {}',
-                               'function impure(proc: ProcessGrant): void { shellTimeout(proc, "true", 1); }'))
+                               'function impure(proc: ProcessGrant): void { shellTimeout(proc, "true", seconds(1)); }'))
     effects = run([orinc, "effects", source, "--format=json"])
     assert "Process.Spawn" in effects.stdout, effects
     print("PASS impure contract rejected and Process.Spawn effect retained", flush=True)

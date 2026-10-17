@@ -6,10 +6,10 @@
 import { FsGrant } from "std:fs";
 import {
   Item, FunctionDecl, TypeDecl, ConstDecl, ImportDecl, importedName, TypeExpr, Param, FieldDecl, VariantDecl,
-  Ident, InterfaceDecl, parse, lex,
+  Ident, InterfaceDecl, ClassDecl, parse, lex,
 } from "../syntax";
 import { Span } from "../diag";
-import { dirname, joinPath, normalizePath, isNormalized } from "../loader";
+import { dirname, joinPath, normalizePath, isNormalized, preludeRoots } from "../loader";
 import { Workspace, fileText } from "./workspace";
 
 export type DeclKind =
@@ -167,6 +167,24 @@ function typeSymbol(t: TypeDecl): DocSymbol {
   };
 }
 
+// A class (members are not listed): a record-like type, so it shares `DkRecord`.
+function classSymbol(c: ClassDecl): DocSymbol {
+  let name = c.name.name;
+  if (c.typeParams.length > 0) {
+    name += "<" + c.typeParams.map(t => t.name).join(", ") + ">";
+  }
+  const none: DocSymbol[] = [];
+  return DocSymbol {
+    name: c.name.name,
+    kind: DkRecord,
+    detail: "class " + name,
+    exported: c.exported,
+    span: c.span,
+    nameSpan: c.name.span,
+    children: none,
+  };
+}
+
 // An interface (ADR-0019) with its methods as children.
 function interfaceSymbol(k: InterfaceDecl): DocSymbol {
   let children: DocSymbol[] = [];
@@ -241,6 +259,9 @@ function symbolsOfText(text: string): Result<DocSymbol[], string> {
       },
       IInterface(k) => {
         out.push(interfaceSymbol(k));
+      },
+      IClass(c) => {
+        out.push(classSymbol(c));
       },
       _ => {},
     }
@@ -515,12 +536,10 @@ function namespaceBeforeCursor(text: string, off: usize): Option<string> {
   return Some(text.substring(st, end));
 }
 
-// Member completion after `ns.` (ADR-0048 addendum): when the cursor follows a namespace import of the file
-// (`import * as ns from "./m"`), the exported declarations of the target module (and the variants of its unions). None
-// when the cursor does not follow `name.` or `name` is no namespace import. The target of a std module cannot be read
-// here (`resolveModulePath`), so the list for a std namespace is empty. The file need not parse (it is being typed): the
-// import is found in the token stream.
-export function namespaceCompletions(fs: FsGrant, ws: Workspace, path: string, text: string, off: usize): Option<CompletionItem[]> {
+// The import path of the namespace import (`import * as ns from "p"`) that `ns` names when the cursor (byte offset
+// `off` of `text`) sits after `ns.` or `ns.prefix`; None when the cursor does not follow `name.` or `name` is no
+// namespace import of the file. The file need not parse (it is being typed): the import is found in the token stream.
+export function namespaceImportPath(text: string, off: usize): Option<string> {
   const nsq = namespaceBeforeCursor(text, off);
   if (nsq.isNone()) {
     return None;
@@ -534,26 +553,109 @@ export function namespaceCompletions(fs: FsGrant, ws: Workspace, path: string, t
   while (k + 5 < ts.length) {
     if (ts[k].text == "import" && ts[k + 1].text == "*" && ts[k + 2].text == "as" && ts[k + 3].text == nsq.unwrap()
         && ts[k + 4].text == "from") {
-      let out: CompletionItem[] = [];
-      const mp = resolveModulePath(fs, ws, path, ts[k + 5].text);
-      if (mp.isSome()) {
-        const tt = readText(fs, ws, mp.unwrap());
-        if (tt.isSome()) {
-          for (const s of symbolsOrEmpty(tt.unwrap())) {
-            if (s.exported) {
-              out.push(asItem(s));
-              if (isUnion(s.kind)) {
-                for (const v of s.children) {
-                  out.push(asItem(v));
-                }
-              }
-            }
-          }
-        }
-      }
-      return Some(out);
+      return Some(ts[k + 5].text);
     }
     k += 1;
   }
   return None;
+}
+
+// The embedded source of the std module `p` (`std:bytes`, `std:json/number`, `std:bytes/internal` = the flat file
+// `bytes_internal.or`, `std:math`), the same mapping as the loader's import resolver. None for the runtime-backed
+// modules (`std:process`, `std:core`, ...), which have no Orin source, and for unknown modules.
+function stdSourceText(p: string): Option<string> {
+  if (!p.startsWith("std:")) {
+    return None;
+  }
+  const id = p.substring(4, p.length);
+  const file = id.endsWith("/internal") ? id.split("/").join("_") : id;
+  const vp = id == "math" ? "$array/math.or" : "$stdlib/" + file + ".or";
+  for (const r of preludeRoots()) {
+    for (const f of r.files) {
+      if (f.path == vp) {
+        return Some(f.text);
+      }
+    }
+  }
+  return None;
+}
+
+function exportedItems(syms: DocSymbol[]): CompletionItem[] {
+  let out: CompletionItem[] = [];
+  for (const s of syms) {
+    if (s.exported) {
+      out.push(asItem(s));
+      if (isUnion(s.kind)) {
+        for (const v of s.children) {
+          out.push(asItem(v));
+        }
+      }
+    }
+  }
+  return out;
+}
+
+// The members a namespace import of the std module `p` offers: its exported declarations (and the variants of its
+// unions) plus its re-exports (`export { a } from "std:x"`), described from the re-exported module when that one is
+// embedded Orin source, else offered as `DkImported`. Empty when `p` has no embedded source. The sources are
+// compiled into the compiler and never change, so `AnalysisCache.stdMembers` memoizes this.
+export function stdModuleMembers(p: string): CompletionItem[] {
+  const t = stdSourceText(p);
+  if (t.isNone()) {
+    return [];
+  }
+  const pr = parse(0, t.unwrap());
+  if (pr.isErr()) {
+    return [];
+  }
+  let out = exportedItems(symbolsOrEmpty(t.unwrap()));
+  for (const it of pr.unwrap().items) {
+    match (it) {
+      IReExport(d) => {
+        const src = stdSourceText(d.path);
+        let target: CompletionItem[] = [];
+        if (src.isSome()) {
+          target = exportedItems(symbolsOrEmpty(src.unwrap()));
+        }
+        let k: usize = 0;
+        while (k < d.names.length) {
+          const orig = d.names[k].name;
+          const local = importedName(d, k).name;
+          k += 1;
+          if (hasLabel(out, local)) {
+            continue;
+          }
+          const hit = target.filter(c => c.label == orig);
+          if (hit.length > 0) {
+            out.push(CompletionItem { label: local, kind: hit[0].kind, detail: hit[0].detail });
+          } else {
+            out.push(CompletionItem { label: local, kind: DkImported, detail: "re-exported from \"" + d.path + "\"" });
+          }
+        }
+      },
+      _ => {},
+    }
+  }
+  return out;
+}
+
+// Member completion after `ns.` (ADR-0048 addendum): when the cursor follows a namespace import of the file
+// (`import * as ns from "./m"`), the exported declarations of the target module (and the variants of its unions). None
+// when the cursor does not follow `name.` or `name` is no namespace import. The target of a std module is not read here
+// (`resolveModulePath`): the list for a std namespace is empty and the caller answers it with `stdModuleMembers` (through
+// `AnalysisCache.stdMembers`). The file need not parse (it is being typed): the import is found in the token stream.
+export function namespaceCompletions(fs: FsGrant, ws: Workspace, path: string, text: string, off: usize): Option<CompletionItem[]> {
+  const ip = namespaceImportPath(text, off);
+  if (ip.isNone()) {
+    return None;
+  }
+  let out: CompletionItem[] = [];
+  const mp = resolveModulePath(fs, ws, path, ip.unwrap());
+  if (mp.isSome()) {
+    const tt = readText(fs, ws, mp.unwrap());
+    if (tt.isSome()) {
+      out = exportedItems(symbolsOrEmpty(tt.unwrap()));
+    }
+  }
+  return Some(out);
 }

@@ -18,6 +18,18 @@ import { shq, strip } from "./text";
 import { Frame, nextLspFrame, nextLine, frameLsp, frameLine } from "./rpc";
 import { O, F, S, N, nil, at, isIntEq, isStrEq, isBoolEq, str, has, show } from "./jx";
 
+// True when `path` exists; a path the grant refuses to look at counts as absent.
+export function existsOr(fs: FsGrant, path: string): bool {
+  const r = exists(fs, path);
+  return r.isOk() && r.unwrap();
+}
+
+// Exit status 0..255 of the command, -1 when it could not be run (the tool keeps statuses as data).
+export function shellStatus(p: ProcessGrant, cmd: string): int {
+  const r = shell(p, cmd);
+  return r.isOk() ? r.unwrap() : 0 - 1;
+}
+
 export const LSP: int = 0;
 export const MCP: int = 1;
 
@@ -72,7 +84,7 @@ export class Session {
 
   // check(cond, what): the `check` of the Python scripts. Prints `FAIL: <what>` and logs the outcome.
   check(fs: FsGrant, cond: bool, what: string): void {
-    if (exists(fs, this.dir + "/fatal")) {
+    if (existsOr(fs, this.dir + "/fatal")) {
       return;
     }
     appendText(fs, this.dir + "/log", cond ? "ok\n" : "FAIL\n");
@@ -103,7 +115,7 @@ export class Session {
       + " && { ( exec 3>in; cat ctl >/dev/null 2>&1 ) </dev/null >/dev/null 2>&1 & }"
       + " && { ( " + shq(exe) + " " + args + " <in >out 2>err & pid=$!; echo $pid >pid; wait $pid; echo $? >rc )"
       + " </dev/null >/dev/null 2>&1 & }";
-    return shell(proc, script) == 0;
+    return shellStatus(proc, script) == 0;
   }
 
   // Writes raw bytes to the server's stdin.
@@ -111,7 +123,7 @@ export class Session {
     const f = this.dir + "/msg";
     writeFile(fs, f, data);
     // `1<>` opens the pipe read-write, which never blocks for want of a reader (a server that already exited)
-    shell(proc, "cat " + shq(f) + " 1<> " + shq(this.dir + "/in"));
+    shellStatus(proc, "cat " + shq(f) + " 1<> " + shq(this.dir + "/in"));
   }
 
   // One JSON-RPC message to the server (framed for the protocol).
@@ -142,7 +154,7 @@ export class Session {
         }
         return Msg { ok: true, value: j.unwrap(), error: "" };
       }
-      if (exists(fs, this.dir + "/rc")) {
+      if (existsOr(fs, this.dir + "/rc")) {
         // the server exited: one more look, it may have written its last message just before
         if (!this.frameAt(readText(fs, this.dir + "/out"), pos).found) {
           return Msg { ok: false, value: nil(), error: "server closed stdout" };
@@ -151,7 +163,7 @@ export class Session {
         if (waited >= limit) {
           return Msg { ok: false, value: nil(), error: "timeout" };
         }
-        shell(proc, "sleep 0.02");
+        shellStatus(proc, "sleep 0.02");
         waited += 1;
       }
     }
@@ -165,19 +177,19 @@ export class Session {
 
   // Ends the server's input (the `stdin.close()` of the Python scripts).
   closeInput(proc: ProcessGrant): void {
-    shell(proc, ": 1<> " + shq(this.dir + "/ctl"));
+    shellStatus(proc, ": 1<> " + shq(this.dir + "/ctl"));
   }
 
   // Waits up to `seconds` for the server to exit; its exit status, or -1 on timeout (the server is then killed).
   waitExit(fs: FsGrant, proc: ProcessGrant, seconds: int): int {
     let waited = 0;
     const limit = seconds * 1000 / POLL_MS;
-    while (!exists(fs, this.dir + "/rc")) {
+    while (!existsOr(fs, this.dir + "/rc")) {
       if (waited >= limit) {
-        shell(proc, "kill $(cat " + shq(this.dir + "/pid") + ") 2>/dev/null; : 1<> " + shq(this.dir + "/ctl") + "; true");
+        shellStatus(proc, "kill $(cat " + shq(this.dir + "/pid") + ") 2>/dev/null; : 1<> " + shq(this.dir + "/ctl") + "; true");
         return -1;
       }
-      shell(proc, "sleep 0.02");
+      shellStatus(proc, "sleep 0.02");
       waited += 1;
     }
     return readInt(fs, this.dir + "/rc", -1);
@@ -194,7 +206,7 @@ export class Session {
 
   // A request; waits for the response with the same id, keeping everything else as a note. JNull after a failure.
   lspRequest(fs: FsGrant, proc: ProcessGrant, method: string, params: Json): Json {
-    if (exists(fs, this.dir + "/fatal")) {
+    if (existsOr(fs, this.dir + "/fatal")) {
       return nil();
     }
     const i = this.takeId(fs);
@@ -244,7 +256,7 @@ export class Session {
 
   // Reads messages until `ms` pass without a new one.
   drain(fs: FsGrant, proc: ProcessGrant, ms: int): void {
-    while (!exists(fs, this.dir + "/fatal")) {
+    while (!existsOr(fs, this.dir + "/fatal")) {
       const m = this.receive(fs, proc, ms);
       if (!m.ok) {
         return;
@@ -257,7 +269,7 @@ export class Session {
 
   // A request; `params` is omitted when `withParams` is false. Checks that the response id matches.
   mcpRequest(fs: FsGrant, proc: ProcessGrant, method: string, params: Json, withParams: bool): Json {
-    if (exists(fs, this.dir + "/fatal")) {
+    if (existsOr(fs, this.dir + "/fatal")) {
       return nil();
     }
     const i = this.takeId(fs);
