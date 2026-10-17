@@ -1,0 +1,634 @@
+// Derived `Eq`, `Ord` and `Hash` (ADR-0034, tiers 1 and 2): the checker builds the HIR of the structural comparison
+// functions itself, one per type, when `==`, `<`, `compare`, `hash` or a `Map` key needs one.
+//
+//   * `eqFunc(t)`:   `(a: t, b: t): bool`      field by field / variant by variant / element by element;
+//   * `cmpFunc(t)`:  `(a: t, b: t): int`       -1, 0 or 1, lexicographic: fields in order, a union by the order of its
+//                                              variants (`None` before `Some`; `Ok` before `Err`) and then its payload,
+//                                              an array element by element and then by length;
+//   * `hashFunc(t)`: `(a: t): usize`           the component hashes folded with `hashMix` (Map prelude).
+//
+// A class that declares `equals` / `compare` / `hash` (tier 2) uses its own method: the function is the method itself.
+// Everything else is derived. The scalar components are the prelude functions `cmpInt`, `hashStr`, ... (library/collections/
+// map.or), so the Map prelude must be loaded; `eqExpr` / `cmpExpr` / `hashExpr` give the expression for one use. The
+// generated functions are lifted functions (FuncInfo.mode FmLifted, like closures) named `$derive.eq<T>` etc. and created
+// once per type (`Env.wrappers`). Instances are concrete: nothing here happens in an abstract check.
+
+import { Span, Diagnostic, diag } from "../diag";
+import {
+  Type, Function, Local, HBlock, HStmt, HExpr, HExprKind, HArm, HPattern, Place, BinOp, UnOp, Builtin, intKindOf, kindUnsigned64,
+} from "../hir";
+import {
+  Env, FuncInfo, FmLifted, showType, typeEq, tysKey, isIntish, isBool, isString, originOf,
+} from "./env";
+import { mk, dummyDecl } from "./ops";
+import { convExpr } from "./ints";
+import { variantsOf } from "./match";
+import { classOfRec, cmpProblem, cmpMethodOf, cmpMethodName } from "./classes";
+import { instFunc } from "./types";
+
+export type DOut = { env: Env; fid: usize; };
+export type EOut = { env: Env; e: HExpr; };
+
+// The scalar types that compare and hash natively or through the prelude functions.
+function isScalar(t: Type): bool {
+  return isIntish(t) || isBool(t) || isString(t);
+}
+
+function kindWord(kind: usize): string {
+  return kind == 1 ? "Eq" : (kind == 2 ? "Ord" : "Hash");
+}
+
+// The id of prelude function `name` of the Map prelude (`$array/map`).
+function preludeFn(env: Env, name: string, span: Span): Result<usize, Diagnostic> {
+  const q = "$array/map." + name;
+  let i: usize = 0;
+  while (i < env.funcs.length) {
+    if (env.funcs[i].qname == q) {
+      return Ok(i);
+    }
+    i += 1;
+  }
+  return Err(diag("E0475", span, "`==`, `compare` and `hash` on this type need the Map prelude (`" + name + "`), which is not loaded"));
+}
+
+// Is `t` a class instance with an explicit method for `kind`?
+function explicitMethod(env: Env, t: Type, kind: usize): bool {
+  match (t) {
+    TyRecord(r) => {
+      const co = classOfRec(env, r);
+      if (co.isNone()) {
+        return false;
+      }
+      return cmpMethodOf(env.classes[co.unwrap()], kind).isSome();
+    },
+    _ => {
+      return false;
+    },
+  }
+}
+
+// The function of the explicit method `equals` / `compare` / `hash` of the class of `t` (an instance of a generic
+// class is created here and its signature is checked).
+function methodFunc(env: Env, t: Type, kind: usize, depth: usize, span: Span): Result<DOut, Diagnostic> {
+  let r: usize = 0;
+  match (t) {
+    TyRecord(x) => {
+      r = x;
+    },
+    _ => {},
+  }
+  const c = env.classes[classOfRec(env, r).unwrap()];
+  const mi = c.methods[cmpMethodOf(c, kind).unwrap()];
+  if (c.gid < 0) {
+    return Ok(DOut { env: env, fid: mi.fid });
+  }
+  const o = originOf(env, t);
+  const fo = instFunc(env, mi.fid, o.unwrap().args, depth + 1, span)?;
+  const f = fo.env.funcs[fo.fid];
+  const wantRet: Type = kind == 1 ? TyBool : (kind == 2 ? TyInt : TyUsize);
+  const okParams = kind == 3 ? f.params.length == 1 : (f.params.length == 2 && typeEq(f.params[1], t));
+  if (!okParams || !typeEq(f.srcRet, wantRet)) {
+    return Err(diag(
+      "E0476", span,
+      "`" + cmpMethodName(kind) + "` of class `" + c.name + "` must be `" + cmpMethodName(kind) + "(" + (kind == 3 ? "" : "other: " + showType(env, t)) + "): "
+        + (kind == 1 ? "bool" : (kind == 2 ? "int" : "usize")) + "` for `" + showType(env, t) + "`"
+    ));
+  }
+  return Ok(DOut { env: fo.env, fid: fo.fid });
+}
+
+// ---------------------------------------------------------------------------
+// Registration of a derived function
+// ---------------------------------------------------------------------------
+
+type Reg = { env: Env; fid: usize; lid: usize; params: Local[]; };
+
+// Registers function `name` with a placeholder body (so that recursive types find it) in `Env.lifted`.
+function register(env0: Env, name: string, pnames: string[], ptys: Type[], ret: Type, unit: usize, span: Span): Reg {
+  let e = env0;
+  let params: Local[] = [];
+  let k: usize = 0;
+  while (k < ptys.length) {
+    params.push(Local { name: pnames[k], ty: ptys[k], mutable: false });
+    k += 1;
+  }
+  const lid = e.lifted.length;
+  e.lifted.push(Function { name: name, paramCount: params.length, locals: params, ret: ret, body: HBlock { stmts: [] }, span: span });
+  const fid = e.funcs.length;
+  e.funcs.push(FuncInfo {
+    unit: unit,
+    qname: name,
+    decl: dummyDecl(name, span),
+    params: ptys,
+    paramLocals: params,
+    ret: ret,
+    tpNames: [],
+    tpTys: [],
+    depth: 0,
+    mode: FmLifted,
+    cls: lid,
+    srcRet: TyVoid,
+  });
+  e.wrappers.set(name, fid);
+  return Reg { env: e, fid: fid, lid: lid, params: params };
+}
+
+function noBindings(n: usize): Option<usize>[] {
+  let out: Option<usize>[] = [];
+  let k: usize = 0;
+  while (k < n) {
+    out.push(None);
+    k += 1;
+  }
+  return out;
+}
+
+function emptyBlock(): HBlock {
+  return HBlock { stmts: [] };
+}
+
+// The rank of variant `i` of `t` in the order of `compare`: declaration order, except that `None` comes before `Some`.
+function rankOf(t: Type, i: usize): int {
+  return match (t) {
+    TyOption(_) => 1 - i.toInt(),
+    _ => i.toInt(),
+  };
+}
+
+// The builder of one derived function: its locals and the environment it grows.
+class Fb {
+  env: Env;
+  unit: usize;
+  depth: usize;
+  span: Span;
+  locals: Local[];
+
+  constructor(env: Env, unit: usize, depth: usize, span: Span, locals: Local[]) {
+    this.env = env;
+    this.unit = unit;
+    this.depth = depth;
+    this.span = span;
+    this.locals = locals;
+  }
+
+  newLocal(name: string, ty: Type, mutable: bool): usize {
+    this.locals.push(Local { name: name, ty: ty, mutable: mutable });
+    return this.locals.length - 1;
+  }
+
+  loc(id: usize): HExpr {
+    return mk(XLocal(id), this.locals[id].ty, this.span);
+  }
+
+  // Fresh locals for the payload of a variant, and their binding list.
+  bind(prefix: string, payload: Type[]): usize[] {
+    let ids: usize[] = [];
+    let k: usize = 0;
+    while (k < payload.length) {
+      ids.push(this.newLocal(prefix + k.toString(), payload[k], false));
+      k += 1;
+    }
+    return ids;
+  }
+
+  // `a == b` for one component.
+  eq(t: Type, a: HExpr, b: HExpr): Result<HExpr, Diagnostic> {
+    if (isScalar(t)) {
+      return Ok(mk(XBinary(OpEq, a, b), TyBool, this.span));
+    }
+    const o = eqFunc(this.env, t, this.unit, this.depth, this.span)?;
+    this.env = o.env;
+    return Ok(mk(XCall(o.fid, [a, b]), TyBool, this.span));
+  }
+
+  // `compare(a, b)` for one component: an `int` expression.
+  cmp(t: Type, a: HExpr, b: HExpr): Result<HExpr, Diagnostic> {
+    if (isScalar(t)) {
+      const f = scalarCmp(this.env, t, this.span)?;
+      return Ok(mk(XCall(f, [scalarArg(t, a, this.span), scalarArg(t, b, this.span)]), TyInt, this.span));
+    }
+    const o = cmpFunc(this.env, t, this.unit, this.depth, this.span)?;
+    this.env = o.env;
+    return Ok(mk(XCall(o.fid, [a, b]), TyInt, this.span));
+  }
+
+  // `hash(a)` for one component: a `usize` expression.
+  hash(t: Type, a: HExpr): Result<HExpr, Diagnostic> {
+    if (isScalar(t)) {
+      const f = scalarHash(this.env, t, this.span)?;
+      return Ok(mk(XCall(f, [scalarArg(t, a, this.span)]), TyUsize, this.span));
+    }
+    const o = hashFunc(this.env, t, this.unit, this.depth, this.span)?;
+    this.env = o.env;
+    return Ok(mk(XCall(o.fid, [a]), TyUsize, this.span));
+  }
+
+  mix(h: HExpr, x: HExpr): Result<HExpr, Diagnostic> {
+    const f = preludeFn(this.env, "hashMix", this.span)?;
+    return Ok(mk(XCall(f, [h, x]), TyUsize, this.span));
+  }
+
+  usizeLit(n: int): HExpr {
+    return mk(XInt(n), TyUsize, this.span);
+  }
+
+  intLit(n: int): HExpr {
+    return mk(XInt(n), TyInt, this.span);
+  }
+
+  boolLit(b: bool): HExpr {
+    return mk(XBool(b), TyBool, this.span);
+  }
+
+  arrLen(a: HExpr): HExpr {
+    return mk(XBuiltin(BArrLength, [a]), TyUsize, this.span);
+  }
+
+  place(id: usize): Place {
+    return Place { root: id, path: [], ty: this.locals[id].ty };
+  }
+
+  // ----------------------------------------------------------------- Eq
+
+  eqBody(t: Type): Result<HStmt[], Diagnostic> {
+    const a = this.loc(0);
+    const b = this.loc(1);
+    if (isScalar(t)) {
+      return Ok([HReturn(Some(mk(XBinary(OpEq, a, b), TyBool, this.span)))]);
+    }
+    match (t) {
+      TyRecord(r) => {
+        let acc: Option<HExpr> = None;
+        let k: usize = 0;
+        const fields = this.env.records[r].fields;
+        while (k < fields.length) {
+          const fa = mk(XField(a, r, k), fields[k].ty, this.span);
+          const fb = mk(XField(b, r, k), fields[k].ty, this.span);
+          const c = this.eq(fields[k].ty, fa, fb)?;
+          acc = match (acc) {
+            Some(x) => Some(mk(XBinary(OpAnd, x, c), TyBool, this.span)),
+            None => Some(c),
+          };
+          k += 1;
+        }
+        return Ok([HReturn(Some(acc.unwrapOr(this.boolLit(true))))]);
+      },
+      TyArray(e) => {
+        let stmts: HStmt[] = [];
+        stmts.push(HIf(
+          mk(XBinary(OpNe, this.arrLen(a), this.arrLen(b)), TyBool, this.span),
+          HBlock { stmts: [HReturn(Some(this.boolLit(false)))] },
+          None
+        ));
+        const i = this.newLocal("i", TyUsize, true);
+        stmts.push(HLet(i, this.usizeLit(0)));
+        const ea = mk(XIndex(a, this.loc(i)), e, this.span);
+        const eb = mk(XIndex(b, this.loc(i)), e, this.span);
+        const c = this.eq(e, ea, eb)?;
+        const body = HBlock { stmts: [
+          HIf(mk(XUnary(UnNot, c), TyBool, this.span), HBlock { stmts: [HReturn(Some(this.boolLit(false)))] }, None),
+          HAssign(this.place(i), Some(OpAdd), this.usizeLit(1)),
+        ] };
+        stmts.push(HWhile(mk(XBinary(OpLt, this.loc(i), this.arrLen(a)), TyBool, this.span), body));
+        stmts.push(HReturn(Some(this.boolLit(true))));
+        return Ok(stmts);
+      },
+      _ => {
+        const vs = variantsOf(this.env, t).unwrap();
+        let arms: HArm[] = [];
+        let i: usize = 0;
+        while (i < vs.length) {
+          const xs = this.bind("x", vs[i].payload);
+          const ys = this.bind("y", vs[i].payload);
+          let acc: Option<HExpr> = None;
+          let k: usize = 0;
+          while (k < xs.length) {
+            const c = this.eq(vs[i].payload[k], this.loc(xs[k]), this.loc(ys[k]))?;
+            acc = match (acc) {
+              Some(x) => Some(mk(XBinary(OpAnd, x, c), TyBool, this.span)),
+              None => Some(c),
+            };
+            k += 1;
+          }
+          let inner: HArm[] = [HArm { pattern: HPVariant(i, ys.map(y => Some(y))), body: emptyBlock(), value: Some(acc.unwrapOr(this.boolLit(true))) }];
+          if (vs.length > 1) {
+            inner.push(HArm { pattern: HPWildcard, body: emptyBlock(), value: Some(this.boolLit(false)) });
+          }
+          const innerMatch = mk(XMatch(b, inner), TyBool, this.span);
+          arms.push(HArm { pattern: HPVariant(i, xs.map(x => Some(x))), body: emptyBlock(), value: Some(innerMatch) });
+          i += 1;
+        }
+        return Ok([HReturn(Some(mk(XMatch(a, arms), TyBool, this.span)))]);
+      },
+    }
+  }
+
+  // ----------------------------------------------------------------- Ord
+
+  // `if (c != 0) return c;` after `let c = compare(x, y)`: the statements of one lexicographic step.
+  step(t: Type, x: HExpr, y: HExpr): Result<HStmt[], Diagnostic> {
+    const c = this.cmp(t, x, y)?;
+    const id = this.newLocal("c", TyInt, false);
+    return Ok([
+      HLet(id, c),
+      HIf(
+        mk(XBinary(OpNe, this.loc(id), this.intLit(0)), TyBool, this.span),
+        HBlock { stmts: [HReturn(Some(this.loc(id)))] },
+        None
+      ),
+    ]);
+  }
+
+  cmpBody(t: Type): Result<HStmt[], Diagnostic> {
+    const a = this.loc(0);
+    const b = this.loc(1);
+    let stmts: HStmt[] = [];
+    if (isScalar(t)) {
+      const c = this.cmp(t, a, b)?;
+      return Ok([HReturn(Some(c))]);
+    }
+    match (t) {
+      TyRecord(r) => {
+        const fields = this.env.records[r].fields;
+        let k: usize = 0;
+        while (k < fields.length) {
+          const fa = mk(XField(a, r, k), fields[k].ty, this.span);
+          const fb = mk(XField(b, r, k), fields[k].ty, this.span);
+          if (k + 1 == fields.length) {
+            const c = this.cmp(fields[k].ty, fa, fb)?;
+            stmts.push(HReturn(Some(c)));
+          } else {
+            const st = this.step(fields[k].ty, fa, fb)?;
+            for (const s of st) {
+              stmts.push(s);
+            }
+          }
+          k += 1;
+        }
+        if (fields.length == 0) {
+          stmts.push(HReturn(Some(this.intLit(0))));
+        }
+        return Ok(stmts);
+      },
+      TyArray(e) => {
+        const i = this.newLocal("i", TyUsize, true);
+        stmts.push(HLet(i, this.usizeLit(0)));
+        const ea = mk(XIndex(a, this.loc(i)), e, this.span);
+        const eb = mk(XIndex(b, this.loc(i)), e, this.span);
+        let body: HStmt[] = this.step(e, ea, eb)?;
+        body.push(HAssign(this.place(i), Some(OpAdd), this.usizeLit(1)));
+        const both = mk(XBinary(
+          OpAnd,
+          mk(XBinary(OpLt, this.loc(i), this.arrLen(a)), TyBool, this.span),
+          mk(XBinary(OpLt, this.loc(i), this.arrLen(b)), TyBool, this.span)
+        ), TyBool, this.span);
+        stmts.push(HWhile(both, HBlock { stmts: body }));
+        const lt = mk(XBinary(OpLt, this.arrLen(a), this.arrLen(b)), TyBool, this.span);
+        const gt = mk(XBinary(OpGt, this.arrLen(a), this.arrLen(b)), TyBool, this.span);
+        stmts.push(HReturn(Some(mk(XCond(lt, this.intLit(-1), mk(XCond(gt, this.intLit(1), this.intLit(0)), TyInt, this.span)), TyInt, this.span))));
+        return Ok(stmts);
+      },
+      _ => {
+        const vs = variantsOf(this.env, t).unwrap();
+        // The rank of each value, then the payloads when the ranks agree.
+        let rankArms: HArm[] = [];
+        let rankArmsB: HArm[] = [];
+        let anyPayload = false;
+        let i: usize = 0;
+        while (i < vs.length) {
+          rankArms.push(HArm { pattern: HPVariant(i, noBindings(vs[i].payload.length)), body: emptyBlock(), value: Some(this.intLit(rankOf(t, i))) });
+          rankArmsB.push(HArm { pattern: HPVariant(i, noBindings(vs[i].payload.length)), body: emptyBlock(), value: Some(this.intLit(rankOf(t, i))) });
+          if (vs[i].payload.length > 0) {
+            anyPayload = true;
+          }
+          i += 1;
+        }
+        const ta = this.newLocal("ta", TyInt, false);
+        const tb = this.newLocal("tb", TyInt, false);
+        stmts.push(HLet(ta, mk(XMatch(a, rankArms), TyInt, this.span)));
+        stmts.push(HLet(tb, mk(XMatch(b, rankArmsB), TyInt, this.span)));
+        const diff = mk(XBinary(OpNe, this.loc(ta), this.loc(tb)), TyBool, this.span);
+        const lt = mk(XBinary(OpLt, this.loc(ta), this.loc(tb)), TyBool, this.span);
+        stmts.push(HIf(
+          diff,
+          HBlock { stmts: [HReturn(Some(mk(XCond(lt, this.intLit(-1), this.intLit(1)), TyInt, this.span)))] },
+          None
+        ));
+        if (anyPayload) {
+          let arms: HArm[] = [];
+          i = 0;
+          while (i < vs.length) {
+            if (vs[i].payload.length > 0) {
+              const xs = this.bind("x", vs[i].payload);
+              const ys = this.bind("y", vs[i].payload);
+              let inStmts: HStmt[] = [];
+              let k: usize = 0;
+              while (k < xs.length) {
+                if (k + 1 == xs.length) {
+                  const c = this.cmp(vs[i].payload[k], this.loc(xs[k]), this.loc(ys[k]))?;
+                  inStmts.push(HReturn(Some(c)));
+                } else {
+                  const st = this.step(vs[i].payload[k], this.loc(xs[k]), this.loc(ys[k]))?;
+                  for (const s of st) {
+                    inStmts.push(s);
+                  }
+                }
+                k += 1;
+              }
+              const innerArms: HArm[] = [
+                HArm { pattern: HPVariant(i, ys.map(y => Some(y))), body: HBlock { stmts: inStmts }, value: None },
+                HArm { pattern: HPWildcard, body: emptyBlock(), value: None },
+              ];
+              const innerMatch = mk(XMatch(b, innerArms), TyVoid, this.span);
+              arms.push(HArm { pattern: HPVariant(i, xs.map(x => Some(x))), body: HBlock { stmts: [HExprStmt(innerMatch)] }, value: None });
+            }
+            i += 1;
+          }
+          arms.push(HArm { pattern: HPWildcard, body: emptyBlock(), value: None });
+          stmts.push(HExprStmt(mk(XMatch(a, arms), TyVoid, this.span)));
+        }
+        stmts.push(HReturn(Some(this.intLit(0))));
+        return Ok(stmts);
+      },
+    }
+  }
+
+  // ----------------------------------------------------------------- Hash
+
+  hashBody(t: Type): Result<HStmt[], Diagnostic> {
+    const a = this.loc(0);
+    if (isScalar(t)) {
+      const h = this.hash(t, a)?;
+      return Ok([HReturn(Some(h))]);
+    }
+    match (t) {
+      TyRecord(r) => {
+        let acc = this.usizeLit(17);
+        const fields = this.env.records[r].fields;
+        let k: usize = 0;
+        while (k < fields.length) {
+          const h = this.hash(fields[k].ty, mk(XField(a, r, k), fields[k].ty, this.span))?;
+          acc = this.mix(acc, h)?;
+          k += 1;
+        }
+        return Ok([HReturn(Some(acc))]);
+      },
+      TyArray(e) => {
+        let stmts: HStmt[] = [];
+        const h = this.newLocal("h", TyUsize, true);
+        const i = this.newLocal("i", TyUsize, true);
+        stmts.push(HLet(h, this.usizeLit(11)));
+        stmts.push(HLet(i, this.usizeLit(0)));
+        const eh = this.hash(e, mk(XIndex(a, this.loc(i)), e, this.span))?;
+        const mixed = this.mix(this.loc(h), eh)?;
+        const body = HBlock { stmts: [
+          HAssign(this.place(h), None, mixed),
+          HAssign(this.place(i), Some(OpAdd), this.usizeLit(1)),
+        ] };
+        stmts.push(HWhile(mk(XBinary(OpLt, this.loc(i), this.arrLen(a)), TyBool, this.span), body));
+        const fin = this.mix(this.loc(h), this.arrLen(a))?;
+        stmts.push(HReturn(Some(fin)));
+        return Ok(stmts);
+      },
+      _ => {
+        const vs = variantsOf(this.env, t).unwrap();
+        let arms: HArm[] = [];
+        let i: usize = 0;
+        while (i < vs.length) {
+          const xs = this.bind("x", vs[i].payload);
+          let acc = this.usizeLit(rankOf(t, i) + 1);
+          let k: usize = 0;
+          while (k < xs.length) {
+            const h = this.hash(vs[i].payload[k], this.loc(xs[k]))?;
+            acc = this.mix(acc, h)?;
+            k += 1;
+          }
+          arms.push(HArm { pattern: HPVariant(i, xs.map(x => Some(x))), body: emptyBlock(), value: Some(acc) });
+          i += 1;
+        }
+        return Ok([HReturn(Some(mk(XMatch(a, arms), TyUsize, this.span)))]);
+      },
+    }
+  }
+}
+
+// The prelude function that compares / hashes the scalar type `t`, and the argument conversion it needs: every integer
+// type held in an `MInt` goes through `int`, `u64` / `usize` through `usize` (see `classSuffix`).
+function scalarCmp(env: Env, t: Type, span: Span): Result<usize, Diagnostic> {
+  if (isBool(t)) {
+    return preludeFn(env, "cmpBool", span);
+  }
+  if (isString(t)) {
+    return preludeFn(env, "cmpStr", span);
+  }
+  return preludeFn(env, kindUnsigned64(intKindOf(t)) ? "cmpUsize" : "cmpInt", span);
+}
+
+function scalarHash(env: Env, t: Type, span: Span): Result<usize, Diagnostic> {
+  if (isBool(t)) {
+    return preludeFn(env, "hashBool", span);
+  }
+  if (isString(t)) {
+    return preludeFn(env, "hashStr", span);
+  }
+  return preludeFn(env, kindUnsigned64(intKindOf(t)) ? "hashUsize" : "hashInt", span);
+}
+
+function scalarArg(t: Type, e: HExpr, span: Span): HExpr {
+  if (!isIntish(t)) {
+    return e;
+  }
+  return convExpr(e, kindUnsigned64(intKindOf(t)) ? 9 : 3, span);
+}
+
+// ---------------------------------------------------------------------------
+// The functions
+// ---------------------------------------------------------------------------
+
+function notInstance(env: Env, t: Type, kind: usize, span: Span): Diagnostic {
+  const p = cmpProblem(env, t, kind);
+  return diag(
+    p.isSome() ? p.unwrap().code : "E0475",
+    span,
+    "type `" + showType(env, t) + "` is not `" + kindWord(kind) + "`" + (p.isSome() ? ": " + p.unwrap().msg : "")
+  );
+}
+
+// The comparison function of `kind` (1 Eq, 2 Ord, 3 Hash) of `t`: the explicit method of a class, else the derived one.
+function derived(env0: Env, t: Type, kind: usize, unit: usize, depth: usize, span: Span): Result<DOut, Diagnostic> {
+  if (cmpProblem(env0, t, kind).isSome()) {
+    return Err(notInstance(env0, t, kind, span));
+  }
+  if (explicitMethod(env0, t, kind)) {
+    return methodFunc(env0, t, kind, depth, span);
+  }
+  const name = "$derive." + (kind == 1 ? "eq" : (kind == 2 ? "cmp" : "hash")) + "<" + tysKey(env0, [t]) + ">";
+  const found = env0.wrappers.get(name);
+  if (found.isSome()) {
+    return Ok(DOut { env: env0, fid: found.unwrap() });
+  }
+  const ret: Type = kind == 1 ? TyBool : (kind == 2 ? TyInt : TyUsize);
+  const ptys: Type[] = kind == 3 ? [t] : [t, t];
+  const pnames: string[] = kind == 3 ? ["a"] : ["a", "b"];
+  const reg = register(env0, name, pnames, ptys, ret, unit, span);
+  let fb = new Fb(reg.env, unit, depth, span, reg.params);
+  let body: HStmt[] = [];
+  if (kind == 1) {
+    body = fb.eqBody(t)?;
+  } else if (kind == 2) {
+    body = fb.cmpBody(t)?;
+  } else {
+    body = fb.hashBody(t)?;
+  }
+  let e = fb.env;
+  e.lifted[reg.lid] = Function { name: name, paramCount: reg.params.length, locals: fb.locals, ret: ret, body: HBlock { stmts: body }, span: span };
+  return Ok(DOut { env: e, fid: reg.fid });
+}
+
+// `(a: t, b: t): bool`.
+export function eqFunc(env: Env, t: Type, unit: usize, depth: usize, span: Span): Result<DOut, Diagnostic> {
+  return derived(env, t, 1, unit, depth, span);
+}
+
+// `(a: t, b: t): int`: negative, zero or positive.
+export function cmpFunc(env: Env, t: Type, unit: usize, depth: usize, span: Span): Result<DOut, Diagnostic> {
+  return derived(env, t, 2, unit, depth, span);
+}
+
+// `(a: t): usize`.
+export function hashFunc(env: Env, t: Type, unit: usize, depth: usize, span: Span): Result<DOut, Diagnostic> {
+  return derived(env, t, 3, unit, depth, span);
+}
+
+// ---------------------------------------------------------------------------
+// Expressions for one use
+// ---------------------------------------------------------------------------
+
+// `a == b` as HIR: the native comparison for the scalars, else a call of the derived / explicit function.
+export function eqExpr(env: Env, t: Type, a: HExpr, b: HExpr, unit: usize, depth: usize, span: Span): Result<EOut, Diagnostic> {
+  if (isScalar(t)) {
+    return Ok(EOut { env: env, e: mk(XBinary(OpEq, a, b), TyBool, span) });
+  }
+  const o = eqFunc(env, t, unit, depth, span)?;
+  return Ok(EOut { env: o.env, e: mk(XCall(o.fid, [a, b]), TyBool, span) });
+}
+
+// `compare(a, b)` as HIR: an `int` that is negative, zero or positive.
+export function cmpExpr(env: Env, t: Type, a: HExpr, b: HExpr, unit: usize, depth: usize, span: Span): Result<EOut, Diagnostic> {
+  if (isScalar(t)) {
+    const f = scalarCmp(env, t, span)?;
+    return Ok(EOut { env: env, e: mk(XCall(f, [scalarArg(t, a, span), scalarArg(t, b, span)]), TyInt, span) });
+  }
+  const o = cmpFunc(env, t, unit, depth, span)?;
+  return Ok(EOut { env: o.env, e: mk(XCall(o.fid, [a, b]), TyInt, span) });
+}
+
+// `hash(a)` as HIR: a `usize`.
+export function hashExpr(env: Env, t: Type, a: HExpr, unit: usize, depth: usize, span: Span): Result<EOut, Diagnostic> {
+  if (isScalar(t)) {
+    const f = scalarHash(env, t, span)?;
+    return Ok(EOut { env: env, e: mk(XCall(f, [scalarArg(t, a, span)]), TyUsize, span) });
+  }
+  const o = hashFunc(env, t, unit, depth, span)?;
+  return Ok(EOut { env: o.env, e: mk(XCall(o.fid, [a]), TyUsize, span) });
+}

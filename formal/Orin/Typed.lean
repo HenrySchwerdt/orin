@@ -28,6 +28,11 @@ inductive Ty where
   | arr
   deriving DecidableEq, Repr
 
+/-- The typed signature of a function as its callers see it: parameter types and result type. -/
+structure TSig where
+  ptys : List Ty
+  rty : Ty
+
 /-- slot types of every struct type -/
 abbrev Shapes := List (List Ty)
 
@@ -84,16 +89,24 @@ def tcheckI (sh : Shapes) (Γ : List Ty) : MI → Bool
   | .arraySet x i v => decide (Γ[x]? = some .arr ∧ Γ[i]? = some .int ∧ Γ[v]? = some .int)
   | .arrayNew d nl => decide (Γ[d]? = some .arr ∧ Γ[nl]? = some .int)
 
-/-- the type pass on structured code (calls: see `TypedCall.lean`) -/
-def tcode (sh : Shapes) (Γ : List Ty) : Code → Bool
+/-- The type pass on structured code against the typed signatures `tsg` of the program's functions:
+a `call d f args k` needs `tsg[f]`, the operands typed as the parameters, and the destination
+typed as the result. -/
+def tcode (sh : Shapes) (tsg : List TSig) (Γ : List Ty) : Code → Bool
   | .nil => true
-  | .op i k => tcheckI sh Γ i && tcode sh Γ k
-  | .ite c t e k => decide (Γ[c]? = some .int) && tcode sh Γ t && tcode sh Γ e && tcode sh Γ k
-  | .loop c t k => decide (Γ[c]? = some .int) && tcode sh Γ t && tcode sh Γ k
-  | .call .. => false
+  | .op i k => tcheckI sh Γ i && tcode sh tsg Γ k
+  | .ite c t e k =>
+    decide (Γ[c]? = some .int) && tcode sh tsg Γ t && tcode sh tsg Γ e && tcode sh tsg Γ k
+  | .loop c t k => decide (Γ[c]? = some .int) && tcode sh tsg Γ t && tcode sh tsg Γ k
+  | .call d f args k =>
+    match tsg[f]? with
+    | none => false
+    | some ts =>
+      decide (args.map (fun j => Γ[j]?) = ts.ptys.map some ∧ Γ[d]? = some ts.rty) &&
+        tcode sh tsg Γ k
 
-theorem tcode_app {sh : Shapes} {Γ : List Ty} : ∀ (t k : Code),
-    tcode sh Γ t = true → tcode sh Γ k = true → tcode sh Γ (t.app k) = true
+theorem tcode_app {sh : Shapes} {tsg : List TSig} {Γ : List Ty} : ∀ (t k : Code),
+    tcode sh tsg Γ t = true → tcode sh tsg Γ k = true → tcode sh tsg Γ (t.app k) = true
   | .nil, k, _, h => by simpa [Code.app] using h
   | .op i t, k, ht, hk => by
     simp only [tcode, Bool.and_eq_true] at ht
@@ -107,7 +120,16 @@ theorem tcode_app {sh : Shapes} {Γ : List Ty} : ∀ (t k : Code),
     simp only [tcode, Bool.and_eq_true] at ht
     simp only [Code.app, tcode, Bool.and_eq_true]
     exact ⟨⟨ht.1.1, ht.1.2⟩, tcode_app k' k ht.2 hk⟩
-  | .call .., k, ht, hk => by simp [tcode] at ht
+  | .call d f args k', k, ht, hk => by
+    simp only [tcode] at ht
+    simp only [Code.app, tcode]
+    cases hs : tsg[f]? with
+    | none => rw [hs] at ht; simp at ht
+    | some ts =>
+      rw [hs] at ht
+      simp only [Bool.and_eq_true] at ht
+      simp only [Bool.and_eq_true]
+      exact ⟨ht.1, tcode_app k' k ht.2 hk⟩
 
 /-! ### values, slots, objects -/
 
@@ -147,6 +169,13 @@ def HyExt (hty hty' : HTy) (H H' : Heap) : Prop :=
   (∀ l, l < H.next → hty' l = hty l) ∧ H.next ≤ H'.next
 
 theorem HyExt.refl (hty : HTy) (H : Heap) : HyExt hty hty H H := ⟨fun _ _ => rfl, Nat.le_refl _⟩
+
+theorem HyExt.keep {hty : HTy} {H H' : Heap} (h : H.next ≤ H'.next) : HyExt hty hty H H' :=
+  ⟨fun _ _ => rfl, h⟩
+
+theorem HyExt.trans {hty hty' hty'' : HTy} {H H' H'' : Heap} (h1 : HyExt hty hty' H H')
+    (h2 : HyExt hty' hty'' H' H'') : HyExt hty hty'' H H'' :=
+  ⟨fun l hl => by rw [h2.1 l (by have := h1.2; omega), h1.1 l hl], Nat.le_trans h1.2 h2.2⟩
 
 theorem VT_mono {hty hty' : HTy} {H H' : Heap} (he : HyExt hty hty' H H') {τ : Ty} {v : Val}
     (h : VT hty H τ v) : VT hty' H' τ v := by

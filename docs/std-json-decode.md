@@ -1,12 +1,14 @@
-# std:jsondecode
+# std:json/decode
 
-Pure field validation over `std:jsonvalue`. `decodeRoot(value, limits)` validates
+Pure field validation over `std:json`. `decodeRoot(value, limits)` validates
 caller-built trees, then returns a sealed `DecodeCursor` for navigation. No I/O,
 coercion, floating-point conversion, or source offsets are introduced. The runnable
 [pure config example](../examples/json_config.or) separates parsing/output from
 `decodeConfig(JsonValue): Result<Config, DecodeError>`.
 
 ## API
+
+`decodeErrorMessage(e: DecodeError): string` renders "<JSON Pointer or (root)>: <cause>: expected E, found A"; it contains the path but never an input value.
 
 Import enum types as well as functions to bring their constructors into scope.
 
@@ -38,7 +40,7 @@ Kinds are `DecodeMissingField`, `DecodeWrongType`, `DecodeNotIntegral`,
 `DecodeLimitExceeded`, `DecodeInvalidLimits`, and `DecodeInvalidSchema`.
 `DecodeFloatOverflow` and `DecodeFloatUnderflow` reserve the RFC categories;
 there is no float decoder in this slice. Prefixes avoid constructor collisions
-with `std:jsonnumber` when importing both enum types.
+with `std:json/number` when importing both enum types.
 
 A path contains `Key(string)` and `Index(usize)`. Dotted keys remain literal.
 `formatPath([Key("a/b~"), Index(1)])` is `/a~1b~0/1`. Empty key is `/`.

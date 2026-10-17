@@ -1,0 +1,141 @@
+// `==`, `!=`, `<`, `<=`, `>`, `>=` and the methods `equals`, `compare`, `hash` on the types that are `Eq` / `Ord` / `Hash`
+// beyond the native scalars (ADR-0034). The expression checker (expr.or) calls these where an operator or a method is not
+// defined natively; the HIR comes from derive.or. In an abstract check (and in the mutation probe) a value of a bounded type
+// parameter is compared too, but nothing is generated: the HIR of an abstract body is discarded, and the instances (which are
+// concrete) generate the comparisons.
+
+import { Span, Diagnostic, diag } from "../diag";
+import { BinaryOp } from "../syntax";
+import { Type, HExpr, HExprKind, BinOp, UnOp } from "../hir";
+import { Env, showType, typeEq } from "./env";
+import { FnCtx } from "./fnctx";
+import { mk, opDefined } from "./ops";
+import { cmpProblem, cmpMethodOf, classOfRec } from "./classes";
+import { eqExpr, cmpExpr, hashExpr } from "./derive";
+
+// An expression and the environment after it (derived functions may have been added).
+export type COut = { e: HExpr; env: Env; };
+
+// 1 for `==` / `!=` (needs `Eq`), 2 for the orderings (need `Ord`), 0 for any other operator.
+export function opCmpKind(op: BinaryOp): usize {
+  return match (op) {
+    BEq => 1,
+    BNe => 1,
+    BLt => 2,
+    BLe => 2,
+    BGt => 2,
+    BGe => 2,
+    _ => 0,
+  };
+}
+
+// Is `t` an array, `Option`, `Result`, union or record (its own value has a structural comparison, so the other operand can
+// take its type from it)?
+export function isCompositeTy(t: Type): bool {
+  return match (t) {
+    TyArray(_) => true,
+    TyOption(_) => true,
+    TyResult(_, _) => true,
+    TyUnion(_) => true,
+    TyRecord(_) => true,
+    _ => false,
+  };
+}
+
+// 1, 2, 3 for the method names `equals`, `compare`, `hash`, else 0.
+export function cmpMethodKind(n: string): usize {
+  return n == "equals" ? 1 : (n == "compare" ? 2 : (n == "hash" ? 3 : 0));
+}
+
+// The operator `l op r` on operands without a native operator. None: this is not a comparison of an `Eq` / `Ord` type (the
+// caller reports the usual error). The operands have the same type.
+export function cmpOperator(fx: FnCtx, op: BinaryOp, l: HExpr, r: HExpr, span: Span): Result<Option<COut>, Diagnostic> {
+  const kind = opCmpKind(op);
+  const none: Option<COut> = None;
+  if (kind == 0 || !typeEq(l.ty, r.ty) || opDefined(op, l.ty)) {
+    return Ok(none);
+  }
+  const t = l.ty;
+  const p = cmpProblem(fx.env, t, kind);
+  if (p.isSome()) {
+    match (t) {
+      TyRecord(_) => {
+        return Err(diag("E0410", span, "operator is not defined for type `" + showType(fx.env, t) + "`: " + p.unwrap().msg));
+      },
+      TyUnion(_) => {
+        return Err(diag("E0410", span, "operator is not defined for type `" + showType(fx.env, t) + "`: " + p.unwrap().msg));
+      },
+      TyArray(_) => {
+        return Err(diag("E0410", span, "operator is not defined for type `" + showType(fx.env, t) + "`: " + p.unwrap().msg));
+      },
+      TyOption(_) => {
+        return Err(diag("E0410", span, "operator is not defined for type `" + showType(fx.env, t) + "`: " + p.unwrap().msg));
+      },
+      TyResult(_, _) => {
+        return Err(diag("E0410", span, "operator is not defined for type `" + showType(fx.env, t) + "`: " + p.unwrap().msg));
+      },
+      _ => {
+        return Ok(none);
+      },
+    }
+  }
+  const isEq = kind == 1;
+  if (fx.abs || fx.probe) {
+    return Ok(Some(COut { e: mk(XBool(false), TyBool, span), env: fx.env }));
+  }
+  if (isEq) {
+    const o = eqExpr(fx.env, t, l, r, fx.unit, fx.depth, span)?;
+    const neg = match (op) {
+      BNe => true,
+      _ => false,
+    };
+    return Ok(Some(COut { e: neg ? mk(XUnary(UnNot, o.e), TyBool, span) : o.e, env: o.env }));
+  }
+  const o = cmpExpr(fx.env, t, l, r, fx.unit, fx.depth, span)?;
+  const zero = mk(XInt(0), TyInt, span);
+  const hop: BinOp = match (op) {
+    BLt => OpLt,
+    BLe => OpLe,
+    BGt => OpGt,
+    _ => OpGe,
+  };
+  return Ok(Some(COut { e: mk(XBinary(hop, o.e, zero), TyBool, span), env: o.env }));
+}
+
+// Does the method `n` (`equals` / `compare` / `hash`, `kind` 1..3) on a receiver of type `t` mean the built-in comparison? Not
+// when the receiver is a class that declares the method itself (a normal method call), nor when the type has no such instance.
+export function cmpMethodApplies(fx: FnCtx, t: Type, kind: usize): bool {
+  match (t) {
+    TyRecord(r) => {
+      const co = classOfRec(fx.env, r);
+      if (co.isSome() && cmpMethodOf(fx.env.classes[co.unwrap()], kind).isSome()) {
+        return false;
+      }
+    },
+    _ => {},
+  }
+  return cmpProblem(fx.env, t, kind).isNone();
+}
+
+// `recv.equals(other)`, `recv.compare(other)` (`args` = [other]) or `recv.hash()`.
+export function cmpMethodExpr(fx: FnCtx, kind: usize, recv: HExpr, args: HExpr[], span: Span): Result<COut, Diagnostic> {
+  if (fx.abs || fx.probe) {
+    if (kind == 1) {
+      return Ok(COut { e: mk(XBool(false), TyBool, span), env: fx.env });
+    }
+    if (kind == 2) {
+      return Ok(COut { e: mk(XInt(0), TyInt, span), env: fx.env });
+    }
+    return Ok(COut { e: mk(XInt(0), TyUsize, span), env: fx.env });
+  }
+  if (kind == 1) {
+    const o = eqExpr(fx.env, recv.ty, recv, args[0], fx.unit, fx.depth, span)?;
+    return Ok(COut { e: o.e, env: o.env });
+  }
+  if (kind == 2) {
+    const o = cmpExpr(fx.env, recv.ty, recv, args[0], fx.unit, fx.depth, span)?;
+    return Ok(COut { e: o.e, env: o.env });
+  }
+  const o = hashExpr(fx.env, recv.ty, recv, fx.unit, fx.depth, span)?;
+  return Ok(COut { e: o.e, env: o.env });
+}
