@@ -1,0 +1,448 @@
+// Erasure of `void` values (ADR-0040). `void` can instantiate a type parameter (`T = void`): the unit type, one value, no
+// run-time representation. The checker leaves the instance as written (a local, a parameter or a field of type `void`, a
+// payload of type `void`); this pass, which runs first in the lowering, removes what has no slot:
+//
+//   * a local or a parameter of type `void` is dropped (the later locals are renumbered); a read of it is the unit value
+//     (`XBool(false)` of type `void`, the checker's `nopExpr`), a `let` of it keeps the initializer as a statement;
+//   * a record field of type `void` is dropped from the record and the later fields are renumbered (`XField`, `PField`,
+//     record literals); the read of a dropped field is a `void` expression the lowering evaluates for its effects;
+//   * a variant payload of type `void` is dropped from the union and from the bindings of a pattern.
+//
+// What stays in the HIR are the `void`-typed expressions in value positions (an argument, a payload, an array element, a
+// captured value, a field initializer): they may have effects, so the lowering evaluates them in order and gives them no
+// operand or slot (lowerer.or). A field initializer of a dropped field has the index `fields.length` of the new record.
+//
+// Without a `void` local, field or payload the program is returned as it is: every program that has no `void` type
+// argument lowers exactly as before.
+
+import {
+  Type, Program, Function, Local, HBlock, HStmt, HExpr, HExprKind, Place, PlaceElem, FieldInitH, HArm, HPattern,
+  RecordDef, UnionDef, VariantDef, BinOp,
+} from "../hir";
+import { Span } from "../diag";
+import { isVoidTy } from "./util";
+
+const NONE: usize = 4294967295;
+
+function isVoidT(t: Type): bool {
+  return isVoidTy(t);
+}
+
+// The new index of every field of every record (NONE for a void field), and of every payload of every variant.
+type Maps = { fields: usize[][]; payloads: usize[][][]; };
+
+function anyVoidField(r: RecordDef): bool {
+  return r.fields.some(f => isVoidT(f.ty));
+}
+
+function anyVoidPayload(u: UnionDef): bool {
+  return u.variants.some(v => v.payload.some(t => isVoidT(t)));
+}
+
+// Does the program have a `void` local (other than the environment of a closure, which is patched to a record), field or
+// payload?
+function needsErasure(p: Program): bool {
+  for (const r of p.records) {
+    if (anyVoidField(r)) {
+      return true;
+    }
+  }
+  for (const u of p.unions) {
+    if (anyVoidPayload(u)) {
+      return true;
+    }
+  }
+  for (const f of p.functions) {
+    for (const l of f.locals) {
+      if (isVoidT(l.ty)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function indexMap(tys: Type[]): usize[] {
+  let out: usize[] = [];
+  let next: usize = 0;
+  for (const t of tys) {
+    if (isVoidT(t)) {
+      out.push(NONE);
+    } else {
+      out.push(next);
+      next += 1;
+    }
+  }
+  return out;
+}
+
+function buildMaps(p: Program): Maps {
+  let fs: usize[][] = [];
+  for (const r of p.records) {
+    fs.push(indexMap(r.fields.map(f => f.ty)));
+  }
+  let ps: usize[][][] = [];
+  for (const u of p.unions) {
+    let vs: usize[][] = [];
+    for (const v of u.variants) {
+      vs.push(indexMap(v.payload));
+    }
+    ps.push(vs);
+  }
+  return Maps { fields: fs, payloads: ps };
+}
+
+function unit(span: Span): HExpr {
+  return HExpr { kind: XBool(false), ty: TyVoid, span: span };
+}
+
+function isUnit(e: HExpr): bool {
+  return match (e.kind) {
+    XBool(_) => isVoidT(e.ty),
+    _ => false,
+  };
+}
+
+// The payload types of variant `tag` of the scrutinee type `t` (the types of the bindings of its pattern).
+function payloadTypes(p: Program, t: Type, tag: usize): Type[] {
+  return match (t) {
+    TyOption(x) => tag == 0 ? [x] : [],
+    TyResult(a, b) => tag == 0 ? (isVoidT(a) ? [] : [a]) : [b],
+    TyUnion(u) => p.unions[u].variants[tag].payload,
+    _ => [],
+  };
+}
+
+class Eraser {
+  private prog: Program;
+  private maps: Maps;
+  // HIR local -> new local (NONE: dropped)
+  private lmap: usize[] = [];
+  private fn: Function;
+
+  constructor(prog: Program, maps: Maps, fn: Function) {
+    this.prog = prog;
+    this.maps = maps;
+    this.fn = fn;
+  }
+
+  private newLocal(l: usize): usize {
+    return this.lmap[l];
+  }
+
+  // The function: void locals dropped, the rest renumbered. A loop variable over a `void[]` stays (it receives the
+  // placeholder element), as an `int`.
+  run(): Function {
+    const keep = this.loopVars(this.fn.body, []);
+    let locals: Local[] = [];
+    let params: usize = 0;
+    let i: usize = 0;
+    while (i < this.fn.locals.length) {
+      const l = this.fn.locals[i];
+      if (isVoidT(l.ty) && !keep.includes(i)) {
+        this.lmap.push(NONE);
+      } else {
+        this.lmap.push(locals.length);
+        locals.push(isVoidT(l.ty) ? Local { name: l.name, ty: TyInt, mutable: l.mutable } : l);
+        if (i < this.fn.paramCount) {
+          params += 1;
+        }
+      }
+      i += 1;
+    }
+    return Function {
+      name: this.fn.name,
+      paramCount: params,
+      locals: locals,
+      ret: this.fn.ret,
+      body: this.block(this.fn.body),
+      span: this.fn.span,
+    };
+  }
+
+  // The loop variables of `for (const v of xs)` loops of type void (collected in `acc`).
+  private loopVars(b: HBlock, acc: usize[]): usize[] {
+    let out = acc;
+    for (const s of b.stmts) {
+      match (s) {
+        HForOf(l, _, body) => {
+          if (isVoidT(this.fn.locals[l].ty)) {
+            out.push(l);
+          }
+          out = this.loopVars(body, out);
+        },
+        HIf(_, t, e) => {
+          out = this.loopVars(t, out);
+          match (e) {
+            Some(eb) => {
+              out = this.loopVars(eb, out);
+            },
+            None => {},
+          }
+        },
+        HWhile(_, body) => {
+          out = this.loopVars(body, out);
+        },
+        HBlockStmt(body) => {
+          out = this.loopVars(body, out);
+        },
+        _ => {},
+      }
+    }
+    return out;
+  }
+
+  private block(b: HBlock): HBlock {
+    let out: HStmt[] = [];
+    for (const s of b.stmts) {
+      for (const t of this.stmt(s)) {
+        out.push(t);
+      }
+    }
+    return HBlock { stmts: out };
+  }
+
+  private blockOpt(b: Option<HBlock>): Option<HBlock> {
+    return match (b) {
+      Some(x) => Some(this.block(x)),
+      None => None,
+    };
+  }
+
+  // The statements `s` becomes: none, one or (an assignment of a void place) several.
+  private stmt(s: HStmt): HStmt[] {
+    let out: HStmt[] = [];
+    match (s) {
+      HLet(l, init) => {
+        const e = this.expr(init);
+        if (this.newLocal(l) == NONE) {
+          if (!isUnit(e)) {
+            out.push(HExprStmt(e));
+          }
+        } else {
+          out.push(HLet(this.newLocal(l), e));
+        }
+      },
+      HAssign(p, op, v) => {
+        out = this.assign(p, op, v);
+      },
+      HExprStmt(e) => {
+        const x = this.expr(e);
+        if (!isUnit(x)) {
+          out.push(HExprStmt(x));
+        }
+      },
+      HIf(c, t, e) => {
+        out.push(HIf(this.expr(c), this.block(t), this.blockOpt(e)));
+      },
+      HWhile(c, b) => {
+        out.push(HWhile(this.expr(c), this.block(b)));
+      },
+      HForOf(l, it, b) => {
+        out.push(HForOf(this.newLocal(l), this.expr(it), this.block(b)));
+      },
+      HBreak => {
+        out.push(HBreak);
+      },
+      HContinue => {
+        out.push(HContinue);
+      },
+      HReturn(e) => {
+        out.push(HReturn(this.exprOpt(e)));
+      },
+      HBlockStmt(b) => {
+        out.push(HBlockStmt(this.block(b)));
+      },
+    }
+    return out;
+  }
+
+  // An assignment to a place of type void (a void local, a void field, an element of a `void[]`) only evaluates its index
+  // expressions and its value, in order.
+  private assign(p: Place, op: Option<BinOp>, v: HExpr): HStmt[] {
+    let out: HStmt[] = [];
+    if (isVoidT(p.ty)) {
+      for (const el of p.path) {
+        match (el) {
+          PIndex(ix) => {
+            const x = this.expr(ix);
+            if (!isUnit(x)) {
+              out.push(HExprStmt(x));
+            }
+          },
+          PField(_, _) => {},
+        }
+      }
+      const x = this.expr(v);
+      if (!isUnit(x)) {
+        out.push(HExprStmt(x));
+      }
+      return out;
+    }
+    out.push(HAssign(this.place(p), op, this.expr(v)));
+    return out;
+  }
+
+  private place(p: Place): Place {
+    let path: PlaceElem[] = [];
+    for (const el of p.path) {
+      match (el) {
+        PField(r, i) => {
+          path.push(PField(r, this.maps.fields[r][i]));
+        },
+        PIndex(ix) => {
+          path.push(PIndex(this.expr(ix)));
+        },
+      }
+    }
+    return Place { root: this.newLocal(p.root), path: path, ty: p.ty };
+  }
+
+  private exprs(es: HExpr[]): HExpr[] {
+    return es.map(e => this.expr(e));
+  }
+
+  private exprOpt(e: Option<HExpr>): Option<HExpr> {
+    return match (e) {
+      Some(x) => Some(this.expr(x)),
+      None => None,
+    };
+  }
+
+  private expr(e: HExpr): HExpr {
+    return HExpr { kind: this.kind(e), ty: e.ty, span: e.span };
+  }
+
+  private kind(e: HExpr): HExprKind {
+    return match (e.kind) {
+      XInt(_) => e.kind,
+      XFloat(_) => e.kind,
+      XBool(_) => e.kind,
+      XStr(_) => e.kind,
+      XLocal(l) => this.newLocal(l) == NONE ? XBool(false) : XLocal(this.newLocal(l)),
+      XUnary(op, x) => XUnary(op, this.expr(x)),
+      XBinary(op, a, b) => XBinary(op, this.expr(a), this.expr(b)),
+      XCall(f, args) => XCall(f, this.exprs(args)),
+      XBuiltin(b, args) => XBuiltin(b, this.exprs(args)),
+      XMutMethod(m, p, args) => XMutMethod(m, this.place(p), this.exprs(args)),
+      XField(b, r, i) => this.field(e, b, r, i),
+      XIndex(a, b) => XIndex(this.expr(a), this.expr(b)),
+      XRecord(r, sp, fs) => XRecord(r, this.exprOpt(sp), this.inits(r, fs)),
+      XVariant(tag, payload) => XVariant(tag, this.exprs(payload)),
+      XArray(xs) => XArray(this.exprs(xs)),
+      XTry(x) => XTry(this.expr(x)),
+      XCond(c, a, b) => XCond(this.expr(c), this.expr(a), this.expr(b)),
+      XMatch(s, arms) => XMatch(this.expr(s), this.arms(s.ty, arms)),
+      XClosure(f, caps) => XClosure(f, this.exprs(caps)),
+      XCallIndirect(f, args) => XCallIndirect(this.expr(f), this.exprs(args)),
+      XIface(vt, v) => XIface(vt, this.expr(v)),
+      XCallVirtual(r, slot, args) => XCallVirtual(this.expr(r), slot, this.exprs(args)),
+    };
+  }
+
+  // The read of a void field has no slot to read: index 0 stands for it, the lowering only evaluates the base.
+  private field(e: HExpr, b: HExpr, r: usize, i: usize): HExprKind {
+    if (isVoidT(e.ty)) {
+      return XField(this.expr(b), r, 0);
+    }
+    return XField(this.expr(b), r, this.maps.fields[r][i]);
+  }
+
+  // The initializers of a record literal: a void field keeps its (evaluated) initializer under the index one past the last
+  // field of the new record.
+  private inits(r: usize, fs: FieldInitH[]): FieldInitH[] {
+    const n = this.newFieldCount(r);
+    let out: FieldInitH[] = [];
+    for (const f of fs) {
+      const ni = this.maps.fields[r][f.index];
+      out.push(FieldInitH { index: ni == NONE ? n : ni, value: this.expr(f.value) });
+    }
+    return out;
+  }
+
+  private newFieldCount(r: usize): usize {
+    let n: usize = 0;
+    for (const i of this.maps.fields[r]) {
+      if (i != NONE) {
+        n += 1;
+      }
+    }
+    return n;
+  }
+
+  private arms(scrut: Type, arms: HArm[]): HArm[] {
+    let out: HArm[] = [];
+    for (const a of arms) {
+      out.push(HArm {
+        pattern: this.pattern(scrut, a.pattern),
+        body: this.block(a.body),
+        value: this.exprOpt(a.value),
+      });
+    }
+    return out;
+  }
+
+  // The bindings of the void payloads are dropped, the others renumbered.
+  private pattern(scrut: Type, p: HPattern): HPattern {
+    match (p) {
+      HPVariant(tag, binds) => {
+        const tys = payloadTypes(this.prog, scrut, tag);
+        let nb: Option<usize>[] = [];
+        let k: usize = 0;
+        for (const b of binds) {
+          const t: Type = k < tys.length ? tys[k] : TyVoid;
+          if (!isVoidT(t)) {
+            match (b) {
+              Some(l) => {
+                nb.push(Some(this.newLocal(l)));
+              },
+              None => {
+                nb.push(None);
+              },
+            }
+          }
+          k += 1;
+        }
+        return HPVariant(tag, nb);
+      },
+      _ => {},
+    }
+    return p;
+  }
+}
+
+function eraseRecord(r: RecordDef): RecordDef {
+  return RecordDef { name: r.name, fields: r.fields.filter(f => !isVoidT(f.ty)) };
+}
+
+function eraseUnion(u: UnionDef): UnionDef {
+  return UnionDef {
+    name: u.name,
+    variants: u.variants.map(v => VariantDef { name: v.name, payload: v.payload.filter(t => !isVoidT(t)) }),
+  };
+}
+
+// The program without void locals, fields and payloads, or `p` itself when it has none.
+@Ensures(result.functions.length == p.functions.length && result.main == p.main)
+@Ensures(result.records.length == p.records.length && result.unions.length == p.unions.length)
+export function eraseVoid(p: Program): Program {
+  if (!needsErasure(p)) {
+    return p;
+  }
+  const maps = buildMaps(p);
+  let fns: Function[] = [];
+  for (const f of p.functions) {
+    let er = new Eraser(p, maps, f);
+    fns.push(er.run());
+  }
+  return Program {
+    records: p.records.map(r => eraseRecord(r)),
+    unions: p.unions.map(u => eraseUnion(u)),
+    functions: fns,
+    main: p.main,
+    vtables: p.vtables,
+    ifaces: p.ifaces,
+    mutating: p.mutating,
+    inlineFns: p.inlineFns,
+  };
+}

@@ -4,7 +4,7 @@
 
 import { Span, Diagnostic, diag } from "../diag";
 import { Type, HExpr } from "../hir";
-import { TypeExpr } from "../syntax";
+import { TypeExpr, TNamed } from "../syntax";
 import { Env, typeEq, isVoid } from "./env";
 import { unify, noBinds, mentionsUnbound, bindsKept } from "./types";
 import { bindsOrVoid } from "./ops";
@@ -28,6 +28,14 @@ export function filledCount(xs: Option<HExpr>[]): usize {
     }
   }
   return n;
+}
+
+// Is `te` exactly one of the type parameters `tp` (not a type that merely mentions one)?
+function isBareParam(te: TypeExpr, tp: string[]): bool {
+  return match (te.kind) {
+    TNamed(id, args) => args.length == 0 && tp.includes(id.name),
+    _ => false,
+  };
 }
 
 // What is known while the type arguments of a call to a generic callee (function, variant constructor
@@ -62,6 +70,9 @@ export class Inference {
   // bindings made earlier win and are never undone.
   @Ensures(bindsKept(old(this.binds), this.binds))
   learn(env: Env, unit: usize, te: TypeExpr, actual: Type): void {
+    if (isVoid(actual) && isBareParam(te, this.tp)) {
+      return;
+    }
     this.binds = unify(env, unit, te, actual, this.tp, this.binds);
   }
 
@@ -89,24 +100,14 @@ export class Inference {
     return bindsOrVoid(this.binds);
   }
 
-  // The type arguments once the arguments are in: every parameter bound, none `void`.
+  // The type arguments once the arguments are in: every parameter bound (`void` is a type argument, ADR-0040).
   @Ensures(result.isOk() ==> result.unwrap().length == this.tp.length)
-  @Ensures(result.isOk() ==> result.unwrap().every(t => !isVoid(t)))
   typeArgs(span: Span, what: string): Result<Type[], Diagnostic> {
     let tys: Type[] = [];
     let bi: usize = 0;
     for (const b of this.binds) {
       match (b) {
         Some(t) => {
-          if (isVoid(t)) {
-            return Err(
-              diag(
-                "E0400",
-                span,
-                "type argument `" + this.tp[bi] + "` of " + what + " cannot be `void`",
-              ),
-            );
-          }
           tys.push(t);
         },
         None => {
