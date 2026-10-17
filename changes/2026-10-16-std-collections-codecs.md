@@ -14,4 +14,5 @@
   (`Result<void, Utf8Error>`); `bytesFromHex` is deprecated in favour of `encoding.hexDecodeText` (a `Result`; std:bytes
   cannot import std:encoding, so it is no thin wrapper). The prelude hooks `indexOfStr`/`includesStr`/`hashStr`/`eqStr`
   are now `...String` (internal). Public doc comments are signature-first with errors and cost; `compiler/mcp/apitable.or`
-  lists the new `std:encoding` and `std:graph` signatures.
+  lists the new `std:encoding` and `std:graph` signatures. The contract helpers and B-tree internals moved to
+  `std:collections/internal` and `std:bytes/internal` (not API; `allBytes` is no longer exported from `std:bytes`).

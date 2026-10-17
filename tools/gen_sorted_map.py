@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""Generate the two B-tree sorted maps of library/std/collections.or from tools/sorted_map.tmpl.
+"""Generate the two B-tree sorted maps of library/std/collections.or (the classes) and library/std/collections_internal.or
+(their helper functions and node types) from tools/sorted_map.tmpl.
 
 `SortedMap<V>` (int keys) and `SortedStringMap<V>` (string keys) are the same algorithm; Orin has no equality or
 ordering on type parameters (docs/std.md "Limitations"), so the key type and its comparisons are template
-parameters and the two classes are generated, not copied by hand. The generated region of library/std/collections.or is
-between the markers `// BEGIN GENERATED` and `// END GENERATED`.
+parameters and the two classes are generated, not copied by hand. The template has two parts, separated by the line
+`//@@SPLIT@@`: the helpers (node types, `lowerBound*`, `btree*`; ADR-0048 rule 7.3: not API) go to std:collections/internal,
+the classes to std:collections. The generated region of each file is between the markers `// BEGIN GENERATED` and
+`// END GENERATED`.
 
-Usage: python3 tools/gen_sorted_map.py [--check]   (--check: exit 1 if collections.or is stale)
+Usage: python3 tools/gen_sorted_map.py [--check]   (--check: exit 1 if a generated file is stale)
 """
 import os
 import re
@@ -67,7 +70,7 @@ def expand_macros(s, inst):
         a, b = (expand_macros(x.strip(), inst) for x in args)
         op = inst["ops"][m.group(1)]
         if inst["cmp"]:
-            out.append("(compareStrings(%s, %s) %s 0)" % (a, b, op))
+            out.append("(compareBytewise(%s, %s) %s 0)" % (a, b, op))
         else:
             out.append("(%s %s %s)" % (a, op, b))
         i = end
@@ -82,26 +85,35 @@ def render(inst, tmpl):
     return s
 
 
+SPLIT = "//@@SPLIT@@\n"
+
+
 def generated():
+    """(helpers, classes): the two generated regions."""
     tmpl = open(os.path.join(ROOT, "tools", "sorted_map.tmpl"), encoding="utf-8").read()
-    return BEGIN + render(INT, tmpl) + render(STR, tmpl) + END
+    head, tail = tmpl.split(SPLIT)
+    helpers = BEGIN + render(INT, head) + render(STR, head) + END
+    classes = BEGIN + render(INT, tail) + render(STR, tail) + END
+    return helpers, classes
 
 
 def main():
-    path = os.path.join(ROOT, "library", "std", "collections.or")
-    src = open(path, encoding="utf-8").read()
-    a = src.index(BEGIN)
-    b = src.index(END) + len(END)
-    new = src[:a] + generated() + src[b:]
-    if "--check" in sys.argv[1:]:
+    helpers, classes = generated()
+    stale = False
+    for rel, region in (("collections_internal.or", helpers), ("collections.or", classes)):
+        path = os.path.join(ROOT, "library", "std", rel)
+        src = open(path, encoding="utf-8").read()
+        a = src.index(BEGIN)
+        b = src.index(END) + len(END)
+        new = src[:a] + region + src[b:]
         if new != src:
-            print("library/std/collections.or is stale: run python3 tools/gen_sorted_map.py")
-            return 1
-        return 0
-    if new != src:
-        open(path, "w", encoding="utf-8").write(new)
-        print("wrote library/std/collections.or")
-    return 0
+            if "--check" in sys.argv[1:]:
+                print("library/std/%s is stale: run python3 tools/gen_sorted_map.py" % rel)
+                stale = True
+            else:
+                open(path, "w", encoding="utf-8").write(new)
+                print("wrote library/std/%s" % rel)
+    return 1 if stale else 0
 
 
 if __name__ == "__main__":
