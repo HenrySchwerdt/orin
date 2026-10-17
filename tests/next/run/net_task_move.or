@@ -1,0 +1,154 @@
+// Network ownership across tasks (ADR-0017 Addendum C): a NetGrant is delegated to client tasks (spawnNet); every accepted
+// Stream is MOVED out of the accepting task into a task of its own (spawnAccepted), or into a pool of workers through a
+// channel of `Accepted` tokens (acceptDetached + serveAccepted). One process, loopback, port 0.
+import { Host, useNet } from "std:host";
+import { milliseconds } from "std:time";
+import { Bytes, bytesFromString } from "std:bytes";
+import { Scope, TaskHandle, scopeNetDo, spawn, spawnNet, channel, Receiver } from "std:task";
+import {
+  NetGrant, Listener, Stream, Accepted, useListenerNet, spawnAccepted, acceptDetached, serveAccepted, dropAccepted, withConnection,
+  portOf, recv, sendAll, RecvData
+} from "std:net";
+
+function say(label: string, ok: bool): void {
+  console.log(label + ": " + (ok ? "ok" : "FAIL"));
+}
+
+// One request / reply: "ping <i>\n" -> "pong <i>\n".
+function client(net: NetGrant, port: int, i: int): string {
+  const r = withConnection(net, "127.0.0.1", port, milliseconds(2000), (s: Stream) => {
+    sendAll(s, bytesFromString("ping " + i.toString() + "\n"), milliseconds(2000));
+    const got = recv(s, 64, milliseconds(2000));
+    return match (got) {
+      RecvData(b) => b.toRawString(),
+      _ => "no reply"
+    };
+  });
+  return r.isOk() ? r.unwrap() : "connect failed";
+}
+
+// The server side of one connection; returns the number of bytes handled.
+function serveOne(s: Stream, who: string): int {
+  const got = recv(s, 64, milliseconds(2000));
+  let n: int = 0;
+  match (got) {
+    RecvData(b) => {
+      const text = b.toRawString();
+      sendAll(s, bytesFromString("pong" + text.substring(4, text.length)), milliseconds(2000));
+      n = text.length.toInt();
+    },
+    _ => {}
+  }
+  return n;
+}
+
+function worker(rx: Receiver<Accepted>): int {
+  let n: int = 0;
+  let going = true;
+  while (going) {
+    const next = rx.recv();
+    match (next) {
+      Some(a) => {
+        n += serveAccepted(a, (s: Stream, peer) => serveOne(s, peer.host));
+      },
+      None => { going = false; }
+    }
+  }
+  return n;
+}
+
+function run(sc: Scope, ln: Listener, net: NetGrant): void {
+  const port = portOf(ln);
+  // Phase 1: a task per connection. 8 client tasks (each owns a NetGrant of the same scope) and 8 serving tasks.
+  const count = 8;
+  let clients: TaskHandle<string>[] = [];
+  let i: int = 0;
+  while (i < count) {
+    const k = i;
+    clients.push(spawnNet(sc, net, (g: NetGrant) => client(g, port, k)));
+    i += 1;
+  }
+  let servers: TaskHandle<int>[] = [];
+  i = 0;
+  while (i < count) {
+    const r = spawnAccepted(sc, ln, milliseconds(2000), (s: Stream, peer) => serveOne(s, peer.host));
+    say("accept " + i.toString(), r.isOk());
+    if (r.isOk()) {
+      servers.push(r.unwrap());
+    }
+    i += 1;
+  }
+  let bytes: int = 0;
+  for (const h of servers) {
+    bytes += h.join();
+  }
+  let good: int = 0;
+  let seen: int = 0;
+  for (const h of clients) {
+    const text = h.join();
+    if (text.startsWith("pong ")) {
+      good += 1;
+      seen += parseInt(text.substring(5, text.length - 1)).unwrapOr(0);
+    }
+  }
+  say("phase 1 replies", good == count);
+  say("phase 1 each client got its own reply", seen == 0 + 1 + 2 + 3 + 4 + 5 + 6 + 7);
+  say("phase 1 bytes served", bytes == 8 * 7);
+
+  // Phase 2: a pool of 3 workers fed through a bounded channel of moved connections.
+  const total = 12;
+  const ch = channel<Accepted>(2);
+  let workers: TaskHandle<int>[] = [];
+  i = 0;
+  while (i < 3) {
+    const rx = ch.rx;
+    workers.push(spawn(sc, () => worker(rx)));
+    i += 1;
+  }
+  let clients2: TaskHandle<string>[] = [];
+  i = 0;
+  while (i < total) {
+    const k = 100 + i;
+    clients2.push(spawnNet(sc, net, (g: NetGrant) => client(g, port, k)));
+    i += 1;
+  }
+  let moved: int = 0;
+  while (moved < total) {
+    const a = acceptDetached(ln, milliseconds(2000));
+    match (a) {
+      Ok(acc) => {
+        moved += 1;
+        if (!ch.tx.send(acc)) {
+          dropAccepted(acc);
+        }
+      },
+      Err(e) => { moved = total + 1; }
+    }
+  }
+  ch.tx.close();
+  let served2: int = 0;
+  for (const w of workers) {
+    served2 += w.join();
+  }
+  ch.rx.close();
+  let good2: int = 0;
+  for (const h of clients2) {
+    if (h.join().startsWith("pong 1")) {
+      good2 += 1;
+    }
+  }
+  say("phase 2 moved", moved == total);
+  say("phase 2 replies", good2 == total);
+  say("phase 2 bytes served", served2 == 12 * 9);
+}
+
+function main(host: Host): void {
+  useNet(host, net => {
+    scopeNetDo(net, (sc: Scope, g: NetGrant) => {
+      const r = useListenerNet(g, "127.0.0.1", 0, 64, (ln: Listener, n2: NetGrant) => {
+        run(sc, ln, n2);
+      });
+      say("listener", r.isOk());
+    });
+  });
+}
