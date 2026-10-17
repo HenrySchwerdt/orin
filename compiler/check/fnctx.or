@@ -7,7 +7,7 @@ import { Ident } from "../syntax";
 import { Type, Local, HStmt, HExpr, Place } from "../hir";
 import {
   FuncInfo, Env, typeEq, FnMode, FmOrdinary, ContractMode, CmCode, sameContractMode, isOrdinaryMode,
-  isClassMode,
+  isClassMode, isNamespaceName, nsShadowErr,
 } from "./env";
 import { MAX_DEPTH } from "./types";
 
@@ -267,16 +267,18 @@ export class FnCtx {
     return this.newLocal(name, ty, false);
   }
 
-  // Makes the local `id` visible as `name` in the innermost scope. Refused (E0304) only when the name
-  // is already declared in the innermost scope.
+  // Makes the local `id` visible as `name` in the innermost scope. Refused (E0304) when the name
+  // is already declared in the innermost scope, or is the name of a namespace import of the file (ADR-0048 addendum).
   @Requires(id < this.locals.length)
   @Ensures(this.scope.depth() == old(this.scope.depth())
       && this.locals.length == old(this.locals.length))
   @Ensures(result.isOk()
       ==> this.scope.lookup(name.name).isSome() && this.scope.lookup(name.name).unwrap() == id)
-  @Ensures(result.isErr()
-      ==> result.unwrapErr().code == "E0304" && this.scope.inInnermost(name.name))
+  @Ensures(result.isErr() ==> result.unwrapErr().code == "E0304")
   declare(name: Ident, id: usize): Result<void, Diagnostic> {
+    if (isNamespaceName(this.env, this.unit, name.name)) {
+      return Err(nsShadowErr(name));
+    }
     if (this.scope.inInnermost(name.name)) {
       return Err(diag("E0304", name.span, `\`${name.name}\` is already declared in this block`));
     }

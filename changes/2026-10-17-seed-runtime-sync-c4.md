@@ -1,0 +1,1 @@
+- The frozen seed runtime takes the remaining #175 runtime changes verbatim: a per-task network buffer, delegable net grants and moving only family grants or Streams into tasks.

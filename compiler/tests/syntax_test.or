@@ -14,7 +14,7 @@ import {
   T_FUNCTION, T_METHOD, T_CTOR, T_CLASS, T_LOOP, T_CONST, T_FIELD, annotationName, clauseAllowed, annotationAllowed, checkPlacement,
   checkAnnoPlacement, inside, nestedIn, exprOk, exprShallowOk, stmtOk, typeOk, itemSpan,
   moduleWellFormed, Comment, scanComments, commentsWellFormed, cookOxText, decodeEntities, oxExprs,
-  oxComponents, oxIsComponent,
+  oxComponents, oxIsComponent, importedName,
 } from "../syntax";
 
 function sp(a: usize, b: usize): Span {
@@ -902,4 +902,56 @@ function parserRejectsMisplacedOxSlots(): void {
     assertEqString(r.unwrapErr().code, "E0200", "syntax error code: " + b);
   }
   assert(parse(0, "const v = <Card><:x>a</Card>;").isErr(), "slot not closed (lexical error)");
+}
+
+// ADR-0048 addendum: namespace imports and import aliases.
+
+@Test
+function parserNamespaceImportCollectsItsUses(): void {
+  const r = parse(0, "import * as m from \"./x\";\nfunction f(a: m.T): m.T { return m.g(a); }\nfunction h(m2: int): int { return m2; }");
+  assert(r.isOk(), "parses");
+  match (r.unwrap().items[0]) {
+    IImport(d) => {
+      assert(d.namespace.isSome(), "namespace");
+      assertEqString(d.namespace.unwrap().name, "m", "namespace name");
+      assertEqUsize(d.names.length, 0, "binds no single name");
+      assertEqUsize(d.uses.length, 2, "m.T and m.g");
+      assertEqString(d.uses[0].name, "m.T", "first use");
+      assertEqString(d.uses[1].name, "m.g", "second use");
+    },
+    _ => {
+      assert(false, "not an import");
+    },
+  }
+}
+
+@Test
+function parserImportAliases(): void {
+  const r = parse(0, "import { a as b, c, as, d as as } from \"./x\";\nexport { a as z } from \"./x\";");
+  assert(r.isOk(), "parses");
+  match (r.unwrap().items[0]) {
+    IImport(d) => {
+      assertEqUsize(d.names.length, 4, "four names");
+      assertEqString(importedName(d, 0).name, "b", "alias");
+      assertEqString(d.names[0].name, "a", "exported name");
+      assertEqString(importedName(d, 1).name, "c", "no alias");
+      assertEqString(importedName(d, 2).name, "as", "a name `as`");
+      assertEqString(importedName(d, 3).name, "as", "an alias `as`");
+    },
+    _ => {
+      assert(false, "not an import");
+    },
+  }
+  match (r.unwrap().items[1]) {
+    IReExport(d) => {
+      assertEqString(importedName(d, 0).name, "z", "re-export alias");
+    },
+    _ => {
+      assert(false, "not a re-export");
+    },
+  }
+  assertEqString(errOf("import * from \"a\";").code, "E0200", "import * needs as");
+  assert(parse(0, "import * as m, { a } from \"a\";").isErr(), "no mixed form");
+  assert(parse(0, "export * as m from \"a\";").isErr(), "no namespace re-export");
+  assert(parse(0, "import { a as } from \"a\";").isErr(), "alias needs a name");
 }
