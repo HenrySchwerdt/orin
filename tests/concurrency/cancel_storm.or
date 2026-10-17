@@ -1,0 +1,198 @@
+// Cancellation storms (ADR-0017 Addendum D; tools/test_concurrency.sh: plain, ThreadSanitizer, ASan + UBSan; C5 "cancellation
+// storms"). Tasks block in accept and recv on loopback sockets with a 30 s timeout while several tasks cancel their scope at
+// the same moment, some before the others have even started to wait. A wake that was lost shows as Timeout (after 30 s) or as a
+// hang; any answer but Cancelled is a failure.
+//  1. 12 rounds x 24 tasks (accept / recv alternating) x 4 concurrent cancellers: every task ends Cancelled, every round;
+//  2. nested storm: 8 tasks that each open a scope with 3 blocked tasks of their own; one cancel of the OUTER scope wakes all 24;
+//  3. cancel-then-spawn: tasks spawned while the cancel is in flight fail at once.
+// No descriptor leaks: the whole run uses a few hundred sockets one round after the other.
+import { Host, useNet } from "std:host";
+import { milliseconds } from "std:time";
+import { Scope, TaskHandle, CancelToken, scopeNetDo, spawnNet } from "std:task";
+import {
+  NetGrant, Listener, Stream, Peer, NetErrorKind, RecvResult, RecvData, RecvEof, RecvTimeout, RecvReset, RecvError,
+  Denied, Closed, Timeout, Cancelled, Reset, InvalidArgument, InvalidPeer, Os,
+  useListenerNet, useConnectionBeside, useAccepted, acceptDetached, dropAccepted, portOf, recv
+} from "std:net";
+
+const LONG: int = 30000;
+
+function kindName(k: NetErrorKind): string {
+  return match (k) {
+    Denied => "Denied",
+    Closed => "Closed",
+    Timeout => "Timeout",
+    Cancelled => "Cancelled",
+    Reset => "Reset",
+    InvalidArgument => "InvalidArgument",
+    InvalidPeer => "InvalidPeer",
+    Os => "Os"
+  };
+}
+
+function recvName(r: RecvResult): string {
+  return match (r) {
+    RecvData(b) => "data",
+    RecvEof => "eof",
+    RecvTimeout => "Timeout",
+    RecvReset => "Reset",
+    RecvError(e) => kindName(e.kind)
+  };
+}
+
+// One blocked task: its own listener; kind 0 waits in accept on it, kind 1 connects, accepts and waits in recv on the accepted side.
+// Returns the kind of the error that ended the wait, or what it got.
+function blocked(net: NetGrant, kind: int): string {
+  const out: string[] = [];
+  useListenerNet(net, "127.0.0.1", 0, 4, (ln: Listener, n: NetGrant) => {
+    if (kind == 0) {
+      const r = acceptDetached(ln, milliseconds(LONG));
+      match (r) {
+        Ok(a) => {
+          dropAccepted(a);
+          out.push("accepted");
+        },
+        Err(e) => {
+          out.push(kindName(e.kind));
+        }
+      }
+    } else {
+      const c = useConnectionBeside(n, "127.0.0.1", portOf(ln), milliseconds(LONG), ln, (cs: Stream, l2: Listener) => {
+        const a = useAccepted(l2, milliseconds(LONG), (s: Stream, p: Peer) => {
+          out.push(recvName(recv(s, 16, milliseconds(LONG))));
+        });
+        if (a.isErr()) {
+          out.push(kindName(a.unwrapErr().kind));
+        }
+      });
+      if (c.isErr() && out.length == 0) {
+        out.push(kindName(c.unwrapErr().kind));
+      }
+    }
+  });
+  return out.length > 0 ? out[0] : "no listener";
+}
+
+// a short, uneven delay that does not read the clock: the cancellers fire while the others are at different stages
+function spin(n: int): int {
+  let x: int = 1;
+  let i: int = 0;
+  while (i < n) {
+    x = (x * 31 + i) % 1000003;
+    i += 1;
+  }
+  return x;
+}
+
+function round(net: NetGrant, tasks: int, cancellers: int, salt: int): int {
+  const counts: int[] = [0];
+  scopeNetDo(net, (sc: Scope, g: NetGrant) => {
+    const tok = sc.token();
+    let probes: TaskHandle<string>[] = [];
+    let i: int = 0;
+    while (i < tasks) {
+      const k = i;
+      probes.push(spawnNet(sc, g, (t: NetGrant) => blocked(t, k % 2)));
+      i += 1;
+    }
+    let stops: TaskHandle<int>[] = [];
+    i = 0;
+    while (i < cancellers) {
+      const k = i;
+      stops.push(spawnNet(sc, g, (t: NetGrant) => {
+        const x = spin(3000 * (k + 1) + salt * 700);
+        tok.cancel();
+        return x % 2;
+      }));
+      i += 1;
+    }
+    for (const h of stops) {
+      h.join();
+    }
+    for (const p of probes) {
+      if (p.join() == "Cancelled") {
+        counts[0] = counts[0] + 1;
+      }
+    }
+  });
+  return counts[0];
+}
+
+// nested: 8 outer tasks, each with an inner scope of 3 blocked tasks; only the outer token is cancelled
+function nestedStorm(net: NetGrant): int {
+  const counts: int[] = [0];
+  scopeNetDo(net, (sc: Scope, g: NetGrant) => {
+    const tok = sc.token();
+    let outer: TaskHandle<int>[] = [];
+    let i: int = 0;
+    while (i < 8) {
+      outer.push(spawnNet(sc, g, (t: NetGrant) => {
+        const n: int[] = [0];
+        scopeNetDo(t, (sc2: Scope, g2: NetGrant) => {
+          let inner: TaskHandle<string>[] = [];
+          let j: int = 0;
+          while (j < 3) {
+            const k = j;
+            inner.push(spawnNet(sc2, g2, (u: NetGrant) => blocked(u, k % 2)));
+            j += 1;
+          }
+          for (const h of inner) {
+            if (h.join() == "Cancelled") {
+              n[0] = n[0] + 1;
+            }
+          }
+        });
+        return n[0];
+      }));
+      i += 1;
+    }
+    const x = spin(20000);
+    tok.cancel();
+    for (const h of outer) {
+      counts[0] = counts[0] + h.join();
+    }
+    if (x < 0) {
+      counts[0] = -1;
+    }
+  });
+  return counts[0];
+}
+
+// tasks spawned after the cancel (or while it is in flight) fail at once instead of blocking
+function lateSpawns(net: NetGrant): int {
+  const counts: int[] = [0];
+  scopeNetDo(net, (sc: Scope, g: NetGrant) => {
+    sc.cancel();
+    let hs: TaskHandle<string>[] = [];
+    let i: int = 0;
+    while (i < 16) {
+      const k = i;
+      hs.push(spawnNet(sc, g, (t: NetGrant) => blocked(t, k % 2)));
+      i += 1;
+    }
+    for (const h of hs) {
+      if (h.join() == "Cancelled") {
+        counts[0] = counts[0] + 1;
+      }
+    }
+  });
+  return counts[0];
+}
+
+function main(host: Host): void {
+  useNet(host, net => {
+    let total: int = 0;
+    let r: int = 0;
+    while (r < 12) {
+      const got = round(net, 24, 4, r);
+      if (got != 24) {
+        console.log("round " + r.toString() + ": only " + got.toString() + " of 24 tasks ended Cancelled");
+      }
+      total += got;
+      r += 1;
+    }
+    console.log("rounds: " + total.toString() + " of 288 cancelled");
+    console.log("nested: " + nestedStorm(net).toString() + " of 24 cancelled");
+    console.log("late: " + lateSpawns(net).toString() + " of 16 cancelled");
+  });
+}

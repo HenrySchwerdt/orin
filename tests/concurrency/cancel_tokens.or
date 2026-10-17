@@ -1,0 +1,140 @@
+// Cancellation tokens of scopes (ADR-0017 Addendum D; tools/test_concurrency.sh: plain, ThreadSanitizer, ASan + UBSan). No network:
+// the wake sources of L0 are tested through std:task alone.
+//  1. a scope token cancels once (true, then false), is permanent, and is seen by the body and by tasks, also by tasks spawned
+//     after the cancellation; a sibling scope is not affected;
+//  2. generation-tagged handles: a token kept after its scope ended is stale (cancel() false, isCancelled() false) and never
+//     cancels another scope that reuses the slot, over many rounds;
+//  3. nesting: an inner cancel does not reach up, an outer cancel reaches every depth, also beyond the 32 levels with a token of
+//     their own (a deeper scope has none and observes its ancestors');
+//  4. a token is a value a task can capture: a task cancels its own scope and the others see it.
+import { scope, spawn, spawnDo, channel, isCancelled, CancelToken, Scope, TaskHandle } from "std:task";
+
+function check(label: string, cond: bool): void {
+  console.log(label + ": " + (cond ? "yes" : "NO"));
+}
+
+function basics(): void {
+  const r = scope(s => {
+    const tok = s.token();
+    check("fresh: not cancelled", !s.isCancelled() && !tok.isCancelled() && !isCancelled());
+    const first = s.cancel();
+    const second = s.cancel();
+    const third = tok.cancel();
+    check("cancel reports a change once", first && !second && !third);
+    check("permanent: scope, token and body see it", s.isCancelled() && tok.isCancelled() && isCancelled());
+    const late = spawn(s, () => isCancelled());
+    check("a task spawned afterwards sees it", late.join());
+    return 0;
+  });
+  check("a sibling scope is untouched", scope(s => !s.isCancelled() && !isCancelled()) && r == 0);
+  check("after the scope: the thread is unbound again", !isCancelled());
+}
+
+function staleTokens(): void {
+  let ok = true;
+  let slotsReused = true;
+  let round = 0;
+  let kept: CancelToken[] = [];
+  while (round < 200) {
+    const t = scope(s => s.token());
+    kept.push(t);
+    ok = ok && !t.cancel() && !t.isCancelled();
+    const fresh = scope(s => {
+      // every token of an earlier scope is stale: none of them can cancel this scope, whichever slot it got
+      for (const old of kept) {
+        if (old.cancel() || old.isCancelled()) {
+          return false;
+        }
+      }
+      return !s.isCancelled() && !isCancelled();
+    });
+    slotsReused = slotsReused && fresh;
+    round += 1;
+  }
+  check("stale tokens are harmless (200 rounds)", ok && slotsReused);
+}
+
+function nesting(): void {
+  const outerSaw = scope(s => {
+    const outer = s.token();
+    const innerTokens = scope(s2 => {
+      const inner = s2.token();
+      const innerCancelled = s2.cancel();
+      check("inner cancel does not reach up", innerCancelled && inner.isCancelled() && !outer.isCancelled() && !s.isCancelled());
+      return true;
+    });
+    const deepSees = scope(s3 => {
+      outer.cancel();
+      return s3.isCancelled() && isCancelled();
+    });
+    check("outer cancel reaches an inner scope", innerTokens && deepSees);
+    return outer.isCancelled();
+  });
+  check("outer stays cancelled", outerSaw);
+}
+
+// nest(n): n scopes deep, then reports whether the cancellation of the outermost token is visible at the bottom
+function nest(n: int, root: CancelToken): bool {
+  if (n == 0) {
+    root.cancel();
+    return isCancelled();
+  }
+  return scope(s => nest(n - 1, root));
+}
+
+function deep(): void {
+  const seen = scope(s => nest(40, s.token()));
+  check("40 nested scopes: the outermost cancel is visible at the bottom", seen);
+  // a task in a deep chain: the chain is made inside tasks, so each level binds in its own thread
+  const viaTasks = scope(s => {
+    const root = s.token();
+    const h = spawn(s, () => scope(s2 => {
+      const g = spawn(s2, () => {
+        root.cancel();
+        return isCancelled();
+      });
+      return g.join();
+    }));
+    return h.join();
+  });
+  check("a grandchild task sees the cancel of the root", viaTasks);
+}
+
+function captured(): void {
+  const r = scope(s => {
+    const tok = s.token();
+    const ch = channel<bool>(4);
+    const rx = ch.rx;
+    const tx = ch.tx;
+    let hs: TaskHandle<bool>[] = [];
+    let i = 0;
+    while (i < 8) {
+      hs.push(spawn(s, () => {
+        const mine = rx.recv().unwrapOr(false);
+        return mine && isCancelled();
+      }));
+      i += 1;
+    }
+    const canceller = spawn(s, () => tok.cancel());
+    const changed = canceller.join();
+    i = 0;
+    while (i < 8) {
+      tx.send(true);
+      i += 1;
+    }
+    let all = true;
+    for (const h of hs) {
+      all = h.join() && all;
+    }
+    return changed && all;
+  });
+  check("a task cancels the scope; 8 other tasks see it", r);
+}
+
+function main(): void {
+  basics();
+  staleTokens();
+  nesting();
+  deep();
+  captured();
+}
