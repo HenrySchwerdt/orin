@@ -149,6 +149,7 @@ function bigDigitsValue(src: string, a: usize, b: usize, base: int): Option<int>
 }
 
 // Character code for a simple escape letter (`n t r 0 \ " '`), or -1.
+@Ensures(result >= -1 && result <= 255)
 function simpleEscape(e: int): int {
   if (e == 110) {
     return 10;
@@ -187,6 +188,8 @@ function lexTemplateChunk(
   let parts: string[] = [];
   let i = start;
   let run = i;
+  @Invariant(start <= i && i <= n)
+  @Invariant(run <= i)
   while (true) {
     if (i >= n) {
       return Err(diag("E0100", span(file, open, open + 1), "unterminated template literal"));
@@ -248,12 +251,14 @@ function lexTemplateChunk(
 function skipTrivia(file: usize, src: string, start: usize): Result<usize, Diagnostic> {
   const n = src.length;
   let i = start;
+  @Invariant(start <= i && i <= n)
   while (i < n) {
     const c = src.charCodeAt(i);
     if (c == 32 || c == 9 || c == 10 || c == 13) {
       i += 1;
     } else if (c == 47 && i + 1 < n && src.charCodeAt(i + 1) == 47) {
       i += 2;
+      @Invariant(start <= i && i <= n)
       while (i < n && src.charCodeAt(i) != 10) {
         i += 1;
       }
@@ -261,6 +266,7 @@ function skipTrivia(file: usize, src: string, start: usize): Result<usize, Diagn
       const cstart = i;
       i += 2;
       let closed = false;
+      @Invariant(cstart + 2 <= i && i <= n)
       while (i < n && !closed) {
         if (src.charCodeAt(i) == 42 && i + 1 < n && src.charCodeAt(i + 1) == 47) {
           closed = true;
@@ -382,9 +388,12 @@ export function decodeEntities(s: string): string {
   let parts: string[] = [];
   let run: usize = 0;
   let i: usize = 0;
+  @Invariant(run <= i && i <= s.length)
   while (i < s.length) {
+    let decoded = false;
     if (s.charCodeAt(i) == 38) {
       let j = i + 1;
+      @Invariant(i < j && j <= s.length)
       while (j < s.length && j - i <= 10 && s.charCodeAt(j) != 59 && s.charCodeAt(j) != 38) {
         j += 1;
       }
@@ -395,11 +404,13 @@ export function decodeEntities(s: string): string {
           parts.push(bytes);
           i = j + 1;
           run = i;
-          continue;
+          decoded = true;
         }
       }
     }
-    i += 1;
+    if (!decoded) {
+      i += 1;
+    }
   }
   parts.push(s.substring(run, s.length));
   return parts.join("");
@@ -517,6 +528,9 @@ export class Lexer {
           && this.toks[this.toks.length - 1].span.end == this.pos)
   @Ensures(this.done && this.err.isNone()
       ==> this.pos == this.src.length && this.toks.length == old(this.toks.length))
+  @Ensures(this.pos <= this.src.length)
+  @Ensures(this.err.isNone()
+      || this.err.unwrap().code == "E0100" && this.err.unwrap().span.end <= this.src.length)
   step(): void {
     const mode = this.mode();
     if (mode == CTX_OX_KIDS) {
@@ -616,6 +630,18 @@ export class Lexer {
   @Ensures(result.isErr()
       ==> result.unwrapErr().code == "E0100" && result.unwrapErr().span.end <= this.src.length)
   run(): Result<Token[], Diagnostic> {
+    // The class invariants again: the verifier havocs `this` at the start of an iteration and assumes the callee's
+    // class invariants only for a receiver that satisfies them (`step` maintains them). Not run time checks (loop
+    // invariants are type-checked only, compiler/check/rtcheck.or); the two quantifiers range over the context stack.
+    @Invariant(this.pos <= this.src.length)
+    @Invariant(this.toks.length == 0 || this.toks[this.toks.length - 1].span.end <= this.pos)
+    @Invariant(this.depth.every(d => d >= 0))
+    @Invariant(this.depth.length == this.ctx.length)
+    @Invariant(this.ctx.every(k => k >= CTX_TPL && k <= CTX_OX_CLOSE))
+    @Invariant(!this.done || this.err.isSome() || this.pos == this.src.length)
+    @Invariant(this.err.isNone() || this.done)
+    @Invariant(this.err.isNone()
+        || this.err.unwrap().code == "E0100" && this.err.unwrap().span.end <= this.src.length)
     while (!this.done) {
       this.step();
     }
@@ -643,6 +669,7 @@ export class Lexer {
   // does not get the invariants assumed by the verifier.)
   @Requires(this.ctx.every(k => k >= CTX_TPL && k <= CTX_OX_CLOSE))
   @Ensures(result >= -1 && result <= CTX_OX_CLOSE)
+  @Ensures(result == -1 || this.ctx.length > 0)
   private mode(): int {
     const k = this.ctx.length;
     return k == 0 ? -1 : this.ctx[k - 1];
@@ -698,6 +725,7 @@ export class Lexer {
   // One token inside an OX opening (`mode` CTX_OX_TAG) or closing tag (CTX_OX_CLOSE), at a significant offset: a name,
   // `=`, a string value, the `{` of an expression value, or the `>` / `/>` that ends the tag.
   @Requires(!this.done && this.pos < this.src.length)
+  @Requires(this.err.isNone())
   private oxTag(mode: int): void {
     const src = this.src;
     const n = src.length;
@@ -748,11 +776,13 @@ export class Lexer {
 
   // An OX attribute string at the cursor (`"` or `'`), as in TypeScript: no backslash escapes, line breaks allowed,
   // character references decoded (`title="Tom &amp; Jerry"` is `Tom & Jerry`). The token is a KStr.
+  @Requires(this.err.isNone() && this.pos < this.src.length)
   private oxString(): void {
     const src = this.src;
     const start = this.pos;
     const q = src.charCodeAt(start);
     let j = start + 1;
+    @Invariant(start < j && j <= src.length)
     while (j < src.length && src.charCodeAt(j) != q) {
       j += 1;
     }
@@ -767,11 +797,16 @@ export class Lexer {
   // next `<` or `{` (not emitted when it cooks to nothing), then that `{` (an expression child), `</` (the closing tag)
   // or `<` (a nested element); `<:` starts a named slot tag and `</:` closes it (ADR-0044). `}` and `>` are not allowed in text (as in TypeScript): write `{"}"}` or `&gt;`.
   @Requires(!this.done)
+  @Requires(this.err.isNone() && this.ctx.length > 0 && this.pos <= this.src.length)
   private oxChild(): void {
     const src = this.src;
     const n = src.length;
     const i = this.pos;
     let j = i;
+    // (`this.pos`, `this.src`, `this.err` and `this.ctx` are not changed by an iteration that continues: the ones that
+    // call `fail` return)
+    @Invariant(i <= j && j <= n)
+    @Invariant(this.pos == i && this.src.length == n && this.err.isNone() && this.ctx.length > 0)
     while (j < n && src.charCodeAt(j) != 60 && src.charCodeAt(j) != 123) {
       const c = src.charCodeAt(j);
       if (c == 125 || c == 62) {
@@ -1014,6 +1049,7 @@ export class Lexer {
   }
 
   // String literal at the cursor (the opening quote). The token text is the unescaped content.
+  @Requires(this.err.isNone() && this.pos < this.src.length)
   private string(): void {
     const src = this.src;
     const file = this.file;
@@ -1022,7 +1058,11 @@ export class Lexer {
     let parts: string[] = [];
     let i = start + 1;
     let run = i;
-    while (true) {
+    let closed = false;
+    // (an iteration that continues leaves `this` as it was: the ones that call `fail` return)
+    @Invariant(start < i && i <= n && run <= i)
+    @Invariant(this.pos == start && this.src.length == n && this.err.isNone())
+    while (!closed) {
       if (i >= n) {
         this.fail(diag("E0100", span(file, start, n), "unterminated string literal"));
         return;
@@ -1031,13 +1071,11 @@ export class Lexer {
       if (c == 34) {
         parts.push(src.substring(run, i));
         i += 1;
-        break;
-      }
-      if (c == 10) {
+        closed = true;
+      } else if (c == 10) {
         this.fail(diag("E0100", span(file, start, i), "unterminated string literal"));
         return;
-      }
-      if (c == 92) {
+      } else if (c == 92) {
         parts.push(src.substring(run, i));
         if (i + 1 >= n) {
           this.fail(diag("E0100", span(file, start, n), "unterminated string literal"));
