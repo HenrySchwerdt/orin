@@ -59,3 +59,14 @@ import Orin
 #print axioms Orin.loopFix_spec
 #print axioms Orin.Cont.seq
 #print axioms Orin.Fle.trans
+#print axioms Orin.inv_prep
+#print axioms Orin.inv_entry
+#print axioms Orin.inv_ret
+#print axioms Orin.frozen_step_nopending
+#print axioms Orin.frozen_step
+#print axioms Orin.good_step
+#print axioms Orin.good_reach
+#print axioms Orin.prog_sound
+#print axioms Orin.prog_no_use_after_free
+#print axioms Orin.prog_no_shared_store
+#print axioms Orin.fcheck_cont
