@@ -5,9 +5,9 @@
 // prelude's fixed messages first, then every other `TTrap` message in function, block order, first occurrence wins), and
 // the counts of string literals (`@orin_s<k>`) and vtables (`@orin_vt<k>`). Emitting a function only reads this table.
 
-import { MProgram } from "../../mir";
+import { MProgram, rtIds, rtLoaded } from "../../mir";
 import { fnSymbol } from "../c";
-import { fixedMsgs, prelude, declares, factsDeclare } from "./runtime";
+import { fixedMsgs, prelude, declares, coreDeclares, factsDeclare } from "./runtime";
 
 // Function symbols in function order, all distinct; trap messages without repeats, each indexed by `msgIdx`; the runtime
 // symbols the module declares or defines (C runtime, prelude helpers, intrinsics).
@@ -22,6 +22,7 @@ export class LlvmSymbols {
   private runtime: Map<string, bool>;
   private nStrings: usize;
   private nVtables: usize;
+  private rt: int[];
 
   constructor(
     names: string[],
@@ -31,6 +32,7 @@ export class LlvmSymbols {
     runtime: Map<string, bool>,
     nStrings: usize,
     nVtables: usize,
+    rt: int[],
   ) {
     this.names = names;
     this.byName = byName;
@@ -39,6 +41,18 @@ export class LlvmSymbols {
     this.runtime = runtime;
     this.nStrings = nStrings;
     this.nVtables = nVtables;
+    this.rt = rt;
+  }
+
+  // The symbol of the L1 entry `k` (mir/rt.or) in the program; "" when the program has none (it then calls the C runtime).
+  @Requires(k < this.rt.length)
+  l1(k: usize): string {
+    return this.rt[k] < 0 ? "" : this.names[this.rt[k].toUsize()];
+  }
+
+  // True when the program was built with the L1 entries (`$rt` loaded): its immortal variants are global objects.
+  l1Loaded(): bool {
+    return rtLoaded(this.rt);
   }
 
   count(): usize {
@@ -85,10 +99,14 @@ export class LlvmSymbols {
   }
 }
 
-// The names that the `declare` / `define` lines of `text` introduce.
+// The names that the `declare` / `define` lines of `text` introduce, and the external globals it declares.
 export function introducedNames(text: string): string[] {
   let out: string[] = [];
   for (const line of text.split("\n")) {
+    if (line.startsWith("@") && line.includes(" = external ")) {
+      // a global of the C runtime (`@orin_heap = external thread_local ...`)
+      out.push(line.substring(1, line.indexOf(" ").unwrap()));
+    }
     if (line.startsWith("declare ") || line.startsWith("define ")) {
       const at = line.indexOf("@");
       if (at.isSome()) {
@@ -139,7 +157,7 @@ export function llvmSymbols(prog: MProgram): LlvmSymbols {
     }
   }
   let runtime = new Map<string, bool>();
-  for (const n of introducedNames(declares() + factsDeclare() + prelude())) {
+  for (const n of introducedNames(declares() + coreDeclares(prog) + factsDeclare() + prelude())) {
     runtime.set(n, true);
   }
   return new LlvmSymbols(
@@ -150,6 +168,7 @@ export function llvmSymbols(prog: MProgram): LlvmSymbols {
     runtime,
     prog.strings.length,
     prog.vtables.length,
+    rtIds(prog),
   );
 }
 
@@ -208,6 +227,10 @@ function globalDeclared(w: string, syms: LlvmSymbols): bool {
   }
   if (numberedBelow(w, "orin_s", syms.strings()) || numberedBelow(w, "orin_vt", syms.vtables())) {
     return true;
+  }
+  if (w.startsWith("orin_nz") && w.length > 7 && syms.l1Loaded()) {
+    // a static payload-less variant (`nullaryDecls` in llvm.or): the tag is any decimal number
+    return numberedBelow(w, "orin_nz", 4294967296);
   }
   return syms.isRuntime(w) || w == "main";
 }

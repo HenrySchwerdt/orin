@@ -110,6 +110,10 @@ def selftest():
         (["tooling/conformance/src/main.or"], {"code": True, "macos": True, "vscode": False, "mutants": []}),
         (["tooling/differential/src/main.or"], {"code": True, "macos": True, "vscode": False, "mutants": []}),
         (["tools/differential.sh"], {"code": True, "macos": True, "vscode": False, "mutants": []}),
+        (["tooling/protocol/src/lsp.or"], {"code": True, "macos": True, "vscode": False, "mutants": []}),
+        (["tooling/protocol/tests/rpc_test.or", "tools/protocol.sh"], {"code": True, "macos": True, "vscode": False, "mutants": []}),
+        (["tooling/clitests/src/osig.or"], {"code": True, "macos": True, "vscode": False, "mutants": []}),
+        (["tooling/clitests/tests/fmtlogic_test.or", "tools/clitests.sh"], {"code": True, "macos": True, "vscode": False, "mutants": []}),
         (["editors/vscode/package.json"], {"code": False, "macos": False, "vscode": True, "mutants": []}),
         (["compiler/backends/c/function.or"], {"code": True, "macos": True, "vscode": False, "mutants": []}),
         (["compiler/backends/llvm/function.or"], {"code": True, "macos": True, "vscode": False, "mutants": []}),
@@ -155,7 +159,7 @@ def selftest():
     for file, checks in dependencies:
         cases.append(([file], {"code": True, "macos": True, "vscode": False,
                                "mutants": [], "std_backend_checks": checks}))
-    cases.append((["docs/std-jsonvalue.md", "docs/std-jsondecode.md"], {
+    cases.append((["docs/std-json.md", "docs/std-json-decode.md"], {
         "code": False, "macos": False, "vscode": False, "mutants": [], "std_backend_checks": []}))
     cases.append((["library/std/jsondecode.or", "library/std/jsonnumber.or", "tools/check_jsonvalue.py"], {
         "code": True, "macos": True, "vscode": False, "mutants": [],

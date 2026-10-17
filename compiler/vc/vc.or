@@ -31,7 +31,8 @@ import { Program } from "../hir";
 import { LoadedProgram } from "../loader";
 import { isSyntacticallyTrivial, inferPurity, allFunctions } from "../check";
 import { writeFile, readFile } from "std:fs";
-import { shellRun } from "../util";
+import { shellRun, mapOrderedProcess } from "../util";
+import { parallelism } from "std:task";
 import { Res, QWarn, Report, assumptionsFor } from "./report";
 import { replyValues } from "./sx";
 import {
@@ -334,7 +335,7 @@ function prelude(): string {
     + "(define-fun trem ((a Int) (b Int)) Int (- a (* b (tdiv a b))))\n";
 }
 
-type Rt = { p: Prog; z3: string; qn: usize; out: Res[]; warns: QWarn[]; };
+type Rt = { p: Prog; or: Oracle; fi: usize; qn: usize; out: Res[]; warns: QWarn[]; miss: string[]; };
 
 // A value the counterexample shows: `label = value`, shown when its guard holds (an element only below the
 // length, a payload only when present).
@@ -365,13 +366,22 @@ function queryText(g: Gen, base: string[], pc: string[], goal: string, probes: P
     + assertAll(extra) + "(assert (not " + goal + "))\n(check-sat)\n" + get;
 }
 
-function solve(fs: FsGrant, proc: ProcessGrant, z3: string, qn: usize, tag: string, query: string): Result<Solved, string> {
-  const base = "build/contracts-vc/q" + qn.toString() + tag;
-  const w = writeFile(fs, base + ".smt2", prelude() + query);
-  if (w.isErr()) {
-    return Err("cannot write " + base + ".smt2: " + w.unwrapErr());
-  }
-  const rc = shellRun(proc, z3 + " -in -t:4000 -T:15 < " + base + ".smt2 > " + base + ".out 2>&1");
+// The solver's answers, by query. With one thread a query is solved when it is asked. With more, `solve` cannot run
+// the solver (a task has one grant, and a function's proofs need the file system and the process), so a query without
+// an answer is written to its file and answered `pending` (a Solved whose `values` are its file base and its key); the
+// asker passes these up in `miss`, the driver solves them in parallel, enters the answers here, and runs the functions
+// that asked again. An answer depends on the text of its query only, so the results do not depend on the number of
+// threads.
+type Oracle = { z3: string; deferred: bool; answers: Map<string, Result<Solved, string>>; };
+
+const PENDING: string = "pending";
+
+function solverCommand(z3: string, base: string): string {
+  return z3 + " -in -t:4000 -T:15 < " + base + ".smt2 > " + base + ".out 2>&1";
+}
+
+// The answer in `base.out` after the solver ran with exit status `rc`.
+function readAnswer(fs: FsGrant, z3: string, base: string, rc: int): Result<Solved, string> {
   if (rc != 0 && rc != 1) {
     return Err("solver `" + z3 + "` could not be run (exit status " + rc.toString() + ")");
   }
@@ -387,6 +397,45 @@ function solve(fs: FsGrant, proc: ProcessGrant, z3: string, qn: usize, tag: stri
     return Ok(Solved { status: first, values: first == "sat" ? replyValues(rest) : [] });
   }
   return Err("solver answered: " + first);
+}
+
+function solve(fs: FsGrant, proc: ProcessGrant, or: Oracle, fi: usize, qn: usize, tag: string, query: string): Result<Solved, string> {
+  const base = "build/contracts-vc/f" + fi.toString() + "q" + qn.toString() + tag;
+  const text = prelude() + query;
+  const key = base + "\n" + text;
+  if (or.deferred) {
+    const known = or.answers.get(key);
+    if (known.isSome()) {
+      return known.unwrap();
+    }
+  }
+  const w = writeFile(fs, base + ".smt2", text);
+  if (w.isErr()) {
+    return Err("cannot write " + base + ".smt2: " + w.unwrapErr());
+  }
+  if (or.deferred) {
+    return Ok(Solved { status: PENDING, values: [base, key] });
+  }
+  return readAnswer(fs, or.z3, base, shellRun(proc, solverCommand(or.z3, base)));
+}
+
+// Solves the missed queries (pairs of file base and key) on all threads and enters the answers.
+function solveMissing(fs: FsGrant, proc: ProcessGrant, or0: Oracle, miss: string[]): Oracle {
+  let or = or0;
+  const n = miss.length / 2;
+  let cmds: string[] = [];
+  let j: usize = 0;
+  while (j < n) {
+    cmds.push(solverCommand(or0.z3, miss[2 * j]));
+    j += 1;
+  }
+  const rcs = mapOrderedProcess(proc, n, (k, pg) => shellRun(pg, cmds[k]));
+  let k: usize = 0;
+  while (k < n) {
+    or.answers.set(miss[2 * k + 1], readAnswer(fs, or0.z3, miss[2 * k], rcs[k]));
+    k += 1;
+  }
+  return or;
 }
 
 // ---------------------------------------------------------------------------------------- counterexamples
@@ -662,20 +711,23 @@ function postVars(entry: Var[], fin: Var[]): Var[] {
 }
 
 // What the solver said, before it is judged.
-type Raw = { status: string; reason: string; values: string[]; };
+type Raw = { status: string; reason: string; values: string[]; miss: string[]; };
 
 // Is `unknown` worth a second try? The quantified facts that make a proof possible (the lemmas about sums, the
 // elementwise definitions) often keep the solver from building a model when the claim is false. A bounded search
 // drops the lemmas (they follow from the definitions, so a model of the definitions satisfies them) and limits the
 // length of every array and string that is shown in the counterexample: a model found that way is a model of the
 // original query, hence a real counterexample.
-function rawProve(fs: FsGrant, proc: ProcessGrant, z3: string, qn: usize, g: Gen, base: string[], pc: string[], goal: string, probes: Probe[]): Raw {
+function rawProve(fs: FsGrant, proc: ProcessGrant, or: Oracle, fi: usize, qn: usize, g: Gen, base: string[], pc: string[], goal: string, probes: Probe[]): Raw {
   const q = queryText(g, base, pc, goal, probes, true, []);
-  const s = solve(fs, proc, z3, qn, "", q);
+  const s = solve(fs, proc, or, fi, qn, "", q);
   if (s.isErr()) {
-    return Raw { status: "error", reason: s.unwrapErr(), values: [] };
+    return Raw { status: "error", reason: s.unwrapErr(), values: [], miss: [] };
   }
   const r = s.unwrap();
+  if (r.status == PENDING) {
+    return Raw { status: "error", reason: PENDING, values: [], miss: r.values };
+  }
   if (r.status == "unknown" && probes.length > 0) {
     let bounds: string[] = [];
     for (const pr of probes) {
@@ -685,13 +737,16 @@ function rawProve(fs: FsGrant, proc: ProcessGrant, z3: string, qn: usize, g: Gen
     }
     if (bounds.length > 0) {
       const q2 = queryText(g, base, pc, goal, probes, false, bounds);
-      const s2 = solve(fs, proc, z3, qn, "b", q2);
+      const s2 = solve(fs, proc, or, fi, qn, "b", q2);
+      if (s2.isOk() && s2.unwrap().status == PENDING) {
+        return Raw { status: "error", reason: PENDING, values: [], miss: s2.unwrap().values };
+      }
       if (s2.isOk() && s2.unwrap().status == "sat") {
-        return Raw { status: "sat", reason: "", values: s2.unwrap().values };
+        return Raw { status: "sat", reason: "", values: s2.unwrap().values, miss: [] };
       }
     }
   }
-  return Raw { status: r.status, reason: "", values: r.values };
+  return Raw { status: r.status, reason: "", values: r.values, miss: [] };
 }
 
 // A sat answer is a counterexample only if nothing on the way was an abstraction.
@@ -754,7 +809,7 @@ function depsVerdict(g: Gen, statuses: string[], deps: usize[], v: Verdict): Ver
 
 // A clause at the end of every path: proved together; when that fails and some paths went through an
 // abstraction, the exact paths are tried alone (a counterexample on one of them is a real one).
-type Proved = { v: Verdict; used: usize; };
+type Proved = { v: Verdict; used: usize; miss: string[]; };
 
 // Why a path's counterexample is not trusted, once the solver has produced one: the path went through an
 // abstraction (a loop), or its path condition or goal mentions a value that is only known through a callee's contract.
@@ -786,7 +841,7 @@ function taintOf(g: Gen, base: string[], pc: string[], goal: string): string {
   return "";
 }
 
-function proveRets(fs: FsGrant, proc: ProcessGrant, z3: string, qn0: usize, g: Gen, base: string[], goals: RetGoal[], statuses: string[], probes: Probe[]): Proved {
+function proveRets(fs: FsGrant, proc: ProcessGrant, or: Oracle, fi: usize, qn0: usize, g: Gen, base: string[], goals: RetGoal[], statuses: string[], probes: Probe[]): Proved {
   let parts: string[] = [];
   let deps: usize[] = [];
   for (const r of goals) {
@@ -794,12 +849,14 @@ function proveRets(fs: FsGrant, proc: ProcessGrant, z3: string, qn0: usize, g: G
     deps = unionUsize(deps, r.deps);
   }
   let used: usize = 1;
-  const raw = rawProve(fs, proc, z3, qn0, g, base, [], andAll(parts), probes);
+  let miss: string[] = [];
+  const raw = rawProve(fs, proc, or, fi, qn0, g, base, [], andAll(parts), probes);
+  miss = concat(miss, raw.miss);
   if (raw.status == "unsat") {
-    return Proved { v: depsVerdict(g, statuses, deps, Verdict { status: "VERIFIED", reason: "", cex: [] }), used: used };
+    return Proved { v: depsVerdict(g, statuses, deps, Verdict { status: "VERIFIED", reason: "", cex: [] }), used: used, miss: miss };
   }
   if (raw.status != "sat") {
-    return Proved { v: judge(g, raw, "", probes), used: used };
+    return Proved { v: judge(g, raw, "", probes), used: used, miss: miss };
   }
   // A model: it is a counterexample only if some path that is exact (no abstraction, no dependence on a callee's
   // contract) can violate the clause. Paths without such a flaw are judged alone.
@@ -815,18 +872,19 @@ function proveRets(fs: FsGrant, proc: ProcessGrant, z3: string, qn0: usize, g: G
     }
   }
   if (allExact) {
-    return Proved { v: judge(g, raw, "", probes), used: used };
+    return Proved { v: judge(g, raw, "", probes), used: used, miss: miss };
   }
   for (const r of goals) {
     if (pathApprox(g, base, r) == "") {
-      const one = rawProve(fs, proc, z3, qn0 + used, g, base, [], "(=> " + andAll(r.pc) + " " + r.goal + ")", probes);
+      const one = rawProve(fs, proc, or, fi, qn0 + used, g, base, [], "(=> " + andAll(r.pc) + " " + r.goal + ")", probes);
       used += 1;
+      miss = concat(miss, one.miss);
       if (one.status == "sat") {
-        return Proved { v: judge(g, one, "", probes), used: used };
+        return Proved { v: judge(g, one, "", probes), used: used, miss: miss };
       }
     }
   }
-  return Proved { v: unknownV(anyApprox), used: used };
+  return Proved { v: unknownV(anyApprox), used: used, miss: miss };
 }
 
 // ---------------------------------------------------------------------------------------- the function
@@ -1006,8 +1064,9 @@ function verifyFn(fs: FsGrant, proc: ProcessGrant, rt0: Rt, f: Fn): Rt {
     if (!wanted) {
       statuses[id] = "SKIPPED";
     } else if (!o.exact) {
-      const raw = rawProve(fs, proc, rt.z3, rt.qn, g, base, o.pc, o.goal, en.probes);
+      const raw = rawProve(fs, proc, rt.or, rt.fi, rt.qn, g, base, o.pc, o.goal, en.probes);
       rt.qn += 1;
+      rt.miss = concat(rt.miss, raw.miss);
       verdicts[id] = judge(g, raw, obligApprox(g, base, raw, o), en.probes);
       statuses[id] = verdicts[id].status;
     }
@@ -1028,8 +1087,9 @@ function verifyFn(fs: FsGrant, proc: ProcessGrant, rt0: Rt, f: Fn): Rt {
       if (covered) {
         statuses[id] = "COVERED";
       } else {
-        const raw = rawProve(fs, proc, rt.z3, rt.qn, g, base, o.pc, o.goal, en.probes);
+        const raw = rawProve(fs, proc, rt.or, rt.fi, rt.qn, g, base, o.pc, o.goal, en.probes);
         rt.qn += 1;
+        rt.miss = concat(rt.miss, raw.miss);
         verdicts[id] = judge(g, raw, obligApprox(g, base, raw, o), en.probes);
         statuses[id] = verdicts[id].status;
       }
@@ -1112,8 +1172,9 @@ function verifyFn(fs: FsGrant, proc: ProcessGrant, rt0: Rt, f: Fn): Rt {
     if (failure != "") {
       rt = pushRes(rt, f, t.line, t.kind, t.text, unknownV(failure), []);
     } else {
-      const pr = proveRets(fs, proc, rt.z3, rt.qn, g, base, goals, statuses, en.probes);
+      const pr = proveRets(fs, proc, rt.or, rt.fi, rt.qn, g, base, goals, statuses, en.probes);
       rt.qn += pr.used;
+      rt.miss = concat(rt.miss, pr.miss);
       rt = pushRes(rt, f, t.line, t.kind, t.text, pr.v, g.usedList());
     }
   }
@@ -1129,8 +1190,9 @@ type Entail = { rt: Rt; holds: bool; };
 function entails(fs: FsGrant, proc: ProcessGrant, rt0: Rt, g: Gen, base: string[], goal: string): Entail {
   let rt = rt0;
   const none: Probe[] = [];
-  const raw = rawProve(fs, proc, rt.z3, rt.qn, g, base, [], goal, none);
+  const raw = rawProve(fs, proc, rt.or, rt.fi, rt.qn, g, base, [], goal, none);
   rt.qn += 1;
+  rt.miss = concat(rt.miss, raw.miss);
   return Entail { rt: rt, holds: raw.status == "unsat" };
 }
 
@@ -1232,17 +1294,63 @@ function qualityChecks(fs: FsGrant, proc: ProcessGrant, rt0: Rt, f: Fn, en: Entr
 
 // ----------------------------------------------------------------------------------------------- driver
 
+// What proving one function yields; the driver puts these together in function order. `miss`: the queries that had no
+// answer yet (then the rest is not final).
+type FnRes = { out: Res[]; warns: QWarn[]; miss: string[]; };
+
+// Functions are independent: query files are named after the function index (f<fi>q<n>), and nothing but the
+// read-only program and the answers of the solver is shared.
+function verifyOne(fs: FsGrant, proc: ProcessGrant, p: Prog, or: Oracle, fi: usize): FnRes {
+  const rt = verifyFn(fs, proc, Rt { p: p, or: or, fi: fi, qn: 0, out: [], warns: [], miss: [] }, p.fns[fi]);
+  return FnRes { out: rt.out, warns: rt.warns, miss: rt.miss };
+}
+
 export function verifyContracts(fs: FsGrant, proc: ProcessGrant, prog: LoadedProgram, sm: SourceMap, hir: Program, z3: string): Report {
   const p = buildProg(prog, sm, hir);
   shellRun(proc, "mkdir -p build/contracts-vc");
-  let rt = Rt { p: p, z3: z3, qn: 0, out: [], warns: [] };
-  for (const f of p.fns) {
-    if (!f.verify) {
-      continue;
+  let or = Oracle { z3: z3, deferred: parallelism() > 1, answers: new Map<string, Result<Solved, string>>() };
+  // Functions without clauses are still analysed (their calls of contracted functions are proof obligations);
+  // if they are outside the fragment nothing is reported for them.
+  let todo: usize[] = [];
+  let done: FnRes[] = [];
+  let open: usize[] = [];
+  let i: usize = 0;
+  while (i < p.fns.length) {
+    if (p.fns[i].verify) {
+      open.push(todo.length);
+      todo.push(i);
+      done.push(FnRes { out: [], warns: [], miss: [] });
     }
-    // Functions without clauses are still analysed (their calls of contracted functions are proof obligations);
-    // if they are outside the fragment nothing is reported for them.
-    rt = verifyFn(fs, proc, rt, f);
+    i += 1;
   }
-  return Report { results: rt.out, warnings: rt.warns };
+  // Rounds: a function that asked a query without an answer is run again after the queries of the round are solved;
+  // one that asked none is final. Without deferring there is one round.
+  while (open.length > 0) {
+    let again: usize[] = [];
+    let miss: string[] = [];
+    for (const k of open) {
+      const r = verifyOne(fs, proc, p, or, todo[k]);
+      if (r.miss.length == 0) {
+        done[k] = r;
+      } else {
+        again.push(k);
+        miss = concat(miss, r.miss);
+      }
+    }
+      if (miss.length > 0) {
+      or = solveMissing(fs, proc, or, miss);
+    }
+    open = again;
+  }
+  let results: Res[] = [];
+  let warns: QWarn[] = [];
+  for (const r of done) {
+    for (const x of r.out) {
+      results.push(x);
+    }
+    for (const w of r.warns) {
+      warns.push(w);
+    }
+  }
+  return Report { results: results, warnings: warns };
 }

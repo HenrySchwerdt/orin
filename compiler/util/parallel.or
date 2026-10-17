@@ -10,7 +10,7 @@
 // every worker a grant of the same authority as a parameter of `f` (std:task `spawnFs` / `spawnProcess`).
 
 import {
-  forkJoin, parallelism, scopeFs, scopeProcess, spawnFs, spawnProcess, TaskHandle,
+  forkJoin, forkJoinLent, parallelism, scopeFs, scopeProcess, spawnFs, spawnProcess, TaskHandle,
 } from "std:task";
 import { FsGrant } from "std:fs";
 import { ProcessGrant } from "std:process";
@@ -41,6 +41,37 @@ function interleave<T>(parts: T[][], n: usize): T[] {
 @Ensures(result.length == n)
 export function mapOrdered<T>(n: usize, f: (i: usize) => T): T[] {
   return forkJoin(n, workerCount(n), f);
+}
+
+// As mapOrdered, with `lent` shared by the workers instead of copied (std:task forkJoinLent): `f` reaches it through its
+// captures (it must capture `lent` itself, not a copy of part of it, and nothing else large). Results are copies, never
+// references into `lent`. With one worker nothing is lent. The caller keeps `lent` unchanged.
+@Ensures(result.length == n)
+export function mapOrderedLent<A, T>(lent: A, n: usize, f: (i: usize) => T): T[] {
+  return forkJoinLent(lent, n, workerCount(n), f);
+}
+
+// [f(0, min(size, n)), f(size, ...), ...]: f gets the half-open index range [lo, hi) of each piece of `size` consecutive
+// indices (the last piece may be shorter), one piece per task step; the results are in piece order. `lent` is shared as in
+// mapOrderedLent. size == 0 is treated as 1.
+export function mapChunksLent<A, T>(
+  lent: A,
+  n: usize,
+  size: usize,
+  f: (lo: usize, hi: usize) => T,
+): T[] {
+  const sz = size == 0 ? 1 : size;
+  const pieces = (n + sz - 1) / sz;
+  return forkJoinLent(
+    lent,
+    pieces,
+    workerCount(pieces),
+    k => {
+      const lo = k * sz;
+      const hi = lo + sz < n ? lo + sz : n;
+      return f(lo, hi);
+    },
+  );
 }
 
 // As mapOrdered, `f` also gets a file-system grant (with the authority of `fs`, owned by its worker).

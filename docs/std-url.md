@@ -1,6 +1,6 @@
 # std:url — percent components and query pairs
 
-`import { percentEncode, percentDecode, parseQuery, stringifyQuery, QueryPair } from "std:url";`
+`import { percentEncode, percentDecode, parseQuery, stringifyQuery, QueryPair, PlusAsSpace, PercentSpace } from "std:url";`
 
 This pure Orin module needs no capabilities. It handles components and query bodies; it does not parse
 whole URLs, resolve hosts, normalize paths, or promise browser/WHATWG URL behavior. Strings in Orin
@@ -12,28 +12,33 @@ are byte strings. All lengths and error offsets here count bytes, not Unicode co
 type UrlErrorKind = TruncatedEscape | InvalidHex | InvalidUtf8;
 type UrlError = { kind: UrlErrorKind; offset: usize; };
 type QueryPair = { key: string; value: string; };
-type QueryEncodeError = { pairIndex: usize; inValue: bool; offset: usize; };
+type QueryEncodeErrorKind = InvalidKeyUtf8 | InvalidValueUtf8;
+type QueryEncodeError = { kind: QueryEncodeErrorKind; pairIndex: usize; offset: usize; };
+type FormSpace = PlusAsSpace | PercentSpace;
 
-percentEncode(s: string, spaceAsPlus: bool): string
-percentEncodeBytes(b: Bytes, spaceAsPlus: bool): string
-percentDecode(s: string, plusAsSpace: bool): Result<string, UrlError>
-percentDecodeBytes(s: string, plusAsSpace: bool): Result<Bytes, UrlError>
-parseQuery(s: string, plusAsSpace: bool): Result<QueryPair[], UrlError>
-stringifyQuery(pairs: QueryPair[], spaceAsPlus: bool): Result<string, QueryEncodeError>
+percentEncode(s: string, space: FormSpace): string
+percentEncodeBytes(b: Bytes, space: FormSpace): string
+percentDecode(s: string, space: FormSpace): Result<string, UrlError>
+percentDecodeBytes(s: string, space: FormSpace): Result<Bytes, UrlError>
+parseQuery(s: string, space: FormSpace): Result<QueryPair[], UrlError>
+stringifyQuery(pairs: QueryPair[], space: FormSpace): Result<string, QueryEncodeError>
 urlErrorMessage(e: UrlError): string
+queryEncodeErrorMessage(e: QueryEncodeError): string
 ```
 
-All mode arguments are required. Use `false` for ordinary percent components and `true` for query
-form-style spaces. Encoding leaves only ASCII letters, digits and `-._~` unchanged; all other bytes
-become uppercase `%HH`, except that `spaceAsPlus=true` emits `+` for ASCII space. Literal `+` always
-encodes as `%2B`. UTF-8 text is encoded byte by byte: `percentEncode("café 🐈", false)` produces
+The space mode is a required argument of type `FormSpace` (ADR-0048 rule 2.5; it replaces the `spaceAsPlus` /
+`plusAsSpace` booleans, which had opposite polarity in encoders and decoders). Use `PercentSpace` for ordinary
+percent components and `PlusAsSpace` for query form-style spaces: with `PlusAsSpace` encoding writes ASCII space as
+`+` and decoding reads a raw `+` as a space. Encoding leaves only ASCII letters, digits and `-._~` unchanged; all
+other bytes become uppercase `%HH`, except that `PlusAsSpace` emits `+` for ASCII space. Literal `+` always
+encodes as `%2B`. UTF-8 text is encoded byte by byte: `percentEncode("café 🐈", PercentSpace)` produces
 `caf%C3%A9%20%F0%9F%90%88`. No Unicode normalization occurs. The two encoders also accept invalid
 UTF-8 and NUL; a Bytes view encodes only its selected bytes.
 
 Decoding accepts either hex case, performs one decoding pass, and leaves other raw bytes unchanged.
-`plusAsSpace=false` preserves `+`; `true` changes raw `+` to space, while `%2B` still becomes literal
-plus. `percentDecode("a+%2B%2520", true)` yields `a +%20`. The Bytes decoder permits every decoded byte.
-The text decoder validates the complete decoded component using `std:utf8.checkUtf8`, rejecting
+`PercentSpace` preserves a raw `+`; `PlusAsSpace` changes it to space, while `%2B` still becomes literal
+plus. `percentDecode("a+%2B%2520", PlusAsSpace)` yields `a +%20`. The Bytes decoder permits every decoded byte.
+The text decoder validates the complete decoded component using `std:utf8.validate`, rejecting
 invalid leading/continuation bytes, overlong forms, surrogates, truncated sequences and values above
 U+10FFFF. Raw invalid UTF-8 is rejected too. Neither decoder strips whitespace or replaces bad bytes.
 
@@ -50,10 +55,10 @@ allocate a per-byte offset table.
 Pass a query body, excluding `?` and fragment delimiters:
 
 ```typescript
-const pairs = parseQuery("a=1&a=2&flag&=x&plus=a+b%2Bc", true).unwrap();
+const pairs = parseQuery("a=1&a=2&flag&=x&plus=a+b%2Bc", PlusAsSpace).unwrap();
 // [{key:"a", value:"1"}, {key:"a", value:"2"}, {key:"flag", value:""},
 //  {key:"", value:"x"}, {key:"plus", value:"a b+c"}]
-const wire = stringifyQuery(pairs, true).unwrap();
+const wire = stringifyQuery(pairs, PlusAsSpace).unwrap();
 // a=1&a=2&flag=&=x&plus=a+b%2Bc
 ```
 
@@ -67,9 +72,10 @@ should impose their own field policy.
 
 Keys and values are strict UTF-8. Parse errors use absolute offsets in the whole query body. Fields
 are processed in source order, keys before values, with the component error precedence above. No
-partial pairs are returned on error. The serializer also validates keys and values; its error gives
-the zero-based pair index, whether the value failed, and the invalid sequence's byte offset **within
-that key/value**. It always emits `key=value` joined by `&`, with no leading `?`. It retains pair order
+partial pairs are returned on error. The serializer also validates keys and values; its error has a `kind`
+(`InvalidKeyUtf8` or `InvalidValueUtf8`), the zero-based pair index, and the invalid sequence's byte offset **within
+that key/value**; `queryEncodeErrorMessage` renders it (`invalid UTF-8 in value in pair 0 at byte 4`).
+(`QueryEncodeError` replaces the old `inValue: bool` field with `kind`, per ADR-0048 rule 3.1.) It always emits `key=value` joined by `&`, with no leading `?`. It retains pair order
 and encodes all separators within keys and values. An empty list emits `""`; one empty pair emits `"="`.
 
 For valid UTF-8 pairs, `parseQuery(stringifyQuery(pairs, mode).unwrap(), mode)` preserves every pair.

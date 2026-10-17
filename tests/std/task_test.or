@@ -4,7 +4,7 @@
 import { assert, assertEq, assertEqUsize, assertEqBool, assertEqString } from "std:test";
 import {
   scope, scopeDo, spawn, spawnDo, channel, movedCount, copiedCount, TaskHandle, parallelMap, forkJoin, forkJoinUntil,
-  parallelism
+  forkJoinLent, parallelism
 } from "std:task";
 
 // ------------------------------------------------------------------------------------------------ channels (one task)
@@ -178,4 +178,78 @@ function forkJoinUntilStopsAtTheFirstHit(): void {
   assertEqBool(rs[17], true, "the last is the hit");
   assertEqBool(rs.slice(0, 17).some(h => h), false, "none before it");
   assertEqUsize(forkJoinUntil(9, 3, k => false, h => h).length, 9, "no hit: every piece");
+}
+
+// ---- forkJoinLent (ADR-0049 row 13a): the pieces of forkJoin, reading a lent graph ------------------------------------------
+
+type Entry = { id: usize; name: string; tags: string[]; };
+
+function entries(n: usize): Entry[] {
+  let es: Entry[] = [];
+  while (es.length < n) {
+    const id = es.length;
+    es.push(Entry { id: id, name: "e" + id.toString(), tags: ["a" + id.toString(), "b"] });
+  }
+  return es;
+}
+
+@Test
+function forkJoinLentKeepsPieceOrder(): void {
+  const es = entries(100);
+  let w: usize = 0;
+  while (w <= 8) {
+    const rs = forkJoinLent(es, 25, w, k => es[k * 4].name + "/" + es[k * 4 + 3].tags[0]);
+    assertEqUsize(rs.length, 25, "one result per piece");
+    let k: usize = 0;
+    while (k < 25) {
+      assertEqString(rs[k], "e" + (k * 4).toString() + "/a" + (k * 4 + 3).toString(), "piece order is kept");
+      k += 1;
+    }
+    w += 1;
+  }
+  assertEqUsize(forkJoinLent(es, 0, 4, k => k).length, 0, "no pieces");
+  assertEqUsize(forkJoinLent(es, 1, 4, k => k + 5)[0], 5, "one piece: the sequential path");
+}
+
+@Test
+function forkJoinLentSequentialPathLendsNothing(): void {
+  const es = entries(50);
+  const c0 = copiedCount();
+  const m0 = movedCount();
+  const rs = forkJoinLent(es, 10, 1, k => es[k].id);
+  assertEqUsize(rs.length, 10, "length");
+  assertEqUsize((copiedCount() - c0) + (movedCount() - m0), 0, "no transfer at all on the calling task");
+}
+
+@Test
+function forkJoinLentResultsDoNotAliasTheGraph(): void {
+  let es = entries(40);
+  const rs = forkJoinLent(es, 8, 4, k => es[k * 5]);
+  assertEqUsize(rs.length, 8, "length");
+  es[0].name = "changed";
+  es[0].tags[0] = "changed";
+  assertEqString(rs[0].name, "e0", "the result kept its value");
+  assertEqString(rs[0].tags[0], "a0", "also in a nested array");
+  let r0 = rs[0];
+  r0.name = "mine";
+  assertEqString(es[0].name, "changed", "and the graph does not see a change of the result");
+  assertEqString(rs[1].name, "e5", "the other results are untouched");
+}
+
+@Test
+function forkJoinLentNests(): void {
+  const es = entries(60);
+  const outer = forkJoinLent(
+    es,
+    6,
+    3,
+    k => {
+      const mine = entries(20 + k);
+      const inner = forkJoinLent(mine, 4, 2, j => mine[j * 5].name + es[k * 10].name);
+      return inner.join(",");
+    },
+  );
+  assertEqUsize(outer.length, 6, "length");
+  assertEqString(outer[2], "e0e20,e5e20,e10e20,e15e20", "inner pool of the third piece");
+  assertEqString(outer[5], "e0e50,e5e50,e10e50,e15e50", "inner pool of the last piece");
 }

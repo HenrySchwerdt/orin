@@ -1,0 +1,673 @@
+// End-to-end test of `orin lsp` (spec 18 P2): speaks real LSP JSON-RPC over stdio. The Orin port of tools/test_lsp.py:
+// the same requests, expected responses and `check` messages, in the same order. Checks: initialize capabilities,
+// diagnostics (valid file, syntax error E0200, type error E0400), a two-module project in a temp dir (definition, hover,
+// references, rename across files), formatting, completion (locals, declarations, keywords), classes, interfaces,
+// generic classes, template literals, contracts and shutdown/exit (exit code 0).
+
+import { FsGrant, writeFile } from "std:fs";
+import { ProcessGrant } from "std:process";
+import { Json } from "std:json/legacy";
+import { Session } from "./session";
+import { Pos, posOf, uriOf } from "./rpc";
+import { replaceAll, strip, sortedStrs, reprStr } from "./text";
+import {
+  S, N, B, A, O, F, nil, at, has, isNull, isObj, isArr, isStrEq, isIntEq, str, items, len, strs, keysOf, eq, show,
+  containsStr, strEq
+} from "./jx";
+
+function pj(p: Pos): Json {
+  return O([F("line", N(p.line)), F("character", N(p.character))]);
+}
+
+function posStr(p: Pos): string {
+  return "{'line': " + p.line.toString() + ", 'character': " + p.character.toString() + "}";
+}
+
+function td(path: string, pos: Pos): Json {
+  return O([F("textDocument", O([F("uri", S(uriOf(path)))])), F("position", pj(pos))]);
+}
+
+// td(...) plus `context.includeDeclaration` (references)
+function tdRefs(path: string, pos: Pos, includeDecl: bool): Json {
+  return O([F("textDocument", O([F("uri", S(uriOf(path)))])), F("position", pj(pos)),
+    F("context", O([F("includeDeclaration", B(includeDecl))]))]);
+}
+
+// td(...) plus `newName` (rename)
+function tdName(path: string, pos: Pos, newName: string): Json {
+  return O([F("textDocument", O([F("uri", S(uriOf(path)))])), F("position", pj(pos)), F("newName", S(newName))]);
+}
+
+function openDoc(s: Session, fs: FsGrant, p: ProcessGrant, path: string, text: string, version: int): void {
+  s.notify(fs, p, "textDocument/didOpen", O([F("textDocument", O([F("uri", S(uriOf(path))), F("languageId", S("orin")),
+    F("version", N(version)), F("text", S(text))]))]));
+}
+
+function changeDoc(s: Session, fs: FsGrant, p: ProcessGrant, path: string, text: string, version: int): void {
+  s.notify(fs, p, "textDocument/didChange", O([F("textDocument", O([F("uri", S(uriOf(path))), F("version", N(version))])),
+    F("contentChanges", A([O([F("text", S(text))])]))]));
+}
+
+// A round trip guaranteeing earlier notifications were processed; returns the diagnostics for `uri` (JNull: none).
+function sync(s: Session, fs: FsGrant, p: ProcessGrant, uri: string): Json {
+  s.lspRequest(fs, p, "textDocument/documentSymbol", O([F("textDocument", O([F("uri", S(uri))]))]));
+  s.drain(fs, p, 300);
+  return s.diagnosticsFor(fs, uri);
+}
+
+function hoverAt(s: Session, fs: FsGrant, p: ProcessGrant, path: string, pos: Pos): string {
+  const r = s.lspRequest(fs, p, "textDocument/hover", td(path, pos));
+  return str(at(r, ["result", "contents", "value"]));
+}
+
+function refsAt(s: Session, fs: FsGrant, p: ProcessGrant, path: string, pos: Pos, decl: bool): Json[] {
+  return items(at(s.lspRequest(fs, p, "textDocument/references", tdRefs(path, pos, decl)), ["result"]));
+}
+
+// `len(x)` of a possibly missing list: 0 when absent (`changes.get(uri, [])`).
+function cnt(j: Json): int {
+  const n = len(j);
+  return n < 0 ? 0 : n;
+}
+
+// A definition/implementation result as a list (`dict` -> one element).
+function asLocs(j: Json): Json[] {
+  if (isObj(j)) {
+    return [j];
+  }
+  return items(j);
+}
+
+function uriSet(locs: Json[]): string[] {
+  let out: string[] = [];
+  for (const l of locs) {
+    const u = str(at(l, ["uri"]));
+    if (!containsStr(out, u)) {
+      out.push(u);
+    }
+  }
+  return sortedStrs(out);
+}
+
+function countsOf(changes: Json): string {
+  let out = "{";
+  let first = true;
+  for (const k of keysOf(changes)) {
+    if (!first) {
+      out += ", ";
+    }
+    first = false;
+    out += "'" + k + "': " + cnt(at(changes, [k])).toString();
+  }
+  return out + "}";
+}
+
+function codesOf(d: Json): string[] {
+  let out: string[] = [];
+  for (const x of items(d)) {
+    out.push(str(at(x, ["code"])));
+  }
+  return out;
+}
+
+function startLines(d: Json): string {
+  let out: string[] = [];
+  for (const x of items(d)) {
+    out.push(show(at(x, ["range", "start", "line"])));
+  }
+  return "[" + out.join(", ") + "]";
+}
+
+function isLoc(loc: Json, uri: string, want: Pos): bool {
+  return isObj(loc) && isStrEq(at(loc, ["uri"]), uri) && eq(at(loc, ["range", "start"]), pj(want));
+}
+
+function write(fs: FsGrant, path: string, text: string): void {
+  writeFile(fs, path, text);
+}
+
+export function runLsp(fs: FsGrant, p: ProcessGrant, s: Session, exe: string, tmp: string): void {
+  if (!s.start(fs, p, exe, "lsp")) {
+    s.setFatal(fs, "cannot start " + exe + " lsp");
+    return;
+  }
+
+  // ---- initialize ------------------------------------------------------------------------
+  let r = s.lspRequest(fs, p, "initialize", O([F("processId", nil()), F("rootUri", S(uriOf(tmp))), F("capabilities", O([]))]));
+  const caps = at(r, ["result", "capabilities"]);
+  for (const k of ["textDocumentSync", "documentSymbolProvider", "completionProvider", "documentFormattingProvider",
+    "definitionProvider", "hoverProvider", "referencesProvider", "implementationProvider", "renameProvider"]) {
+    s.check(fs, has(caps, k), "initialize: capability " + k + " advertised");
+  }
+  s.check(fs, isStrEq(at(r, ["result", "serverInfo", "name"]), "orin"), "initialize: serverInfo.name");
+  s.notify(fs, p, "initialized", O([]));
+
+  // ---- diagnostics: valid, syntax error, type error ---------------------------------------
+  const solo = tmp + "/solo.or";
+  const good = "function add(a: int, b: int): int {\n  return a + b;\n}\n\nfunction main(): void {\n  console.log(add(1, 2).toString());\n}\n";
+  openDoc(s, fs, p, solo, good, 1);
+  let d = sync(s, fs, p, uriOf(solo));
+  s.check(fs, eq(d, A([])), "valid file: empty diagnostics (got " + show(d) + ")");
+
+  const badSyntax = replaceAll(good, "return a + b;", "return a + ;");
+  changeDoc(s, fs, p, solo, badSyntax, 2);
+  d = sync(s, fs, p, uriOf(solo));
+  s.check(fs, !isNull(d) && len(d) >= 1 && isStrEq(at(d, ["0", "code"]), "E0200"), "syntax error: E0200 (got " + show(d) + ")");
+  if (len(d) > 0) {
+    const want = posOf(badSyntax, ";", 0, 0);
+    s.check(fs, isIntEq(at(d, ["0", "range", "start", "line"]), want.line) && want.line == 1,
+      "syntax error: reported on line 2 (" + show(at(d, ["0", "range"])) + ")");
+    s.check(fs, isIntEq(at(d, ["0", "range", "start", "character"]), want.character),
+      "syntax error: column of the `;` (" + show(at(d, ["0", "range"])) + " vs " + posStr(want) + ")");
+  }
+  s.check(fs, !isNull(d) && len(d) == 1, "one syntax error: one diagnostic (got " + show(d) + ")");
+
+  // Parser error recovery: every syntax error of the file, in order, and no type error (the checker does not run).
+  const multi = replaceAll(badSyntax, "console.log(add(1, 2).toString());",
+    "let x = ;\n  console.log(add(1, 2).toString())\n  return true;");
+  changeDoc(s, fs, p, solo, multi, 3);
+  d = sync(s, fs, p, uriOf(solo));
+  s.check(fs, !isNull(d) && strEq(codesOf(d), ["E0200", "E0200", "E0200"]),
+    "three syntax errors: three E0200 diagnostics (got " + show(d) + ")");
+  if (len(d) == 3) {
+    s.check(fs, startLines(d) == "[1, 5, 7]", "syntax errors on lines 2, 6, 8 (" + show(d) + ")");
+    s.check(fs, isStrEq(at(d, ["2", "message"]), "expected `;`, found `return`"), "third message (" + show(at(d, ["2"])) + ")");
+  }
+
+  const badType = replaceAll(good, "return a + b;", "return true;");
+  changeDoc(s, fs, p, solo, badType, 4);
+  d = sync(s, fs, p, uriOf(solo));
+  s.check(fs, !isNull(d) && len(d) >= 1 && isStrEq(at(d, ["0", "code"]), "E0400"), "type error: E0400 (got " + show(d) + ")");
+  if (len(d) > 0) {
+    s.check(fs, isIntEq(at(d, ["0", "range", "start", "line"]), 1), "type error: on line 2 (" + show(at(d, ["0", "range"])) + ")");
+  }
+
+  changeDoc(s, fs, p, solo, good, 5);
+  d = sync(s, fs, p, uriOf(solo));
+  s.check(fs, eq(d, A([])), "fixed file: diagnostics cleared (got " + show(d) + ")");
+
+  // ---- formatting ---------------------------------------------------------------------------
+  const ugly = "function   add(a:int,b:int):int{return a+b;}\nfunction main():void{console.log(add(1,2).toString());}\n";
+  changeDoc(s, fs, p, solo, ugly, 6);
+  r = s.lspRequest(fs, p, "textDocument/formatting", O([F("textDocument", O([F("uri", S(uriOf(solo)))])),
+    F("options", O([F("tabSize", N(2)), F("insertSpaces", B(true))]))]));
+  let edits = at(r, ["result"]);
+  s.check(fs, isArr(edits) && len(edits) == 1, "formatting: one edit (got " + show(r) + ")");
+  if (len(edits) > 0) {
+    const nt = str(at(edits, ["0", "newText"]));
+    s.check(fs, nt.startsWith("function add(a: int, b: int): int {"),
+      "formatting: canonical text (" + nt.substring(0, nt.length < 60 ? nt.length : 60) + ")");
+  }
+  changeDoc(s, fs, p, solo, good, 7);
+
+  // ---- completion --------------------------------------------------------------------------
+  const compText = "function helper(): int {\n  return 1;\n}\n\nfunction main(): void {\n  const total = helper();\n  const other = 2;\n  console.log(total.toString());\n}\n";
+  const comp = tmp + "/comp.or";
+  openDoc(s, fs, p, comp, compText, 1);
+  r = s.lspRequest(fs, p, "textDocument/completion", td(comp, posOf(compText, "console", 0, 0)));
+  let labels: string[] = [];
+  for (const it of items(at(r, ["result", "items"]))) {
+    labels.push(str(at(it, ["label"])));
+  }
+  s.check(fs, containsStr(labels, "total") && containsStr(labels, "other"), "completion: locals (" + "[" + labels.join(", ") + "]" + ")");
+  s.check(fs, containsStr(labels, "helper") && containsStr(labels, "main"), "completion: declarations");
+  s.check(fs, containsStr(labels, "function") && containsStr(labels, "return") && containsStr(labels, "while"), "completion: keywords");
+
+  // ---- cross-module project --------------------------------------------------------------
+  const lib = tmp + "/lib.or";
+  const main = tmp + "/main.or";
+  const libText = "export type Point = { x: int; y: int; };\n\nexport function dist(p: Point): int {\n  return p.x + p.y;\n}\n";
+  const mainText = "import { dist, Point } from \"./lib\";\n\nfunction main(): void {\n  const p = Point { x: 1, y: 2 };\n  const d = dist(p);\n  console.log(d.toString());\n}\n";
+  write(fs, lib, libText);
+  openDoc(s, fs, p, main, mainText, 1);
+  d = sync(s, fs, p, uriOf(main));
+  s.check(fs, eq(d, A([])), "project: main.or has no diagnostics (got " + show(d) + ")");
+
+  const call = posOf(mainText, "dist(p)", 0, 1);
+  r = s.lspRequest(fs, p, "textDocument/definition", td(main, call));
+  let loc = at(r, ["result"]);
+  s.check(fs, isObj(loc) && isStrEq(at(loc, ["uri"]), uriOf(lib)), "definition: jumps into lib.or (got " + show(loc) + ")");
+  if (isObj(loc)) {
+    const want = posOf(libText, "dist", 0, 0);
+    s.check(fs, eq(at(loc, ["range", "start"]), pj(want)),
+      "definition: at the declaration name (" + show(at(loc, ["range", "start"])) + " vs " + posStr(want) + ")");
+  }
+
+  let hv = hoverAt(s, fs, p, main, call);
+  s.check(fs, hv.includes("function dist(p: Point): int"), "hover: function signature (got " + reprStr(hv) + ")");
+  s.check(fs, hv.includes("**Effects**: none (pure)"), "hover: the effect summary of a pure function, across modules (got " + reprStr(hv) + ")");
+
+  hv = hoverAt(s, fs, p, main, posOf(mainText, "d.toString", 0, 0));
+  s.check(fs, hv.includes("int"), "hover: local type (got " + reprStr(hv) + ")");
+
+  let locs = refsAt(s, fs, p, main, call, true);
+  let uris = uriSet(locs);
+  s.check(fs, containsStr(uris, uriOf(lib)) && containsStr(uris, uriOf(main)), "references: across both files (got " + show(A(locs)) + ")");
+  // declaration in lib + the import name + the call in main
+  s.check(fs, locs.length >= 3, "references: declaration, import name and call (got " + locs.length.toString() + ")");
+
+  // field references: p.x in lib and the literal field name `x` in main
+  locs = refsAt(s, fs, p, main, posOf(mainText, "x: 1", 0, 0), true);
+  s.check(fs, locs.length >= 3 && containsStr(uriSet(locs), uriOf(lib)),
+    "references: record field (declaration, p.x read, literal) (got " + locs.length.toString() + ")");
+
+  r = s.lspRequest(fs, p, "textDocument/prepareRename", td(main, call));
+  s.check(fs, !isNull(at(r, ["result"])) && isStrEq(at(r, ["result", "placeholder"]), "dist"),
+    "prepareRename: placeholder dist (got " + show(at(r, ["result"])) + ")");
+
+  r = s.lspRequest(fs, p, "textDocument/rename", tdName(main, call, "distance"));
+  let changes = at(r, ["result", "changes"]);
+  s.check(fs, has(changes, uriOf(lib)) && has(changes, uriOf(main)), "rename: edits in both files (got [" + keysOf(changes).join(", ") + "])");
+  s.check(fs, allNewText(changes, "distance"), "rename: new text");
+  s.check(fs, cnt(at(changes, [uriOf(main)])) == 2 && cnt(at(changes, [uriOf(lib)])) == 1,
+    "rename: 2 edits in main (import + call), 1 in lib (" + countsOf(changes) + ")");
+
+  r = s.lspRequest(fs, p, "textDocument/rename", tdName(main, call, "while"));
+  s.check(fs, has(r, "error"), "rename: reserved word rejected");
+
+  // rename a record field: all of lib's reads and main's literal change
+  r = s.lspRequest(fs, p, "textDocument/rename", tdName(main, posOf(mainText, "x: 1", 0, 0), "px"));
+  changes = at(r, ["result", "changes"]);
+  s.check(fs, cnt(at(changes, [uriOf(lib)])) == 2 && cnt(at(changes, [uriOf(main)])) == 1,
+    "rename field: decl + p.x in lib, literal in main (" + countsOf(changes) + ")");
+
+  // references/rename requested from lib.or see main.or's uses (main.or is open and imports lib)
+  locs = refsAt(s, fs, p, lib, posOf(libText, "dist", 0, 0), true);
+  s.check(fs, containsStr(uriSet(locs), uriOf(main)) && locs.length >= 3,
+    "references from the library file include its importer (got " + locs.length.toString() + ")");
+
+  // a type error in lib shows up as a diagnostic on lib.or when main is the entry
+  const libBad = replaceAll(libText, "p.x + p.y", "p.x + true");
+  openDoc(s, fs, p, lib, libBad, 1);
+  d = sync(s, fs, p, uriOf(lib));
+  s.check(fs, !isNull(d) && anyCodeStarts(d, "E04"), "project: type error in lib reported on lib.or (got " + show(d) + ")");
+
+  // rename is refused while the program has errors (the index is partial then)
+  r = s.lspRequest(fs, p, "textDocument/rename", tdName(main, call, "distance"));
+  s.check(fs, has(r, "error"), "rename: refused while the workspace has errors");
+  openDoc(s, fs, p, lib, libText, 3);
+
+  // ---- richer language constructs in one file ----------------------------------------------
+  const rich = tmp + "/rich.or";
+  const richText = "type Shape = Circle(int) | Rect(int, int) | Empty;\n"
+    + "type Pos = { x: int; y: int; };\n"
+    + "type Sprite = { pos: Pos; hp: int; };\n\n"
+    + "function area(s: Shape): int {\n"
+    + "  return match (s) {\n"
+    + "    Circle(r) => r * r,\n"
+    + "    Rect(w, h) => w * h,\n"
+    + "    Empty => 0\n"
+    + "  };\n"
+    + "}\n\n"
+    + "function main(): void {\n"
+    + "  let sp = Sprite { pos: Pos { x: 1, y: 2 }, hp: 3 };\n"
+    + "  sp.pos.x = 5;\n"
+    + "  sp.hp += 1;\n"
+    + "  const shapes = [Circle(2), Rect(2, 3), Empty];\n"
+    + "  let total = 0;\n"
+    + "  for (const s of shapes) {\n"
+    + "    total += area(s);\n"
+    + "  }\n"
+    + "  console.log((total + sp.pos.x).toString());\n"
+    + "}\n";
+  openDoc(s, fs, p, rich, richText, 1);
+  d = sync(s, fs, p, uriOf(rich));
+  s.check(fs, eq(d, A([])), "rich: no diagnostics (got " + show(d) + ")");
+
+  let n = refsAt(s, fs, p, rich, posOf(richText, "Circle", 0, 0), true).length;
+  s.check(fs, n == 3, "rich: variant Circle (decl, construction, pattern) -> " + n.toString());
+  n = refsAt(s, fs, p, rich, posOf(richText, "Empty", 0, 0), true).length;
+  s.check(fs, n == 3, "rich: variant Empty (decl, pattern, construction) -> " + n.toString());
+  n = refsAt(s, fs, p, rich, posOf(richText, "x: int", 0, 0), true).length;
+  s.check(fs, n == 4, "rich: field Pos.x (decl, literal, assignment, read) -> " + n.toString());
+  n = refsAt(s, fs, p, rich, posOf(richText, "hp", 0, 0), true).length;
+  s.check(fs, n == 3, "rich: field Sprite.hp (decl, literal, compound assignment) -> " + n.toString());
+  n = refsAt(s, fs, p, rich, posOf(richText, "total", 0, 0), true).length;
+  s.check(fs, n == 3, "rich: local total (decl, +=, read) -> " + n.toString());
+  n = refsAt(s, fs, p, rich, posOf(richText, "s of", 0, 0), true).length;
+  s.check(fs, n == 2, "rich: for-of variable (decl, use) -> " + n.toString());
+  n = refsAt(s, fs, p, rich, posOf(richText, "Shape", 0, 0), true).length;
+  s.check(fs, n == 2, "rich: type Shape (decl, parameter type) -> " + n.toString());
+  n = refsAt(s, fs, p, rich, posOf(richText, "area", 0, 0), true).length;
+  s.check(fs, n == 2, "rich: function area (decl, call) -> " + n.toString());
+
+  hv = hoverAt(s, fs, p, rich, posOf(richText, "r) =>", 0, 0));
+  s.check(fs, hv.includes("const r: int"), "rich: hover pattern binding (" + reprStr(hv) + ")");
+  hv = hoverAt(s, fs, p, rich, posOf(richText, "sp = Sprite", 0, 0));
+  s.check(fs, hv.includes("let sp: Sprite"), "rich: hover let (" + reprStr(hv) + ")");
+  hv = hoverAt(s, fs, p, rich, posOf(richText, "Circle(2)", 0, 0));
+  s.check(fs, hv.includes("Circle(int)"), "rich: hover variant (" + reprStr(hv) + ")");
+  hv = hoverAt(s, fs, p, rich, posOf(richText, "y: 2", 0, 0));
+  s.check(fs, hv.includes("y: int"), "rich: hover field (" + reprStr(hv) + ")");
+  hv = hoverAt(s, fs, p, rich, posOf(richText, "pos.x)", 0, 1));
+  s.check(fs, hv.includes("Pos") || hv.includes("int"), "rich: hover member (" + reprStr(hv) + ")");
+
+  // ---- template literals and fixed-width integers (ADR-0022): identifiers inside `${...}` resolve ----
+  const tpl = tmp + "/tpl.or";
+  const tplText = "type P = { x: i32; };\n\n"
+    + "function greet(name: string, age: u8): string {\n"
+    + "  return `Hello ${name}, you are ${age + 1} (${`${name}!`})`;\n"
+    + "}\n\n"
+    + "function main(): void {\n"
+    + "  const p = P { x: 5 };\n"
+    + "  console.log(greet(\"Ann\", 7) + `${p.x}`);\n"
+    + "}\n";
+  openDoc(s, fs, p, tpl, tplText, 1);
+  d = sync(s, fs, p, uriOf(tpl));
+  s.check(fs, eq(d, A([])), "template: no diagnostics (got " + show(d) + ")");
+  r = s.lspRequest(fs, p, "textDocument/definition", td(tpl, posOf(tplText, "name}", 0, 0)));
+  locs = asLocs(at(r, ["result"]));
+  s.check(fs, locs.length == 1 && eq(at(locs[0], ["range", "start"]), pj(posOf(tplText, "name:", 0, 0))),
+    "template: go to definition of a parameter used in ${} (got " + show(A(locs)) + ")");
+  n = refsAt(s, fs, p, tpl, posOf(tplText, "name:", 0, 0), true).length;
+  s.check(fs, n == 3, "template: references of a parameter (decl + 2 in ${}) -> " + n.toString());
+  hv = hoverAt(s, fs, p, tpl, posOf(tplText, "age + 1", 0, 0));
+  s.check(fs, hv.includes("u8"), "template: hover of a parameter inside ${} (got " + reprStr(hv) + ")");
+  hv = hoverAt(s, fs, p, tpl, posOf(tplText, "p.x}", 0, 0));
+  s.check(fs, hv.includes("P"), "template: hover of a local inside ${} (got " + reprStr(hv) + ")");
+  hv = hoverAt(s, fs, p, tpl, posOf(tplText, "x: i32", 0, 0));
+  s.check(fs, hv.includes("i32"), "integers: hover of a field of type i32 (got " + reprStr(hv) + ")");
+  const tplBad = replaceAll(tplText, "`${p.x}`", "`${p}`");
+  changeDoc(s, fs, p, tpl, tplBad, 2);
+  d = sync(s, fs, p, uriOf(tpl));
+  s.check(fs, len(d) == 1 && isStrEq(at(d, ["0", "code"]), "E0432") && eq(at(d, ["0", "range", "start"]), pj(posOf(tplBad, "p}`", 0, 0))),
+    "template: diagnostic E0432 on an interpolated record, located at the expression (got " + show(d) + ")");
+
+  // ---- user annotations (ADR-0046 S2): a use is a reference to its @Annotation record ---------------
+  const alib = tmp + "/alib.or";
+  const amain = tmp + "/amain.or";
+  const alibText = "export type Verb = Get | Post;\n\n"
+    + "@Annotation(function, method, field)\nexport type Route = { path: string; verb: Verb; };\n";
+  const amainText = "import { Route, Verb } from \"./alib\";\n\n"
+    + "class Api {\n  @Route(\"/n\", Get) n: int = 0;\n"
+    + "  @Route(\"/c\", Post)\n  call(): int {\n    return this.n;\n  }\n}\n\n"
+    + "@Route(\"/users/:id\", Get)\nfunction find(id: int): int {\n  return id;\n}\n\n"
+    + "function main(): void {\n  console.log(find(new Api().call()).toString());\n}\n";
+  openDoc(s, fs, p, alib, alibText, 1);
+  openDoc(s, fs, p, amain, amainText, 1);
+  d = sync(s, fs, p, uriOf(amain));
+  s.check(fs, eq(d, A([])), "annotations: no diagnostics (got " + show(d) + ")");
+  const useFind = posOf(amainText, "Route(\"/users", 0, 0);
+  r = s.lspRequest(fs, p, "textDocument/definition", td(amain, useFind));
+  locs = asLocs(at(r, ["result"]));
+  s.check(fs, locs.length == 1 && isLoc(locs[0], uriOf(alib), posOf(alibText, "Route =", 0, 0)),
+    "annotations: go to definition of a use is the @Annotation record (got " + show(A(locs)) + ")");
+  locs = items(at(s.lspRequest(fs, p, "textDocument/references", tdRefs(alib, posOf(alibText, "Route =", 0, 0), true)), ["result"]));
+  let inMain = 0;
+  for (const l of locs) {
+    if (isStrEq(at(l, ["uri"]), uriOf(amain))) {
+      inMain += 1;
+    }
+  }
+  s.check(fs, locs.length == 5 && inMain == 4,
+    "annotations: references of the record are the import and the 3 uses (got " + inMain.toString() + " in main, " + locs.length.toString() + " in all)");
+  hv = hoverAt(s, fs, p, amain, useFind);
+  s.check(fs, hv.includes("@Annotation(function, method, field)") && hv.includes("type Route = { path: string; verb: Verb }"),
+    "annotations: hover on the annotation name shows the definition (got " + reprStr(hv) + ")");
+  hv = hoverAt(s, fs, p, amain, posOf(amainText, "find(id", 0, 0));
+  s.check(fs, hv.includes("@Route(\"/users/:id\", Get)") && hv.includes("function find(id: int): int"),
+    "annotations: hover on a declaration shows its annotations with their arguments (got " + reprStr(hv) + ")");
+  hv = hoverAt(s, fs, p, amain, posOf(amainText, "call()", 0, 0));
+  s.check(fs, hv.includes("@Route(\"/c\", Post)"), "annotations: hover on a method shows its annotation (got " + reprStr(hv) + ")");
+  hv = hoverAt(s, fs, p, amain, posOf(amainText, "n: int", 0, 0));
+  s.check(fs, hv.includes("@Route(\"/n\", Get)"), "annotations: hover on a field shows its annotation (got " + reprStr(hv) + ")");
+  r = s.lspRequest(fs, p, "textDocument/rename", tdName(alib, posOf(alibText, "Route =", 0, 0), "Endpoint"));
+  changes = at(r, ["result", "changes"]);
+  s.check(fs, cnt(at(changes, [uriOf(alib)])) == 1 && cnt(at(changes, [uriOf(amain)])) == 4 && allNewText(changes, "Endpoint"),
+    "annotations: rename of the record renames the import and every use (got " + countsOf(changes) + ")");
+  r = s.lspRequest(fs, p, "textDocument/rename", tdName(amain, useFind, "Endpoint"));
+  changes = at(r, ["result", "changes"]);
+  s.check(fs, cnt(at(changes, [uriOf(alib)])) == 1 && cnt(at(changes, [uriOf(amain)])) == 4,
+    "annotations: rename from a use renames the definition too (got " + countsOf(changes) + ")");
+
+  // ---- contract clauses (ADR-0012): diagnostics with their own codes, hover shows the clauses ----
+  const kc = tmp + "/contracts.or";
+  const kcGood = "@Requires(a > 0)\n@Ensures(result >= a)\nfunction add(a: int): int {\n  return a;\n}\n\n"
+    + "function main(): void {\n  console.log(add(1).toString());\n}\n";
+  openDoc(s, fs, p, kc, kcGood, 1);
+  d = sync(s, fs, p, uriOf(kc));
+  s.check(fs, eq(d, A([])), "contracts: valid clauses, no diagnostics (got " + show(d) + ")");
+  hv = hoverAt(s, fs, p, kc, posOf(kcGood, "add(1)", 0, 0));
+  s.check(fs, hv.includes("@Requires(a > 0)") && hv.includes("@Ensures(result >= a)"), "contracts: hover shows the clauses (" + reprStr(hv) + ")");
+  const kcNew = ["@Requires(a + 1)", "@Requires(old(a) > 0)", "@Requires(result > 0)", "@Cached(a)"];
+  const kcCode = ["E0414", "E0415", "E0300", "E0408"];
+  let ki: usize = 0;
+  while (ki < kcNew.length) {
+    changeDoc(s, fs, p, kc, replaceAll(kcGood, "@Requires(a > 0)", kcNew[ki]), 2);
+    d = sync(s, fs, p, uriOf(kc));
+    s.check(fs, !isNull(d) && len(d) >= 1 && isStrEq(at(d, ["0", "code"]), kcCode[ki]),
+      "contracts: " + kcNew[ki] + " -> " + kcCode[ki] + " (got " + show(d) + ")");
+    ki += 1;
+  }
+  changeDoc(s, fs, p, kc, kcGood, 3);
+
+  // ---- classes across files (ADR-0009): definition, hover, references, rename ----------------
+  const clib = tmp + "/clib.or";
+  const cmain = tmp + "/cmain.or";
+  const clibText = "export class Counter {\n  constructor(public value: int) {}\n"
+    + "  increment(): void {\n    this.value += 1;\n  }\n"
+    + "  get(): int {\n    return this.value;\n  }\n}\n";
+  const cmainText = "import { Counter } from \"./clib\";\n\n"
+    + "function main(): void {\n"
+    + "  let c = new Counter(0);\n"
+    + "  c.increment();\n"
+    + "  console.log(c.get().toString());\n"
+    + "  console.log(c.value.toString());\n"
+    + "}\n";
+  write(fs, clib, clibText);
+  openDoc(s, fs, p, cmain, cmainText, 1);
+  d = sync(s, fs, p, uriOf(cmain));
+  s.check(fs, eq(d, A([])), "classes: cmain.or has no diagnostics (got " + show(d) + ")");
+  const inc = posOf(cmainText, "increment", 0, 1);
+  r = s.lspRequest(fs, p, "textDocument/definition", td(cmain, inc));
+  loc = at(r, ["result"]);
+  s.check(fs, isLoc(loc, uriOf(clib), posOf(clibText, "increment", 0, 0)),
+    "classes: definition of a method call jumps to the method in clib.or (got " + show(loc) + ")");
+  r = s.lspRequest(fs, p, "textDocument/definition", td(cmain, posOf(cmainText, "Counter(0)", 0, 1)));
+  loc = at(r, ["result"]);
+  s.check(fs, isLoc(loc, uriOf(clib), posOf(clibText, "Counter", 0, 0)),
+    "classes: definition of `new Counter` jumps to the class (got " + show(loc) + ")");
+  hv = hoverAt(s, fs, p, cmain, inc);
+  s.check(fs, hv.includes("mut method increment()"), "classes: hover shows the inferred mutability (got " + reprStr(hv) + ")");
+  hv = hoverAt(s, fs, p, cmain, posOf(cmainText, "get()", 0, 1));
+  s.check(fs, hv.includes("method get(): int") && !hv.includes("mut"), "classes: non-mutating method hover (got " + reprStr(hv) + ")");
+  locs = refsAt(s, fs, p, cmain, inc, true);
+  s.check(fs, locs.length == 2 && containsStr(uriSet(locs), uriOf(clib)), "classes: method references (decl + call) (got " + locs.length.toString() + ")");
+  locs = refsAt(s, fs, p, cmain, posOf(cmainText, "value", 0, 0), true);
+  s.check(fs, locs.length >= 4, "classes: field references (decl, this.value x2, c.value) (got " + locs.length.toString() + ")");
+  r = s.lspRequest(fs, p, "textDocument/rename", tdName(cmain, inc, "bump"));
+  changes = at(r, ["result", "changes"]);
+  s.check(fs, cnt(at(changes, [uriOf(clib)])) == 1 && cnt(at(changes, [uriOf(cmain)])) == 1,
+    "classes: rename method in both files (" + countsOf(changes) + ")");
+  r = s.lspRequest(fs, p, "textDocument/rename", tdName(cmain, posOf(cmainText, "Counter(0)", 0, 0), "Tally"));
+  changes = at(r, ["result", "changes"]);
+  s.check(fs, cnt(at(changes, [uriOf(clib)])) == 1 && cnt(at(changes, [uriOf(cmain)])) == 2,
+    "classes: rename class (decl in clib; import + new in cmain) (" + countsOf(changes) + ")");
+
+  // ---- interfaces across files (ADR-0019): definition, hover, references, implementations ----
+  const ilib = tmp + "/ilib.or";
+  const imain = tmp + "/imain.or";
+  const ilibText = "export interface Shape {\n  area(): int;\n}\n\n"
+    + "export class Square implements Shape {\n  constructor(public s: int) {}\n"
+    + "  area(): int {\n    return this.s * this.s;\n  }\n}\n";
+  const imainText = "import { Shape, Square } from \"./ilib\";\n\n"
+    + "function total<T extends Shape>(xs: T[]): int {\n"
+    + "  let t = 0;\n  for (const x of xs) {\n    t += x.area();\n  }\n  return t;\n}\n\n"
+    + "function main(): void {\n"
+    + "  const s: Shape = new Square(3);\n"
+    + "  console.log(s.area().toString());\n"
+    + "  console.log(total([new Square(2)]).toString());\n"
+    + "}\n";
+  write(fs, ilib, ilibText);
+  openDoc(s, fs, p, imain, imainText, 1);
+  d = sync(s, fs, p, uriOf(imain));
+  s.check(fs, eq(d, A([])), "interfaces: imain.or has no diagnostics (got " + show(d) + ")");
+  // definition of `Shape` in a type position jumps to the interface
+  r = s.lspRequest(fs, p, "textDocument/definition", td(imain, posOf(imainText, "Shape =", 0, 1)));
+  loc = at(r, ["result"]);
+  s.check(fs, isLoc(loc, uriOf(ilib), posOf(ilibText, "Shape", 0, 0)),
+    "interfaces: definition of an interface type jumps to the declaration (got " + show(loc) + ")");
+  // definition of an interface method call (through an interface value) jumps to the interface method
+  r = s.lspRequest(fs, p, "textDocument/definition", td(imain, posOf(imainText, "area().toString", 0, 1)));
+  loc = at(r, ["result"]);
+  s.check(fs, isLoc(loc, uriOf(ilib), posOf(ilibText, "area", 0, 0)),
+    "interfaces: definition of s.area() jumps to the interface method (got " + show(loc) + ")");
+  // ... and so does a call on a bounded type parameter
+  r = s.lspRequest(fs, p, "textDocument/definition", td(imain, posOf(imainText, "x.area", 0, 3)));
+  loc = at(r, ["result"]);
+  s.check(fs, isLoc(loc, uriOf(ilib), posOf(ilibText, "area", 0, 0)),
+    "interfaces: definition of x.area() on T extends Shape jumps to the interface method (got " + show(loc) + ")");
+  // the bound itself is a reference to the interface
+  r = s.lspRequest(fs, p, "textDocument/definition", td(imain, posOf(imainText, "extends Shape", 0, 9)));
+  loc = at(r, ["result"]);
+  s.check(fs, isObj(loc) && isStrEq(at(loc, ["uri"]), uriOf(ilib)), "interfaces: definition of a bound (got " + show(loc) + ")");
+  // hover on the interface lists its implementations
+  hv = hoverAt(s, fs, p, imain, posOf(imainText, "Shape =", 0, 1));
+  s.check(fs, hv.includes("interface Shape") && hv.includes("implemented by Square"), "interfaces: hover lists implementations (got " + reprStr(hv) + ")");
+  // go to implementations: of the interface, and of its method
+  r = s.lspRequest(fs, p, "textDocument/implementation", td(imain, posOf(imainText, "Shape =", 0, 1)));
+  locs = items(at(r, ["result"]));
+  s.check(fs, locs.length == 1 && isStrEq(at(locs[0], ["uri"]), uriOf(ilib)) && eq(at(locs[0], ["range", "start"]), pj(posOf(ilibText, "Square", 0, 0))),
+    "interfaces: implementation of an interface -> the class (got " + show(A(locs)) + ")");
+  r = s.lspRequest(fs, p, "textDocument/implementation", td(imain, posOf(imainText, "area().toString", 0, 1)));
+  locs = items(at(r, ["result"]));
+  s.check(fs, locs.length == 1 && isStrEq(at(locs[0], ["uri"]), uriOf(ilib)) && eq(at(locs[0], ["range", "start"]), pj(posOf(ilibText, "area", 1, 0))),
+    "interfaces: implementation of an interface method -> the class method (got " + show(A(locs)) + ")");
+  // references of the interface method: declaration + both calls (virtual and via the bound)
+  locs = refsAt(s, fs, p, imain, posOf(imainText, "area().toString", 0, 1), true);
+  s.check(fs, locs.length == 3, "interfaces: method references (decl + s.area + x.area) (got " + locs.length.toString() + ")");
+  // document symbols list the interface with its methods
+  r = s.lspRequest(fs, p, "textDocument/documentSymbol", O([F("textDocument", O([F("uri", S(uriOf(ilib)))]))]));
+  const syms = items(at(r, ["result"]));
+  s.check(fs, hasInterfaceSymbol(syms), "interfaces: document symbol Shape(interface) with child area (got " + show(A(syms)) + ")");
+
+  // ---- generic classes across files (ADR-0026): definition, hover, references, rename -----------
+  const glib = tmp + "/glib.or";
+  const gmain = tmp + "/gmain.or";
+  const glibText = "export interface Shape {\n  area(): int;\n}\n\n"
+    + "export class Cell<T extends Shape> {\n  items: T[] = [];\n"
+    + "  add(x: T): void {\n    this.items.push(x);\n  }\n"
+    + "  total(): int {\n    let t = 0;\n    for (const i of this.items) {\n      t += i.area();\n    }\n    return t;\n  }\n}\n";
+  const gmainText = "import { Shape, Cell } from \"./glib\";\n\n"
+    + "class Sq implements Shape {\n  constructor(public s: int) {}\n"
+    + "  area(): int {\n    return this.s * this.s;\n  }\n}\n\n"
+    + "function main(): void {\n"
+    + "  let c = new Cell<Sq>();\n"
+    + "  c.add(new Sq(2));\n"
+    + "  console.log(c.total().toString());\n"
+    + "  console.log(c.items.length.toString());\n"
+    + "}\n";
+  write(fs, glib, glibText);
+  openDoc(s, fs, p, gmain, gmainText, 1);
+  d = sync(s, fs, p, uriOf(gmain));
+  s.check(fs, eq(d, A([])), "generic classes: gmain.or has no diagnostics (got " + show(d) + ")");
+  const add = posOf(gmainText, "add(new", 0, 1);
+  r = s.lspRequest(fs, p, "textDocument/definition", td(gmain, add));
+  loc = at(r, ["result"]);
+  s.check(fs, isLoc(loc, uriOf(glib), posOf(glibText, "add", 0, 0)),
+    "generic classes: definition of a method call jumps to the generic class's method (got " + show(loc) + ")");
+  r = s.lspRequest(fs, p, "textDocument/definition", td(gmain, posOf(gmainText, "Cell<Sq>", 0, 1)));
+  loc = at(r, ["result"]);
+  s.check(fs, isLoc(loc, uriOf(glib), posOf(glibText, "Cell", 0, 0)),
+    "generic classes: definition of `new Cell<Sq>` jumps to the class (got " + show(loc) + ")");
+  hv = hoverAt(s, fs, p, gmain, add);
+  s.check(fs, hv.includes("mut method add(x: T): void"), "generic classes: hover shows the inferred mutability (got " + reprStr(hv) + ")");
+  hv = hoverAt(s, fs, p, gmain, posOf(gmainText, "total()", 0, 1));
+  s.check(fs, hv.includes("method total(): int") && !hv.includes("mut"), "generic classes: non-mutating method hover (got " + reprStr(hv) + ")");
+  hv = hoverAt(s, fs, p, gmain, posOf(gmainText, "Cell<Sq>", 0, 1));
+  s.check(fs, hv.includes("class Cell<T extends Shape>"), "generic classes: hover on the class shows type parameters and bounds (got " + reprStr(hv) + ")");
+  locs = refsAt(s, fs, p, gmain, add, true);
+  s.check(fs, locs.length == 2 && containsStr(uriSet(locs), uriOf(glib)), "generic classes: method references (decl + call) (got " + locs.length.toString() + ")");
+  locs = refsAt(s, fs, p, gmain, posOf(gmainText, "items.length", 0, 0), true);
+  s.check(fs, locs.length >= 3, "generic classes: field references (decl, this.items x2, c.items) (got " + locs.length.toString() + ")");
+  r = s.lspRequest(fs, p, "textDocument/definition", td(gmain, posOf(gmainText, "items.length", 0, 0)));
+  loc = at(r, ["result"]);
+  s.check(fs, isLoc(loc, uriOf(glib), posOf(glibText, "items", 0, 0)),
+    "generic classes: definition of a field of an instance (got " + show(loc) + ")");
+  r = s.lspRequest(fs, p, "textDocument/definition", td(glib, posOf(glibText, "extends Shape", 0, 9)));
+  loc = at(r, ["result"]);
+  s.check(fs, isLoc(loc, uriOf(glib), posOf(glibText, "Shape", 0, 0)),
+    "generic classes: definition of a class type parameter bound (got " + show(loc) + ")");
+  r = s.lspRequest(fs, p, "textDocument/rename", tdName(gmain, add, "put"));
+  changes = at(r, ["result", "changes"]);
+  s.check(fs, cnt(at(changes, [uriOf(glib)])) == 1 && cnt(at(changes, [uriOf(gmain)])) == 1,
+    "generic classes: rename method in both files (" + countsOf(changes) + ")");
+
+  // ---- analysis cache: requests after an edit / a save / a change on disk never see stale analyses -------------------
+  // (in tmp itself as cachelib.or / cachemain.or: std:fs has no mkdir; the test is the same)
+  const cacheLib = tmp + "/cachelib.or";
+  const cacheMain = tmp + "/cachemain.or";
+  const cacheLibText = "export function g(x: int): int {\n  return x;\n}\n";
+  const cacheMainText = "import { g } from \"./cachelib\";\nfunction main(): void {\n  const n: int = g(1);\n}\n";
+  write(fs, cacheLib, cacheLibText);
+  openDoc(s, fs, p, cacheMain, cacheMainText, 1);
+  const gpos = posOf(cacheMainText, "g(1)", 0, 0);
+  const h1 = show(at(s.lspRequest(fs, p, "textDocument/hover", td(cacheMain, gpos)), ["result"]));
+  s.check(fs, h1.includes("function g(x: int): int"), "cache: hover on an import from a file that is not open (" + h1 + ")");
+  s.check(fs, show(at(s.lspRequest(fs, p, "textDocument/hover", td(cacheMain, gpos)), ["result"])) == h1,
+    "cache: the same hover twice gives the same answer");
+  // the imported file changes on disk and is saved: the next hover sees it
+  write(fs, cacheLib, replaceAll(cacheLibText, "(x: int): int {\n  return x;", "(x: int): string {\n  return \"s\";"));
+  s.notify(fs, p, "textDocument/didSave", O([F("textDocument", O([F("uri", S(uriOf(cacheMain)))]))]));
+  const h2 = show(at(s.lspRequest(fs, p, "textDocument/hover", td(cacheMain, gpos)), ["result"]));
+  s.check(fs, h2.includes("function g(x: int): string"), "cache: hover after the imported file changed on disk and didSave (" + h2 + ")");
+  // and without a save notification the content check still notices a change on disk
+  write(fs, cacheLib, cacheLibText);
+  const h3 = show(at(s.lspRequest(fs, p, "textDocument/hover", td(cacheMain, gpos)), ["result"]));
+  s.check(fs, h3 == h1, "cache: hover after the file changed back on disk (" + h3 + ")");
+  // didChange of the open document, then hover
+  changeDoc(s, fs, p, cacheMain, replaceAll(cacheMainText, "g(1)", "g(2)") + "\n", 2);
+  const h4 = show(at(s.lspRequest(fs, p, "textDocument/hover", td(cacheMain, gpos)), ["result"]));
+  s.check(fs, h4 == h1, "cache: hover after didChange of the open document");
+  const newMain = replaceAll(cacheMainText, "const n: int = g(1);", "const n: string = \"s\";");
+  changeDoc(s, fs, p, cacheMain, newMain, 3);
+  r = s.lspRequest(fs, p, "textDocument/hover", td(cacheMain, posOf(newMain, "n:", 0, 0)));
+  s.check(fs, show(at(r, ["result"])).includes("const n: string"), "cache: hover sees the new local type after didChange (" + show(at(r, ["result"])) + ")");
+  s.notify(fs, p, "textDocument/didClose", O([F("textDocument", O([F("uri", S(uriOf(cacheMain)))]))]));
+  sync(s, fs, p, uriOf(cacheMain));
+
+  // ---- shutdown / exit --------------------------------------------------------------------
+  r = s.lspRequest(fs, p, "shutdown", nil());
+  s.check(fs, has(r, "result") && isNull(at(r, ["result"])) && !has(r, "error"), "shutdown: null result");
+  s.notify(fs, p, "exit", nil());
+  const rc = s.waitExit(fs, p, 30);
+  s.check(fs, rc == 0, "exit code 0 after shutdown+exit (got " + (rc < 0 ? "None" : rc.toString()) + ")");
+  const err = s.stderrText(fs);
+  s.check(fs, strip(err) == "", "no stderr output (got '" + err.substring(0, err.length < 200 ? err.length : 200) + "')");
+}
+
+function allNewText(changes: Json, want: string): bool {
+  for (const k of keysOf(changes)) {
+    for (const e of items(at(changes, [k]))) {
+      if (!isStrEq(at(e, ["newText"]), want)) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+function anyCodeStarts(d: Json, prefix: string): bool {
+  for (const x of items(d)) {
+    if (str(at(x, ["code"])).startsWith(prefix)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// any(x["name"] == "Shape" and x["kind"] == 11 and [k["name"] for k in x["children"]] == ["area"] for x in syms)
+function hasInterfaceSymbol(syms: Json[]): bool {
+  for (const x of syms) {
+    if (isStrEq(at(x, ["name"]), "Shape") && isIntEq(at(x, ["kind"]), 11)) {
+      let names: string[] = [];
+      for (const k of items(at(x, ["children"]))) {
+        names.push(str(at(k, ["name"])));
+      }
+      if (strEq(names, ["area"])) {
+        return true;
+      }
+    }
+  }
+  return false;
+}

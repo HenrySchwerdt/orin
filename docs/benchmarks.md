@@ -346,7 +346,7 @@ larger than that bar, which is why the argument rests on the counters and on the
 ## Cost of the field bounds checks (shape-confusion backstop)
 
 Change measured: every struct/variant slot access checks `kind == struct && index < nslots` (runtime inline
-accessors, `orin_mir_struct_*`, LLVM `@orinl_slot`), array slot access and push check `kind == array`;
+accessors, `orinc_mir_struct_*`, LLVM `@orinl_slot`), array slot access and push check `kind == array`;
 initialising stores into a fresh `orin_struct_new` stay unchecked (docs/assurance.md F-shape). Same machine as above.
 
 Method: the base (the commit before the change) and the changed tree were bootstrapped separately.
@@ -842,3 +842,18 @@ object exits 1 with a one-line message instead of a traceback; `--repo` has no `
 environment access; the workflow passes it). Workarounds for missing language/library features: `std:fs` cannot create
 directories (`render` runs `mkdir -p` through `std:io.shell`), floats have no fixed-precision formatting
 (`tooling/reports/src/numfmt.or` implements `%.Nf`, `%g` and `round` exactly with 64-bit integers), and `float` has no `log10`.
+
+## Annotation processors: cost of generated code (ADR-0046 S6)
+
+`examples/json-codec/app` (2 `@Json` records, 8 fields, 160 lines of generated companion), `orin compile` to C, 3 runs each, sandbox
+machine, time of the compiler only (no C compile of the result):
+
+| build | time |
+|---|---|
+| hand-written (companion pasted into `models.or`, no processor) | 0.06 s |
+| processor, warm cache | 0.08-0.11 s |
+| processor, cold cache (helper built with `cc -O1` and run) | 2.87 s |
+
+The C output is 222,271 bytes with the processor and 221,849 bytes hand-written (only helper names differ); runtime behaviour is
+identical on the C and LLVM backends (`tools/test_processors.py`). The cold cost is the helper build (the processor module with
+`std:meta`, `std:json` and the generated `main`) and is paid once per processor change, not per annotated-module change.

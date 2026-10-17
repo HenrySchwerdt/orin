@@ -892,3 +892,61 @@ the owner took it on 2026-10-16: `orin build|run|test --release` now defaults to
 
 **Decision (2026-10-16, owner): LLVM is the `--release` default.** Without the pinned toolchain the default release build uses a system
 `clang` of at least the pin's major version, else falls back to C with one note. Both backends run the same optimiser at `-O2`.
+
+## Addendum (2026-10-16): packed arrays (b) and reuse in place for field / element in-out (e), measured first
+
+Both levers were measured before any code (main `2fc3895`, C backend, `tools/bench.py --instructions` and `valgrind --tool=callgrind`
+on the self-compile; the baseline of every benchmark is the "before" column of the table below).
+
+### (e) in-place reuse for `x.f = g(x.f)` / `a[i] = g(a[i])`: ceiling below the gate, not built
+
+The benchmarks cannot gain: their COW counters are 1 (`cow_copies` of all 18 workloads other than the self-compile and html/url).
+Only the self-compile copies. Its ceiling for *every* copy, the inclusive cost of `orin_make_unique_slow` (callgrind):
+520.5 M of 23,087 M instructions = **2.25 %** (929,236 copies, 166.9 M in-place reuses). Splitting that by caller:
+
+| caller | inclusive | share | is it the field in/out pattern? |
+|---|---:|---:|---|
+| `mapSet<string,string>` (217,859 copies; `Sources` / `Tab.addUni`: `l16 = struct_get(l1,0); l21 = dup l16; mapSet(l21,..); struct_replace(l1,0,..)`) | 97.0 M + 27.6 M | 0.54 % | **yes**: the field is read (rc 2), the callee copies, the replace releases the old value; `ITakeField` (as used for `push`) would avoid it |
+| `Transfer.set` / `Transfer.load` (`this.ls[l] = ..`) | 78.1 M + 65.0 M | 0.62 % | no: `ls` is shared with the in-state on purpose (`state()` hands it out); a genuine COW |
+| `UniqueSet.step`, `uniqueIn`, `Fixpoint.joinInto` | 63.2 M + 29.6 M + 34.9 M | 0.55 % | no: a shared in-state array that is then written; a data-structure fix (lever 1 style), not a move-out-and-back |
+| `registerLifted`, `instFunc`, `newLocal`, `ancestors`, other | 82 M | 0.35 % | no |
+
+So the pattern named by (e) is worth at most **0.54 % of the self-compile** and nothing on any benchmark, under the gate (1 %). The
+rest of the COW cost is real sharing. Not built; the recipe if a program ever needs it: an optimiser rewrite of
+`getfield; dup; call g(owned); structreplace` into `takefield; call; structset` with the existing hole rules.
+
+### (b) packed arrays: ceilings
+
+`u8[]` is the only scalar array a benchmark or the compiler exercises through a bulk path. Users of `bytesToString` /
+`stringToBytes` (the only operations that read or write a whole `u8[]` as bytes): `bench/bytesstr` and `bench/http_parse`; the
+self-compile has none (`orin_bytes_to_string`, `orin_string_to_bytes` do not appear in its profile).
+
+| experiment | bytesstr | http_parse | self-compile |
+|---|---:|---:|---:|
+| baseline (6 instructions per converted byte) | 507.2 M | 1,537.9 M | 24,274 M |
+| ideal packed storage: both conversions free (a memcpy; hack runtime, wrong output) | about 4 M (-99 %) | about -9.0 % (`orin_bytes_to_string` is 9.03 % inclusive) | 0 |
+
+Real packing needs the element width at `IArrayNew` / `IArrayGet` / `IArraySet` and in the `.ll` the LLVM backend inlines, or a
+second array kind with a slow path in every runtime array operation (a `slot_ptr` into a packed array does not exist). That is a
+MIR version (v2.7), a lowering change outside this branch's directories, a rewrite of the runtime's 40 array sites and of the LLVM
+runtime IR, for one micro-benchmark (-99 %) and at most -9 % on http_parse, nothing on the compiler. Not built.
+
+### Built: the conversion loops, 4 elements per iteration (runtime only)
+
+What packing would have saved on those two operations is the per-byte loop, not the storage width. `orin_bytes_to_string` and
+`orin_string_to_bytes` now narrow and widen 4 elements per iteration in plain C, with the same checks (`byte out of range` from
+the OR of all slots, slice bounds, shape). No MIR, verifier, backend or compiler change, so no new trusted code beyond two
+runtime loops.
+
+| executed instructions (valgrind, C backend / LLVM backend) | before | after | change |
+|---|---:|---:|---:|
+| bytesstr, C | 507,236,033 | 370,922,073 | -26.9 % |
+| bytesstr, LLVM | 506,826,797 | 328,569,037 | -35.2 % |
+| http_parse, C | 1,537,904,468 | 1,535,635,006 | -0.1 % |
+| http_parse, LLVM | 1,489,300,029 | 1,466,340,146 | -1.5 % |
+
+An SSE2 version (16 per iteration) reached bytesstr -58.9 %, but `<emmintrin.h>` is outside the platform boundary
+(`tools/check_platform_boundary.sh`, ADR-0030); GCC's generic vector types (`__builtin_convertvector`) stay inside it but GCC 13
+compiles them worse than the plain loop (bytesstr 444 M, http_parse +5 %). The plain loop is kept; an intrinsics path would need
+its own place in the platform layer. The rest of bytesstr is the 8-byte slot traffic (2 x 8 MB per round trip); only packed
+storage removes it. http_parse gains little because its strings are short.

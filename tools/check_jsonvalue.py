@@ -12,6 +12,7 @@ import re
 import statistics
 import subprocess
 import time
+from runtime_files import rt_inc, rt_src, rt_llvm  # the runtime source list: tools/runtime-sources.txt
 
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "build/jsonvalue"
@@ -35,10 +36,10 @@ def build(orinc, source, backend, contracts=False, sanitize=False):
         cmd += ["--check-contracts"]
     run(cmd)
     binary = OUT / stem
-    cmd = ["clang", "-O1" if sanitize else "-O2", "-w", "-I", "runtime/core", generated,
-           "runtime/core/orin_runtime.c", "runtime/platform/orin_platform.c", "-o", binary]
+    cmd = ["clang", "-O1" if sanitize else "-O2", "-w", *rt_inc(), generated,
+           *rt_src(), "-o", binary]
     if backend == "llvm":
-        cmd += ["runtime/core/orin_runtime_llvm.c"]
+        cmd += rt_llvm()
     if sanitize:
         cmd += ["-fsanitize=address,undefined", "-fno-sanitize-recover=undefined"]
     run(cmd)
@@ -126,7 +127,7 @@ def oracle_cases():
 BENCHMARK = '''import { Host, useProcess } from "std:host";
 import { args } from "std:process";
 import { assert, assertEqString, assertEqUsize } from "std:test";
-import { JsonReadOptions, JsonDuplicatePolicy, parseDocument, writeDocument, defaultJsonLimits } from "std:jsonvalue";
+import { JsonReadOptions, JsonDuplicatePolicy, parseDocument, writeDocument, defaultLimits } from "std:json";
 function source(n: usize, mode: string): string {
   if (mode == "string") {
     let s = "a"; while (s.length < n) { s = s + s; }
@@ -148,7 +149,7 @@ function source(n: usize, mode: string): string {
 }
 function measure(n: usize, mode: string): void {
   const s = source(n,mode);
-  let l = defaultJsonLimits(); l.maxInputBytes = n*2+64;
+  let l = defaultLimits(); l.maxInputBytes = n*2+64;
   l.maxStringBytes = n+64; l.maxDecodedStringBytes = n*2+64;
   l.maxNodes = n+64; l.maxContainerItems = n+64;
   const opt = JsonReadOptions { limits:l, duplicates: mode == "duplicate" ? PreserveDuplicates : RejectDuplicates };
@@ -201,7 +202,7 @@ function main(): void {
 ''' + "".join(f"  {name}();\n" for name in names) +
                       "  const cases = [\n" + ",\n".join(entries) + '''];
   for (const c of cases) {
-    let opt = defaultJsonOptions();
+    let opt = defaultReadOptions();
     if (c.preserve) { opt.duplicates = PreserveDuplicates; }
     const parsed = parseDocument(c.text,opt).unwrap();
     assert(equal(parsed,c.value),"independent Python source tree");

@@ -260,7 +260,8 @@ single root. See [`docs/bootstrap.md`](docs/bootstrap.md).
 
 - [Documentation index](docs/README.md): current guides, implementation status, decisions and dated release evidence
 - Coming from TypeScript? [Orin for TypeScript developers](docs/ts-developers.md): where code that looks the same behaves differently
-- Language specification: [`spec/`](spec/spec.md)
+- Language reference (normative, as implemented, rules traced to tests): [`docs/reference/`](docs/reference/README.md)
+- Language specification (design RFC): [`spec/`](spec/spec.md)
 - Architecture and safety status: [`docs/architecture.md`](docs/architecture.md)
 - Design decisions (ADRs): [`docs/decisions/`](docs/decisions)
 - Formal model: [`docs/formal.md`](docs/formal.md) · Memory IR: [`docs/mir.md`](docs/mir.md)

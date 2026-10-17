@@ -31,6 +31,7 @@ import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from runtime_files import rt_inc, rt_src, rt_llvm  # the runtime source list: tools/runtime-sources.txt
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CC = os.environ.get("CC", "cc")
@@ -53,9 +54,9 @@ def sh(cmd, **kw):
 
 def build_runtime(out):
     objs = []
-    for src in ("runtime/core/orin_runtime.c", "runtime/platform/orin_platform.c"):
+    for src in rt_src():
         o = os.path.join(out, os.path.basename(src)[:-2] + ".sites.o")
-        sh([CC] + CFLAGS + ["-DORIN_SITE_STATS", "-I", "runtime/core", "-c", src, "-o", o])
+        sh([CC] + CFLAGS + ["-DORIN_SITE_STATS", *rt_inc(), "-c", src, "-o", o])
         objs.append(o)
     return objs
 
@@ -64,7 +65,7 @@ def build(orinc, src, out, name, rt):
     c = os.path.join(out, name + ".c")
     exe = os.path.join(out, name)
     sh([orinc, "compile", "--stats-sites", src, "-o", c], timeout=1800)
-    sh([CC] + CFLAGS + ["-I", "runtime/core", c] + rt + ["-lm", "-lpthread", "-o", exe], timeout=1800)
+    sh([CC] + CFLAGS + [*rt_inc(), c] + rt + ["-lm", "-lpthread", "-o", exe], timeout=1800)
     save_mir(orinc, src, out, name)
     return exe
 
@@ -709,14 +710,14 @@ RULES = [
      "`this.acc + sliceString(..)` / `tok` concatenations when a value spans chunks; append into the accumulator in place"),
     (r"^\$stdlib/http\.MessageParser\.(doName|doMethod|doTarget)$", r"strappend", "g", "string", "as doValue"),
     (r"^\$stdlib/http\.MessageParser\.bodyBytes$", r"arraynew val", "-", "array<u8>", "the body is the result"),
-    (r"^\$stdlib/bytes\.emptyBytes$", r"arraynew val", "g", "array<u8> (empty)",
-     "`new Bytes([], 0, 0)` for every `emptyBytes()` (a fresh empty array and a view): callers that only need \"no body\" "
+    (r"^\$stdlib/bytes\.empty$", r"arraynew val", "g", "array<u8> (empty)",
+     "`new Bytes([], 0, 0)` for every `empty()` (a fresh empty array and a view): callers that only need \"no body\" "
      "(bodyBytes, serveConnection) can skip it; one shared empty value needs (f) freeze"),
     (r"^\$stdlib/bytes\.ByteBuilder\.appendString$", r"string\.toBytes", "g", "array<u8> (temporary)",
      "`this.data.concat(stringToBytes(s))` makes a temporary u8[] per appended string: append the string's bytes directly "
      "(one runtime call, no temporary)"),
     (r"^\$stdlib/bytes\.ByteBuilder\.constructor$", r"", "-", None, "the response buffer"),
-    (r"^\$stdlib/bytes\.bytesFromString$", r"string\.toBytes", "-", "array<u8>", "the bytes are the result"),
+    (r"^\$stdlib/bytes\.fromString$", r"string\.toBytes", "-", "array<u8>", "the bytes are the result"),
     (r"^\$stdlib/http\.fieldsText$", r"arraynew ref", "g", "array<string> (parts)",
      "header lines collected into a string[] and then joined: append to one string / the ByteBuilder directly"),
     (r"^\$stdlib/http\.emptyHeaders$", r"arraynew ref", "a", "array<ref> (empty)", "shared immortal empty arrays"),

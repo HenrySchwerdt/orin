@@ -1,14 +1,27 @@
 // std:url: byte-oriented percent components and strict UTF-8 query pairs.
 // See docs/std-url.md for the wire format, offsets, allocation and complexity.
-import { Bytes, ByteBuilder, bytesFromString } from "std:bytes";
-import { checkUtf8 } from "std:utf8";
+import { Bytes, ByteBuilder, fromString } from "std:bytes";
+import { validate } from "std:utf8";
 
 export type UrlErrorKind = TruncatedEscape | InvalidHex | InvalidUtf8;
 // offset is always a byte offset in the original input, including for UTF-8 errors.
 export type UrlError = { kind: UrlErrorKind; offset: usize; };
 export type QueryPair = { key: string; value: string; };
 
-// urlErrorMessage(e): diagnostic text. Never fails; O(1), allocates message.
+// How a space is written in a component (ADR-0048 rule 2.5; replaces the opposite-polarity `spaceAsPlus` /
+// `plusAsSpace` booleans). PlusAsSpace is the form-style (`application/x-www-form-urlencoded`) mode: encoding writes
+// ASCII space as `+` and decoding reads a raw `+` as a space. PercentSpace is the ordinary component mode: space is
+// `%20` and a raw `+` is an ordinary byte. A literal `+` is always encoded as `%2B` and `%2B` always decodes to `+`.
+export type FormSpace = PlusAsSpace | PercentSpace;
+
+function plusMode(space: FormSpace): bool {
+  return match (space) {
+    PlusAsSpace => true,
+    PercentSpace => false,
+  };
+}
+
+// urlErrorMessage(e): string -- diagnostic text, "<cause> at byte <offset>". Never fails; O(1), allocates the message.
 @Ensures(result.length > 0)
 export function urlErrorMessage(e: UrlError): string {
   const why = match (e.kind) {
@@ -43,11 +56,12 @@ function hexValue(c: int): int {
   return -1;
 }
 
-// Only ALPHA / DIGIT / "-._~" pass through. Upper-case %HH; optionally space -> +.
-// Strings hold bytes: no validation, normalization or Unicode conversion occurs here.
-// Never fails; O(s.length) time and allocation.
+// percentEncode(s, space): string -- only ALPHA / DIGIT / "-._~" pass through, every other byte becomes upper-case %HH;
+// with PlusAsSpace an ASCII space becomes `+`. Strings hold bytes: no validation, normalization or Unicode conversion
+// occurs here. Never fails (no errors, no traps); O(s.length) time and allocation.
 @Ensures(result.length >= s.length && result.length <= s.length * 3)
-export function percentEncode(s: string, spaceAsPlus: bool): string {
+export function percentEncode(s: string, space: FormSpace): string {
+  const spaceAsPlus = plusMode(space);
   let out = new ByteBuilder();
   let i: usize = 0;
   while (i < s.length) {
@@ -66,14 +80,14 @@ export function percentEncode(s: string, spaceAsPlus: bool): string {
   return out.build().toRawString();
 }
 
-// Encodes an arbitrary Bytes view, including NUL and invalid UTF-8.
+// percentEncodeBytes(b, space): string -- `percentEncode` of an arbitrary Bytes view, including NUL and invalid UTF-8.
 // Never fails; O(b.length()) time and allocation (including a temporary raw string).
 @Ensures(result.length >= b.length() && result.length <= b.length() * 3)
-export function percentEncodeBytes(b: Bytes, spaceAsPlus: bool): string {
-  return percentEncode(b.toRawString(), spaceAsPlus);
+export function percentEncodeBytes(b: Bytes, space: FormSpace): string {
+  return percentEncode(b.toRawString(), space);
 }
 
-// Decode a range without copying the encoded substring. Every '%' must have two hex digits.
+// Internal: decode a range without copying the encoded substring. Every '%' must have two hex digits.
 @Requires(start <= end && end <= s.length)
 @Ensures(result.isOk() ==> result.unwrap().length <= end - start)
 @Ensures(result.isErr() ==> result.unwrapErr().offset >= start && result.unwrapErr().offset < end)
@@ -106,10 +120,10 @@ function decodeRange(
   }
   const decoded = out.build().toRawString();
   if (text) {
-    const valid = checkUtf8(decoded);
+    const valid = validate(decoded);
     if (valid.isErr()) {
       // Translate the decoded sequence start back to the encoded source in one extra scan.
-      const target = valid.unwrapErr().position;
+      const target = valid.unwrapErr().offset;
       let source = start;
       let pos: usize = 0;
       while (pos < target) {
@@ -122,32 +136,36 @@ function decodeRange(
   return Ok(decoded);
 }
 
-// Byte decoder: raw non-'%' bytes pass through, arbitrary decoded bytes are accepted.
-// Err on malformed escapes, source offset at '%'; O(n) time and allocation.
+// percentDecodeBytes(s, space): Result<Bytes, UrlError> -- byte decoder: raw non-'%' bytes pass through, arbitrary
+// decoded bytes are accepted; with PlusAsSpace a raw `+` reads as a space. Err(TruncatedEscape | InvalidHex) on a
+// malformed escape, offset at the '%'. Never traps; O(n) time and allocation.
 @Ensures(result.isOk() ==> result.unwrap().length() <= s.length)
 @Ensures(result.isErr() ==> result.unwrapErr().offset < s.length)
-export function percentDecodeBytes(s: string, plusAsSpace: bool): Result<Bytes, UrlError> {
-  const r = decodeRange(s, 0, s.length, plusAsSpace, false);
+export function percentDecodeBytes(s: string, space: FormSpace): Result<Bytes, UrlError> {
+  const r = decodeRange(s, 0, s.length, plusMode(space), false);
   if (r.isErr()) {
     return Err(r.unwrapErr());
   }
-  return Ok(bytesFromString(r.unwrap()));
+  return Ok(fromString(r.unwrap()));
 }
 
-// Text decoder: rejects invalid UTF-8; '+' stays literal unless explicitly enabled.
-// Err on malformed escapes or invalid UTF-8 with original source offset; O(n) time/allocation.
+// percentDecode(s, space): Result<string, UrlError> -- text decoder: rejects invalid UTF-8; a raw '+' stays literal
+// unless PlusAsSpace is given. Err(TruncatedEscape | InvalidHex | InvalidUtf8) with the offset in the original input.
+// Never traps; O(n) time and allocation.
 @Ensures(result.isOk() ==> result.unwrap().length <= s.length)
 @Ensures(result.isErr() ==> result.unwrapErr().offset < s.length)
-export function percentDecode(s: string, plusAsSpace: bool): Result<string, UrlError> {
-  return decodeRange(s, 0, s.length, plusAsSpace, true);
+export function percentDecode(s: string, space: FormSpace): Result<string, UrlError> {
+  return decodeRange(s, 0, s.length, plusMode(space), true);
 }
 
-// Query body only (no leading '?'). Split on '&', then the first '=', before decoding.
-// Empty fields are skipped; a bare key has value ""; empty keys and duplicates survive.
-// Err on malformed escapes or invalid UTF-8 with absolute source offset; O(n) time/allocation.
+// parseQuery(s, space): Result<QueryPair[], UrlError> -- query body only (no leading '?'). Split on '&', then the first
+// '=', before decoding. Empty fields are skipped; a bare key has value ""; empty keys and duplicates survive.
+// Err(TruncatedEscape | InvalidHex | InvalidUtf8) with the absolute offset in `s`; no partial result. Never traps;
+// O(n) time and allocation.
 @Ensures(s.length == 0 ==> result.isOk() && result.unwrap().length == 0)
 @Ensures(result.isErr() ==> result.unwrapErr().offset < s.length)
-export function parseQuery(s: string, plusAsSpace: bool): Result<QueryPair[], UrlError> {
+export function parseQuery(s: string, space: FormSpace): Result<QueryPair[], UrlError> {
+  const plusAsSpace = plusMode(space);
   let pairs: QueryPair[] = [];
   let start: usize = 0;
   while (start < s.length) {
@@ -179,44 +197,58 @@ export function parseQuery(s: string, plusAsSpace: bool): Result<QueryPair[], Ur
   return Ok(pairs);
 }
 
-// Every pair emits key=value in input order. Rejects invalid UTF-8 in keys/values.
-// Error offset is relative to that key/value, identified by pairIndex and inValue.
-export type QueryEncodeError = { pairIndex: usize; inValue: bool; offset: usize; };
+// Why a query could not be written: the key or the value of a pair is not valid UTF-8.
+export type QueryEncodeErrorKind = InvalidKeyUtf8 | InvalidValueUtf8;
+// pairIndex is the zero-based index of the offending pair; offset is the byte offset of the invalid sequence
+// WITHIN that key or value (which of the two is `kind`).
+export type QueryEncodeError = { kind: QueryEncodeErrorKind; pairIndex: usize; offset: usize; };
 
-// stringifyQuery(pairs, spaceAsPlus): ordered key=value fields, with no leading question mark.
-// Err(QueryEncodeError) on invalid UTF-8; O(total bytes + pair count) time and allocation.
+// queryEncodeErrorMessage(e): string -- diagnostic text, "<cause> in pair <index> at byte <offset>". Never fails;
+// O(1), allocates the message.
+@Ensures(result.length > 0)
+export function queryEncodeErrorMessage(e: QueryEncodeError): string {
+  const why = match (e.kind) {
+    InvalidKeyUtf8 => "invalid UTF-8 in key",
+    InvalidValueUtf8 => "invalid UTF-8 in value",
+  };
+  return `${why} in pair ${e.pairIndex.toString()} at byte ${e.offset.toString()}`;
+}
+
+// stringifyQuery(pairs, space): Result<string, QueryEncodeError> -- ordered key=value fields joined by '&', with no
+// leading question mark; every pair emits key=value in input order. Err(InvalidKeyUtf8 | InvalidValueUtf8) for a key
+// or value that is not valid UTF-8, no partial result. Never traps; O(total bytes + pair count) time and allocation.
 @Ensures(pairs.length == 0 ==> result.isOk() && result.unwrap().length == 0)
 @Ensures(result.isErr() ==> result.unwrapErr().pairIndex < pairs.length)
 export function stringifyQuery(
   pairs: QueryPair[],
-  spaceAsPlus: bool,
+  space: FormSpace,
 ): Result<string, QueryEncodeError> {
   let out = new ByteBuilder();
   let i: usize = 0;
   while (i < pairs.length) {
     const p = pairs[i];
-    const key = checkUtf8(p.key);
+    const key = validate(p.key);
     if (key.isErr()) {
       return Err(QueryEncodeError {
+        kind: InvalidKeyUtf8,
         pairIndex: i,
-        inValue: false,
-        offset: key.unwrapErr().position,
+        offset: key.unwrapErr().offset,
       });
     }
-    const value = checkUtf8(p.value);
+    const value = validate(p.value);
     if (value.isErr()) {
       return Err(QueryEncodeError {
+        kind: InvalidValueUtf8,
         pairIndex: i,
-        inValue: true,
-        offset: value.unwrapErr().position,
+        offset: value.unwrapErr().offset,
       });
     }
     if (i > 0) {
       out.appendU8(38);
     }
-    out.appendString(percentEncode(p.key, spaceAsPlus));
+    out.appendString(percentEncode(p.key, space));
     out.appendU8(61);
-    out.appendString(percentEncode(p.value, spaceAsPlus));
+    out.appendString(percentEncode(p.value, space));
     i += 1;
   }
   return Ok(out.build().toRawString());

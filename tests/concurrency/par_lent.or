@@ -1,0 +1,114 @@
+// forkJoinLent (ADR-0049 row 13a): a graph of records, strings, arrays and nested records is lent to the workers of a pool and
+// read without a copy; the results are built by the workers and never refer into the lent graph. The output must not depend on
+// the number of workers or ORIN_THREADS (tools/test_parallel.sh runs this with ORIN_THREADS = 1 .. 8, under ThreadSanitizer and
+// ASan, and checks that no object is live at exit).
+import { forkJoinLent, forkJoin, parallelism, copiedCount } from "std:task";
+
+type Tag = { name: string; weight: int; };
+type Inner = { a: int; xs: int[]; };
+type Item = { id: int; label: string; tags: Tag[]; inner: Inner; };
+type Piece = { k: usize; sum: int; first: Item; label: string; };
+
+function build(n: int): Item[] {
+  let items: Item[] = [];
+  let i = 0;
+  while (i < n) {
+    items.push(
+      Item {
+        id: i,
+        label: "item-" + i.toString(),
+        tags: [Tag { name: "t" + i.toString(), weight: i % 7 }, Tag { name: "u", weight: 3 }],
+        inner: Inner { a: i * 2, xs: [i, i + 1, i + 2] },
+      },
+    );
+    i += 1;
+  }
+  return items;
+}
+
+function piece(items: Item[], k: usize, size: usize): Piece {
+  let sum = 0;
+  let i = k * size;
+  const lo = i;
+  const hi = i + size < items.length ? i + size : items.length;
+  while (i < hi) {
+    const it = items[i];
+    sum += it.id + it.tags[0].weight + it.inner.a + it.inner.xs[2] + it.label.length.toInt();
+    i += 1;
+  }
+  return Piece { k: k, sum: sum, first: items[lo], label: items[lo].label + "/" + items[lo].tags[0].name };
+}
+
+function run(items: Item[], pieces: usize, size: usize, workers: usize): Piece[] {
+  return forkJoinLent(items, pieces, workers, k => piece(items, k, size));
+}
+
+function digest(ps: Piece[]): string {
+  let s = "";
+  for (const p of ps) {
+    s += p.k.toString() + ":" + p.sum.toString() + ":" + p.first.id.toString() + ":" + p.label + ";";
+  }
+  return s;
+}
+
+function seqDigest(items: Item[], pieces: usize, size: usize): string {
+  return digest(forkJoin(pieces, 1, k => piece(items, k, size)));
+}
+
+function main(): void {
+  const items = build(500);
+  const pieces: usize = 25;
+  const size: usize = 20;
+  const ref = seqDigest(items, pieces, size);
+  console.log(ref);
+  // workers 0 and 1: nothing is lent, the calling task runs the pieces in order
+  console.log((digest(run(items, pieces, size, 0)) == ref).toString());
+  console.log((digest(run(items, pieces, size, 1)) == ref).toString());
+  // one piece with many workers is the sequential path too
+  console.log((digest(run(items, 1, 20, 8)) == seqDigest(items, 1, 20)).toString());
+  console.log(run(items, 0, 20, 4).length.toString());
+  // 2..8 workers, and as many as the machine says
+  let w: usize = 2;
+  while (w <= 8) {
+    console.log("workers " + w.toString() + ": " + (digest(run(items, pieces, size, w)) == ref).toString());
+    w += 1;
+  }
+  console.log((digest(run(items, pieces, size, parallelism())) == ref).toString());
+  // results do not alias the lent graph: the graph is unpinned again afterwards, so it can be changed in place, and the
+  // results keep the values they had
+  let items2 = build(500);
+  const rs = run(items2, pieces, size, 4);
+  items2[0].label = "changed";
+  items2[0].tags[0].weight = 99;
+  console.log(rs[0].first.label + " " + rs[0].first.tags[0].weight.toString() + " " + rs[0].label);
+  console.log(items2[0].label + " " + items2[0].tags[0].weight.toString());
+  let first = rs[0];
+  first.first.label = "mine";
+  console.log(rs[0].first.label + " " + first.first.label);
+  // lending in a row: lent, unlent, lent again, with a different graph
+  const small = build(40);
+  console.log((digest(run(small, 4, 10, 4)) == seqDigest(small, 4, 10)).toString());
+  console.log((digest(run(items, pieces, size, 4)) == ref).toString());
+  // nested: a piece of the outer pool lends a graph it built itself to an inner pool
+  const nested = forkJoinLent(
+    items,
+    6,
+    3,
+    k => {
+      const mine = build(30 + k.toInt());
+      const inner = forkJoinLent(mine, 5, 2, j => piece(mine, j, 5));
+      return digest(inner).length.toString() + "/" + piece(items, k, 10).sum.toString();
+    },
+  );
+  console.log(nested.join(","));
+  const nestedSeq = forkJoin(
+    6,
+    1,
+    k => {
+      const mine = build(30 + k.toInt());
+      const inner = forkJoin(5, 1, j => piece(mine, j, 5));
+      return digest(inner).length.toString() + "/" + piece(items, k, 10).sum.toString();
+    },
+  );
+  console.log((nested.join(",") == nestedSeq.join(",")).toString());
+}

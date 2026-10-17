@@ -12,6 +12,7 @@
 # parts are TESTED_ONLY until R3/R4, docs/concurrency.md "Assurance").
 set -eu
 cd "$(dirname "$0")/.."
+. tools/runtime_files.sh   # the runtime source list: tools/runtime-sources.txt
 ORIN2=${ORIN2:-build/bootstrap/orin2}
 CC=${CC:-cc}
 B=build/concurrency
@@ -32,19 +33,23 @@ run_tsan() {
 }
 
 echo "[concurrency] runtime task tests"
-SRC="runtime/core/tests/task_test.c runtime/core/orin_runtime.c runtime/platform/orin_platform.c"
-$CC -g -O1 -Wall -I runtime/core $SRC -lm -o $B/task_test
+# the object model (allocator, destroy, make_unique) is Orin code: the C test links the stub that defines its C names (tools/rt_stub.sh)
+SRC="runtime/core/tests/task_test.c $(rt_src)"
+STUB=$(ORIN2=$ORIN2 CC=$CC tools/rt_stub.sh $B/rt_stub.o -g -O1)
+$CC -g -O1 -Wall -I runtime/core $SRC $STUB -lm -o $B/task_test
 $B/task_test
-$CC -g -O1 -fsanitize=thread -I runtime/core $SRC -lm -o $B/task_test_tsan
+STUB_TSAN=$(ORIN2=$ORIN2 CC=$CC tools/rt_stub.sh $B/rt_stub_tsan.o -g -O1 -fsanitize=thread)
+$CC -g -O1 -fsanitize=thread -I runtime/core $SRC $STUB_TSAN -lm -o $B/task_test_tsan
 run_tsan $B/task_test_tsan
-$CC -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -I runtime/core $SRC -lm -o $B/task_test_asan
+STUB_ASAN=$(ORIN2=$ORIN2 CC=$CC tools/rt_stub.sh $B/rt_stub_asan.o -g -fsanitize=address,undefined -fno-sanitize-recover=undefined)
+$CC -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -I runtime/core $SRC $STUB_ASAN -lm -o $B/task_test_asan
 ASAN_OPTIONS=detect_leaks=0 $B/task_test_asan
 
 for t in tests/concurrency/*.or; do
   n=$(basename "$t" .or)
   echo "[concurrency] $n"
   $ORIN2 compile "$t" -o $B/$n.c
-  RT="runtime/core/orin_runtime.c runtime/platform/orin_platform.c"
+  RT="$(rt_src)"
   $CC -O1 -w -I runtime/core $B/$n.c $RT -lm -o $B/$n
   # a first line `// exit: N` says the program must end with status N (a panic test); default 0
   want=$(sed -n '1s|^// exit: *\([0-9][0-9]*\) *$|\1|p' "$t")

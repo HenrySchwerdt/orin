@@ -19,6 +19,7 @@ import {
 import { CRef, CHandle, localClass, wfInstr, wfTerm, wfFunction } from "./wf";
 import { Transfer } from "./rules";
 import { accessFacts } from "./unchecked";
+import { mapChunksLent } from "../util";
 
 export type VerifyReport = { errors: VerifyIssue[]; warnings: VerifyIssue[]; };
 
@@ -461,6 +462,17 @@ function vtableMsg(prog: MProgram, g: usize): string {
   return "";
 }
 
+// The reports of the functions lo..hi-1 of `prog`, in order.
+function verifyRange(prog: MProgram, lo: usize, hi: usize): VerifyReport[] {
+  let out: VerifyReport[] = [];
+  let i = lo;
+  while (i < hi) {
+    out.push(verifyFunction(prog, prog.functions[i]));
+    i += 1;
+  }
+  return out;
+}
+
 // Verifies every function of `prog`. No error means the program is well-formed (`isWellFormedProgram`, compiler/mir)
 // and every function follows the ownership discipline of docs/mir.md. Every issue names something that exists.
 @Ensures(result.errors.length == 0 ==> isWellFormedProgram(prog))
@@ -490,13 +502,19 @@ export function verify(prog: MProgram): VerifyReport {
       }
     }
   }
-  for (const f of prog.functions) {
-    const r = verifyFunction(prog, f);
-    for (const e of r.errors) {
-      rep.errors.push(e);
-    }
-    for (const w of r.warnings) {
-      rep.warnings.push(w);
+  // Pieces of 64 consecutive functions, verified on the task pool with `prog` lent (ADR-0049 row 14); the pieces come
+  // back in index order, so the issues are appended function by function as the sequential loop did. `prog` is not used
+  // after the call but by the contracts.
+  const n = prog.functions.length;
+  const pieces = mapChunksLent(prog, n, 64, (lo: usize, hi: usize) => verifyRange(prog, lo, hi));
+  for (const reports of pieces) {
+    for (const r of reports) {
+      for (const e of r.errors) {
+        rep.errors.push(e);
+      }
+      for (const w of r.warnings) {
+        rep.warnings.push(w);
+      }
     }
   }
   return rep;

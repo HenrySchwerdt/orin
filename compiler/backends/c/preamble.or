@@ -1,0 +1,290 @@
+// The preamble of every generated C unit (ADR-0052 Addendum A section 3, step R3d.6): the inline helpers of the object model that
+// generated code calls (retain / release, checked slot access, array push, checked arithmetic, ...), defined by the compiler
+// itself instead of by the hand-written runtime header, exactly as the LLVM backend defines its own (`orinl_*`, llvm/runtime.or).
+// They are `static inline` functions of the unit, written against the object layout of `runtime/core/orin_runtime.h`
+// (`OrinObj`, `OrinStruct`, `OrinArray`, `OrinString`), the counters and census hooks of that header (`ORIN_STAT`,
+// `ORIN_SITE_RC`, `orin_stats`) and its out-of-line entries (`orin_destroy`, `orin_make_unique_slow`, `orin_array_push_grow`,
+// `orin_trap`, `orin_trap_shape`). The text of each helper is the text the header had before R3d.6, so the machine code is
+// unchanged. They carry the prefix `orinc_`; the `orin_*` inlines that stay in the header serve the C shells of the runtime
+// and its unit tests only (generated code does not call them).
+//
+// `cfg(k)` (hir/coreops.or, core operation 19) is the macro constants `ORIN_CFG_*` defined here: 0 free lists on (off under
+// ASan / MSan or `-DORIN_NO_FREELIST`), 1 hot counters (`ORIN_STATS_ENABLED`), 2 allocation-site census (`ORIN_SITE_STATS`).
+//
+// The text is deterministic and does not depend on the program, so a split program (`split.or`) repeats it in its header and
+// its data unit like the rest of the preamble.
+
+// The unboxed aggregates (docs/mir.md v2.2): an Option / Result / record / pair of scalars held by value in n + 1 words.
+function aggTypes(): string[] {
+  return [
+    "typedef struct { uint64_t w[1]; } OrinV0;",
+    "typedef struct { uint64_t w[2]; } OrinV1;",
+    "typedef struct { uint64_t w[3]; } OrinV2;",
+    "typedef struct { uint64_t w[4]; } OrinV3;",
+  ];
+}
+
+// The build configuration seen by `cfg(k)`; constants, so the Orin code that tests them folds.
+function cfgConstants(): string[] {
+  return [
+    "#if defined(ORIN_NO_FREELIST) || defined(__SANITIZE_ADDRESS__)",
+    "#define ORIN_CFG_FREELIST 0",
+    "#elif defined(__has_feature)",
+    "#if __has_feature(address_sanitizer) || __has_feature(memory_sanitizer)",
+    "#define ORIN_CFG_FREELIST 0",
+    "#endif",
+    "#endif",
+    "#ifndef ORIN_CFG_FREELIST",
+    "#define ORIN_CFG_FREELIST 1",
+    "#endif",
+    "#define ORIN_CFG_STATS ORIN_STAT_ON",
+    "#ifdef ORIN_SITE_STATS",
+    "#define ORIN_CFG_SITES 1",
+    "#else",
+    "#define ORIN_CFG_SITES 0",
+    "#endif",
+  ];
+}
+
+// Slots and counts: float <-> slot (ADR-0018), retain / release / make_unique (ADR-0002; `rc > 0` is live, `rc <= 0` immortal
+// or lend-pinned, so retain and release are no-ops on it).
+function countHelpers(): string[] {
+  return [
+    "static inline uint64_t orinc_f2s(double d) {",
+    "    union { double d; uint64_t u; } v;",
+    "    v.d = d;",
+    "    return v.u;",
+    "}",
+    "static inline double orinc_s2f(uint64_t u) {",
+    "    union { double d; uint64_t u; } v;",
+    "    v.u = u;",
+    "    return v.d;",
+    "}",
+    "static inline OrinObj *orinc_dup(OrinObj *o) {",
+    "    if (ORIN_LIKELY(o->rc > 0)) {",
+    "        o->rc++;",
+    "        ORIN_STAT(orin_stats.retains++);",
+    "        ORIN_SITE_RC(o, ORIN_SITE_RETAIN);",
+    "    }",
+    "    return o;",
+    "}",
+    "static inline void orinc_release(OrinObj *o) {",
+    "    if (o && o->rc > 0) {",
+    "        ORIN_STAT(orin_stats.releases++);",
+    "        ORIN_SITE_RC(o, ORIN_SITE_RELEASE);",
+    "        if (ORIN_UNLIKELY(--o->rc == 0)) orin_destroy(o);",
+    "    }",
+    "}",
+    "static inline OrinObj *orinc_make_unique(OrinObj *o) {",
+    "    if (ORIN_LIKELY(o->rc == 1)) {",
+    "        ORIN_STAT(orin_stats.cow_inplace++);",
+    "        ORIN_SITE_RC(o, ORIN_SITE_COW_INPLACE);",
+    "        return o;",
+    "    }",
+    "    return orin_make_unique_slow(o);",
+    "}",
+  ];
+}
+
+// Checked arithmetic (ADR-0022): a trap on overflow, division by zero and a failed conversion.
+function arithHelpers(): string[] {
+  return [
+    "static inline int64_t orinc_add_i(int64_t a, int64_t b) {",
+    "    int64_t r;",
+    "    if (ORIN_UNLIKELY(__builtin_add_overflow(a, b, &r))) orin_trap(\"integer overflow\");",
+    "    return r;",
+    "}",
+    "static inline int64_t orinc_sub_i(int64_t a, int64_t b) {",
+    "    int64_t r;",
+    "    if (ORIN_UNLIKELY(__builtin_sub_overflow(a, b, &r))) orin_trap(\"integer overflow\");",
+    "    return r;",
+    "}",
+    "static inline int64_t orinc_mul_i(int64_t a, int64_t b) {",
+    "    int64_t r;",
+    "    if (ORIN_UNLIKELY(__builtin_mul_overflow(a, b, &r))) orin_trap(\"integer overflow\");",
+    "    return r;",
+    "}",
+    "static inline int64_t orinc_div_i(int64_t a, int64_t b) {",
+    "    if (ORIN_UNLIKELY(b == 0)) orin_trap(\"division by zero\");",
+    "    if (ORIN_UNLIKELY(a == INT64_MIN && b == -1)) orin_trap(\"integer overflow\");",
+    "    return a / b;",
+    "}",
+    "static inline int64_t orinc_rem_i(int64_t a, int64_t b) {",
+    "    if (ORIN_UNLIKELY(b == 0)) orin_trap(\"modulo by zero\");",
+    "    if (ORIN_UNLIKELY(a == INT64_MIN && b == -1)) orin_trap(\"integer overflow\");",
+    "    return a % b;",
+    "}",
+    "static inline int64_t orinc_neg_i(int64_t a) {",
+    "    if (ORIN_UNLIKELY(a == INT64_MIN)) orin_trap(\"integer overflow\");",
+    "    return -a;",
+    "}",
+    "static inline uint64_t orinc_add_u(uint64_t a, uint64_t b) {",
+    "    uint64_t r;",
+    "    if (ORIN_UNLIKELY(__builtin_add_overflow(a, b, &r))) orin_trap(\"usize overflow\");",
+    "    return r;",
+    "}",
+    "static inline uint64_t orinc_sub_u(uint64_t a, uint64_t b) {",
+    "    uint64_t r;",
+    "    if (ORIN_UNLIKELY(__builtin_sub_overflow(a, b, &r))) orin_trap(\"usize underflow\");",
+    "    return r;",
+    "}",
+    "static inline uint64_t orinc_mul_u(uint64_t a, uint64_t b) {",
+    "    uint64_t r;",
+    "    if (ORIN_UNLIKELY(__builtin_mul_overflow(a, b, &r))) orin_trap(\"usize overflow\");",
+    "    return r;",
+    "}",
+    "static inline uint64_t orinc_div_u(uint64_t a, uint64_t b) {",
+    "    if (ORIN_UNLIKELY(b == 0)) orin_trap(\"division by zero\");",
+    "    return a / b;",
+    "}",
+    "static inline uint64_t orinc_rem_u(uint64_t a, uint64_t b) {",
+    "    if (ORIN_UNLIKELY(b == 0)) orin_trap(\"modulo by zero\");",
+    "    return a % b;",
+    "}",
+    "static inline uint64_t orinc_neg_u(uint64_t a) {",
+    "    if (ORIN_UNLIKELY(a != 0)) orin_trap(\"usize underflow\");",
+    "    return 0;",
+    "}",
+    "static inline uint64_t orinc_int_to_usize(int64_t a) {",
+    "    if (ORIN_UNLIKELY(a < 0)) orin_trap(\"negative int to usize\");",
+    "    return (uint64_t)a;",
+    "}",
+    "static inline int64_t orinc_usize_to_int(uint64_t a) {",
+    "    if (ORIN_UNLIKELY(a > (uint64_t)INT64_MAX)) orin_trap(\"usize too large for int\");",
+    "    return (int64_t)a;",
+    "}",
+    "static inline int64_t orinc_range_i(int64_t v, int64_t lo, int64_t hi) {",
+    "    if (ORIN_UNLIKELY(v < lo || v > hi)) orin_trap(\"integer overflow\");",
+    "    return v;",
+    "}",
+    "static inline int64_t orinc_conv_i(int64_t v, int64_t lo, int64_t hi) {",
+    "    if (ORIN_UNLIKELY(v < lo || v > hi)) orin_trap(\"integer conversion out of range\");",
+    "    return v;",
+    "}",
+    "static inline int64_t orinc_conv_u(uint64_t v, int64_t hi) {",
+    "    if (ORIN_UNLIKELY(v > (uint64_t)hi)) orin_trap(\"integer conversion out of range\");",
+    "    return (int64_t)v;",
+    "}",
+  ];
+}
+
+// Struct and variant slots. Every access of an object of unknown provenance checks that it is a struct and that the slot index
+// is below its slot count (a lowering bug becomes a trap, not an out-of-bounds access); `orinc_struct_init` is the unchecked
+// initialising store into an object `orin_struct_new` just returned in the same code sequence with a constant slot count.
+function structHelpers(): string[] {
+  return [
+    "static inline void orinc_chk_slot(const OrinObj *o, uint32_t i) {",
+    "    if (ORIN_UNLIKELY(o->kind != ORIN_K_STRUCT || i >= ((const OrinStruct *)o)->nslots)) orin_trap_shape();",
+    "}",
+    "static inline void orinc_struct_init(OrinObj *o, uint32_t i, uint64_t slot) {",
+    "    ((OrinStruct *)o)->slots[i] = slot;",
+    "}",
+    "static inline void orinc_struct_set(OrinObj *o, uint32_t i, uint64_t slot) {",
+    "    orinc_chk_slot(o, i);",
+    "    ((OrinStruct *)o)->slots[i] = slot;",
+    "}",
+    "static inline uint64_t orinc_struct_get(const OrinObj *o, uint32_t i) {",
+    "    orinc_chk_slot(o, i);",
+    "    return ((const OrinStruct *)o)->slots[i];",
+    "}",
+    "static inline uint64_t *orinc_struct_slot_ptr(OrinObj *o, uint32_t i) {",
+    "    orinc_chk_slot(o, i);",
+    "    return &((OrinStruct *)o)->slots[i];",
+    "}",
+    "static inline uint32_t orinc_tag(const OrinObj *o) { return o->tag; }",
+    // take / put / in-place replace of a slot of an object the MIR verifier has shown to be Unique (docs/mir.md)
+    "static inline uint64_t orinc_mir_struct_take(OrinObj *o, uint32_t i) {",
+    "    uint64_t *p = orinc_struct_slot_ptr(o, i);",
+    "    uint64_t v = *p;",
+    "    *p = 0;",
+    "    return v;",
+    "}",
+    "static inline void orinc_mir_struct_replace(OrinObj *o, uint32_t i, uint64_t slot) {",
+    "    orinc_chk_slot(o, i);",
+    "    OrinStruct *s = (OrinStruct *)o;",
+    "    uint64_t old = s->slots[i];",
+    "    s->slots[i] = slot;",
+    "    if ((s->refmask >> i) & 1) orinc_release(ORIN_REF(old));",
+    "}",
+  ];
+}
+
+// Strings and arrays. `orinc_array_at_u` / `orinc_array_slot_ptr_u` are the unchecked forms of IArrayGetU / IArraySetU
+// (docs/mir.md v2.6, rule U1): the only helpers whose memory safety rests on a fact the verifier has shown.
+function arrayHelpers(): string[] {
+  return [
+    "static inline uint64_t orinc_str_len(const OrinObj *s) { return ((const OrinString *)s)->len; }",
+    "static inline int64_t orinc_str_char_code_at(OrinObj *s, uint64_t i) {",
+    "    const OrinString *x = (const OrinString *)s;",
+    "    if (ORIN_UNLIKELY(i >= x->len)) orin_trap(\"charCodeAt index out of range\");",
+    "    return (unsigned char)x->data[i];",
+    "}",
+    "static inline uint64_t orinc_array_len(const OrinObj *a) { return ((const OrinArray *)a)->len; }",
+    "static inline void orinc_array_push(OrinObj *o, uint64_t slot) {",
+    "    OrinArray *a = (OrinArray *)o;",
+    "    if (ORIN_UNLIKELY(o->kind != ORIN_K_ARRAY)) orin_trap_shape();",
+    "    if (ORIN_UNLIKELY(a->len == a->cap)) {",
+    "        orin_array_push_grow(o, slot);",
+    "        return;",
+    "    }",
+    "    a->items[a->len++] = slot;",
+    "}",
+    "static inline uint64_t orinc_array_at(OrinObj *o, uint64_t i) {",
+    "    OrinArray *a = (OrinArray *)o;",
+    "    if (ORIN_UNLIKELY(o->kind != ORIN_K_ARRAY)) orin_trap_shape();",
+    "    if (ORIN_UNLIKELY(i >= a->len)) orin_trap(\"index out of bounds\");",
+    "    return a->items[i];",
+    "}",
+    "static inline uint64_t *orinc_array_slot_ptr(OrinObj *o, uint64_t i) {",
+    "    OrinArray *a = (OrinArray *)o;",
+    "    if (ORIN_UNLIKELY(o->kind != ORIN_K_ARRAY)) orin_trap_shape();",
+    "    if (ORIN_UNLIKELY(i >= a->len)) orin_trap(\"index out of bounds\");",
+    "    return &a->items[i];",
+    "}",
+    "static inline uint64_t orinc_array_at_u(OrinObj *o, uint64_t i) { return ((OrinArray *)o)->items[i]; }",
+    "static inline uint64_t *orinc_array_slot_ptr_u(OrinObj *o, uint64_t i) { return &((OrinArray *)o)->items[i]; }",
+    "static inline uint64_t orinc_mir_array_take(OrinObj *a, uint64_t i) {",
+    "    uint64_t *p = orinc_array_slot_ptr(a, i); /* traps if out of range */",
+    "    uint64_t v = *p;",
+    "    *p = 0;",
+    "    return v;",
+    "}",
+    "static inline void orinc_mir_array_put(OrinObj *a, uint64_t i, uint64_t slot) {",
+    "    *orinc_array_slot_ptr(a, i) = slot;",
+    "}",
+    "static inline void orinc_mir_array_replace(OrinObj *a, uint64_t i, uint64_t slot) {",
+    "    uint64_t *p = orinc_array_slot_ptr(a, i);",
+    "    uint64_t old = *p;",
+    "    *p = slot;",
+    "    if (((OrinArray *)a)->is_ref) orinc_release(ORIN_REF(old));",
+    "}",
+    "static inline void orinc_mir_array_put_u(OrinObj *a, uint64_t i, uint64_t slot) {",
+    "    *orinc_array_slot_ptr_u(a, i) = slot;",
+    "}",
+    "static inline void orinc_mir_array_replace_u(OrinObj *a, uint64_t i, uint64_t slot) {",
+    "    uint64_t *p = orinc_array_slot_ptr_u(a, i);",
+    "    uint64_t old = *p;",
+    "    *p = slot;",
+    "    if (((OrinArray *)a)->is_ref) orinc_release(ORIN_REF(old));",
+    "}",
+    // push onto a possibly shared array: copy-on-write, returns the (owned) array to store back
+    "static inline OrinObj *orinc_mir_array_push(OrinObj *a, uint64_t slot) {",
+    "    a = orinc_make_unique(a);",
+    "    orinc_array_push(a, slot);",
+    "    return a;",
+    "}",
+  ];
+}
+
+// The preamble text: ends with a newline and a blank line.
+export function cInlines(): string {
+  let lines: string[] = [];
+  lines.push("/* Object-model inlines of generated code (ADR-0052 R3d.6): defined by the compiler, not by the runtime header. */");
+  lines = lines.concat(aggTypes());
+  lines = lines.concat(cfgConstants());
+  lines = lines.concat(countHelpers());
+  lines = lines.concat(arithHelpers());
+  lines = lines.concat(structHelpers());
+  lines = lines.concat(arrayHelpers());
+  return lines.join("\n") + "\n\n";
+}

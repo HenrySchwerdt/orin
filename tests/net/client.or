@@ -3,19 +3,20 @@
 // Prints one line per step.
 import { Host, withProcess, useNet } from "std:host";
 import { args } from "std:process";
-import { Bytes, bytesFromString } from "std:bytes";
-import { ResponseParser, ParseResult, NeedMore, Done, Failed, Limits, defaultLimits } from "std:http";
+import { milliseconds } from "std:time";
+import { Bytes, fromString } from "std:bytes";
+import { ResponseParser, ParseResult, NeedMore, Done, Failed, ToOther, defaultLimits } from "std:http";
 import {
-  NetGrant, Stream, useConnect, useConnection, sendAll, recv, RecvData, isDenied, shutdownWrite
+  NetGrant, Stream, useConnect, useConnection, sendAll, recv, RecvData, isDenied, shutdownWrite, netErrorMessage
 } from "std:net";
 
 function getHealth(s: Stream): string {
-  sendAll(s, bytesFromString("GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"), 2000);
-  let p = new ResponseParser(defaultLimits(), false);
+  sendAll(s, fromString("GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"), milliseconds(2000));
+  let p = new ResponseParser(defaultLimits(), ToOther);
   let out = "no response";
   let going = true;
   while (going) {
-    const r = recv(s, 4096, 2000);
+    const r = recv(s, 4096, milliseconds(2000));
     match (r) {
       RecvData(b) => {
         const pr = p.feed(b);
@@ -35,11 +36,11 @@ function getHealth(s: Stream): string {
 }
 
 function attempt(net: NetGrant, host: string, port: int): string {
-  const r = useConnection(net, host, port, 1000, (s: Stream) => { console.log("CONNECTED " + host + ":" + port.toString()); });
+  const r = useConnection(net, host, port, milliseconds(1000), (s: Stream) => { console.log("CONNECTED " + host + ":" + port.toString()); });
   if (r.isOk()) {
     return "connected";
   }
-  return isDenied(r.unwrapErr()) ? "denied" : "failed: " + r.unwrapErr().message;
+  return isDenied(r.unwrapErr()) ? "denied" : "failed: " + netErrorMessage(r.unwrapErr());
 }
 
 function main(host: Host): void {
@@ -47,8 +48,8 @@ function main(host: Host): void {
   const port = match (parseInt(argv[0])) { Some(v) => v, None => 0 };
   useNet(host, net => {
     useConnect(net, "127.0.0.1", port, port, c => {
-      const r = useConnection(c, "127.0.0.1", port, 2000, (s: Stream) => { console.log("health: " + getHealth(s)); });
-      console.log("granted connect: " + (r.isOk() ? "ok" : "FAIL " + r.unwrapErr().message));
+      const r = useConnection(c, "127.0.0.1", port, milliseconds(2000), (s: Stream) => { console.log("health: " + getHealth(s)); });
+      console.log("granted connect: " + (r.isOk() ? "ok" : "FAIL " + netErrorMessage(r.unwrapErr())));
       console.log("other port: " + attempt(c, "127.0.0.1", port + 1));
       console.log("other host: " + attempt(c, "localhost", port));
       useConnect(c, "*", 0, 65535, wide => {

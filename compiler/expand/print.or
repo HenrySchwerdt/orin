@@ -1,0 +1,113 @@
+// `orin expand`: the companion modules through the formatter (ADR-0046 §4). This is the review format and the format of
+// the golden tests. The generated names (`__g<N>_x`) are not parseable source (the parser reserves them); the text is
+// for reading, not for compiling.
+
+import { Span } from "../diag";
+import { Item, Module, ImportDecl, Ident } from "../syntax";
+import { Layout, stripMarkers, printModule } from "../fmt";
+import { LoadedProgram } from "../loader";
+import { moduleLabel } from "../meta";
+import { Companion, RunResult } from "./pipeline";
+
+// One item printed canonically (generated nodes carry the span [0, 2) of a source of two blanks, so the formatter decides
+// every line break).
+function itemText(it: Item): string {
+  const text = stripMarkers(printModule(new Layout("  ", []), Module { file: 0, items: [it] }));
+  return text.endsWith("\n") ? text.substring(0, text.length - 1) : text;
+}
+
+function docText(doc: string): string {
+  if (doc == "") {
+    return "";
+  }
+  let lines: string[] = ["/**"];
+  for (const l of doc.split("\n")) {
+    lines.push(l == "" ? " *" : " * " + l);
+  }
+  lines.push(" */");
+  return lines.join("\n") + "\n";
+}
+
+// The merged imports of a companion (same merge as the pipeline's): printed first.
+function importTexts(c: Companion): string[] {
+  let paths: string[] = [];
+  let names: string[][] = [];
+  for (const r of c.runs) {
+    for (const d of r.out.imports) {
+      let at: Option<usize> = None;
+      let k: usize = 0;
+      while (k < paths.length) {
+        if (paths[k] == d.path) {
+          at = Some(k);
+        }
+        k += 1;
+      }
+      if (at.isNone()) {
+        paths.push(d.path);
+        names.push([]);
+        at = Some(paths.length - 1);
+      }
+      for (const n of d.names) {
+        let have = false;
+        for (const m of names[at.unwrap()]) {
+          if (m == n.name) {
+            have = true;
+          }
+        }
+        if (!have) {
+          names[at.unwrap()].push(n.name);
+        }
+      }
+    }
+  }
+  let out: string[] = [];
+  let k: usize = 0;
+  while (k < paths.length) {
+    let ids: Ident[] = [];
+    for (const n of names[k]) {
+      ids.push(Ident { name: n, span: Span { file: 0, start: 0, end: 0 } });
+    }
+    const sp = Span { file: 0, start: 0, end: 0 };
+    out.push(itemText(IImport(ImportDecl { names: ids, path: paths[k], pathSpan: sp, span: sp, provider: false })));
+    k += 1;
+  }
+  return out;
+}
+
+// The text of one companion module.
+export function companionText(prog: LoadedProgram, c: Companion): string {
+  let parts: string[] = ["// companion module " + moduleLabel(prog, c.source) + ".gen"];
+  const imps = importTexts(c);
+  if (imps.length > 0) {
+    parts.push(imps.join("\n"));
+  }
+  for (const r of c.runs) {
+    parts.push("// generated for " + r.label);
+    let k: usize = 0;
+    while (k < r.out.items.length) {
+      parts.push(docText(r.out.docs[k]) + itemText(r.out.items[k]));
+      k += 1;
+    }
+  }
+  return parts.join("\n\n") + "\n";
+}
+
+// All companions, separated by a blank line.
+export function companionsText(prog: LoadedProgram, cs: Companion[]): string {
+  let texts: string[] = [];
+  for (const c of cs) {
+    texts.push(companionText(prog, c));
+  }
+  return texts.join("\n");
+}
+
+// The `std:meta` inputs of all runs, one compact JSON document per line (`orin expand --input`).
+export function inputsText(cs: Companion[]): string {
+  let lines: string[] = [];
+  for (const c of cs) {
+    for (const r of c.runs) {
+      lines.push(r.snap.text);
+    }
+  }
+  return lines.join("\n") + (lines.length > 0 ? "\n" : "");
+}

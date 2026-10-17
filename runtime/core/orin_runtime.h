@@ -49,10 +49,6 @@ typedef struct OrinObj {
     int64_t rc;    /* >0 live count, <0 immortal */
     uint32_t kind; /* ORIN_K_* */
     uint32_t tag;  /* variant tag (struct kind only; records use 0) */
-#ifdef ORIN_SITE_STATS
-    uint32_t site; /* allocation-site census only (see "Allocation-site census" below): the site that allocated it */
-    uint32_t site_pad;
-#endif
 } OrinObj;
 
 typedef struct OrinString {
@@ -80,16 +76,12 @@ typedef struct OrinStruct {
 
 #define ORIN_SLOT(p) ((uint64_t)(uintptr_t)(p)) /* reference -> slot */
 
-/* float <-> slot: the 64-bit pattern of the double (ADR-0018). */
+/* float -> slot: the 64-bit pattern of the double (ADR-0018). Generated code has its own orinc_f2s / orinc_s2f
+ * (compiler/backends/c/preamble.or). */
 static inline uint64_t orin_f2s(double d) {
     union { double d; uint64_t u; } v;
     v.d = d;
     return v.u;
-}
-static inline double orin_s2f(uint64_t u) {
-    union { double d; uint64_t u; } v;
-    v.u = u;
-    return v.d;
 }
 #define ORIN_REF(s) ((OrinObj *)(uintptr_t)(s)) /* slot -> reference */
 
@@ -117,8 +109,19 @@ void orin_trap(const char *msg) __attribute__((noreturn, cold));
 /* Number of live (non-immortal) heap objects; for leak/UAF tests. Counts the calling thread's allocations minus its
  * frees plus the net of all finished tasks (an object moved between tasks is allocated by one and freed by another). */
 int64_t orin_live_count(void);
+/* internal, ADR-0052 R3d.5: Orin functions of runtime/core/stats.or (the ORIN_STATS report, run at exit by orin_init, and the live-object
+ * count above), defined by the code a program is compiled to (compiler/backends/{c,llvm}/rtwrap.or), and the C services that Orin
+ * runtime code reaches through the core operation `hook` (orin_runtime.c lists them). */
+void orin_stats_report(void);
+uint64_t orin_core_hook(uint64_t k, uint64_t a, uint64_t b, uint64_t c);
 
-void orin_destroy(OrinObj *o); /* internal: free an object whose count reached 0 */
+/* internal, ADR-0052 R3d.3 (c): Orin functions of runtime/core/heap.or and object.or (the small-block cache and string allocation), defined by
+ * the code a program is compiled to for the C shells of the runtime (compiler/backends/{c,llvm}/rtwrap.or). */
+void *orin_sb_alloc(uint64_t n);
+void orin_sb_free(void *p, uint64_t n);
+void *orin_sb_realloc(void *p, uint64_t old, uint64_t n);
+OrinObj *orin_str_alloc(uint64_t len, uint64_t cap); /* a string of length len, capacity max(len, cap); the NUL terminator is set */
+void orin_destroy(OrinObj *o); /* internal: free an object whose count reached 0 (an Orin function of runtime/core/rc.or, ADR-0052 R3d.3 (b)) */
 
 /* ---------------------------------------------------------------- tasks (ADR-0017 stage 0, docs/concurrency.md)
  * TEMPORARY interface (spec 19 R3): the part of task support that needs the object model. Each function maps 1:1 onto
@@ -143,6 +146,7 @@ uint64_t orin_rt_lend(OrinObj *box);             /* lend the value of a two-slot
 uint64_t orin_rt_par_threads(void);              /* the thread count of parallel pipelines */
 uint64_t orin_rt_task_spawn(uint64_t token);
 uint64_t orin_rt_task_join(uint64_t thread);
+void orin_rt_task_watch(uint64_t monitor);         /* the calling task sets word 1 of the monitor to 1 and notifies queue 0 when it ends */
 OrinObj *orin_rt_task_message(void);
 void orin_rt_trap_str(OrinObj *msg) __attribute__((noreturn)); /* trap with the text of an Orin string */
 void orin_rt_heap_exit(void);                                   /* end of a task's heap (called by the runtime itself) */
@@ -154,6 +158,7 @@ void orin_mon_unlock(uint64_t m);
 void orin_mon_wait(uint64_t m, uint64_t cond);       /* cond: 0 or 1, the two condition queues of a monitor */
 void orin_mon_notify_all(uint64_t m, uint64_t cond);
 void orin_mon_notify_one(uint64_t m, uint64_t cond);
+uint64_t orin_mon_wait_until(uint64_t m, uint64_t cond, uint64_t deadline_ms); /* 1: the deadline passed, 0: notified */
 uint64_t orin_mon_get(uint64_t m, uint64_t i);
 void orin_mon_set(uint64_t m, uint64_t i, uint64_t v);
 void orin_mon_grow(uint64_t m, uint64_t nwords);
@@ -211,7 +216,6 @@ typedef struct OrinStats {
 #else
 #define ORIN_TLS_MODEL
 #endif
-extern __thread OrinStats orin_stats ORIN_TLS_MODEL;
 #if defined(ORIN_SITE_STATS) && !defined(ORIN_STATS_ENABLED)
 #define ORIN_STATS_ENABLED 1
 #endif
@@ -223,6 +227,63 @@ extern __thread OrinStats orin_stats ORIN_TLS_MODEL;
 #define ORIN_STAT_ON 0
 #endif
 
+/* The build configuration seen by the core operation cfg(k) (ORIN_CFG_FREELIST / STATS / SITES) is defined by the preamble of the
+ * generated code (compiler/backends/c/preamble.or), not here: no C shell reads it. */
+
+/* The per-thread heap block (ADR-0052 Addendum A section 5, step R3d.1): ALL allocator state of a thread / task (ADR-0017) in one
+ * zero-initialised `__thread` object, so a new thread starts with empty lists and zeroed counters. It is the block the core operation
+ * heapBase() returns, so Orin code (the L1 modules of later steps) reaches every field at a fixed byte offset from heapBase(); the
+ * offsets are part of the runtime ABI like the object layout (rule 3 of the Addendum), pinned by the _Static_asserts below and listed
+ * in spec/19 "R3d.1". Offsets are independent of the build configuration: the free lists and the counters exist (unused) with
+ * -DORIN_NO_FREELIST or without ORIN_STATS_ENABLED. Word 63 (byte 504) is the scratch word of std:coreprobe; the "reserved" ranges
+ * are for later fields (task pointer, grant and file tables) and stay zero. A block is plain malloc memory, so a free-list node may
+ * come from another thread's heap and joins this one's (capped by FL_CAP / SB_CAP). */
+enum { FL_STRUCT_CLASSES = 9, SB_MAX = 256, SB_CLASSES = SB_MAX / 16, ORIN_HEAP_WORDS = 128 };
+typedef struct FreeNode { struct FreeNode *next; } FreeNode;
+/* A small-block cache class: list head and length side by side, so one scaled index reaches both. */
+typedef struct SbClass { FreeNode *head; uint64_t n; } SbClass;
+typedef struct OrinHeap {
+    FreeNode *fl_struct[FL_STRUCT_CLASSES]; /* @0    free struct objects by nslots 0..8 */
+    FreeNode *fl_array;                     /* @72   free array headers */
+    uint64_t fl_n[FL_STRUCT_CLASSES + 1];   /* @80   list lengths: structs by nslots, [9] the array headers */
+    int64_t live;                           /* @160  live objects of this heap (signed: a task can free more than it allocated) */
+    OrinObj **dstack;                       /* @168  the work stack of orin_destroy (NULL until first use) */
+    uint64_t dcap;                          /* @176  its capacity in entries */
+    uint64_t reserved0;                     /* @184 */
+    OrinStats stats;                        /* @192  the counters (OrinStats, 18 words) */
+    uint64_t reserved1[21];                 /* @336  task pointer, grant and file tables, ... */
+    uint64_t probe;                         /* @504  std:coreprobe scratch word */
+    SbClass sb[SB_CLASSES + 1];             /* @512  small-block cache by 16-byte class 0..16: list head, length */
+    uint64_t reserved2[30];                 /* @784  up to 1024 */
+} OrinHeap;
+extern __thread OrinHeap orin_heap ORIN_TLS_MODEL;
+/* The counters keep their name: `orin_stats.retains++` in the inline functions below and in generated code. */
+#define orin_stats (orin_heap.stats)
+#define ORIN_HEAP_OFF(f) offsetof(OrinHeap, f)
+_Static_assert(sizeof(OrinStats) == 144, "OrinStats is 18 words");
+_Static_assert(sizeof(FreeNode *) == 8 && sizeof(size_t) == 8, "the heap block assumes 64-bit pointers");
+_Static_assert(ORIN_HEAP_OFF(fl_struct) == 0, "orin_heap.fl_struct @0");
+_Static_assert(ORIN_HEAP_OFF(fl_array) == 72, "orin_heap.fl_array @72");
+_Static_assert(ORIN_HEAP_OFF(fl_n) == 80, "orin_heap.fl_n @80");
+_Static_assert(ORIN_HEAP_OFF(live) == 160, "orin_heap.live @160");
+_Static_assert(ORIN_HEAP_OFF(dstack) == 168, "orin_heap.dstack @168");
+_Static_assert(ORIN_HEAP_OFF(dcap) == 176, "orin_heap.dcap @176");
+_Static_assert(ORIN_HEAP_OFF(reserved0) == 184, "orin_heap.reserved0 @184");
+_Static_assert(ORIN_HEAP_OFF(stats) == 192, "orin_heap.stats @192");
+_Static_assert(ORIN_HEAP_OFF(reserved1) == 336, "orin_heap.reserved1 @336");
+_Static_assert(ORIN_HEAP_OFF(probe) == 504, "orin_heap.probe @504");
+_Static_assert(ORIN_HEAP_OFF(sb) == 512 && sizeof(SbClass) == 16, "orin_heap.sb @512, 16 bytes per class (head @+0, n @+8)");
+_Static_assert(ORIN_HEAP_OFF(reserved2) == 784, "orin_heap.reserved2 @784");
+_Static_assert(sizeof(OrinHeap) == ORIN_HEAP_WORDS * 8, "orin_heap is 128 words (1024 bytes)");
+_Static_assert(offsetof(OrinStats, alloc_string) == 0 && offsetof(OrinStats, alloc_array) == 8 && offsetof(OrinStats, alloc_struct) == 16 &&
+                   offsetof(OrinStats, frees) == 24 && offsetof(OrinStats, retains) == 32 && offsetof(OrinStats, releases) == 40 &&
+                   offsetof(OrinStats, cow_copies) == 48 && offsetof(OrinStats, cow_inplace) == 56 && offsetof(OrinStats, array_grows) == 64 &&
+                   offsetof(OrinStats, string_grows) == 72 && offsetof(OrinStats, peak_live_objs) == 80 &&
+                   offsetof(OrinStats, peak_live_bytes) == 88 && offsetof(OrinStats, live_bytes) == 96 && offsetof(OrinStats, file_opens) == 104 &&
+                   offsetof(OrinStats, file_closes) == 112 && offsetof(OrinStats, transfer_moves) == 120 &&
+                   offsetof(OrinStats, transfer_copies) == 128 && offsetof(OrinStats, tasks_spawned) == 136,
+               "OrinStats field offsets (relative to orin_heap.stats, i.e. to heapBase())");
+
 /* Allocation-site census (opt-in, docs/perf/alloc-census.md, tools/alloc_census.py). Compiled in only when BOTH the generated C
  * and the runtime are built with ORIN_SITE_STATS: the compiler (`orin2 compile --stats-sites`) then defines it at the top of
  * its output, emits `ORIN_SITE(n, orin_site_caller);` before every MIR instruction and terminator (n: the site id, 1-based, in
@@ -230,8 +291,9 @@ extern __thread OrinStats orin_stats ORIN_TLS_MODEL;
  * every function sets on entry to the call site that entered it, one level of calling context for its allocations) and a
  * table `orin_site_names` describing every site; the
  * runtime must be compiled with -DORIN_SITE_STATS (a mismatch is a link error: each side references a symbol only the other
- * defines). Every object records the site that allocated it (OrinObj.site), so the counters are both "at the site" (operations
- * the site executed, on any object) and "of the site" (operations on the objects the site allocated). Report: ORIN_STATS=sites
+ * defines). Every heap object records the site that allocated it in a prefix word of 8 bytes before its header (ORIN_SITE_OF; the
+ * object layout is the same in all builds), so the counters are both "at the site" (operations the site executed, on any object)
+ * and "of the site" (operations on the objects the site allocated). Report: ORIN_STATS=sites
  * writes one line per site that did anything to $ORIN_SITES_OUT (stderr when unset), besides the usual summary line.
  * Without ORIN_SITE_STATS every hook below is an empty macro: normal builds are unchanged. */
 #ifdef ORIN_SITE_STATS
@@ -239,7 +301,10 @@ extern __thread uint32_t orin_site_cur ORIN_TLS_MODEL; /* the site executing now
 extern __thread uint32_t orin_site_par ORIN_TLS_MODEL; /* the call site that entered the function of orin_site_cur */
 #define ORIN_SITE(n, caller) (orin_site_cur = (uint32_t)(n), orin_site_par = (caller))
 enum { ORIN_SITE_RETAIN = 0, ORIN_SITE_RELEASE = 1, ORIN_SITE_COW_COPY = 2, ORIN_SITE_COW_INPLACE = 3 };
-void orin_site_rc(OrinObj *o, int what); /* out of line: counts at orin_site_cur and at o->site */
+void orin_site_rc(OrinObj *o, int what); /* out of line: counts at orin_site_cur and at the site of o */
+/* The site that allocated `o`: its prefix word. An immortal object (count -1: the static literals and variants, which no prefix word
+ * precedes) has site 0. A dying object (count 0) and a lend-pinned one (top two bits 10, see "lending" in orin_runtime.c) still have it. */
+#define ORIN_SITE_OF(o) (((uint64_t)(o)->rc >> 62) != 3 ? ((const uint32_t *)(o))[-2] : 0u)
 #define ORIN_SITE_RC(o, what) orin_site_rc((o), (what))
 #else
 #define ORIN_SITE_RC(o, what) ((void)0)
@@ -272,7 +337,7 @@ static inline void orin_release(OrinObj *o) {
 
 /* Returns o if o->rc == 1, else a shallow copy (ref children retained) and releases one
  * count of o. Consumes the caller's reference to o, returns an owned one. */
-OrinObj *orin_make_unique_slow(OrinObj *o); /* internal: the copying path */
+OrinObj *orin_make_unique_slow(OrinObj *o); /* internal: the copying path (an Orin function of runtime/core/rc.or, R3d.3 (b)) */
 static inline OrinObj *orin_make_unique(OrinObj *o) {
     if (ORIN_LIKELY(o->rc == 1)) {
         ORIN_STAT(orin_stats.cow_inplace++);
@@ -282,88 +347,13 @@ static inline OrinObj *orin_make_unique(OrinObj *o) {
     return orin_make_unique_slow(o);
 }
 
-/* ---------------------------------------------------------------- checked arithmetic */
-
-static inline int64_t orin_add_i(int64_t a, int64_t b) {
-    int64_t r;
-    if (ORIN_UNLIKELY(__builtin_add_overflow(a, b, &r))) orin_trap("integer overflow");
-    return r;
-}
-static inline int64_t orin_sub_i(int64_t a, int64_t b) {
-    int64_t r;
-    if (ORIN_UNLIKELY(__builtin_sub_overflow(a, b, &r))) orin_trap("integer overflow");
-    return r;
-}
-static inline int64_t orin_mul_i(int64_t a, int64_t b) {
-    int64_t r;
-    if (ORIN_UNLIKELY(__builtin_mul_overflow(a, b, &r))) orin_trap("integer overflow");
-    return r;
-}
-static inline int64_t orin_div_i(int64_t a, int64_t b) {
-    if (ORIN_UNLIKELY(b == 0)) orin_trap("division by zero");
-    if (ORIN_UNLIKELY(a == INT64_MIN && b == -1)) orin_trap("integer overflow");
-    return a / b;
-}
-static inline int64_t orin_rem_i(int64_t a, int64_t b) {
-    if (ORIN_UNLIKELY(b == 0)) orin_trap("modulo by zero");
-    if (ORIN_UNLIKELY(a == INT64_MIN && b == -1)) orin_trap("integer overflow");
-    return a % b;
-}
-static inline int64_t orin_neg_i(int64_t a) {
-    if (ORIN_UNLIKELY(a == INT64_MIN)) orin_trap("integer overflow");
-    return -a;
-}
-static inline uint64_t orin_add_u(uint64_t a, uint64_t b) {
-    uint64_t r;
-    if (ORIN_UNLIKELY(__builtin_add_overflow(a, b, &r))) orin_trap("usize overflow");
-    return r;
-}
-static inline uint64_t orin_sub_u(uint64_t a, uint64_t b) {
-    uint64_t r;
-    if (ORIN_UNLIKELY(__builtin_sub_overflow(a, b, &r))) orin_trap("usize underflow");
-    return r;
-}
-static inline uint64_t orin_mul_u(uint64_t a, uint64_t b) {
-    uint64_t r;
-    if (ORIN_UNLIKELY(__builtin_mul_overflow(a, b, &r))) orin_trap("usize overflow");
-    return r;
-}
-static inline uint64_t orin_div_u(uint64_t a, uint64_t b) {
-    if (ORIN_UNLIKELY(b == 0)) orin_trap("division by zero");
-    return a / b;
-}
-static inline uint64_t orin_rem_u(uint64_t a, uint64_t b) {
-    if (ORIN_UNLIKELY(b == 0)) orin_trap("modulo by zero");
-    return a % b;
-}
-static inline uint64_t orin_neg_u(uint64_t a) {
-    if (ORIN_UNLIKELY(a != 0)) orin_trap("usize underflow");
-    return 0;
-}
-static inline uint64_t orin_int_to_usize(int64_t a) {
-    if (ORIN_UNLIKELY(a < 0)) orin_trap("negative int to usize");
-    return (uint64_t)a;
-}
-static inline int64_t orin_usize_to_int(uint64_t a) {
-    if (ORIN_UNLIKELY(a > (uint64_t)INT64_MAX)) orin_trap("usize too large for int");
-    return (int64_t)a;
-}
+/* ---------------------------------------------------------------- integers
+ * The checked arithmetic of generated code (orinc_add_i, orinc_div_u, orinc_range_i, ...) is defined by the preamble the compiler
+ * emits (compiler/backends/c/preamble.or, ADR-0052 R3d.6); the runtime has no copy, no C shell calls it. */
 
 /* Fixed-width integers (ADR-0022). Types narrower than 64 bits live in int64_t locals; after an operation the
- * result is range-checked. Conversions trap when the value does not fit. Kinds: 0 i8, 1 i16, 2 i32, 3 i64, 4 isize,
+ * result is range-checked (orinc_range_i, orinc_conv_i, orinc_conv_u of the preamble). Conversions trap when the value does not fit. Kinds: 0 i8, 1 i16, 2 i32, 3 i64, 4 isize,
  * 5 u8, 6 u16, 7 u32, 8 u64, 9 usize (see orin_runtime.c). */
-static inline int64_t orin_range_i(int64_t v, int64_t lo, int64_t hi) {
-    if (ORIN_UNLIKELY(v < lo || v > hi)) orin_trap("integer overflow");
-    return v;
-}
-static inline int64_t orin_conv_i(int64_t v, int64_t lo, int64_t hi) {
-    if (ORIN_UNLIKELY(v < lo || v > hi)) orin_trap("integer conversion out of range");
-    return v;
-}
-static inline int64_t orin_conv_u(uint64_t v, int64_t hi) {
-    if (ORIN_UNLIKELY(v > (uint64_t)hi)) orin_trap("integer conversion out of range");
-    return (int64_t)v;
-}
 uint64_t orin_int_op(int64_t mode, uint64_t a, uint64_t b, int64_t kind); /* wrapping (0..2) / saturating (3..5) add sub mul */
 OrinObj *orin_int_chk(int64_t mode, uint64_t a, uint64_t b, int64_t kind); /* checked add sub mul: Option */
 OrinObj *orin_parse_int_k(OrinObj *s, int64_t kind);                      /* Option of the parsed integer */
@@ -371,23 +361,28 @@ OrinObj *orin_parse_int_k(OrinObj *s, int64_t kind);                      /* Opt
 /* ---------------------------------------------------------------- structs / variants */
 /* Records use tag 0. Option: Some=0 (1 slot), None=1. Result: Ok=0 (1 slot, 0 for void), Err=1. */
 
-/* New struct with all slots zero (null refs). Fill with orin_struct_init (init only). */
+/* New struct with all slots zero (null refs). Fill with orin_struct_init (init only).
+ * orin_struct_new, orin_variant1 and orin_array_new are Orin functions of runtime/core/object.or ($rt, ADR-0052 R3d.3 (a)): the code a
+ * program is compiled to defines these C names (compiler/backends/{c,llvm}/rtwrap.or) and calls the Orin functions directly; a test that links
+ * only the C files of the runtime links tools/rt_stub.sh's object. */
 OrinObj *orin_struct_new(uint32_t tag, uint32_t nslots, uint64_t refmask);
-/* Shared immortal singleton for a payload-less variant. */
-OrinObj *orin_nullary(uint32_t tag);
+/* Immortal singleton for a payload-less variant, for the C shells: tag 0 (Ok of void) or 1 (None, Err), one static object per
+ * translation unit. Generated code has its own static objects per tag (`orin_nz<tag>`, ADR-0052 R3d.2). */
+static inline OrinObj *orin_nullary(uint32_t tag) {
+    static struct { OrinObj h; uint32_t nslots; uint32_t pad; uint64_t refmask; } n[2] = {
+        {{-1, ORIN_K_STRUCT, 0}, 0, 0, 0}, {{-1, ORIN_K_STRUCT, 1}, 0, 0, 0}};
+    if (ORIN_UNLIKELY(tag > 1)) orin_trap("variant tag too large");
+    return &n[tag].h;
+}
 /* Variant with one slot; consumes the slot's reference if the slot is a ref (refmask 0/1). */
 OrinObj *orin_variant1(uint32_t tag, uint64_t refmask, uint64_t slot);
-/* dst.slots[i] = src.slots[j], retaining it if it is a reference. dst slot must be empty. */
-void orin_struct_copy_slot(OrinObj *dst, uint32_t i, OrinObj *src, uint32_t j);
 /* Defence in depth (docs/assurance.md, finding "shape confusion"): every field access on an object of unknown
  * provenance checks that it is a struct and that the slot index is below its slot count, so a lowering bug that
  * confuses value shapes becomes a clean trap instead of an out-of-bounds read or write. The ownership verifier
  * does not check value shapes. The LLVM backend does the same check in its inline helper @orinl_slot. */
 void orin_trap_shape(void) __attribute__((noreturn, cold));
-/* `--assert-facts` builds only (docs/mir.md v2.4): checks the value an IForward claims for slot `key` of `o`; exit 70 if it differs. */
-void orin_assert_fact(const OrinObj *o, uint64_t key, uint64_t got);
-/* `--assert-facts` builds only (docs/mir.md v2.6): the kind and bounds checks an IArrayGetU / IArraySetU omits; exit 70 if they would fail. */
-void orin_assert_array(const OrinObj *o, uint64_t i);
+/* `--assert-facts` checks (orin_assert_fact, orin_assert_array), the unwrap helpers (orin_opt_unwrap, orin_res_unwrap(_err), orin_v_unwrap)
+ * and the shape trap of generated LLVM code are Orin functions of runtime/core/leaf.or ($rt, ADR-0052 R3d.2); this C trap serves the inlines below. */
 static inline void orin_chk_slot(const OrinObj *o, uint32_t i) {
     if (ORIN_UNLIKELY(o->kind != ORIN_K_STRUCT || i >= ((const OrinStruct *)o)->nslots)) orin_trap_shape();
 }
@@ -416,17 +411,11 @@ static inline uint32_t orin_tag(const OrinObj *o) { return o->tag; }
 /* Option / Result helpers (return borrowed slots; trap on the wrong variant). */
 static inline OrinObj *orin_none(void) { return orin_nullary(1); }
 static inline OrinObj *orin_ok_void(void) { return orin_nullary(0); }
-uint64_t orin_opt_unwrap(OrinObj *o);
-/* Unboxed Option / Result (ADR-0038 step 1, docs/mir.md v2.2): `word` when `tag` is the expected one, else the trap of
-   the boxed builtin. what: 0 = Option.unwrap (tag 0), 1 = Result.unwrap (tag 0), 2 = Result.unwrapErr (tag 1). */
-uint64_t orin_v_unwrap(uint64_t tag, uint64_t word, int64_t what);
 /* `pop` into an unboxed Option<T>: out[0] = 0 and out[1] = the element, or out[0] = 1 (None) and out[1] = 0 when the
    array is empty. The Option holds a scalar only: an element of a reference array is released (the Option is never
    read as a reference; the optimiser unboxes only Options whose payload is read as a scalar or not at all). */
 void orin_array_pop_v(OrinObj *a, uint64_t *out);
 
-uint64_t orin_res_unwrap(OrinObj *o);
-uint64_t orin_res_unwrap_err(OrinObj *o);
 
 /* ---------------------------------------------------------------- strings (all byte strings) */
 
@@ -526,11 +515,6 @@ static inline uint64_t *orin_array_slot_ptr(OrinObj *o, uint64_t i) {
     if (ORIN_UNLIKELY(i >= a->len)) orin_trap("index out of bounds");
     return &a->items[i];
 }
-/* Unchecked variants for IArrayGetU / IArraySetU (docs/mir.md v2.6, rule U1): the verifier has shown that an earlier access of the
- * same block already passed the kind check and the bounds check for this array and index, and that nothing since changed them.
- * These are the only helpers whose memory safety rests on a verified fact; `orin2 compile --assert-facts` runs orin_assert_array first. */
-static inline uint64_t orin_array_at_u(OrinObj *o, uint64_t i) { return ((OrinArray *)o)->items[i]; }
-static inline uint64_t *orin_array_slot_ptr_u(OrinObj *o, uint64_t i) { return &((OrinArray *)o)->items[i]; }
 OrinObj *orin_array_get(OrinObj *a, uint64_t i); /* Option<T> (element retained) */
 OrinObj *orin_array_slice(OrinObj *a, uint64_t from, uint64_t to);
 OrinObj *orin_array_concat(OrinObj *a, OrinObj *b);
