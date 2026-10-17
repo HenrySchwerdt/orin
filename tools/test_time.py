@@ -53,9 +53,13 @@ def main():
     env = {k: v for k, v in os.environ.items() if k != "ORIN_DENY"}
     env["ASAN_OPTIONS"] = "detect_leaks=0"
     native = OUT / "native"
+    # the test links only C files; the object model (allocator, destroy) of the runtime is the stub tools/rt_stub.sh builds
+    stub = OUT / "rt_stub.o"
+    run(["tools/rt_stub.sh", stub, "-O1", "-g", "-fsanitize=address,undefined", "-fno-sanitize-recover=all"],
+        env={**os.environ, "CC": "clang", "ORIN2": str(compiler)})
     run(["clang", "-O1", "-g", "-fsanitize=address,undefined", "-fno-sanitize-recover=all",
          "-ftrivial-auto-var-init=pattern", "-Dclock_gettime=orin_test_clock_gettime", *rt_inc(),
-         "runtime/core/tests/clock_test.c", *rt_src(), "-lm", "-o", native])
+         "runtime/core/tests/clock_test.c", *rt_src(), stub, "-lm", "-o", native])
     run([native, "platform"], stdout="platform clock cases passed\n", env=env)
     run([native], stdout="clock failure returned None\n", env=env)
     run([native, "wrong"], expected=101, stderr="invalid capability grant", env=env)
