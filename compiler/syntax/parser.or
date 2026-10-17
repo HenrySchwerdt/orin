@@ -38,7 +38,7 @@ import {
 } from "./wellformed";
 
 // Type parameters with their optional bounds (parallel); `any`: some parameter has a bound.
-type Bounds = { ids: Ident[]; bounds: Option<Ident>[]; any: bool; };
+type Bounds = { ids: Ident[]; bounds: Ident[][]; any: bool; };
 
 // Contract clauses and annotations before a declaration; `first` is the span of the first one.
 type Decos = { clauses: ContractClause[]; annos: Annotation[]; first: Span; };
@@ -231,7 +231,8 @@ export function isSyntaxCode(code: string): bool {
       || code == "E0440"
       || code == "E0441"
       || code == "E0442"
-      || code == "E0447";
+      || code == "E0447"
+      || code == "E0460";
 }
 
 function hasIdentNamed(ids: Ident[], name: string): bool {
@@ -758,13 +759,14 @@ export class Parser {
   }
 
   // Optional `<T, U>` list of generic parameter names, each with an optional bound `T extends Shape`
-  // (interfaces, ADR-0019). More than one bound (`A & B`) is E0408. Consumes nothing when there is no `<`.
+  // (interfaces, ADR-0019), or a list of bounds `T extends Ord & Hash` (ADR-0034 limit lifted). `bounds` is parallel to `ids`; an empty
+  // list means no bound. Consumes nothing when there is no `<`.
   @Ensures(result.isOk() ==> result.unwrap().ids.length == result.unwrap().bounds.length)
   @Ensures(result.isOk() ==> result.unwrap().ids.length == 0 == (this.pos == old(this.pos)))
-  @Ensures(result.isOk() ==> result.unwrap().any == result.unwrap().bounds.some(b => b.isSome()))
+  @Ensures(result.isOk() ==> result.unwrap().any == result.unwrap().bounds.some(b => b.length > 0))
   private parseTypeParamsB(): Result<Bounds, Diagnostic> {
     let ids: Ident[] = [];
-    let bounds: Option<Ident>[] = [];
+    let bounds: Ident[][] = [];
     let any = false;
     if (!this.isP("<")) {
       return Ok(Bounds { ids: ids, bounds: bounds, any: any });
@@ -773,20 +775,14 @@ export class Parser {
     while (true) {
       const id = this.parseIdent()?;
       ids.push(id);
-      let b: Option<Ident> = None;
+      let b: Ident[] = [];
       if (this.isIdentText(0, "extends")) {
         this.pos += 1;
-        const bi = this.parseIdent()?;
-        b = Some(bi);
+        b.push(this.parseIdent()?);
         any = true;
-        if (this.isP("&")) {
-          return Err(
-            diag(
-              "E0408",
-              this.toks[this.pos].span,
-              "a type parameter can have only one bound in Orin 1.0 (`T extends A & B` is not supported, ADR-0019)",
-            ),
-          );
+        while (this.isP("&")) {
+          this.pos += 1;
+          b.push(this.parseIdent()?);
         }
       }
       bounds.push(b);
@@ -1418,9 +1414,9 @@ export class Parser {
     if (this.isP("<")) {
       return Err(
         diag(
-          "E0408",
+          "E0460",
           this.toks[this.pos].span,
-          "generic interface methods are not supported (ADR-0019)",
+          "an interface method cannot be generic (a virtual call cannot pick a monomorphised instance, ADR-0040)",
         ),
       );
     }
@@ -1504,14 +1500,15 @@ export class Parser {
     if (this.isP("(") || this.isP("<")) {
       checkPlacement(cls, T_METHOD)?;
       checkAnnoPlacement(annos, T_METHOD)?;
-      const tps = this.parseTypeParams()?;
+      const tps = this.parseTypeParamsB()?;
       const sg = this.parseSigBody()?;
       return Ok(
         MMethod(MethodDecl {
           priv: priv,
           isStatic: isStatic,
           name: name,
-          typeParams: tps,
+          typeParams: tps.ids,
+          bounds: tps.bounds,
           params: sg.params,
           ret: sg.ret,
           body: sg.body,
@@ -2197,7 +2194,23 @@ export class Parser {
       } else if (this.isP(".")) {
         this.pos += 1;
         const m = this.parseIdent()?;
-        e = mkExpr(EMember(e, m), spanTo(e.span, m.span));
+        // `recv.m<T, U>(args)`: explicit type arguments of a generic method (ADR-0040), decided by backtracking like
+        // `f<T>(x)`: the `>` must be followed by `(`.
+        let targs: Option<TypeExpr[]> = None;
+        if (this.isP("<")) {
+          const afterName = this.pos;
+          const ta = this.tryTypeArgs();
+          if (ta.isSome() && this.isP("(")) {
+            targs = ta;
+          } else {
+            this.pos = afterName;
+          }
+        }
+        if (targs.isSome()) {
+          e = mkExpr(EMethodT(e, m, targs.unwrap()), spanTo(e.span, this.lastSpan()));
+        } else {
+          e = mkExpr(EMember(e, m), spanTo(e.span, m.span));
+        }
       } else if (this.isP("[")) {
         this.pos += 1;
         const ix = this.parseExpr()?;

@@ -67,7 +67,7 @@ class Circle implements Shape, Named {            // conformance is declared, ne
   `Shape` on a `T`. The body is checked once with an abstract `T` (only the interface methods and conversion to
   `Shape` are available) and instantiated by monomorphisation, so calls are static: zero cost. Every
   instantiation checks the bound (E0417 at the call): the argument must be a class declaring `implements Shape`,
-  `Shape` itself, or a parameter bounded by `Shape`. One bound per parameter; `T extends A & B` is E0408.
+  `Shape` itself, or a parameter bounded by `Shape`. A parameter may have several bounds, `T extends A & B`: the argument must satisfy all of them, the body sees the members of all of them, and two bounds that declare the same method with different signatures are E0477.
 - **Dynamic use: interface-typed values.** `const s: Shape = new Circle(2);`, `Shape[]`, `Option<Shape>`,
   parameters, fields and results of type `Shape`. A value of a class type **converts implicitly** to every interface
   its class declares: this is the *only* implicit conversion in the language. It applies wherever a value is checked
