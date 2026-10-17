@@ -81,6 +81,22 @@ test("keywords", async () => {
   assertScope(t, "const", "storage.modifier.const.orin");
 });
 
+test("namespace imports and import aliases", async () => {
+  let t = await tokenize('import * as bytes from "std:bytes";');
+  assertScope(t, "import", "keyword.control.import.orin");
+  assertScope(t, "as", "keyword.control.import.orin");
+  assertScope(t, "bytes", "entity.name.namespace.orin");
+  assertScope(t, "from", "keyword.control.import.orin");
+  t = await tokenize('import { empty as emptyBytes, fromString } from "std:bytes";');
+  assertScope(t, "as", "keyword.control.import.orin");
+  assertScope(t, "from", "keyword.control.import.orin");
+  t = await tokenize('export { a as b } from "./m";');
+  assertScope(t, "export", "keyword.control.export.orin");
+  assertScope(t, "as", "keyword.control.import.orin");
+  t = await tokenize('import {\n  a as b,\n} from "./m";\nconst as1 = 1;');
+  assertScope(t, "as", "keyword.control.import.orin");
+});
+
 test("reserved words are flagged illegal", async () => {
   for (const w of ["var", "enum", "null", "undefined", "async", "await"]) {
     const t = await tokenize(`${w} x;`);
