@@ -15,6 +15,7 @@ import re
 import statistics
 import subprocess
 import time
+from runtime_files import rt_inc, rt_src, rt_llvm  # the runtime source list: tools/runtime-sources.txt
 
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "build/jsonnumber"
@@ -39,10 +40,10 @@ def build(orinc, source, backend, contracts=False, sanitize=False):
         cmd += ["--check-contracts"]
     run(cmd)
     binary = OUT / stem
-    cmd = ["clang", "-O2", "-w", "-I", "runtime/core", generated,
-           "runtime/core/orin_runtime.c", "runtime/platform/orin_platform.c", "-lm", "-o", binary]
+    cmd = ["clang", "-O2", "-w", *rt_inc(), generated,
+           *rt_src(), "-lm", "-o", binary]
     if backend == "llvm":
-        cmd += ["runtime/core/orin_runtime_llvm.c"]
+        cmd += rt_llvm()
     if sanitize:
         cmd += ["-fsanitize=address,undefined", "-fno-sanitize-recover=undefined"]
     run(cmd)

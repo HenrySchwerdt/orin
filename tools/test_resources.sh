@@ -5,12 +5,13 @@
 #   2. ORIN_STATS: every opened file was closed (file_opens == file_closes) and no heap object leaks.
 set -eu
 cd "$(dirname "$0")/.."
+. tools/runtime_files.sh   # the runtime source list: tools/runtime-sources.txt
 ORIN2=${ORIN2:-build/bootstrap/orin2}
 mkdir -p build/tests build/resources
 
 build() { # name
   $ORIN2 compile tests/next/run/$1.or -o build/resources/$1.c
-  cc -O1 -w -DORIN_STATS_ENABLED -I runtime/core build/resources/$1.c runtime/core/orin_runtime.c runtime/platform/orin_platform.c -lm -o build/resources/$1
+  cc -O1 -w -DORIN_STATS_ENABLED $(rt_inc) build/resources/$1.c $(rt_src) -lm -o build/resources/$1
 }
 
 fail() { echo "FAIL: $1" >&2; exit 1; }

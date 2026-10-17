@@ -31,6 +31,7 @@ import time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 import gen_mir_fragment as gen  # noqa: E402
+from runtime_files import rt_inc, rt_src, rt_llvm  # the runtime source list: tools/runtime-sources.txt
 
 
 # ---------------------------------------------------------------- running both checkers
@@ -39,8 +40,7 @@ def build_driver(orinc, out_dir):
     c = os.path.join(out_dir, "verify_text.c")
     exe = os.path.join(out_dir, "verify_text")
     subprocess.run([orinc, "compile", "compiler/tests/verify_text.or", "-o", c], cwd=ROOT, check=True)
-    subprocess.run(["cc", "-O1", "-w", "-I", "runtime/core", c, "runtime/core/orin_runtime.c",
-                    "runtime/platform/orin_platform.c", "-lm", "-o", exe], cwd=ROOT, check=True)
+    subprocess.run(["cc", "-O1", "-w", *rt_inc(), c, *rt_src(), "-lm", "-o", exe], cwd=ROOT, check=True)
     return exe
 
 
