@@ -225,6 +225,11 @@ Offsets do not depend on the build configuration (the lists and counters exist u
 
 ### 6. Open questions for the project owner
 
+**Working assumptions until the owner confirms (2026-10-17):** the work proceeds on the recommendations below, as the decision
+card in the project thread says it would. Budget rule as applied: per step at most +1 % executed instructions on the LLVM backend
+(the `--release` default), and below +2 % on the C backend. R3d.1 measured LLVM -0.9 to -1.6 %, C +0.55 to +1.62 % (bintrees).
+Each assumption is a separate commit (R3d.0) and can be reverted alone if the owner decides otherwise.
+
 1. **Marker of a core module.** Recommend virtual root `$rt/` plus internal module `std:core`, and amending spec 19 and this ADR from "manifest
    `core = true`" to "modules of the embedded runtime root"; add the key when a second runtime (WASI, freestanding) needs user-visible core packages.
 2. **Seed bridge.** Recommend the frozen snapshot in `bootstrap/seed/runtime/` (also the `--c-builtins` runtime) over keeping the C object model in
