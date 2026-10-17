@@ -1,0 +1,1 @@
+- **Homebrew tap template follows the beta.** `dist/homebrew/tap/` (README and CI) matches the tap after 0.1.0-beta.1: all four platforms, CI installs and tests the formula on macOS arm64, macOS Intel and Linux x86-64.

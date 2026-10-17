@@ -1,7 +1,7 @@
 # ADR-0017: Concurrency design — isolated tasks, transfer by move or copy, no shared mutable memory
 
 Status: accepted as design (2026-10-13); implementation after the 1.0 core freeze (ADR-0016). **Stage 0 implemented
-(2026-10-14): see "Addendum A: stage 0 as built" at the end and docs/concurrency.md.**
+(2026-10-14): see "Addendum A: stage 0 as built" at the end and docs/concurrency.md. Gate 1 floor C0-C5 implemented; the server acceptance campaign (C5, 2026-10-17) passes: results in docs/roadmaps/async-concurrency.md "Server acceptance campaign".**
 Resolves spec-12 OPEN #5 at the design level. Spec references: 06 (concurrency), 07 (race freedom).
 
 ## Model
@@ -239,7 +239,7 @@ E0475 and E0476 belong to the parallel ADR-0034 work and are not used; E0487 is 
 a Listener, `orin_cap_adopt_net` / `orin_cap_adopt_stream` are new, the net buffer is thread-local. All are listed in the porting
 table of [concurrency.md](../concurrency.md); `runtime/platform` is unchanged.
 
-**Example and tests.** `examples/http_server_concurrent.or` (bounded workers, request-size limits, per-connection deadlines),
+**Example and tests.** `examples/http_server.or` (the concurrent server; bounded workers, request-size limits, per-connection deadlines),
 `tools/test_net.sh` section 6 (Python clients: held connections, 408 at the deadline, queueing behind a full pool, many clients; an
 Orin client with 64 and 256 `spawnNet` tasks; the same server under ThreadSanitizer when available), `tests/next/run/net_task_move.or`,
 error tests for E0483 and E0450, library-level E0487 tests in `tests/net/libcheck`.
