@@ -140,6 +140,16 @@ def check_extras(orinc):
     r = run(orinc, "--format=json", "--z3", "/nonexistent/z3", "tests/contracts/verify_basic.or", case="_extras")
     rep = json.loads(r.stdout.decode())
     check(all(x["status"] == "UNKNOWN" for x in rep["results"] if x["kind"] != "decreases"), "missing solver gives UNKNOWN")
+    # Solver budget flags: accepted, same statuses as the defaults; a bad value is a usage error.
+    base = json.loads(run(orinc, "--format=json", "tests/contracts/verify_basic.or", case="_extras").stdout.decode())
+    want = [(x["function"], x["kind"], x["line"], x["status"]) for x in base["results"]]
+    for flags in (["--timeout-ms", "3000", "--retry-ms", "0"], ["--timeout-ms", "3000", "--rlimit", "5000000"]):
+        r = run(orinc, "--format=json", *flags, "tests/contracts/verify_basic.or", case="_extras")
+        got = [(x["function"], x["kind"], x["line"], x["status"]) for x in json.loads(r.stdout.decode())["results"]]
+        check(got == want, "solver budget flags %s keep the statuses" % flags)
+    for bad in (["--timeout-ms", "0"], ["--timeout-ms", "x"], ["--retry-ms"], ["--rlimit", "-1"]):
+        r = run(orinc, *bad, "tests/contracts/verify_basic.or", case="_extras")
+        check(r.returncode == 2 and b"error: " + bad[0].encode() in r.stderr, "bad %s is a usage error" % bad)
     return out
 
 
