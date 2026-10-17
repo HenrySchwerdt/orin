@@ -556,99 +556,16 @@ OrinObj *orin_struct_new(uint32_t tag, uint32_t nslots, uint64_t refmask) {
     return &s->h;
 }
 
-/* The immortal singletons are shared by all tasks (never counted, never freed, never written after creation): created on
- * first use and published with a compare-and-swap, the loser frees its copy. */
-OrinObj *orin_nullary(uint32_t tag) {
-    enum { N = 1024 };
-    static OrinObj *tbl[N];
-    if (tag >= N) orin_trap("variant tag too large");
-    OrinObj *o = __atomic_load_n(&tbl[tag], __ATOMIC_ACQUIRE);
-    if (!o) {
-        OrinStruct *s = (OrinStruct *)xmalloc(sizeof(OrinStruct));
-        s->h.rc = -1;
-        s->h.kind = ORIN_K_STRUCT;
-        s->h.tag = tag;
-        s->nslots = 0;
-        s->pad = 0;
-        s->refmask = 0;
-        OrinObj *none = NULL;
-        if (__atomic_compare_exchange_n(&tbl[tag], &none, &s->h, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-            o = &s->h;
-        } else {
-            orin_platform_free(s);
-            o = none;
-        }
-    }
-    return o;
-}
-
+/* orin_nullary, orin_assert_fact, orin_assert_array, orin_struct_copy_slot, orin_opt_unwrap, orin_res_unwrap, orin_res_unwrap_err and
+ * orin_v_unwrap are written in Orin now ($rt/leaf.or, ADR-0052 R3d.2); the frozen runtime in bootstrap/seed/runtime/ keeps the C versions
+ * for the seed and --c-builtins. orin_trap_shape stays: the header inlines and the functions below call it. */
 void orin_trap_shape(void) { orin_trap("field access on a value of the wrong shape (compiler bug)"); }
-
-/* `orin2 compile --assert-facts` (docs/mir.md v2.4, ADR-0038 lever 2): the dynamic check of a forwarded load. `got` is the value
- * an IForward claimed for slot `key` of `o` (a field index or an array index); the slot itself is read here, as the original
- * getfield / arrayget would have. A difference is an optimiser or verifier bug, not a program error: exit 70 (internal error). */
-void orin_assert_fact(const OrinObj *o, uint64_t key, uint64_t got) {
-    const char *why = 0;
-    uint64_t want = 0;
-    if (o->kind == ORIN_K_STRUCT && key < ((const OrinStruct *)o)->nslots) want = ((const OrinStruct *)o)->slots[key];
-    else if (o->kind == ORIN_K_ARRAY && key < ((const OrinArray *)o)->len) want = ((const OrinArray *)o)->items[key];
-    else why = "internal error: --assert-facts: a forwarded load names a slot that does not exist";
-    if (!why && want != got) why = "internal error: --assert-facts: a forwarded load differs from the slot it was forwarded from";
-    if (!why) return;
-    size_t n = 0;
-    while (why[n]) n++;
-    orin_platform_write_line(ORIN_PLATFORM_STDERR, why, n);
-    orin_platform_exit(70);
-}
-
-/* `orin2 compile --assert-facts` (docs/mir.md v2.6, rule U1): the kind check and the bounds check that an IArrayGetU / IArraySetU
- * leaves out, executed before it. A failure is a verifier or optimiser bug, not a program error: exit 70 (internal error). */
-void orin_assert_array(const OrinObj *o, uint64_t i) {
-    const char *why = 0;
-    if (o->kind != ORIN_K_ARRAY) why = "internal error: --assert-facts: an unchecked array access on an object that is not an array";
-    else if (i >= ((const OrinArray *)o)->len) why = "internal error: --assert-facts: an unchecked array access is out of bounds";
-    if (!why) return;
-    size_t n = 0;
-    while (why[n]) n++;
-    orin_platform_write_line(ORIN_PLATFORM_STDERR, why, n);
-    orin_platform_exit(70);
-}
 
 OrinObj *orin_variant1(uint32_t tag, uint64_t refmask, uint64_t slot) {
     OrinObj *o = orin_struct_new(tag, 1, refmask & 1);
     ((OrinStruct *)o)->slots[0] = slot;
     return o;
 }
-
-void orin_struct_copy_slot(OrinObj *dst, uint32_t i, OrinObj *src, uint32_t j) {
-    orin_chk_slot(dst, i);
-    orin_chk_slot(src, j);
-    OrinStruct *d = (OrinStruct *)dst;
-    uint64_t v = ((OrinStruct *)src)->slots[j];
-    if ((d->refmask >> i) & 1) orin_retain(ORIN_REF(v));
-    d->slots[i] = v;
-}
-
-uint64_t orin_opt_unwrap(OrinObj *o) {
-    if (o->tag != 0) orin_trap("unwrap on None");
-    return orin_struct_get(o, 0);
-}
-uint64_t orin_res_unwrap(OrinObj *o) {
-    if (o->tag != 0) orin_trap("unwrap on Err");
-    return ((OrinStruct *)o)->nslots ? orin_struct_get(o, 0) : 0;
-}
-uint64_t orin_res_unwrap_err(OrinObj *o) {
-    if (o->tag != 1) orin_trap("unwrapErr on Ok");
-    return orin_struct_get(o, 0);
-}
-
-uint64_t orin_v_unwrap(uint64_t tag, uint64_t word, int64_t what) {
-    if (what == 0 && tag != 0) orin_trap("unwrap on None");
-    if (what == 1 && tag != 0) orin_trap("unwrap on Err");
-    if (what == 2 && tag != 1) orin_trap("unwrapErr on Ok");
-    return word;
-}
-
 
 /* ---------------------------------------------------------------- make_unique */
 

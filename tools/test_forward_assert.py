@@ -57,10 +57,10 @@ def main():
                     emitted = run([str(driver), backend, facts, initial])
                     target = out / ("case.ll" if backend == "llvm" else "case.c")
                     target.write_text(emitted)
-                    extra = rt_llvm() if backend == "llvm" else []
+                    extra = rt_llvm("legacy") if backend == "llvm" else []  # hand-built MIR has no $rt: legacy codegen, frozen runtime
                     exe = out / "case"
                     # LLVM's assembler also rejects duplicate SSA register names.
-                    run(["clang", "-O2", "-w", *rt_inc(), str(target), *runtime, *extra, "-lm", "-o", str(exe)])
+                    run(["clang", "-O2", "-w", *rt_inc("legacy"), str(target), *rt_src("legacy"), *extra, "-lm", "-o", str(exe)])
                     result = subprocess.run([str(exe)], cwd=ROOT, text=True, capture_output=True, timeout=10)
                     if result.returncode != 0 or result.stdout or result.stderr:
                         failures.append(f"{label}: exit {result.returncode}: {result.stdout}{result.stderr}")
