@@ -10,6 +10,10 @@
 #      tools/net_concurrent.py (held connections do not block others, 408 at the deadline, a full pool queues instead of dropping,
 #      many clients), an Orin client with 64 / 256 parallel tasks (spawnNet), the same server built with ThreadSanitizer when the
 #      toolchain has it, and the library-level E0487 rules (tests/net/libcheck)
+#   7. interruptible waits and operation-wide deadlines (ADR-0017 Addendum D, tests/net/interrupt.or): a task blocked in accept, recv, send
+#      and connect wakes within a bound when its scope is cancelled from another task, a cancelled scope fails new calls at once, a
+#      nested scope's cancel reaches only its own tasks, one deadline spans many small reads, writes and a hanging connect; plain and
+#      under ThreadSanitizer when the toolchain has it
 set -eu
 cd "$(dirname "$0")/.."
 . tools/runtime_files.sh   # the runtime source list: tools/runtime-sources.txt
@@ -22,6 +26,16 @@ SERVER_PID=
 kill_server() { if [ -n "$SERVER_PID" ]; then kill "$SERVER_PID" 2>/dev/null || true; wait "$SERVER_PID" 2>/dev/null || true; SERVER_PID=; fi; }
 trap kill_server EXIT
 
+# limit SECONDS CMD...: runs CMD, killed after SECONDS (coreutils `timeout` is missing on macOS)
+limit() {
+  if command -v timeout >/dev/null 2>&1; then timeout "$@"; return; fi
+  _secs=$1; shift
+  "$@" & _pid=$!
+  ( sleep "$_secs"; kill -9 $_pid 2>/dev/null ) & _guard=$!
+  wait $_pid; _rc=$?
+  kill $_guard 2>/dev/null; wait $_guard 2>/dev/null
+  return $_rc
+}
 build() { # source name
   $ORIN2 compile $1 -o $B/$2.c
   $CC -O2 -w $(rt_inc) $B/$2.c $(rt_src) -lm -o $B/$2
@@ -136,6 +150,24 @@ if $CC -fsanitize=thread $B/tsan_probe.c -o $B/tsan_probe 2>/dev/null && $B/tsan
   echo "concurrent server under ThreadSanitizer: ok"
 else
   echo "concurrent server under ThreadSanitizer: skipped (no -fsanitize=thread)"
+fi
+
+# 7. interruptible waits and operation-wide deadlines
+build tests/net/interrupt.or interrupt
+limit 120 $B/interrupt > $B/interrupt.out 2>&1 || fail "interrupt: $(cat $B/interrupt.out)"
+grep -qx "interrupt: ok" $B/interrupt.out || fail "interrupt: $(cat $B/interrupt.out)"
+cat $B/interrupt.out
+echo "interruptible waits and deadlines: ok"
+if $CC -fsanitize=thread $B/tsan_probe.c -o $B/tsan_probe 2>/dev/null && $B/tsan_probe 2>/dev/null; then
+  $ORIN2 compile tests/net/interrupt.or -o $B/interrupt_tsan.c
+  $CC -g -O1 -w -fsanitize=thread -I runtime/core $B/interrupt_tsan.c runtime/core/orin_runtime.c runtime/platform/orin_platform.c -lm -lpthread -o $B/interrupt_tsan
+  rm -f $B/tsan_int.*
+  TSAN_OPTIONS="halt_on_error=0 exitcode=66 log_path=$B/tsan_int" limit 300 $B/interrupt_tsan > $B/interrupt_tsan.out 2>&1 || fail "interrupt under TSan: $(cat $B/interrupt_tsan.out)"
+  grep -qx "interrupt: ok" $B/interrupt_tsan.out || fail "interrupt under TSan: $(cat $B/interrupt_tsan.out)"
+  ! ls $B/tsan_int.* >/dev/null 2>&1 || fail "ThreadSanitizer report: $(head -20 $B/tsan_int.* | head -30)"
+  echo "interruptible waits under ThreadSanitizer: ok"
+else
+  echo "interruptible waits under ThreadSanitizer: skipped (no -fsanitize=thread)"
 fi
 
 # library-level rules of the network handle moves: compiled from tests/net/libcheck so that the `$`-named files count as library code

@@ -46,7 +46,17 @@
 //   first, `Closed` when the channel is closed and drained (all of them, for `select`), `ClockUnavailable` / `InvalidDuration`
 //   from the relative forms. A value that is there when the deadline passes is still delivered, never dropped.
 //
-// Stage 0 has no `async` / `await`, no cancellation other than `rx.close()` (scope cancellation is C2), no deadlock detection
+// * Cancellation of network waits (ADR-0017 Addendum D, C3). Every scope owns a cancellation token (a wake source of L0); a task
+//   is bound to the token of the scope it was spawned in, a nested scope's token is a child of the token of the task that opened
+//   it. `s.cancel()` / `token.cancel()` sets the token (permanent, idempotent): every task of the scope blocked in a network wait
+//   of std:net (accept, connect, recv, send) wakes at once with `Err(Cancelled)`, and so does every later network call of a
+//   cancelled task, until the scope ends. `s.token()` is a copyable value a task may capture (a task cannot capture the Scope), and
+//   `isCancelled()` is the cooperative check for long computations. A token kept after its scope ended is stale and harmless:
+//   `cancel()` returns false and cannot cancel another scope that reuses the slot (generation-tagged handles). Waits on channels
+//   (`recv`, `send`, `join`, `select`, `sleep`) do NOT observe the token yet (they are woken by their deadline or by the channel,
+//   C2); a task that waits on a channel and on the network at once should use the deadline forms.
+//
+// Stage 0 has no `async` / `await`, no cancellation of channel waits other than `rx.close()` (scope cancellation is C2), no deadlock detection
 // (all tasks blocked is a hang) and no work stealing: a task is a thread, so thousands are fine, hundreds of thousands are not.
 // A panic in the BODY of a scope (not in a task) is not unwound: tasks still running keep running until the process ends.
 
@@ -55,7 +65,8 @@ import { Deadline, Duration, MonotonicInstant, monotonicNow } from "std:time";
 import {
   FsGrant, ProcessGrant, StdioGrant, ClockGrant, NetGrant, grantAdoptNet, grantRevoke, grantClone, grantMove, grantAdoptFs, grantAdoptProcess,
   grantAdoptStdio, grantAdoptClock, monNew, monFree, monLock, monUnlock, monWait, monNotifyAll, monGet, monSet, monGrow,
-  transitPut, transitTake, transitDrop, taskSpawn, taskJoin, taskMessage, taskTrap, transferCount, monNotifyOne, parThreads, lendPut, monWaitUntil, taskWatch
+  transitPut, transitTake, transitDrop, taskSpawn, taskJoin, taskMessage, taskTrap, transferCount, monNotifyOne, parThreads, lendPut, monWaitUntil, taskWatch,
+  wakeOpen, wakeClose, wakeSignal, wakeBind, wakeBound, wakeCheck
 } from "std:fsraw";
 
 // ------------------------------------------------------------------------------------------------------ transfer
@@ -553,7 +564,8 @@ export function sleep(clock: ClockGrant, timeout: Duration): Result<void, TaskEr
 
 // ------------------------------------------------------------------------------------------------------ scopes
 
-const LG_HDR: usize = 4;
+const LG_HDR: usize = 5;
+const LG_WAKE: usize = 4; // header word of the scope's cancellation token (0 = none: the table was full or the nesting too deep)
 const LG_STRIDE: usize = 3;
 const LG_FIRST: usize = 8;
 
@@ -566,6 +578,45 @@ function entry(i: usize): usize {
   return LG_HDR + LG_STRIDE * i;
 }
 
+// The cancellation token of the scope whose task table is `tab`; traps when it has none.
+function scopeWake(tab: usize): usize {
+  monLock(tab);
+  const w = monGet(tab, LG_WAKE);
+  monUnlock(tab);
+  if (w == 0) {
+    taskTrap("this scope has no cancellation token (token table full or scopes nested too deep)");
+  }
+  return w;
+}
+
+// A cancellation token: a copyable value that cancels the scope it came from (`Scope.token()`), also from another task. It holds a
+// generation-tagged handle of L0: after the scope ended it is stale, `cancel()` then does nothing and `isCancelled()` is false.
+@Invariant(this.wake >= 0)
+export class CancelToken {
+  private wake: usize;
+
+  constructor(wake: usize) {
+    this.wake = wake;
+  }
+
+  // cancel(): sets the token. Returns true when this call cancelled it, false when it was cancelled already or is stale. Waits of
+  // std:net observing the token (the scope's tasks, and the tasks of scopes nested in them) return `Err(Cancelled)`. O(1).
+  cancel(): bool {
+    return wakeSignal(this.wake) == 1;
+  }
+
+  // isCancelled(): the token or an ancestor scope's token is set. False for a stale token. O(depth).
+  isCancelled(): bool {
+    return wakeCheck(this.wake) == 1;
+  }
+}
+
+// isCancelled(): the calling task's own token, or an ancestor's, is set: it should stop at its next convenient point. A task that
+// is not inside any scope is never cancelled. O(depth).
+export function isCancelled(): bool {
+  return wakeCheck(wakeBound()) == 1;
+}
+
 // A scope: the handle of a task table. `scope` makes one and passes it to its body; it is valid only until `scope` returns.
 @Invariant(this.tab != 0)
 export class Scope {
@@ -574,6 +625,22 @@ export class Scope {
   @Requires(tab != 0)
   constructor(tab: usize) {
     this.tab = tab;
+  }
+
+  // token(): the scope's cancellation token, to hand to tasks (`spawn(s, () => ... token.cancel() ...)`). Traps if the scope has
+  // none (the token table is full, or scopes are nested more than 32 deep).
+  token(): CancelToken {
+    return new CancelToken(scopeWake(this.tab));
+  }
+
+  // cancel(): `token().cancel()`.
+  cancel(): bool {
+    return wakeSignal(scopeWake(this.tab)) == 1;
+  }
+
+  // isCancelled(): the scope's token (or an ancestor's) is set.
+  isCancelled(): bool {
+    return wakeCheck(scopeWake(this.tab)) == 1;
   }
 }
 
@@ -668,7 +735,8 @@ function tryJoin<T>(h: TaskHandle<T>): Option<T> {
 
 // What a task does, as the runtime runs it: compute, publish the result in the result monitor. Result monitor words: [0] the token
 // of the result, [1] 1 once the task has ended (by return or trap; set by the runtime, taskWatch), which `joinUntil` waits for.
-function runTask<T>(f: () => T, res: usize): void {
+function runTask<T>(f: () => T, wake: usize, res: usize): void {
+  wakeBind(wake);
   taskWatch(res);
   const r = f();
   const tok = putBox(r);
@@ -683,7 +751,11 @@ function runTask<T>(f: () => T, res: usize): void {
 @Ensures(result.tab == s.tab)
 export function spawn<T>(s: Scope, f: () => T): TaskHandle<T> {
   const res = monNew(2);
-  const body: Thunk = () => runTask(f, res);
+  monLock(s.tab);
+  const own = monGet(s.tab, LG_WAKE);
+  monUnlock(s.tab);
+  const wake = own != 0 ? own : wakeBound(); // a scope without a token of its own passes the spawner's on
+  const body: Thunk = () => runTask(f, wake, res);
   const tok = putBox(body);
   monLock(s.tab);
   let lg = loadLedger(s.tab);
@@ -772,8 +844,10 @@ function drain(tab: usize): string {
 @Ensures(result != 0)
 function begin(): usize {
   const tab = monNew(LG_FIRST * LG_STRIDE);
+  const w = wakeOpen(); // binds the new token to this thread: the body of the scope observes it too
   monLock(tab);
   monSet(tab, 3, LG_FIRST * LG_STRIDE);
+  monSet(tab, LG_WAKE, w);
   monUnlock(tab);
   return tab;
 }
@@ -781,6 +855,12 @@ function begin(): usize {
 // finish(tab): joins every task of the table, frees it, and panics if a task nobody joined panicked.
 function finish(tab: usize): void {
   const failure = drain(tab);
+  monLock(tab);
+  const w = monGet(tab, LG_WAKE);
+  monUnlock(tab);
+  if (w != 0) {
+    wakeClose(w); // every task has ended: nothing waits on the token any more; the thread is bound to the enclosing token again
+  }
   monFree(tab);
   if (failure != "") {
     taskTrap("task panicked: " + failure);

@@ -717,10 +717,12 @@ function main(host: Host): void {
 | `send(s, data, timeout: Duration)` / `sendAll(s, data, timeout: Duration)` | one attempt (partial write reported) / all bytes, deadline for the whole call |
 | `shutdownWrite(s)` | half-close (FIN); a graceful close is this, a bounded drain with `recv`, then the scope ends |
 | `StreamReader(cap)`: `readExact(s, n, ms)`, `readUntil(s, delim, limit, ms)`, `readSome`, `buffered`, `unread`, `take` | read-ahead buffer next to the stream (a stream cannot be stored); results `Filled | FillClosed | FillLimit | FillTimeout | FillError`; at most `cap` bytes are ever buffered, `readUntil` receives at most `limit - buffered` bytes at a time; the ms is a deadline for the whole call |
+| `recvUntil / sendUntil / sendAllUntil(s, .., deadline: Deadline)`, `StreamReader.readExactUntil / readDelimitedUntil`, `withAcceptedUntil`, `acceptDetachedUntil`, `withConnectionUntil / useConnectionUntil` | ADR-0017 Addendum D: the same operations on an ABSOLUTE `Deadline` (std:time) that any number of calls can share, so one deadline covers a whole exchange of many small reads and writes |
+| `withListenerNet`, `withConnectionBeside` | value-returning twins of `useListenerNet` / `useConnectionBeside` |
 | `monotonicMillis(s)` | monotonic clock via a live stream (deadlines without a clock grant); not `time.nowMillis` (the wall clock) |
 | `resolve(net, name): Result<string[], NetError>` | numeric addresses; the grant's scope must cover `name` |
 | `parsePeer(text): Result<Peer, NetError>` | `"1.2.3.4:5"` / `"[::1]:5"`; `Err(InvalidPeer)` with the byte offset for anything else (no port-0 sentinel) |
-| `NetError { kind, code, offset }`, `netErrorMessage(e)`, `netErrorFromCode(code)`, `isDenied / isTimeout / isReset(e)` | `NetErrorKind = Denied \| Closed \| Timeout \| Reset \| InvalidArgument \| InvalidPeer \| Os` |
+| `NetError { kind, code, offset }`, `netErrorMessage(e)`, `netErrorFromCode(code)`, `isDenied / isTimeout / isReset(e)` | `NetErrorKind = Denied \| Closed \| Timeout \| Cancelled \| Reset \| InvalidArgument \| InvalidPeer \| Os`; `Cancelled` = the task's scope was cancelled while it waited (`Scope.cancel()` / `CancelToken` of std:task): accept, connect, recv and send wake at once, later calls fail at once; name resolution (`getaddrinfo`) is the one wait that is not interruptible |
 | `Peer { host, port }`, `portOf(ln)` | values |
 
 **Security properties.** *Statically* (checker, MIR verifier): every network function needs a `NetGrant` / `Listener` /
