@@ -22,7 +22,7 @@ export type User = { id: int; @JsonName("display_name") name: string; tags: stri
 //   export function decodeUserAt(j: JsonValue, path: string): Result<User, string>
 ```
 
-`JsonValue` is `Json` of `std:json`; it has another name here because `Json` is the annotation. Decode errors carry a path:
+`JsonValue` is `Json` of `std:json/legacy`; it has another name here because `Json` is the annotation. Decode errors carry a path:
 `$.address.zip: expected an int, found a string`, `$: missing field "display_name"`, `$.tags[1]: expected a string, found an int`.
 
 Run it (from the repository root, with a built compiler):
@@ -36,7 +36,7 @@ orin run examples/json-codec/app
 
 `int`, `bool`, `string`, `T[]` and `Option<T>` of supported types, and records annotated `@Json` **declared in the same module**.
 An absent or `null` `Option` field decodes to `None` and encodes to `null`. Everything else is a processor diagnostic at the field
-(E0522), for example `float` (`std:json` has integers only), a union, a record without `@Json`, `Option<Option<T>>`, a generic type or a
+(E0522), for example `float` (`std:json/legacy` has integers only), a union, a record without `@Json`, `Option<Option<T>>`, a generic type or a
 repeated JSON key; see `tests/processors/json_bad`.
 
 Limits of this example, not of the feature: a companion module cannot import another companion (one round of expansion, E0520),

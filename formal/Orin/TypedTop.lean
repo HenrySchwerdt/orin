@@ -57,7 +57,7 @@ theorem entry_tinv (p : Prog) (sh : Shapes) (Γ : List Ty) (hty : HTy) (H : Heap
 never takes an `ill` step (no out-of-range field/array-kind/null fault) and never takes a `bad`
 step, from any typed entry state satisfying the caller contract of `check_sound`. -/
 theorem check_sound_ill (p : Prog) (hp : check p = true) (sh : Shapes) (Γ : List Ty)
-    (ht : tcode sh Γ p.code = true) (hty : HTy) (ext : List Val) (H : Heap)
+    (ht : tcode sh [] Γ p.code = true) (hty : HTy) (ext : List Val) (H : Heap)
     (vals : List Val) (hlen : vals.length = p.params.length) (hext : WF ⟨H, ext, []⟩)
     (href : ∀ i : Nat, p.params[i]? = some true →
       ∃ l q, vals[i]? = some (Val.ref l) ∧ Val.ref q ∈ ext ∧ Desc H q (Val.ref l))
@@ -79,15 +79,15 @@ theorem check_sound_ill (p : Prog) (hp : check p = true) (sh : Shapes) (Γ : Lis
 private def exSh : Shapes := [[Ty.int, Ty.int]]
 private def exG : List Ty := [Ty.st 0, Ty.int]
 
-example : tcode exSh exG (.op (.getField 1 0 1 false) .nil) = true := by decide
+example : tcode exSh [] exG (.op (.getField 1 0 1 false) .nil) = true := by decide
 /-- index out of the arity -/
-example : tcode exSh exG (.op (.getField 1 0 2 false) .nil) = false := by decide
+example : tcode exSh [] exG (.op (.getField 1 0 2 false) .nil) = false := by decide
 /-- field access on a scalar local -/
-example : tcode exSh exG (.op (.getField 0 1 0 false) .nil) = false := by decide
+example : tcode exSh [] exG (.op (.getField 0 1 0 false) .nil) = false := by decide
 /-- array operation on a struct local -/
-example : tcode exSh exG (.op (.arrayLen 1 0) .nil) = false := by decide
+example : tcode exSh [] exG (.op (.arrayLen 1 0) .nil) = false := by decide
 /-- wrong arity at allocation -/
-example : tcode exSh exG (.op (.alloc 0 3) .nil) = false := by decide
-example : tcode exSh exG (.op (.alloc 0 2) .nil) = true := by decide
+example : tcode exSh [] exG (.op (.alloc 0 3) .nil) = false := by decide
+example : tcode exSh [] exG (.op (.alloc 0 2) .nil) = true := by decide
 
 end Orin

@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
-"""Generate the two B-tree sorted maps of library/std/collections.or from tools/sorted_map.tmpl.
+"""Generate the two B-tree sorted maps of library/std/collections.or (the classes) and library/std/collections_internal.or
+(their helper functions and node types) from tools/sorted_map.tmpl.
 
 `SortedMap<V>` (int keys), `SortedStringMap<V>` (string keys) and the generic `OrderedMap<K extends Ord, V>` (ADR-0034)
 are the same algorithm; the specialised two keep their direct int / string comparisons (no instance dispatch, and they
-predate `Ord`), so the key type and its comparisons are template parameters and the classes are generated, not copied by hand. The generated region of library/std/collections.or is
-between the markers `// BEGIN GENERATED` and `// END GENERATED`.
+predate `Ord`), so the key type and its comparisons are template parameters and the three classes are generated, not
+copied by hand. Blocks between `//@@LEGACY` and `//@@END` (the `@Deprecated` ADR-0048 wrappers `put`, `keyArray`,
+`valueArray`) are emitted for the two old classes only: the new `OrderedMap` has the ADR-0048 names from the start. The template has two parts, separated by the line
+`//@@SPLIT@@`: the helpers (node types, `lowerBound*`, `btree*`; ADR-0048 rule 7.3: not API) go to std:collections/internal,
+the classes to std:collections. The generated region of each file is between the markers `// BEGIN GENERATED` and
+`// END GENERATED`.
 
-Usage: python3 tools/gen_sorted_map.py [--check]   (--check: exit 1 if collections.or is stale)
+Usage: python3 tools/gen_sorted_map.py [--check]   (--check: exit 1 if a generated file is stale)
 """
 import os
 import re
@@ -20,20 +25,20 @@ INT = {
     "CLASS": "SortedMap", "P": "Int", "K": "int", "ENTRY": "SortedEntry", "ZERO": "0",
     "INC": "isStrictlyIncreasing",
     "ops": {"LT": "<", "LE": "<=", "GT": ">", "GE": ">=", "EQ": "=="},
-    "cmp": False, "TPV": "V", "AV": "V", "TPK": "",
+    "cmp": False, "TPV": "V", "AV": "V", "TPK": "", "legacy": True,
 }
 STR = {
-    "CLASS": "SortedStringMap", "P": "Str", "K": "string", "ENTRY": "SortedStringEntry", "ZERO": '""',
+    "CLASS": "SortedStringMap", "P": "String", "K": "string", "ENTRY": "SortedStringEntry", "ZERO": '""',
     "INC": "isStrictlyIncreasingStrings",
     "ops": {"LT": "<", "LE": "<=", "GT": ">", "GE": ">=", "EQ": "=="},
-    "cmp": True, "TPV": "V", "AV": "V", "TPK": "",
+    "cmp": True, "TPV": "V", "AV": "V", "TPK": "", "legacy": True,
 }
 # Generic version (ADR-0034 slice 2): the key is a type parameter bounded by the built-in `Ord`, so `<`, `==` ... work on it.
 GEN = {
     "CLASS": "OrderedMap", "P": "Ord", "K": "K", "ENTRY": "OrderedEntry", "ZERO": "",
     "INC": "isStrictlyIncreasingOrd",
     "ops": {"LT": "<", "LE": "<=", "GT": ">", "GE": ">=", "EQ": "=="},
-    "cmp": False, "TPV": "K extends Ord, V", "AV": "K, V", "TPK": "<K extends Ord>",
+    "cmp": False, "TPV": "K extends Ord, V", "AV": "K, V", "TPK": "<K extends Ord>", "legacy": False,
 }
 MACROS = ("LT", "LE", "GT", "GE", "EQ")
 
@@ -74,14 +79,14 @@ def expand_macros(s, inst):
         a, b = (expand_macros(x.strip(), inst) for x in args)
         op = inst["ops"][m.group(1)]
         if inst["cmp"]:
-            out.append("(compareStrings(%s, %s) %s 0)" % (a, b, op))
+            out.append("(compareBytewise(%s, %s) %s 0)" % (a, b, op))
         else:
             out.append("(%s %s %s)" % (a, op, b))
         i = end
 
 
 def render(inst, tmpl):
-    s = tmpl
+    s = re.sub(r"//@@LEGACY\n(.*?)//@@END\n\n?", (lambda m: m.group(1) + "\n") if inst["legacy"] else "", tmpl, flags=re.S)
     for k in ("CLASS", "P", "K", "ENTRY", "ZERO", "INC", "TPV", "AV", "TPK"):
         s = s.replace("@%s@" % k, inst[k])
     s = expand_macros(s, inst)
@@ -89,26 +94,35 @@ def render(inst, tmpl):
     return s
 
 
+SPLIT = "//@@SPLIT@@\n"
+
+
 def generated():
+    """(helpers, classes): the two generated regions."""
     tmpl = open(os.path.join(ROOT, "tools", "sorted_map.tmpl"), encoding="utf-8").read()
-    return BEGIN + render(INT, tmpl) + render(STR, tmpl) + render(GEN, tmpl) + END
+    head, tail = tmpl.split(SPLIT)
+    helpers = BEGIN + render(INT, head) + render(STR, head) + render(GEN, head) + END
+    classes = BEGIN + render(INT, tail) + render(STR, tail) + render(GEN, tail) + END
+    return helpers, classes
 
 
 def main():
-    path = os.path.join(ROOT, "library", "std", "collections.or")
-    src = open(path, encoding="utf-8").read()
-    a = src.index(BEGIN)
-    b = src.index(END) + len(END)
-    new = src[:a] + generated() + src[b:]
-    if "--check" in sys.argv[1:]:
+    helpers, classes = generated()
+    stale = False
+    for rel, region in (("collections_internal.or", helpers), ("collections.or", classes)):
+        path = os.path.join(ROOT, "library", "std", rel)
+        src = open(path, encoding="utf-8").read()
+        a = src.index(BEGIN)
+        b = src.index(END) + len(END)
+        new = src[:a] + region + src[b:]
         if new != src:
-            print("library/std/collections.or is stale: run python3 tools/gen_sorted_map.py")
-            return 1
-        return 0
-    if new != src:
-        open(path, "w", encoding="utf-8").write(new)
-        print("wrote library/std/collections.or")
-    return 0
+            if "--check" in sys.argv[1:]:
+                print("library/std/%s is stale: run python3 tools/gen_sorted_map.py" % rel)
+                stale = True
+            else:
+                open(path, "w", encoding="utf-8").write(new)
+                print("wrote library/std/%s" % rel)
+    return 1 if stale else 0
 
 
 if __name__ == "__main__":

@@ -38,3 +38,15 @@ import Orin.CallRun
 import Orin.CallStep
 import Orin.CallTop
 import Orin.CallExamples
+import Orin.TypedCall
+import Orin.Range
+import Orin.RangeStep
+import Orin.RangeSem
+import Orin.RangeXfer
+import Orin.RangeRes
+import Orin.RangeStepSound
+import Orin.RangeEdge
+import Orin.RangeJoin
+import Orin.RangeCfg
+import Orin.RangeFix
+import Orin.RangeNarrow

@@ -22,10 +22,10 @@ slice (for example read config -> decode -> validate -> run bounded child -> ins
 
 ### Structured data and configuration
 
-Shipped opt-in libraries: [std:jsonnumber](std-jsonnumber.md) preserves validated
-numeric lexemes and converts exact integral values to int; [std:jsonvalue](std-jsonvalue.md)
+Shipped opt-in libraries: [std:json/number](std-json-number.md) preserves validated
+numeric lexemes and converts exact integral values to int; [std:json](std-json.md)
 provides bounded document parse/write with strict UTF-8 and duplicate policies;
-[std:jsondecode](std-jsondecode.md) adds sealed cursors, field paths, absent/null
+[std:json/decode](std-json-decode.md) adds sealed cursors, field paths, absent/null
 distinction, exact inclusive integer bounds and explicit unknown-field policy.
 The [pure config example](../examples/json_config.or) is executable without I/O
 inside its decoder. Legacy `std:json` and compiler-internal JSON remain unchanged.

@@ -159,7 +159,7 @@ def selftest():
     for file, checks in dependencies:
         cases.append(([file], {"code": True, "macos": True, "vscode": False,
                                "mutants": [], "std_backend_checks": checks}))
-    cases.append((["docs/std-jsonvalue.md", "docs/std-jsondecode.md"], {
+    cases.append((["docs/std-json.md", "docs/std-json-decode.md"], {
         "code": False, "macos": False, "vscode": False, "mutants": [], "std_backend_checks": []}))
     cases.append((["library/std/jsondecode.or", "library/std/jsonnumber.or", "tools/check_jsonvalue.py"], {
         "code": True, "macos": True, "vscode": False, "mutants": [],

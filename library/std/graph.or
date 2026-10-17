@@ -16,7 +16,7 @@
 //     does not touch edges pointing at it: they become dangling and `neighbors` silently skips them
 //     (an edge only counts while both ends are live with the generations recorded at addEdge time).
 //     Duplicate edges are allowed and reported once per addEdge call.
-//   * Complexity: `add`, `get`, `contains`, `size` are O(1) (freed slots are reused through a free list);
+//   * Complexity: `add`, `get`, `has`, `size` are O(1) (freed slots are reused through a free list);
 //     `remove` is O(1); `neighbors` is O(out-degree), `ids` O(nodes). Mutating methods update the
 //     graph in place when it is not shared; a shared graph is copied on the first change (O(nodes)).
 //
@@ -26,34 +26,38 @@
 // the id to its graph's value type; obtain ids through `Graph.add`.
 export type GraphId<T> = { tag: int; index: usize; gen: int; };
 
-// StaleId: the node was removed (the slot has a newer generation or is empty).
-// ForeignId: the id belongs to another graph (different tag) or does not name a slot at all.
-export type GraphError = StaleId | ForeignId;
+// Why an id was rejected (ADR-0048 rule 3.1). StaleId: the node was removed (the slot has a newer generation or is
+// empty). ForeignId: the id belongs to another graph (different tag) or does not name a slot at all.
+export type GraphErrorKind = StaleId | ForeignId;
+
+// The error of every fallible `Graph` method. There is no byte offset: the cause is the whole error.
+export type GraphError = { kind: GraphErrorKind; };
 
 type Edge = { index: usize; gen: int; };
 
 type Slot<T> = { gen: int; value: Option<T>; edges: Edge[]; };
 
-// graphErrorMessage(e: GraphError): string -- "stale graph id" / "foreign graph id". O(1).
+// graphErrorMessage(e): string -- "stale graph id" / "foreign graph id". Never fails; O(1).
 export function graphErrorMessage(e: GraphError): string {
-  return match (e) {
+  return match (e.kind) {
     StaleId => "stale graph id",
     ForeignId => "foreign graph id"
   };
 }
 
+// A directed graph owning its nodes; see the header for ids, tags and generations.
 export class Graph<T> {
   private tag: int;
   private slots: Slot<T>[] = [];
   private free: usize[] = [];
   private live: usize = 0;
 
-  // new Graph<T>(tag): an empty graph. Ids minted by it are accepted only by graphs with the same `tag`.
+  // new Graph<T>(tag) -- an empty graph. Ids minted by it are accepted only by graphs with the same `tag`.
   constructor(tag: int) {
     this.tag = tag;
   }
 
-  // size(): usize -- number of live nodes. O(1).
+  // size(): usize -- number of live nodes. Never fails. O(1).
   size(): usize {
     return this.live;
   }
@@ -61,22 +65,31 @@ export class Graph<T> {
   // Validates `id`: Ok(slot index) when it names a live node of this graph.
   private lookup(id: GraphId<T>): Result<usize, GraphError> {
     if (id.tag != this.tag || id.index >= this.slots.length) {
-      return Err(ForeignId);
+      return Err(GraphError { kind: ForeignId });
     }
     if (this.slots[id.index].gen != id.gen || this.slots[id.index].value.isNone()) {
-      return Err(StaleId);
+      return Err(GraphError { kind: StaleId });
     }
     return Ok(id.index);
   }
 
-  // contains(id): bool -- true when `id` names a live node of this graph. O(1).
-  contains(id: GraphId<T>): bool {
+  // has(id): bool -- true when `id` names a live node of this graph. Never fails (a stale or foreign id is just false). O(1).
+  has(id: GraphId<T>): bool {
     return this.lookup(id).isOk();
   }
 
-  // add(value): GraphId<T>
-  // Adds a node (reusing a freed slot, whose generation `remove` already bumped) and returns its id.
-  // Never fails. O(1).
+  @Deprecated("use has(id) (ADR-0048)")
+  contains(id: GraphId<T>): bool {
+    return this.has(id);
+  }
+
+  // isEmpty(): bool -- no live node. Never fails. O(1).
+  isEmpty(): bool {
+    return this.live == 0;
+  }
+
+  // add(value): GraphId<T> -- adds a node (reusing a freed slot, whose generation `remove` already bumped) and returns
+  // its id. Never fails. O(1).
   add(value: T): GraphId<T> {
     if (this.free.length > 0) {
       const i = this.free.pop().unwrap();
@@ -89,25 +102,24 @@ export class Graph<T> {
     return GraphId<T> { tag: this.tag, index: this.slots.length - 1, gen: 0 };
   }
 
-  // get(id): Result<T, GraphError>
-  // The value of a live node. Errors: StaleId (removed node), ForeignId (other graph). O(1).
+  // get(id): Result<T, GraphError> -- the value of a live node. Err(StaleId) for a removed node, Err(ForeignId) for an
+  // id of another graph. O(1).
   get(id: GraphId<T>): Result<T, GraphError> {
     const i = this.lookup(id)?;
     return Ok(this.slots[i].value.unwrap());
   }
 
-  // set(id, value): Result<void, GraphError>
-  // Replaces a live node's value (its edges and id stay). Errors as `get`. O(1).
+  // set(id, value): Result<void, GraphError> -- replaces a live node's value (its edges and id stay). Errors as `get`.
+  // O(1).
   set(id: GraphId<T>, value: T): Result<void, GraphError> {
     const i = this.lookup(id)?;
     this.slots[i].value = Some(value);
     return Ok();
   }
 
-  // remove(id): Result<T, GraphError>
-  // Removes a live node and its outgoing edges and returns its value. The slot generation is bumped
-  // (invalidating `id` and every copy of it) and the slot is freed for reuse. Edges of other nodes that
-  // pointed at it dangle and are skipped by `neighbors`. Errors as `get`. O(1).
+  // remove(id): Result<T, GraphError> -- removes a live node and its outgoing edges and returns its value. The slot
+  // generation is bumped (invalidating `id` and every copy of it) and the slot is freed for reuse. Edges of other
+  // nodes that pointed at it dangle and are skipped by `neighbors`. Errors as `get`. O(1).
   remove(id: GraphId<T>): Result<T, GraphError> {
     const i = this.lookup(id)?;
     const old = this.slots[i].value.unwrap();
@@ -120,9 +132,8 @@ export class Graph<T> {
     return Ok(old);
   }
 
-  // addEdge(a, b): Result<void, GraphError>
-  // Adds the directed edge a -> b (self loops and duplicates allowed). Both ids must be live in this
-  // graph; the first failing id's error is returned (`a` is checked first). O(1).
+  // addEdge(a, b): Result<void, GraphError> -- adds the directed edge a -> b (self loops and duplicates allowed). Both
+  // ids must be live in this graph; the first failing id's error is returned (`a` is checked first). O(1).
   addEdge(a: GraphId<T>, b: GraphId<T>): Result<void, GraphError> {
     const i = this.lookup(a)?;
     const j = this.lookup(b)?;
@@ -130,9 +141,8 @@ export class Graph<T> {
     return Ok();
   }
 
-  // neighbors(id): Result<GraphId<T>[], GraphError>
-  // The targets of the outgoing edges of a live node, in insertion order, skipping dangling edges
-  // (removed targets). Errors as `get`. O(out-degree).
+  // neighbors(id): Result<GraphId<T>[], GraphError> -- the targets of the outgoing edges of a live node, in insertion
+  // order, skipping dangling edges (removed targets). Errors as `get`. O(out-degree).
   neighbors(id: GraphId<T>): Result<GraphId<T>[], GraphError> {
     const i = this.lookup(id)?;
     let out: GraphId<T>[] = [];
@@ -144,7 +154,7 @@ export class Graph<T> {
     return Ok(out);
   }
 
-  // ids(): GraphId<T>[] -- ids of all live nodes in slot order. O(nodes).
+  // ids(): GraphId<T>[] -- ids of all live nodes in slot order. Never fails. O(nodes).
   ids(): GraphId<T>[] {
     let out: GraphId<T>[] = [];
     let i: usize = 0;
