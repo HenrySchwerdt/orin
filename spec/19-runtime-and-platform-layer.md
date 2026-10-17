@@ -191,6 +191,14 @@ separator is raised through `process.exit(101)` after printing the same message.
     `#ifdef ORIN_SITE_STATS` until R3d.5; `sb_drain` stays C. `cfg(0)` is a constant 1 in LLVM, so LLVM builds under ASan keep the free lists
     (ASan then does not see a recycled header). The C unit tests of the runtime link `tools/rt_stub.sh` (an empty program compiled to C with `main`
     renamed), which carries the wrappers. `compiler/mir/rt.or` also holds `rtAlways` (the entries `opt/prune.or` always keeps).
+  - **R3d.4 strings and arrays in Orin (done, ADR-0052 Addendum A section 5).** `runtime/core/str.or` (`strConcat`, `strAppend`, `strAppendSub`,
+    `strAppendInt`, `strAppendUsize`, `strPrepend`) and `runtime/core/array.or` (`arraySlice`, `arrayConcat`, `arrayExtend`, `bytesToString`,
+    `stringToBytes`; the byte loops take eight elements per step) are entries 17..27 of `compiler/mir/rt.or`. The backends call them directly
+    (`rtCallC`, `rtCallL`; objects as address words); without `$rt` (`--c-builtins`) they emit the old C call, which the frozen snapshot defines.
+    Only `str_concat`, `str_append`, `array_slice`, `array_concat`, `array_extend`, `bytes_to_string` and `string_to_bytes` get a C-named wrapper
+    (`rtWraps`), because the C unit tests call them; the others (`rtPlain`) have none. Growth, fresh allocation and the copying path of
+    `arrayExtend` are separate `noinline` functions (`rtCold`). Counters are updated exactly as the C versions did. Census builds keep the C
+    versions under `#ifdef ORIN_SITE_STATS` (`rtIdsFor` leaves all of these entries out) until R3d.5. `rc.or` exports `retain` and `release`.
   - **R3d.1 the per-thread heap block (done, ADR-0052 Addendum A section 5).** `g_live`, the free lists, the small-block cache, the
     work stack of `orin_destroy` and `orin_stats` are fields of one exported `__thread OrinHeap orin_heap` (1024 bytes, zero-initialised,
     the block `heapBase()` returns), so Orin code reaches each at a fixed offset. ADR-0017 behaviour is unchanged (per task, returned in

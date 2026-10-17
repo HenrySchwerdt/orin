@@ -28,14 +28,27 @@ export const RT_SB_FREE: usize = 13;
 export const RT_SB_REALLOC: usize = 14;
 export const RT_STR_ALLOC: usize = 15;
 export const RT_ARRAY_PUSH_GROW: usize = 16;
+export const RT_STR_CONCAT: usize = 17;
+export const RT_STR_APPEND: usize = 18;
+export const RT_STR_APPEND_SUB: usize = 19;
+export const RT_STR_APPEND_USIZE: usize = 20;
+export const RT_STR_APPEND_INT: usize = 21;
+export const RT_STR_PREPEND: usize = 22;
+export const RT_ARRAY_SLICE: usize = 23;
+export const RT_ARRAY_CONCAT: usize = 24;
+export const RT_ARRAY_EXTEND: usize = 25;
+export const RT_BYTES_TO_STRING: usize = 26;
+export const RT_STRING_TO_BYTES: usize = 27;
 
-// The qualified names of the entries, by number (the modules `$rt/leaf.or` and `$rt/object.or`).
+// The qualified names of the entries, by number (the modules of runtime/core).
 export function rtNames(): string[] {
   return [
     "$rt/leaf.optUnwrap", "$rt/leaf.resUnwrap", "$rt/leaf.resUnwrapErr", "$rt/leaf.vUnwrap", "$rt/leaf.trapShape",
     "$rt/leaf.assertFact", "$rt/leaf.assertArray", "$rt/object.structNew", "$rt/object.variant1", "$rt/object.arrayNew",
     "$rt/rc.destroy", "$rt/rc.makeUniqueSlow", "$rt/heap.sbAlloc", "$rt/heap.sbFree", "$rt/heap.sbRealloc", "$rt/object.strAlloc",
-    "$rt/object.arrayPushGrow"
+    "$rt/object.arrayPushGrow", "$rt/str.strConcat", "$rt/str.strAppend", "$rt/str.strAppendSub", "$rt/str.strAppendUsize",
+    "$rt/str.strAppendInt", "$rt/str.strPrepend", "$rt/array.arraySlice", "$rt/array.arrayConcat", "$rt/array.arrayExtend",
+    "$rt/array.bytesToString", "$rt/array.stringToBytes"
   ];
 }
 
@@ -58,7 +71,58 @@ export function rtWraps(): RtWrap[] {
     RtWrap { entry: RT_SB_REALLOC, name: "orin_sb_realloc", ret: "p", params: ["p", "u64", "u64"] },
     RtWrap { entry: RT_STR_ALLOC, name: "orin_str_alloc", ret: "o", params: ["u64", "u64"] },
     RtWrap { entry: RT_ARRAY_PUSH_GROW, name: "orin_array_push_grow", ret: "v", params: ["o", "u64"] },
+    RtWrap { entry: RT_STR_CONCAT, name: "orin_str_concat", ret: "o", params: ["o", "o"] },
+    RtWrap { entry: RT_STR_APPEND, name: "orin_str_append", ret: "o", params: ["o", "o"] },
+    RtWrap { entry: RT_ARRAY_SLICE, name: "orin_array_slice", ret: "o", params: ["o", "u64", "u64"] },
+    RtWrap { entry: RT_ARRAY_CONCAT, name: "orin_array_concat", ret: "o", params: ["o", "o"] },
+    RtWrap { entry: RT_ARRAY_EXTEND, name: "orin_array_extend", ret: "o", params: ["o", "o"] },
+    RtWrap { entry: RT_BYTES_TO_STRING, name: "orin_bytes_to_string", ret: "o", params: ["o", "u64", "u64"] },
+    RtWrap { entry: RT_STRING_TO_BYTES, name: "orin_string_to_bytes", ret: "o", params: ["o"] },
   ];
+}
+
+// The entries of the string and array functions that no C code calls: the emitted code calls them directly and defines no wrapper
+// (`name` is the C function they replace, which a program without `$rt` and a census build still call).
+export function rtPlain(): RtWrap[] {
+  return [
+    RtWrap { entry: RT_STR_APPEND_SUB, name: "orin_str_append_sub", ret: "o", params: ["o", "o", "u64", "u64"] },
+    RtWrap { entry: RT_STR_APPEND_USIZE, name: "orin_str_append_usize", ret: "o", params: ["o", "u64"] },
+    RtWrap { entry: RT_STR_APPEND_INT, name: "orin_str_append_int", ret: "o", params: ["o", "i64"] },
+    RtWrap { entry: RT_STR_PREPEND, name: "orin_str_prepend", ret: "o", params: ["o", "o"] },
+  ];
+}
+
+// The C signature of the entry `k` when it replaces a C runtime function (`rtWraps` and `rtPlain`), else None.
+export function rtSig(k: usize): Option<RtWrap> {
+  for (const w of rtWraps()) {
+    if (w.entry == k) {
+      return Some(w);
+    }
+  }
+  for (const w of rtPlain()) {
+    if (w.entry == k) {
+      return Some(w);
+    }
+  }
+  return None;
+}
+
+// The L1 entry that a builtin calls, if it has one.
+export function l1Builtin(op: Builtin): Option<usize> {
+  return match (op) {
+    BArrSlice => Some(RT_ARRAY_SLICE),
+    BArrConcat => Some(RT_ARRAY_CONCAT),
+    BBytesToString => Some(RT_BYTES_TO_STRING),
+    BStringToBytes => Some(RT_STRING_TO_BYTES),
+    _ => None,
+  };
+}
+
+// The slow paths of the string and array functions that the backends keep out of line (`noinline`): the in-place path of an append is
+// a few instructions, and a fresh allocation inlined into it would make every caller save the registers of the cold code.
+export function rtCold(name: string): bool {
+  return name == "$rt/str.strGrow" || name == "$rt/str.appendFresh" || name == "$rt/str.decimalFresh" || name == "$rt/str.prependFresh"
+      || name == "$rt/array.growItems" || name == "$rt/array.extendCopy";
 }
 
 // The entries a live program always needs when `$rt` is loaded: the shape trap (the LLVM helpers and the C inlines call it) and
@@ -97,12 +161,15 @@ export function rtIds(prog: MProgram): int[] {
 }
 
 // `rtIds`, and for the allocation-site census build (`--stats-sites`) without the entries that replace C runtime functions of the
-// object model (`rtWraps`): the census hooks live in the C runtime, so a census build keeps calling its C allocator (compiled in
+// object model (`rtWraps`, `rtPlain`): the census hooks live in the C runtime, so a census build keeps calling its C allocator (compiled in
 // under -DORIN_SITE_STATS until the census moves, R3d.5).
 export function rtIdsFor(prog: MProgram, sites: bool): int[] {
   let ids = rtIds(prog);
   if (sites) {
     for (const w of rtWraps()) {
+      ids[w.entry] = -1;
+    }
+    for (const w of rtPlain()) {
       ids[w.entry] = -1;
     }
   }
@@ -122,8 +189,17 @@ function implied(ins: Instr): usize[] {
       BOptUnwrap => [RT_OPT_UNWRAP, RT_V_UNWRAP],
       BResUnwrap => [RT_RES_UNWRAP, RT_V_UNWRAP],
       BResUnwrapErr => [RT_RES_UNWRAP_ERR, RT_V_UNWRAP],
+      BArrSlice => [RT_ARRAY_SLICE],
+      BArrConcat => [RT_ARRAY_CONCAT],
+      BBytesToString => [RT_BYTES_TO_STRING],
+      BStringToBytes => [RT_STRING_TO_BYTES],
       _ => [],
     },
+    IStrAppend(_, _) => [RT_STR_APPEND],
+    IStrAppendSub(_, _, _, _) => [RT_STR_APPEND_SUB],
+    IStrAppendNum(_, _, uns) => [uns ? RT_STR_APPEND_USIZE : RT_STR_APPEND_INT],
+    IStrPrepend(_, _) => [RT_STR_PREPEND],
+    IArrayExtend(_, _) => [RT_ARRAY_EXTEND],
     IForward(_, _, _, _) => [RT_ASSERT_FACT],
     IArrayGetU(_, _, _) => [RT_ASSERT_ARRAY],
     IArraySetU(_, _, _) => [RT_ASSERT_ARRAY],
