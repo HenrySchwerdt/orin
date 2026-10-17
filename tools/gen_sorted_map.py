@@ -2,9 +2,11 @@
 """Generate the two B-tree sorted maps of library/std/collections.or (the classes) and library/std/collections_internal.or
 (their helper functions and node types) from tools/sorted_map.tmpl.
 
-`SortedMap<V>` (int keys) and `SortedStringMap<V>` (string keys) are the same algorithm; Orin has no equality or
-ordering on type parameters (docs/std.md "Limitations"), so the key type and its comparisons are template
-parameters and the two classes are generated, not copied by hand. The template has two parts, separated by the line
+`SortedMap<V>` (int keys), `SortedStringMap<V>` (string keys) and the generic `OrderedMap<K extends Ord, V>` (ADR-0034)
+are the same algorithm; the specialised two keep their direct int / string comparisons (no instance dispatch, and they
+predate `Ord`), so the key type and its comparisons are template parameters and the three classes are generated, not
+copied by hand. Blocks between `//@@LEGACY` and `//@@END` (the `@Deprecated` ADR-0048 wrappers `put`, `keyArray`,
+`valueArray`) are emitted for the two old classes only: the new `OrderedMap` has the ADR-0048 names from the start. The template has two parts, separated by the line
 `//@@SPLIT@@`: the helpers (node types, `lowerBound*`, `btree*`; ADR-0048 rule 7.3: not API) go to std:collections/internal,
 the classes to std:collections. The generated region of each file is between the markers `// BEGIN GENERATED` and
 `// END GENERATED`.
@@ -23,13 +25,20 @@ INT = {
     "CLASS": "SortedMap", "P": "Int", "K": "int", "ENTRY": "SortedEntry", "ZERO": "0",
     "INC": "isStrictlyIncreasing",
     "ops": {"LT": "<", "LE": "<=", "GT": ">", "GE": ">=", "EQ": "=="},
-    "cmp": False,
+    "cmp": False, "TPV": "V", "AV": "V", "TPK": "", "legacy": True,
 }
 STR = {
     "CLASS": "SortedStringMap", "P": "String", "K": "string", "ENTRY": "SortedStringEntry", "ZERO": '""',
     "INC": "isStrictlyIncreasingStrings",
     "ops": {"LT": "<", "LE": "<=", "GT": ">", "GE": ">=", "EQ": "=="},
-    "cmp": True,
+    "cmp": True, "TPV": "V", "AV": "V", "TPK": "", "legacy": True,
+}
+# Generic version (ADR-0034 slice 2): the key is a type parameter bounded by the built-in `Ord`, so `<`, `==` ... work on it.
+GEN = {
+    "CLASS": "OrderedMap", "P": "Ord", "K": "K", "ENTRY": "OrderedEntry", "ZERO": "",
+    "INC": "isStrictlyIncreasingOrd",
+    "ops": {"LT": "<", "LE": "<=", "GT": ">", "GE": ">=", "EQ": "=="},
+    "cmp": False, "TPV": "K extends Ord, V", "AV": "K, V", "TPK": "<K extends Ord>", "legacy": False,
 }
 MACROS = ("LT", "LE", "GT", "GE", "EQ")
 
@@ -77,8 +86,8 @@ def expand_macros(s, inst):
 
 
 def render(inst, tmpl):
-    s = tmpl
-    for k in ("CLASS", "P", "K", "ENTRY", "ZERO", "INC"):
+    s = re.sub(r"//@@LEGACY\n(.*?)//@@END\n\n?", (lambda m: m.group(1) + "\n") if inst["legacy"] else "", tmpl, flags=re.S)
+    for k in ("CLASS", "P", "K", "ENTRY", "ZERO", "INC", "TPV", "AV", "TPK"):
         s = s.replace("@%s@" % k, inst[k])
     s = expand_macros(s, inst)
     # an expanded macro that is a whole `if (..)` or contract condition keeps its own parentheses: harmless
@@ -92,8 +101,8 @@ def generated():
     """(helpers, classes): the two generated regions."""
     tmpl = open(os.path.join(ROOT, "tools", "sorted_map.tmpl"), encoding="utf-8").read()
     head, tail = tmpl.split(SPLIT)
-    helpers = BEGIN + render(INT, head) + render(STR, head) + END
-    classes = BEGIN + render(INT, tail) + render(STR, tail) + END
+    helpers = BEGIN + render(INT, head) + render(STR, head) + render(GEN, head) + END
+    classes = BEGIN + render(INT, tail) + render(STR, tail) + render(GEN, tail) + END
     return helpers, classes
 
 
