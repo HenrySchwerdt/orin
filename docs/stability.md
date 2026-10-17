@@ -76,4 +76,5 @@ After that freeze only the three rows above remain on the list. A pre-1.0 beta d
 - [Trusted computing base](tcb.md): what you have to trust.
 - [ADR-0016](decisions/0016-language-1.0-core-scope.md): the 1.0 language scope.
 - [Roadmap to 1.0](roadmaps/orin-1.0.md): milestones and open decisions.
+- [ADR-0056](decisions/0056-syntax-and-std-freeze.md) (draft): what the syntax and std freeze at `1.0.0-beta.1` covers and its entry criteria.
 - [Installing](install.md) and [getting started](getting-started.md).
