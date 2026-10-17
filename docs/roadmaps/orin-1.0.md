@@ -138,7 +138,7 @@ These are the async-concurrency.md steps. Without them no option delivers usable
 | C2 | Trap-safe structured cleanup: live-scope registry, parent trap cancels and joins descendants, primary/secondary failure reporting | M-L | runtime task code (temporary C) | Prefer implementing in Orin as part of R3e rather than growing the 342-line C interface that R3e deletes (see M2/M3 ordering) |
 | C3 | Interruptible network waits and operation-wide deadlines (accept/read/write/connect), wake source in readiness wait, generation-tagged handles; DNS limitation stated or resolver pool | M-L | `library/std/net.or`, L0 net wait | Same L0 budget issue |
 | C4 | Network ownership for concurrent servers: either delegate a net grant and move an accepted `Stream` into a task, or an acceptor task that owns sockets and exchanges bounded value messages with workers | M | ADR amendment (resources, E0450-E0452, E0483), checker, verifier rules like `grantMove` | Needs a language-level resource rule; this is the one floor item that touches the checker and the MIR verifier |
-| C5 | Server acceptance campaign (1, 64, 1,024 clients; slowloris, non-reading peers, cancellation storms; C/LLVM parity; TSan) and a concurrent `examples/http_server.or` | M | `tests/concurrency`, `tests/net`, `examples/` | Defined in async-concurrency.md "Server acceptance campaign" |
+| C5 | Server acceptance campaign (1, 64, 1,024 clients; slowloris, non-reading peers, cancellation storms; C/LLVM parity; TSan) and a concurrent `examples/http_server.or` | M | `tests/concurrency`, `tests/net`, `examples/` | **Done (2026-10-17):** `tools/test_server_campaign.sh` (1 / 64 / 1,024 clients, slowloris, non-reading peers, cancellation storms, graceful shutdown, C/LLVM parity, TSan, ASan+UBSan; CI `concurrency` job) against `examples/http_server.or`, now the concurrent server. Results: async-concurrency.md "Server acceptance campaign" |
 | C6 | Windows thread/monitor backend, if Windows is supported (D4) | M-L | `runtime/platform`, L0 budget again | Only if Windows is in the 1.0 platform list |
 
 Everything in C0-C5 keeps the existing model: isolated tasks, non-atomic RC, move-or-copy transfer, no
@@ -345,7 +345,7 @@ what is in, with (a) and (b) in and (d) relaxed per D5.
 **D3. TLS / HTTPS client / HTTP in 1.0?**
 Options: (i) none, `std:net` TCP and the pure `std:http` layer only; (ii) HTTP/1.1 client and server over
 `std:net` without TLS; (iii) TLS client with certificate validation. Recommendation: (ii) with the
-concurrency floor as the demonstration (`examples/http_server.or` becomes concurrent), and document TLS as
+concurrency floor as the demonstration (`examples/http_server.or` is concurrent since C5), and document TLS as
 post-1.0 behind a reverse proxy. TLS needs either a verified or well-audited implementation and is a large
 TCB addition; the readiness audit does not require it.
 

@@ -26,7 +26,7 @@
   may not contain side-effecting index expressions (E0408). Class values cannot be built with record
   literals outside their class (E0408). Method hover types on the call expression show the lowered type.
 - Generic classes (ADR-0026): no generic methods yet (E0460; ADR-0040 adds them, plus `void` as a type argument); static methods cannot use the class type parameters
-  (E0461); one interface bound per parameter; instances are created on demand, so an instance method that is never
+  (E0461); several interface bounds per parameter (`T extends A & B`); instances are created on demand, so an instance method that is never
   called is only checked abstractly; a `?` in a mutating method with a result is hoisted like a mutating call.
 - Concurrency, stage 0 (ADR-0017 Addendum A, docs/concurrency.md): a task is an OS thread (thousands fine, hundreds of thousands not; no
   M:N scheduler); no `async` / `await`, no timeouts or `select`, no cancellation beyond `rx.close()`, **no deadlock detection** (tasks that
@@ -36,7 +36,7 @@
   are tested, not verified; Windows has no thread backend yet.
 - Interfaces (ADR-0019, self-hosted compiler only): nominal conformance (`implements`), method signatures only
   (no fields, default methods, `extends`, type parameters: E0408), non-mutating methods only (a mutating
-  implementation is E0418), one bound per type parameter (`T extends A & B` is E0408). A class converts
+  implementation is E0418), several bounds per type parameter are allowed (`T extends A & B`). A class converts
   implicitly to the interfaces it declares (the only implicit conversion; not lifted over arrays); no
   downcasts, no `instanceof`, `==` on interface values is E0410. Interface values are boxed (one allocation
   per conversion, one indirect call per method call). Go-to-definition from a call on a bounded type parameter inside a generic body
