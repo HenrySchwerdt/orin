@@ -6,9 +6,12 @@
 // heap block are described in heap.or. A failed allocation traps "out of memory" in `memAlloc` itself. Counters and the
 // live-object balance are updated exactly as the C versions did (the ORIN_STATS=1 report is the equivalence oracle).
 
-import { load64, store8, store32, store64, memAlloc, memSet, heapBase, cfg, expect, wadd, shl, and } from "std:core";
+import { load64, store8, store32, store64, memAlloc, memSet, heapBase, cfg, expect, wadd, wsub, wmul, shl, and } from "std:core";
 import { taskTrap } from "std:fsraw";
-import { sbAlloc, subAt, liveInc, statAlloc, S_ALLOC_STRING, S_ALLOC_STRUCT, S_ALLOC_ARRAY, FL_ARRAY, FL_N } from "./heap";
+import {
+  sbAlloc, sbRealloc, subAt, addAt, liveInc, statAlloc, statGrow, S_ALLOC_STRING, S_ALLOC_STRUCT, S_ALLOC_ARRAY, S_ARRAY_GROWS, FL_ARRAY,
+  FL_N
+} from "./heap";
 
 // A new struct with all slots zero (null refs): `nslots` slots of 8 bytes behind the 32-byte header, rc 1. `refmask` bit i set:
 // slot i is a reference (at most 64 slots).
@@ -117,4 +120,20 @@ export function strAlloc(len: usize, cap0: usize): usize {
   liveInc();
   statAlloc(S_ALLOC_STRING, total);
   return s;
+}
+
+// `push` on a full array (len == cap): double the item buffer (4 slots at first), then store `slot`.
+export function arrayPushGrow(o: usize, slot: usize): void {
+  const cap0 = load64(wadd(o, 24));
+  const cap = cap0 != 0 ? wmul(cap0, 2) : 4;
+  const items = sbRealloc(load64(wadd(o, 40)), shl(cap0, 3), shl(cap, 3));
+  store64(wadd(o, 40), items);
+  statGrow(shl(wsub(cap, cap0), 3));
+  if (cfg(1) == 1) {
+    addAt(wadd(heapBase(), S_ARRAY_GROWS), 1);
+  }
+  store64(wadd(o, 24), cap);
+  const len = load64(wadd(o, 16));
+  store64(wadd(items, shl(len, 3)), slot);
+  store64(wadd(o, 16), wadd(len, 1));
 }

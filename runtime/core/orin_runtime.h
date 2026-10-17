@@ -118,6 +118,12 @@ void orin_trap(const char *msg) __attribute__((noreturn, cold));
  * frees plus the net of all finished tasks (an object moved between tasks is allocated by one and freed by another). */
 int64_t orin_live_count(void);
 
+/* internal, ADR-0052 R3d.3 (c): Orin functions of runtime/core/heap.or and object.or (the small-block cache and string allocation), defined by
+ * the code a program is compiled to for the C shells of the runtime (compiler/backends/{c,llvm}/rtwrap.or). */
+void *orin_sb_alloc(uint64_t n);
+void orin_sb_free(void *p, uint64_t n);
+void *orin_sb_realloc(void *p, uint64_t old, uint64_t n);
+OrinObj *orin_str_alloc(uint64_t len, uint64_t cap); /* a string of length len, capacity max(len, cap); the NUL terminator is set */
 void orin_destroy(OrinObj *o); /* internal: free an object whose count reached 0 (an Orin function of runtime/core/rc.or, ADR-0052 R3d.3 (b)) */
 
 /* ---------------------------------------------------------------- tasks (ADR-0017 stage 0, docs/concurrency.md)

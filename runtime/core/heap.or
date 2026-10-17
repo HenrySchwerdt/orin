@@ -13,7 +13,7 @@
 // Object layout (frozen, spec 19): header rc@0 kind@8 tag@12 (16 bytes); string len@16 cap@24 data@32; array len@16 cap@24
 // is_ref@32 items@40; struct nslots@16 refmask@24 slots@32; kinds string 1, array 2, struct 3.
 
-import { load64, store64, memAlloc, memFree, heapBase, cfg, wadd, wsub, shl, shr, xor } from "std:core";
+import { load64, store64, memAlloc, memFree, memRealloc, memCopy, heapBase, cfg, wadd, wsub, shl, shr, xor } from "std:core";
 
 // ---------------------------------------------------------------- offsets in the heap block
 
@@ -32,6 +32,7 @@ export const S_RELEASES: usize = 232;
 export const S_COW_COPIES: usize = 240;
 export const S_COW_INPLACE: usize = 248;
 export const S_ARRAY_GROWS: usize = 256;
+export const S_STRING_GROWS: usize = 264;
 export const S_PEAK_LIVE_OBJS: usize = 272;
 export const S_PEAK_LIVE_BYTES: usize = 280;
 export const S_LIVE_BYTES: usize = 288;
@@ -79,6 +80,19 @@ export function statAlloc(counter: usize, bytes: usize): void {
     const lv = load64(wadd(h, LIVE));
     if (xor(lv, SIGN) > xor(load64(wadd(h, S_PEAK_LIVE_OBJS)), SIGN)) {
       store64(wadd(h, S_PEAK_LIVE_OBJS), lv);
+    }
+  }
+}
+
+// `bytes` more live bytes (a buffer grew) and the peak.
+@Inline
+export function statGrow(bytes: usize): void {
+  if (cfg(1) == 1) {
+    const h = heapBase();
+    const lb = wadd(load64(wadd(h, S_LIVE_BYTES)), bytes);
+    store64(wadd(h, S_LIVE_BYTES), lb);
+    if (xor(lb, SIGN) > xor(load64(wadd(h, S_PEAK_LIVE_BYTES)), SIGN)) {
+      store64(wadd(h, S_PEAK_LIVE_BYTES), lb);
     }
   }
 }
@@ -133,4 +147,24 @@ export function sbFree(p: usize, n: usize): void {
     }
   }
   memFree(p);
+}
+
+// Grow (or shrink) the buffer `p` (0 when `old` is 0) from `old` to `n` bytes. Large buffers keep the in-place growth of `realloc`; a
+// small one stays where it is while it fits its 16-byte class, else it moves to a block of the new class.
+export function sbRealloc(p: usize, old: usize, n: usize): usize {
+  if (cfg(0) == 0) {
+    return memRealloc(p, n);
+  }
+  if (old > 256 && n > 256) {
+    return memRealloc(p, n);
+  }
+  if (p != 0 && old <= 256 && n <= 256 && shr(wadd(old, 15), 4) == shr(wadd(n, 15), 4)) {
+    return p;
+  }
+  const q = sbAlloc(n);
+  if (p != 0) {
+    memCopy(q, p, old < n ? old : n);
+    sbFree(p, old);
+  }
+  return q;
 }
