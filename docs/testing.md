@@ -28,9 +28,9 @@ orin test <file.or | package-dir> [--filter <substring>] [--format=json] [--time
   turns it off), a non-zero `exit`, a crash, or exceeding the timeout. Returning normally passes.
   `Result`-returning tests are not part of 1.0 (E0443 rejects them).
 * `std:test` (import explicitly): `assert(cond, msg)`, `assertEq(actual, expected, msg)` for `int`,
-  `assertEqUsize`, `assertEqString`, `assertEqBool`, `assertNear(actual, expected, tolerance, msg)` for
+  `assertEqUsize`, `assertEqString`, `assertEqBool`, `assertEqual`, `assertNear(actual, expected, tolerance, msg)` for
   floats, `fail(msg)`. A failure prints `trap: assertion failed: <msg>` / `trap: assertEq failed: <msg>:
-  expected 3, got 2` on stderr and exits 101. One `assertEq*` per type: Orin has no generic equality.
+  expected 3, got 2` on stderr and exits 101. One `assertEq*` per scalar type, and `assertEqual<T extends Eq>(actual, expected, msg)` for any `Eq` type (it does not print the values).
 * Tests are type-checked with the rest of the program — also by `orin check` and `orin compile` — so
   they cannot rot. Calling a test function or using it as a value is E0445.
 * A test file needs no `main`; if the entry module has one, `orin test` does not run it.

@@ -17,7 +17,7 @@ API table (`compiler/mcp/apitable.or`).
 | `std:bytes` | Orin, `library/std/bytes.or` | `Bytes`, `ByteBuilder`, `ByteReader`; provable-std layer 1 (ADR-0030), contract standard |
 | `std:url` | Orin, `library/std/url.or` | percent encode/decode over bytes or strict UTF-8, ordered query pairs; explicit `FormSpace` mode (`PlusAsSpace` or `PercentSpace`) and structured byte offsets; [API and policies](std-url.md) |
 | `std:utf8` | Orin, `library/std/utf8.or` | validated decoding, encoding, `Utf8String` ("always valid UTF-8"), `CodePointCursor`; ADR-0030 |
-| `std:collections` | Orin, `library/std/collections.or` | `IntSet`, `StringSet`, `Deque<T>`, `SortedMap<V>`, `SortedStringMap<V>`, `PriorityQueue<T>`; ADR-0030 |
+| `std:collections` | Orin, `library/std/collections.or` | `Set<T extends Hash>`, `OrderedMap<K extends Ord, V>`, `MinHeap<T extends Ord>` (ADR-0034), `IntSet`, `StringSet`, `Deque<T>`, `SortedMap<V>`, `SortedStringMap<V>`, `PriorityQueue<T>`; ADR-0030 |
 | `std:http` | Orin, `library/std/http.or` | the **pure** part of HTTP/1.1: `Request`, `Response`, `Headers`, `Status`, an incremental request and response parser (smuggling-safe, limits as parameters) and a serializer with a round-trip contract; the sockets are `std:net` (ADR-0033); `examples/http_server.or` joins them; ADR-0030 |
 | `std:net` | Orin, `library/std/net.or` over the network primitives of `std:fsraw` (L0: ADR-0033) | blocking TCP: `Listener`, `Stream` (resources), `connect`, `resolve`, `readExact`, `readUntil`, deadlines, half-close; takes a `NetGrant` first, narrowed by `useListen` / `useConnect`; **unstable** (ADR-0033, below) |
 | `std:seq` | Orin, `library/std/seq.or` | `range(lo, hi)`, `sum(xs)`, `sumBy(xs, f)`: pure aggregates for contracts and code; `orin verify --contracts` reads them as bounded quantifiers and recursive sums (ADR-0036) |
@@ -167,7 +167,8 @@ ordinary programs. All functions return `void`; `msg` ("" allowed) is part of th
 `assertEqUsize`, `assertEqString` (values shown in quotes), `assertEqBool`
 ("assertEq failed: msg: expected 3, got 2"), `assertNear(actual: float, expected: float, tolerance: float,
 msg)` (|actual - expected| <= tolerance; NaN always fails), `fail(msg)`. One `assertEq*` per type because
-Orin has no generic equality or `toString`.
+Orin has no generic `toString`. For any `Eq` type (records, unions, `Option`, arrays, strings, classes with `equals`) there is
+`assertEqual<T extends Eq>(actual: T, expected: T, msg)` (ADR-0034): it traps with "assertEq failed: msg: values differ" and shows no values.
 
 ## std:graph (spec 06 cyclic graphs)
 
@@ -337,6 +338,9 @@ itself; `sumBy` is generic and so outside the fragment. Tests: `tests/std/seq_te
 class IntSet / StringSet          // on Map; invariants: map size == key count, every stored flag true
   size() isEmpty() has(x) add(x): bool remove(x): bool clear() toArray()   // expected O(1); add/remove say whether the set changed
   isSubsetOf(o) union(o) intersection(o) difference(o)                       // O(n + m)
+class Set<T extends Hash>         // the generic set, same algorithm and operations as IntSet (Set<int>) / StringSet (Set<string>); any
+                                  // Hash element: records, unions, Option, arrays, classes with hash/equals. has/add/remove/size/
+                                  // isEmpty/clear/toArray/isSubsetOf/union/intersection/difference
 class Deque<T>                    // ring buffer, doubling from 4 slots, wrap by conditional subtraction; invariants:
                                   // len <= capacity, head in range, a filler value exists exactly when there is storage
   size() isEmpty() capacity() pushBack(x) pushFront(x) popFront() popBack() front() back() get(i) clear() toArray()   // amortised O(1)
@@ -344,6 +348,12 @@ class SortedMap<V>                // int keys: a B-tree in an arena; new SortedM
 class SortedStringMap<V>          // the same with string keys in compareStrings order (byte-wise lexicographic)
   size() isEmpty() height() has(k) get(k): Option<V> put(k, v): bool remove(k): Option<V>   // all O(t log_t n) = O(log n)
   firstKey() lastKey() floorKey(k) ceilKey(k)   popFirst() popLast(): Option<SortedEntry<V>>  keyArray() valueArray() clear()
+class OrderedMap<K extends Ord, V>  // the generic sorted map: the same B-tree as SortedMap / SortedStringMap (generated from the
+                                  // same template), keys in the order of their Ord instance (records field by field, Option None
+                                  // first, arrays lexicographic, classes by compare); new OrderedMap<K, V>(minDegree), use 16
+  // same methods as SortedMap; entries are OrderedEntry<K, V>; isStrictlyIncreasingOrd(xs) is the generic isStrictlyIncreasing
+class MinHeap<T extends Ord>      // the generic queue: the same 4-ary heap, ordered by the value itself, FIFO among equal values
+  size() isEmpty() peek(): Option<T> push(x) pop(): Option<T> allAtLeast(x) clear()   // push/pop O(log n)
 class PriorityQueue<T>            // 4-ary min-heap in three parallel arrays; invariants: equal lengths, heap property (strict,
                                   // on (priority, insertion number)), every insertion number < the counter, which never decreases
   size() isEmpty() minPriority() peek() push(priority: int, value: T) pop(): Option<PQEntry<T>> allAtLeast(p) clear()   // push/pop O(log n)
@@ -355,7 +365,10 @@ shrinks the size by exactly 1 iff the key was present; `get` is `Some` iff `has`
 key on the right side of `k` and, on `None`, the first/last key proves there is none; `popFirst`/`popLast` return
 `old(firstKey())` / `old(lastKey())` and the remaining keys are strictly beyond it; `PriorityQueue.pop` returns the
 priority `old(minPriority())`, shrinks the size by 1 and every remaining priority is `>=` it (`allAtLeast`), `push`
-makes `minPriority` equal `min(priority, old(minPriority()))`; equal priorities leave first-in first-out. Deque pushes
+makes `minPriority` equal `min(priority, old(minPriority()))`; the generic classes state value equality: `Set.add(x)` makes `has(x)`
+true for any value equal to x, `OrderedMap.put(k, v)` makes `floorKey(k)` the key `k` (equal under `Ord`), `MinHeap.pop()` returns
+a value equal to `old(peek())` and `<=` every value left (`get` after `put` returning `v` itself is not in the contract because `V`
+is unbounded: it would need `V extends Eq`, so the tests check it on `int` and string values); equal priorities leave first-in first-out. Deque pushes
 grow the size by 1 and make the pushed end present, pops shrink it by 1 iff non-empty. Set operations state subset
 relations (`union` contains both operands, `intersection` is contained in both, `difference` is disjoint from the
 other and sizes add up).
@@ -374,22 +387,22 @@ other and sizes add up).
 ### Limitations of this layer (language friction, honest list)
 
 * `Map<K, V>` accepts any `Hash` key (ADR-0034, slice 1: integers, `bool`, `string`, records, unions, `Option`, `Result`, arrays and
-  classes with `hash`; a key type parameter is `K extends Hash`). The std collections are not generic over the key yet: `Set<T>`,
-  `SortedMap<K extends Ord, V>` and `PriorityQueue<T extends Ord>` (ADR-0034 §Consequences) are the next slice, so for now the sets and
-  maps are specialised by key class (`IntSet`/`StringSet`, `SortedMap<V>`/`SortedStringMap<V>`); `Deque<T>`, the values `V` and the
-  queue elements `T` are generic.
-* The same missing `==` on type parameters means the contracts of the generic containers cannot say "the value that
-  comes back is the one that was put in" (`get` after `put`, the popped element is the pushed one); they state sizes,
-  membership, key/priority order and presence. The tests check the values on `int` and `string` instances and against
-  naive reference models on pseudo-random operation sequences.
+  classes with `hash`; a key type parameter is `K extends Hash`). The generic collections of slice 2 are `Set<T extends Hash>`,
+  `OrderedMap<K extends Ord, V>` and `MinHeap<T extends Ord>`. The names `SortedMap` and `PriorityQueue` of ADR-0034 §Consequences
+  are taken by the specialised classes (`SortedMap<V>` with int keys, `PriorityQueue<T>` with an explicit `int` priority), so the generic
+  ones have their own names until the std freeze decides which names stay. The specialised classes remain and are not aliases: they
+  keep their direct `int` / `string` comparisons, which skip the derived `compare` dispatch of the generic code. `Deque<T>`, the values `V` and the
+  queue elements of `PriorityQueue<T>` are generic.
+* A type parameter has one bound (ADR-0026): `V` of `OrderedMap` is unbounded, so its contracts cannot say "the value that comes back
+  is the one that was put in"; they state it for keys (`K extends Ord`), set elements and heap elements. The tests check values with
+  `assertEqual` and against reference models on pseudo-random operation sequences.
 * A contract cannot call a function value (E0416), so a comparator closure stored in a class could not appear in the heap
   invariant: `PriorityQueue<T>` takes an explicit `int` priority until the Eq/Ord ADR lands. A `T extends Ranked`
   interface would do for ordered classes, but cannot cover `int`/`string` without wrapper classes.
 * **Tooling gaps found while applying the algorithm rule** (feed ADR-0031 A and the Eq/Ord/Hash constraints ADR):
-  1. no equality/ordering/hash on type parameters (E0410, E0400 for `Map<K, _>`; **fixed in the language by ADR-0034 slice 1,
-     `T extends Eq/Ord/Hash`; the std is not rewritten on it yet**): no generic `Set<T>`, `SortedMap<K, V>`,
-     comparator queue; the B-tree needed a code generator to exist for two key types; contracts cannot say "the same
-     value comes back";
+  1. no equality/ordering/hash on type parameters (E0410, E0400 for `Map<K, _>`; **fixed by ADR-0034: slice 1 added
+     `T extends Eq/Ord/Hash`, slice 2 the generic `Set<T>`, `OrderedMap<K, V>` and `MinHeap<T>`**); the B-tree template is generated for
+     three key types (int, string, any `Ord`) because the specialised ones keep direct comparisons;
   2. no uninitialised or default value for a type parameter (a `MaybeUninit`/`default<T>()` or a `T[]` with capacity):
      the ring buffer must either box every slot in `Option<T>` (statable invariant "exactly the live slots are Some",
      but an allocation per element) or hold a filler value in dead slots (fast, the invariant cannot name the dead slots);
