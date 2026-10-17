@@ -1,8 +1,8 @@
-# std:jsonnumber — exact JSON number values
+# std:json/number — exact JSON number values
 
 This module implements only the first number-utility slice of the
-[JSON RFC](rfcs/json-completeness.md). Existing `std:json.Json`, `JNum(int)`, public
-and compiler-internal parsers remain unchanged. No document parser/writer,
+[JSON RFC](rfcs/json-completeness.md). `std:json/legacy.Json`, `JNum(int)` and the
+compiler-internal parser remain unchanged. No document parser/writer,
 decoders, float conversion or arithmetic is provided.
 
 ```typescript
@@ -25,7 +25,7 @@ for them. There is no numeric equality/canonicalization operation.
 | `numberErrorMessage(e: NumberError): string` | stable human-readable reason, with byte offset when present |
 
 ```typescript
-import { jsonNumber, numberAsInt, numberFromInt } from "std:jsonnumber";
+import { jsonNumber, numberAsInt, numberFromInt } from "std:json/number";
 function main(): void {
   const n = jsonNumber("9.007199254740993e15", 1024).unwrap();
   console.log(n.token); // 9.007199254740993e15
