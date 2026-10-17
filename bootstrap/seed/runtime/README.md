@@ -12,3 +12,7 @@ It is linked by
 
 The files that link it read the list in `tools/runtime-sources.txt` (world `legacy`). The platform layer (`runtime/platform/`) is
 shared with the live runtime. Deletion order: ADR-0052 Addendum A section 4 (R3d.7 refreshes the seed, R3f removes this directory).
+
+**Additive exceptions.** New runtime entry points that std modules call on every program path must also exist here, or the
+legacy world cannot link those programs. They are appended verbatim from `runtime/core/` and change nothing that existed at the
+snapshot: `orin_rt_task_watch` and `orin_mon_wait_until` (ADR-0017 Addendum B, C1; the `done_mon` field of `RtTask`).
