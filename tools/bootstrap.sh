@@ -13,6 +13,11 @@
 # The fixed point is unaffected: it compares the generated C (stage2.c == stage3.c), not binaries, and the C a compiler
 # generates does not depend on the C flags it was built with. STAGE01_CFLAGS="-O2 -w" restores the old all--O2 build;
 # a CFLAGS set by the caller also applies to orin0 and orin1 unless STAGE01_CFLAGS is set.
+#
+# Split C (ADR-0049 P1): orin1 and orin2 know `compile --split N` (the seed does not, so stage 1 stays one C file). The stage 2
+# build of orin2, the long -O2 compile, is split into $SPLIT units that cc compiles in parallel (tools/cc_split.sh).
+# SPLIT defaults to the CPU count; SPLIT=0 builds the single file as before. The split run also writes the single-file
+# C (-o), byte-identical to a run without the flag, and that file is what the fixed point compares.
 set -eu
 cd "$(dirname "$0")/.."
 SEED_ONLY=
@@ -25,6 +30,7 @@ CC=${CC:-cc}
 STAGE01_CFLAGS=${STAGE01_CFLAGS:-${CFLAGS:--O1 -w}}
 CFLAGS=${CFLAGS:--O2 -w}
 B=build/bootstrap
+SPLIT=${SPLIT:-$( (nproc || sysctl -n hw.ncpu) 2>/dev/null || echo 0)}
 SEED_DIR=${ORIN_SEED_DIR:-bootstrap/seed}
 mkdir -p "$B"
 python3 tools/embed_prelude.py --check
@@ -48,8 +54,16 @@ cc_link "$STAGE01_CFLAGS" $B/seed.c $B/orin0
 if [ -n "$SEED_ONLY" ]; then echo "[seed-only] built $B/orin0"; exit 0; fi
 echo "[stage1] orin0 compiles compiler/main.or; cc $STAGE01_CFLAGS -> orin1 ($(elapsed))"
 $B/orin0 compile compiler/main.or -o $B/stage1.c && cc_link "$STAGE01_CFLAGS" $B/stage1.c $B/orin1
-echo "[stage2] orin1 compiles compiler/main.or; cc $CFLAGS -> orin2 ($(elapsed))"
-$B/orin1 compile compiler/main.or -o $B/stage2.c && cc_link "$CFLAGS" $B/stage2.c $B/orin2
+if [ "$SPLIT" -gt 1 ]; then
+  echo "[stage2] orin1 compiles compiler/main.or (--split $SPLIT); cc $CFLAGS in parallel -> orin2 ($(elapsed))"
+  $B/orin1 compile compiler/main.or -o $B/stage2.c --split "$SPLIT"
+  echo "[stage2] compiled ($(elapsed))"
+  CC=$CC JOBS=$SPLIT tools/cc_split.sh $B/stage2.c $B/orin2 $CFLAGS
+  rm -f $B/stage2.h $B/stage2.data.c $B/stage2.[0-9]*.c
+else
+  echo "[stage2] orin1 compiles compiler/main.or; cc $CFLAGS -> orin2 ($(elapsed))"
+  $B/orin1 compile compiler/main.or -o $B/stage2.c && cc_link "$CFLAGS" $B/stage2.c $B/orin2
+fi
 echo "[stage3] orin2 compiles compiler/main.or ($(elapsed))"
 $B/orin2 compile compiler/main.or -o $B/stage3.c
 if cmp -s $B/stage2.c $B/stage3.c; then

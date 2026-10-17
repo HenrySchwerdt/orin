@@ -1296,18 +1296,41 @@ OrinObj *orin_array_extend(OrinObj *x, OrinObj *y) {
     return r;
 }
 
+/* Narrow n 8-byte slots to bytes and widen n bytes to slots (u8[] <-> string). The slots of a u8 array hold 0..255, but the
+ * runtime does not trust that: narrow_slots returns the OR of all slots, so a value above 255 shows as a result above 255.
+ * Both loops handle 4 elements per step (docs/decisions/0038 addendum "packed arrays"). */
+static uint64_t narrow_slots(char *dst, const uint64_t *src, uint64_t n) {
+    uint64_t bad = 0, i = 0;
+    for (; i + 4 <= n; i += 4) {
+        uint64_t a = src[i], b = src[i + 1], c = src[i + 2], d = src[i + 3];
+        bad |= a | b | c | d;
+        dst[i] = (char)(unsigned char)a; dst[i + 1] = (char)(unsigned char)b;
+        dst[i + 2] = (char)(unsigned char)c; dst[i + 3] = (char)(unsigned char)d;
+    }
+    for (; i < n; i++) {
+        uint64_t v = src[i];
+        bad |= v;
+        dst[i] = (char)(unsigned char)v;
+    }
+    return bad;
+}
+
+static void widen_bytes(uint64_t *dst, const char *src, uint64_t n) {
+    uint64_t i = 0;
+    for (; i + 4 <= n; i += 4) {
+        dst[i] = (unsigned char)src[i]; dst[i + 1] = (unsigned char)src[i + 1];
+        dst[i + 2] = (unsigned char)src[i + 2]; dst[i + 3] = (unsigned char)src[i + 3];
+    }
+    for (; i < n; i++) dst[i] = (unsigned char)src[i];
+}
+
 OrinObj *orin_bytes_to_string(OrinObj *o, uint64_t start, uint64_t len) {
     OrinArray *a = (OrinArray *)o;
     if (ORIN_UNLIKELY(o->kind != ORIN_K_ARRAY || a->is_ref)) orin_trap_shape();
     if (ORIN_UNLIKELY(start > a->len || len > a->len - start)) orin_trap("slice out of range");
     OrinString *s = str_alloc(len, len);
-    uint64_t bad = 0;
-    for (uint64_t i = 0; i < len; i++) {
-        /* Empty arrays may have NULL items; only form an element address when len > 0. */
-        uint64_t v = a->items[start + i];
-        bad |= v;
-        s->data[i] = (char)(unsigned char)v;
-    }
+    /* Empty arrays may have NULL items; only form an element address when len > 0. */
+    uint64_t bad = len ? narrow_slots(s->data, a->items + start, len) : 0;
     if (ORIN_UNLIKELY(bad > 255)) {
         orin_release(&s->h);
         orin_trap("byte out of range");
@@ -1320,7 +1343,7 @@ OrinObj *orin_string_to_bytes(OrinObj *o) {
     const OrinString *s = (const OrinString *)o;
     OrinObj *r = orin_array_new(s->len, 0);
     OrinArray *a = (OrinArray *)r;
-    for (uint64_t i = 0; i < s->len; i++) a->items[i] = (unsigned char)s->data[i];
+    if (s->len) widen_bytes(a->items, s->data, s->len);
     a->len = s->len;
     return r;
 }

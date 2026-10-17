@@ -51,7 +51,7 @@ import {
 } from "./analysis";
 import { readFile } from "std:fs";
 import { lower } from "./lower";
-import { emitCFacts, emitCSites } from "./backends/c";
+import { emitCFacts, emitCSites, emitCSplit } from "./backends/c";
 import { emitLlvmFacts } from "./backends/llvm";
 import { MProgram, printProgram, hasSpan } from "./mir";
 import { verify, VerifyIssue } from "./verify";
@@ -66,7 +66,7 @@ import { runMcp } from "./mcp";
 
 function usage(): void {
   console.error(
-    "usage:\n  orin workspace list|lock|check [--root <directory>]\n  orin check [--format=json] [--deps] [--strict-contracts] <entry.or | package-dir>\n  orin api [--check <snapshot>] <entry.or | package-dir>\n  orin expand [--input] [--processor-timeout <seconds>] [--processor-cache <dir>] <entry.or | package-dir>\n  orin graph <entry.or | package-dir> [-o out.json]\n  orin diff --base <dir|.or|.json> --head <dir|.or|.json> [--format=json|text|html] [--link-base <url>] [-o out] [--exit-code]\n  orin effects <entry.or | package-dir> [--format=json] [--summary] [--module <id>] [--function <name>] [--no-paths] [--tests] [--check-purity]\n  orin compile [--format=json] <entry.or> -o <out.c> [--no-verify] [--no-opt] [--no-fuse] [--fuse-report] [--c-builtins] [--backend=c|llvm] [--check-contracts] [--strict-contracts] [--stats-sites] [--assert-facts] [--timings <file.json>]\n  orin fmt [--check] [--stdout] <file.or>...\n  orin lsp\n  orin mcp [--root <dir>] [--allow-exec] [--repo <dir>]\n  orin test [--filter <substring>] [--format=json] [--runtime <dir>] [--cc <cmd>] <entry.or | package-dir>\n  orin mir <entry.or>\n  orin verify [--contracts [--format=json] [--z3 PATH] [--strict]] <entry.or>",
+    "usage:\n  orin workspace list|lock|check [--root <directory>]\n  orin check [--format=json] [--deps] [--strict-contracts] <entry.or | package-dir>\n  orin api [--check <snapshot>] <entry.or | package-dir>\n  orin expand [--input] [--processor-timeout <seconds>] [--processor-cache <dir>] <entry.or | package-dir>\n  orin graph <entry.or | package-dir> [-o out.json]\n  orin diff --base <dir|.or|.json> --head <dir|.or|.json> [--format=json|text|html] [--link-base <url>] [-o out] [--exit-code]\n  orin effects <entry.or | package-dir> [--format=json] [--summary] [--module <id>] [--function <name>] [--no-paths] [--tests] [--check-purity]\n  orin compile [--format=json] <entry.or> -o <out.c> [--no-verify] [--no-opt] [--no-fuse] [--fuse-report] [--c-builtins] [--backend=c|llvm] [--check-contracts] [--strict-contracts] [--stats-sites] [--assert-facts] [--split <n>] [--timings <file.json>]\n  orin fmt [--check] [--stdout] <file.or>...\n  orin lsp\n  orin mcp [--root <dir>] [--allow-exec] [--repo <dir>]\n  orin test [--filter <substring>] [--format=json] [--runtime <dir>] [--cc <cmd>] <entry.or | package-dir>\n  orin mir <entry.or>\n  orin verify [--contracts [--format=json] [--z3 PATH] [--strict]] <entry.or>",
   );
   exit(2);
 }
@@ -221,6 +221,7 @@ type Options = {
   z3: string;
   checkSnap: Option<string>;
   timings: Option<string>;
+  split: usize;
   argv: string[];
   procs: ProcConfig;   // `--processor-timeout`, `--cc`, `--runtime`, `--processor-cache` (ADR-0046 S5)
 };
@@ -253,7 +254,7 @@ function on(o: Options, flag: string): bool {
 // None after printing the usage or the unknown-option error (both exit).
 function parseOptions(all: string[]): Option<Options> {
   const known = switchNames();
-  let o = Options { switches: [], z3: "z3", checkSnap: None, timings: None, argv: [], procs: defaultProcConfig() };
+  let o = Options { switches: [], z3: "z3", checkSnap: None, timings: None, split: 0, argv: [], procs: defaultProcConfig() };
   let expectZ3 = false;
   let ai: usize = 0;
   while (ai < all.length) {
@@ -302,6 +303,15 @@ function parseOptions(all: string[]): Option<Options> {
         return None;
       }
       o.timings = Some(all[ai]);
+      ai += 1;
+    } else if (a == "--split") {
+      const n = parseInt(ai < all.length ? all[ai] : "");
+      if (n.isNone() || n.unwrap() < 1 || n.unwrap() > 1024) {
+        console.error("error: --split needs a number of translation units from 1 to 1024");
+        exit(2);
+        return None;
+      }
+      o.split = n.unwrap().toUsize();
       ai += 1;
     } else if (a == "--backend=c") {
       o.switches = o.switches.filter(f => f != "--backend=llvm");
@@ -459,6 +469,19 @@ function runVerifyContracts(
   }
 }
 
+// The file name of `path`: the text after the last `/`.
+function baseName(path: string): string {
+  let start: usize = 0;
+  let i: usize = 0;
+  while (i < path.length) {
+    if (path.charCodeAt(i) == 47) {
+      start = i + 1;
+    }
+    i += 1;
+  }
+  return path.substring(start, path.length);
+}
+
 // `orin compile`: MIR -> ownership verifier -> C (or LLVM IR) written to `out`.
 function runCompile(
   fs: FsGrant,
@@ -491,8 +514,31 @@ function runCompile(
     exit(2);
     return;
   }
+  if (o.split > 0 && (llvm || statsSites)) {
+    console.error("error: --split needs the C backend without --stats-sites");
+    exit(2);
+    return;
+  }
   let c = "";
-  if (statsSites) {
+  let parts: string[] = [];
+  let partNames: string[] = [];
+  if (o.split > 0) {
+    // `out` is written as usual (the single-file unit, byte-identical to a build without the flag); the split layout is
+    // written next to it: `<base>.h`, `<base>.<k>.c` and `<base>.data.c` (backends/c/split.or).
+    const base = out.endsWith(".c") ? out.substring(0, out.length - 2) : out;
+    const sp = emitCSplit(pruneProgram(mir), assertFacts, o.split, baseName(base) + ".h");
+    c = sp.whole;
+    parts.push(sp.header);
+    partNames.push(base + ".h");
+    parts.push(sp.data);
+    partNames.push(base + ".data.c");
+    let k: usize = 0;
+    while (k < sp.units.length) {
+      parts.push(sp.units[k]);
+      partNames.push(base + "." + k.toString() + ".c");
+      k += 1;
+    }
+  } else if (statsSites) {
     let paths: string[] = [];
     for (const f of sm.files) {
       paths.push(f.path);
@@ -508,6 +554,16 @@ function runCompile(
     console.error("error: cannot write " + out + ": " + written.unwrapErr());
     exit(1);
     return;
+  }
+  let pi: usize = 0;
+  while (pi < parts.length) {
+    const pw = writeFile(fs, partNames[pi], parts[pi]);
+    if (pw.isErr()) {
+      console.error("error: cannot write " + partNames[pi] + ": " + pw.unwrapErr());
+      exit(1);
+      return;
+    }
+    pi += 1;
   }
   const t2 = lapped(t1, clock, "emit");
   if (t2.enabled) {

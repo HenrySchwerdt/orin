@@ -193,6 +193,17 @@ theorem joinL_borrowed_root (a1 a2 : List AS) (h : a1.length = a2.length) :
   · intro r' e
     rw [e] at hroot; simp [AS.isRoot] at hroot
 
+theorem AS.le_trans {k1 k2 k3 : AS} (h1 : AS.le k1 k2) (h2 : AS.le k2 k3) : AS.le k1 k3 := by
+  unfold AS.le at *
+  rcases h1 with h1 | h1 | ⟨h1, h1'⟩ <;> rcases h2 with h2 | h2 | ⟨h2, h2'⟩ <;>
+    first
+    | (subst_vars; simp_all; done)
+    | (exfalso; simp_all; done)
+    | simp_all
+
+theorem Fle.trans {a b c : List AS} (h1 : Fle a b) (h2 : Fle b c) : Fle a c :=
+  ⟨h1.1.trans h2.1, fun i => AS.le_trans (h1.2.1 i) (h2.2.1 i), h2.2.2⟩
+
 theorem joinL_fle_left (a1 a2 : List AS) (h : a1.length = a2.length) :
     Fle a1 (joinL a1 a2) := by
   have hlen : (joinL a1 a2).length = a1.length := by simp [joinL]; omega

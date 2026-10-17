@@ -1,7 +1,7 @@
 #!/bin/sh
 # L0 platform layer checks (spec 19 R2, docs/formal.md "L0 platform layer"):
 #   1. executable contract tests (runtime/platform/tests/platform_test.c), plain, under ASan+UBSan and under ThreadSanitizer
-#   2. size budget (<= 1,000 CODE lines in runtime/platform/*.c, runtime/platform/*.h: comments, contract blocks and blank lines do not
+#   2. size budget (<= 1,400 CODE lines (ADR-0054) in runtime/platform/*.c, runtime/platform/*.h: comments, contract blocks and blank lines do not
 #      count, ADR-0030 / ADR-0017 stage 0) and the runtime boundary check
 #   3. bounded model checking of the pure/memory primitives with CBMC (runtime/platform/tests/cbmc_harness.c);
 #      skipped with a notice when `cbmc` is not installed (apt install cbmc);
@@ -40,7 +40,7 @@ $CC -Wall -Wextra -g -fsanitize=thread runtime/platform/tests/platform_test.c ru
 TSAN_OPTIONS=allocator_may_return_null=1 $B/platform_test_tsan < /dev/null
 
 echo "[platform] size budget"
-# Budget: <= 1,000 CODE lines (non-blank, comments and ACSL contracts excluded) in runtime/platform/*.c, runtime/platform/*.h.
+# Budget: <= 1,400 CODE lines (ADR-0054) (non-blank, comments and ACSL contracts excluded) in runtime/platform/*.c, runtime/platform/*.h.
 # The budget limits trusted code, not its specification (ADR-0030 section 1).
 code=$(python3 - runtime/platform/*.c runtime/platform/*.h <<'PY'
 import re, sys
@@ -53,8 +53,8 @@ print(n)
 PY
 )
 total=$(cat runtime/platform/*.c runtime/platform/*.h | wc -l)
-echo "runtime/platform/*.c, runtime/platform/*.h: $code code lines (budget 1000; comments, contracts, blank lines excluded), $total lines in total"
-[ "$code" -le 1000 ] || { echo "platform layer exceeds its size budget" >&2; exit 1; }
+echo "runtime/platform/*.c, runtime/platform/*.h: $code code lines (budget 1400; comments, contracts, blank lines excluded), $total lines in total"
+[ "$code" -le 1400 ] || { echo "platform layer exceeds its size budget" >&2; exit 1; }
 
 echo "[platform] boundary"
 tools/check_platform_boundary.sh
@@ -89,5 +89,35 @@ for h in harness_net_recv:4 harness_net_send:4 harness_net_narrow:6 harness_net_
   else
     echo "FAILED"; tail -30 "$B/$fn.log"; exit 1
   fi
+done
+# the rest of the pure / model-checkable L0 surface (ADR-0053 M7): float text, clock wrappers, argv, ORIN_DENY loading,
+# path_absolute, error_message and the handle validation (generation + liveness) of monitors and threads as bounded
+# state machines. The harness file includes orin_platform.c and stubs clock_gettime / getenv / getcwd / snprintf /
+# pthread_create / pthread_join: the table LOGIC is checked, not the interleavings (ThreadSanitizer above).
+# The handle tables (65,536 / 262,144 records) are shrunk to 8 in a COPY of orin_platform.c under $B/l0 (the 2^18-entry tables
+# exhaust the solver's memory); the validation arithmetic does not depend on the table size. The source itself is untouched.
+mkdir -p "$B/l0"
+sed 's/THR_MAX = 1 << 16, MON_MAX = 1 << 18/THR_MAX = 8, MON_MAX = 8/' runtime/platform/orin_platform.c >"$B/l0/orin_platform.c"
+cp runtime/platform/orin_platform.h "$B/l0/"
+grep -q 'THR_MAX = 8, MON_MAX = 8' "$B/l0/orin_platform.c" || { echo "table-size line of orin_platform.c changed: adapt the sed above" >&2; exit 1; }
+l0() { # harness:unwind extra-flags...
+  fn=${1%%:*}; un=${1##*:}; shift
+  printf '%s ... ' "$fn"
+  if cbmc runtime/platform/tests/cbmc_l0_harness.c "-DL0_SRC=\"../../../$B/l0/orin_platform.c\"" --function "$fn" \
+       --bounds-check --pointer-check --signed-overflow-check "$@" \
+       --unwind "$un" --unwinding-assertions >"$B/$fn.log" 2>&1; then
+    echo "VERIFIED (bounded)"
+  else
+    echo "FAILED"; tail -30 "$B/$fn.log"; exit 1
+  fi
+}
+for h in harness_double_to_exp:34 harness_parse_double:8 harness_now_millis:4 harness_monotonic_millis:4 \
+         harness_error_message:4 harness_args:4 harness_policy_load:10 harness_path_absolute:7; do
+  l0 "$h" --unsigned-overflow-check --conversion-check
+done
+# handle validation: `(uint32_t)h - 1u` and `(uint64_t)h` deliberately wrap (h = 0 / a negative handle must give an index
+# that is >= the high-water mark, so unsigned-wrap and sign-conversion checks are off for these; signed overflow stays on)
+for h in harness_monitor_generation:4 harness_monitor_grow:6 harness_monitor_state_machine:7 harness_thread_handles:4; do
+  l0 "$h"
 done
 echo "[platform] ok"
