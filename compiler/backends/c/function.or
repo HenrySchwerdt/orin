@@ -4,12 +4,12 @@
 // program-wide `CSymbols` and the program (callee signatures), and writes nothing but its own text, so the text of a
 // function depends only on the function, the symbol table and the callees' `inout` flags (rule 8; `emitCFunction`).
 
-import { BinOp, UnOp, Builtin, taskOpC } from "../../hir";
+import { BinOp, UnOp, Builtin, taskOpC, taskOpRet, platOpCount, platOpName, platOpParams, platOpResult } from "../../hir";
 import {
   MType, MLocal, Operand, Instr, SwitchCase, Terminator, MBlock, MFunction, MProgram, aggWords,
   isAggTy, slotWords, RT_OPT_UNWRAP, RT_RES_UNWRAP, RT_RES_UNWRAP_ERR, RT_V_UNWRAP, RT_ASSERT_FACT, RT_ASSERT_ARRAY,
   RT_STRUCT_NEW, RT_ARRAY_NEW, RT_STR_APPEND, RT_STR_APPEND_SUB, RT_STR_APPEND_USIZE, RT_STR_APPEND_INT, RT_STR_PREPEND,
-  RT_ARRAY_SLICE, RT_ARRAY_CONCAT, RT_ARRAY_EXTEND, RT_BYTES_TO_STRING, RT_STRING_TO_BYTES, rtSig, l1Builtin,
+  RT_ARRAY_SLICE, RT_ARRAY_CONCAT, RT_ARRAY_EXTEND, RT_BYTES_TO_STRING, RT_STRING_TO_BYTES, rtSig, l1Builtin, l1Task,
 } from "../../mir";
 
 import {
@@ -244,10 +244,79 @@ function coreC(k: usize, a: string[]): string {
     24 => "((uint64_t)(" + a[0] + ") + (uint64_t)(" + a[1] + "))",
     25 => "((uint64_t)(" + a[0] + ") - (uint64_t)(" + a[1] + "))",
     26 => "((uint64_t)(" + a[0] + ") * (uint64_t)(" + a[1] + "))",
+    30 => "((uint64_t)(uintptr_t)&orin_shared)",
     27 => "orin_core_hook((uint64_t)(" + a[0] + "), (uint64_t)(" + a[1] + "), (uint64_t)(" + a[2] + "), (uint64_t)(" + a[3] + "))",
     _ => "({ int c_ = orin_platform_mem_cmp(" + addrC(a[0]) + ", " + addrC(a[1]) + ", (size_t)(" + a[2]
         + ")); (int64_t)((c_ > 0) - (c_ < 0)); })",
   };
+}
+
+// The literal value of operand `o` (the `k` of `plat` / `fnAddr`, which the checker guarantees to be a literal), -1 for anything else.
+function litOf(o: Operand): int {
+  return match (o) {
+    OUsize(v) => v,
+    OInt(v) => v,
+    _ => -1,
+  };
+}
+
+// The C expression of `plat(k, a, b, c)` (hir/coreops.or 28): the direct call of the L0 function `orin_platform_<name>` with the
+// arguments `a[1..]` cast to its parameter types (`n` a C int, `p` a pointer, `f` a function pointer, else a 64-bit integer); the
+// result is a word (a C int sign-extended, a pointer as its address, 0 for a void function).
+function platC(o: Operand, a: string[]): string {
+  const k = litOf(o);
+  if (k < 0 || k.toUsize() >= platOpCount()) {
+    return "(orin_trap(\"internal error: plat needs a literal table index\"), (uint64_t)0)";
+  }
+  const ps = platOpParams(k.toUsize());
+  let args = "";
+  let i: usize = 0;
+  while (i < ps.length) {
+    const c = ps.substring(i, i + 1);
+    const v = a[i + 1];
+    args += (i > 0 ? ", " : "")
+        + (c == "p" ? addrC(v) : c == "f" ? "(void (*)(void *))(uintptr_t)(" + v + ")" : c == "n" ? "(int)(" + v + ")" : "(int64_t)(" + v + ")");
+    i += 1;
+  }
+  const call = "orin_platform_" + platOpName(k.toUsize()) + "(" + args + ")";
+  const r = platOpResult(k.toUsize());
+  return r == "v" ? "(" + call + ", (uint64_t)0)"
+      : r == "n" ? "((uint64_t)(int64_t)" + call + ")"
+      : r == "p" ? "((uint64_t)(uintptr_t)" + call + ")"
+      : "((uint64_t)" + call + ")";
+}
+
+// The C expression of `fnAddr(k)` (hir/coreops.or 29): the address of the C-ABI wrapper of the L1 entry k (mir/rt.or `RtWrap`).
+function fnAddrC(o: Operand): string {
+  const k = litOf(o);
+  if (k < 0) {
+    return "(orin_trap(\"internal error: fnAddr needs a literal entry\"), (uint64_t)0)";
+  }
+  return match (rtSig(k.toUsize())) {
+    Some(w) => "((uint64_t)(uintptr_t)&" + w.name + ")",
+    None => "(orin_trap(\"internal error: fnAddr names an entry without a wrapper\"), (uint64_t)0)",
+  };
+}
+
+// The call of a task or monitor operation (`BTask(k)`, hir/taskops.or): the Orin function of `$rt` that replaces the C function (mir/rt.or
+// `l1Task`) when the program has it, with every argument as a word (objects as addresses) and an object result cast back; else the C
+// runtime function `taskOpC(k)`.
+function taskC(syms: CSymbols, k: usize, a: string[]): string {
+  const sym = match (l1Task(k)) {
+    Some(e) => syms.l1(e),
+    None => "",
+  };
+  if (sym == "") {
+    return taskOpC(k) + "(" + a.join(", ") + ")";
+  }
+  let args = "";
+  let i: usize = 0;
+  while (i < a.length) {
+    args += (i > 0 ? ", " : "") + "(uint64_t)(uintptr_t)(" + a[i] + ")";
+    i += 1;
+  }
+  const call = sym + "(" + args + ")";
+  return taskOpRet(k) == 2 ? "((OrinObj *)(uintptr_t)" + call + ")" : call;
 }
 
 // The call of the L1 function `sym` (mir/rt.or) with the object `a` as an address word.
@@ -320,7 +389,7 @@ export function builtinC(op: Builtin, a: string[], rt: MType, syms: CSymbols): s
     BFloatIsNaN => "((int64_t)(!!__builtin_isnan(" + a[0] + ")))",
     BFloatIsFinite => "((int64_t)(!!__builtin_isfinite(" + a[0] + ")))",
     BIntId => "(" + a[0] + ")",
-    BTask(k) => taskOpC(k) + "(" + a.join(", ") + ")",
+    BTask(k) => taskC(syms, k, a),
     BCore(k) => coreC(k, a),
     _ => "?",
   };
@@ -520,7 +589,10 @@ export class CFunctionEmitter {
     const agg: Option<usize> = args.length > 0 ? this.aggLocal(args[0]) : None;
     const code = match (agg) {
       Some(l) => aggBuiltinC(b, l, args.length > 1 ? opC(args[1]) : "0", rt, this.syms),
-      None => builtinC(b, args.map(opC), rt, this.syms),
+      None => match (b) {
+        BCore(k) => k == 28 ? platC(args[0], args.map(opC)) : (k == 29 ? fnAddrC(args[0]) : builtinC(b, args.map(opC), rt, this.syms)),
+        _ => builtinC(b, args.map(opC), rt, this.syms),
+      },
     };
     return assignOpt(d, code);
   }

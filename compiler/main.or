@@ -9,7 +9,7 @@
 //   orin expand [--input] <entry.or | package-dir>   the companion modules (`m.gen`) of the program, through the formatter (ADR-0046)
 //   check/expand/compile run annotation processors (ADR-0046 S5) for the `.gen` modules they import:
 //       [--processor-timeout S] [--processor-cache DIR] [--cc CMD] [--runtime DIR] [--verbose]
-//   orin compile [--format=json] <entry.or> -o <out.c> [--no-verify] [--c-builtins] [--check-contracts] [--strict-contracts]
+//   orin compile [--format=json] <entry.or> -o <out.c> [--no-verify] [--c-builtins] [--rt-wrappers] [--check-contracts] [--strict-contracts]
 //       default pipeline: HIR -> MIR -> ownership verifier -> C (--backend=llvm: LLVM IR, -o x.ll)
 //   orin fmt [--check] [--stdout] <file.or>...
 //   orin lsp                 language server on stdio (spec 18)
@@ -54,7 +54,7 @@ import { readFile } from "std:fs";
 import { lower } from "./lower";
 import { emitCFacts, emitCSites, emitCSplit } from "./backends/c";
 import { emitLlvmFacts } from "./backends/llvm";
-import { MProgram, printProgram, hasSpan } from "./mir";
+import { MProgram, printProgram, hasSpan, withRtWrappers } from "./mir";
 import { verify, VerifyIssue } from "./verify";
 import { optimize, pruneProgram } from "./opt";
 import { fuseProgram, FuseOut, ChainInfo } from "./fuse";
@@ -67,7 +67,7 @@ import { runMcp } from "./mcp";
 
 function usage(): void {
   console.error(
-    "usage:\n  orin workspace list|lock|check [--root <directory>]\n  orin check [--format=json] [--deps] [--strict-contracts] <entry.or | package-dir>\n  orin api [--check <snapshot>] <entry.or | package-dir>\n  orin expand [--input] [--processor-timeout <seconds>] [--processor-cache <dir>] <entry.or | package-dir>\n  orin graph <entry.or | package-dir> [-o out.json]\n  orin diff --base <dir|.or|.json> --head <dir|.or|.json> [--format=json|text|html] [--link-base <url>] [-o out] [--exit-code]\n  orin effects <entry.or | package-dir> [--format=json] [--summary] [--module <id>] [--function <name>] [--no-paths] [--tests] [--check-purity]\n  orin compile [--format=json] <entry.or> -o <out.c> [--no-verify] [--no-opt] [--no-fuse] [--fuse-report] [--c-builtins] [--backend=c|llvm] [--target=native|wasm64-orbit] [--check-contracts] [--strict-contracts] [--stats-sites] [--assert-facts] [--split <n>] [--timings <file.json>]\n  orin fmt [--check] [--stdout] <file.or>...\n  orin lsp\n  orin mcp [--root <dir>] [--allow-exec] [--repo <dir>]\n  orin test [--filter <substring>] [--format=json] [--runtime <dir>] [--cc <cmd>] <entry.or | package-dir>\n  orin mir <entry.or>\n  orin verify [--contracts [--format=json] [--z3 PATH] [--timeout-ms N] [--retry-ms N] [--rlimit N] [--strict]] <entry.or>",
+    "usage:\n  orin workspace list|lock|check [--root <directory>]\n  orin check [--format=json] [--deps] [--strict-contracts] <entry.or | package-dir>\n  orin api [--check <snapshot>] <entry.or | package-dir>\n  orin expand [--input] [--processor-timeout <seconds>] [--processor-cache <dir>] <entry.or | package-dir>\n  orin graph <entry.or | package-dir> [-o out.json]\n  orin diff --base <dir|.or|.json> --head <dir|.or|.json> [--format=json|text|html] [--link-base <url>] [-o out] [--exit-code]\n  orin effects <entry.or | package-dir> [--format=json] [--summary] [--module <id>] [--function <name>] [--no-paths] [--tests] [--check-purity]\n  orin compile [--format=json] <entry.or> -o <out.c> [--no-verify] [--no-opt] [--no-fuse] [--fuse-report] [--c-builtins] [--backend=c|llvm] [--target=native|wasm64-orbit] [--check-contracts] [--strict-contracts] [--stats-sites] [--assert-facts] [--rt-wrappers] [--split <n>] [--timings <file.json>]\n  orin fmt [--check] [--stdout] <file.or>...\n  orin lsp\n  orin mcp [--root <dir>] [--allow-exec] [--repo <dir>]\n  orin test [--filter <substring>] [--format=json] [--runtime <dir>] [--cc <cmd>] <entry.or | package-dir>\n  orin mir <entry.or>\n  orin verify [--contracts [--format=json] [--z3 PATH] [--timeout-ms N] [--retry-ms N] [--rlimit N] [--strict]] <entry.or>",
   );
   exit(2);
 }
@@ -247,6 +247,7 @@ function switchNames(): string[] {
     "--c-builtins",
     "--stats-sites",
     "--assert-facts", // check every forwarded load against its slot at run time (docs/mir.md v2.4); never on by default
+    "--rt-wrappers", // also define the C-named test wrappers of the $rt entries (tools/rt_stub.sh, ADR-0052 Addendum B section 3)
   ];
 }
 
@@ -524,7 +525,7 @@ function runCompile(
   const assertFacts = on(o, "--assert-facts");
   const statsSites = on(o, "--stats-sites");
   const built = buildMir(checked, sm, o, t0, clock);
-  const mir = built.mir;
+  const mir = on(o, "--rt-wrappers") ? withRtWrappers(built.mir) : built.mir;
   if (!on(o, "--no-verify") && runVerify(mir, sm, false) > 0) {
     console.error("error: internal compiler error: MIR ownership verification failed");
     exit(70);

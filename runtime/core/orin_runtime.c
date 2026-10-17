@@ -9,6 +9,7 @@
  * and free lists need no atomics. Moving an object to another task's heap is safe because a block is just malloc memory
  * (freed on any thread). The process-wide totals of finished tasks are g_fold / g_fold_live. */
 __thread OrinHeap orin_heap ORIN_TLS_MODEL; /* all of it, in one block: orin_runtime.h "The per-thread heap block" */
+OrinShared orin_shared;                     /* the process-wide block of the core operation sharedBase (zero-initialised) */
 /* The names the code below uses for the fields of the block. */
 #define g_live (orin_heap.live)
 #define fl_struct (orin_heap.fl_struct)

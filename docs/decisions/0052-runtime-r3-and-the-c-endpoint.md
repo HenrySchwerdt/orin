@@ -244,10 +244,18 @@ Each assumption is a separate commit (R3d.0) and can be reverted alone if the ow
 ## Addendum B: R3e design (task interface)
 
 Status: accepted (2026-10-17; the owner delegated the open decisions to the project coordinator, which took every recommendation of
-section 8). Design only; no code. Structure and depth follow Addendum A. *(inference)* marks a conclusion from the code, not
-something the code states. Basis: `origin/main` d0a17a96 (R3d.5 done) plus the open concurrency work, read from its branches (PR number to head
-branch by `gh api repos/henryschwerdt/orin/pulls/N`): #175 `claude/project-thread-5wtl8u-c4` (C4), #187 `...-c3` (C3, base c4), #189 `...-c5`
-(C5, base c3), #184 `...-gm` (ADR-0040), #191 `claude/adr0048-fs`. What each means for R3e is in section 7. Open questions: section 8.
+section 8). Written as a design; R3e.0 and R3e.1 are implemented (rows of the table in section 5). Structure and depth follow Addendum A.
+*(inference)* marks a conclusion from the code, not something the code states. Basis of the design: `origin/main` d0a17a96 (R3d.5 done)
+plus the open concurrency work, read from its branches (PR number to head branch by `gh api repos/henryschwerdt/orin/pulls/N`): #175
+`claude/project-thread-5wtl8u-c4` (C4), #187 `...-c3` (C3, base c4), #189 `...-c5` (C5, base c3), #184 `...-gm` (ADR-0040), #191
+`claude/adr0048-fs`. What each means for R3e is in section 7. Open questions: section 8.
+
+**Re-derived from the merged tree before R3e.0 (2026-10-17, `origin/main` b8e7a691: the whole stack and R3d.6 are in, R3d.7 is not).** The
+tables below were checked against the code and stand, except: (1) L0 is **1,167** code lines (measured with the `tools/verify_platform.sh`
+method), not 1,163, so **233** of 1,400 stay reserved; (2) `taskOpCount` is 37, the last `rt.or` entry is 29, the heap block is 1,024 bytes
+with the reserved range at 336..503 (21 words), and the C tasks section is 588 lines (1472 to the end of `orin_runtime.c`), as written;
+(3) the core operations were numbered 0..27, so `plat`, `fnAddr` and `sharedBase` are 28, 29 and 30 as written and `coreOpCount` is 31;
+(4) all 20 functions of the `plat` table exist in `orin_platform.h`, `orin_platform.c` and the Orbit L0 (`runtime/platform/orbit`).
 
 ### 1. What moves to Orin, what stays C
 
@@ -284,8 +292,8 @@ The interface is the "tasks and transfer" section of `runtime/core/orin_runtime.
 | process (6) | `runtime_lock`, `runtime_unlock`, `cpu_count`, `getenv`, `write_line(fd, buf, n)`, `exit(code)` |
 
 No atomic, no TLS and no signal primitive is added: Orin code takes shared state only under the runtime lock or a monitor, and the thread-local state
-is the heap block (2.4). **Budget (ADR-0054): R3e adds 0 code lines to L0.** L0 is 1,036 of 1,400 on main (measured with the `tools/verify_platform.sh`
-method) and 1,163 after #187 (its Addendum D: +127), so 237 stay reserved for the scheduler and the Windows backend. The variant of Q3 (setjmp/longjmp
+is the heap block (2.4). **Budget (ADR-0054): R3e adds 0 code lines to L0.** L0 was 1,036 of 1,400 on the base of this design (measured with the `tools/verify_platform.sh`
+method) and is 1,167 on the merged tree (#187, its Addendum D: +127, and later work), so 233 stay reserved for the scheduler and the Windows backend. The variant of Q3 (setjmp/longjmp
 instead of `pthread_exit`) would cost about +10 lines. What leaves the trusted C is about 580 lines of `orin_runtime.c` (the forwarders and the whole
 transfer and task code), none of it L0, so the TCB figure in tcb.md falls by that much at R3e.6. Every L0 function R3e calls already has its contract
 and its executable test; no L0 test is added.
@@ -296,8 +304,8 @@ and its executable test; no L0 test is added.
 
 | new op | C / LLVM | semantics and safety rule |
 |---|---|---|
-| `plat(k, a, b, c)` -> usize (28) | a direct call of `orin_platform_<name>(a, b, c)` / `call @orin_platform_<name>` | `k` indexes a **closed table** of the 20 functions above and must be a literal (a non-literal `k` is a compile error, so there is no computed call). Arguments are words, pointers are addresses (`thread_join`'s `void **` is the address of a word of the heap block). Void functions give 0, the others their `int` / `int64_t` result as usize. **Not pure**, may write any memory, may not return (`thread_exit`, `exit`). The table is the "calls to L0 functions by declaration" of the core dialect list above; it replaces the L0-shaped hooks of R3d.5 (`HK_LOCK`, `HK_UNLOCK`, `HK_GETENV`, `HK_WRITE_LINE`) |
-| `fnAddr(k)` -> usize (29) | `(uint64_t)(uintptr_t)&orin_rt_task_main` / `ptrtoint ptr @orin_rt_task_main` | the address of the C-ABI wrapper (the `RtWrap` machinery of `mir/rt.or`) of the entry `k`, a literal; only entries of type `void(void *)` qualify (one today: the task entry). Needed because `thread_create` takes a C function pointer and a core module has no function-pointer type. Pure |
+| `plat(k, a, b, c)` -> usize (28) | a direct call of `orin_platform_<name>(a, b, c)` / `call @orin_platform_<name>` | `k` indexes a **closed table** of the 20 functions above (numbered in the order of the table: threads 0..3, monitors 4..13, process 14..19; `platOpName` in `hir/coreops.or`, the names `PL_*` in `runtime/core/plat.or`) and must be a literal or a named constant (a non-literal or unknown `k` is the compile error E0404, so there is no computed call). Arguments are words, pointers are addresses (`thread_join`'s `void **` is the address of a word of the heap block). Void functions give 0, the others their `int` / `int64_t` result as usize. **Not pure**, may write any memory, may not return (`thread_exit`, `exit`). The table is the "calls to L0 functions by declaration" of the core dialect list above; it replaces the L0-shaped hooks of R3d.5 (`HK_LOCK`, `HK_UNLOCK`, `HK_GETENV`, `HK_WRITE_LINE`) |
+| `fnAddr(k)` -> usize (29) | `(uint64_t)(uintptr_t)&orin_rt_task_main` / `ptrtoint ptr @orin_rt_task_main` | the address of the C-ABI wrapper (the `RtWrap` machinery of `mir/rt.or`) of the entry `k` (an entry number of `rt.or`), a literal; only entries of type `void(void *)` qualify (`fnAddrEntries` in `hir/coreops.or`, checked against the wrapper table by `rtFnAddrOk`: the probe target of `std:coreprobe` in R3e.0, the task entry joins in R3e.4). Needed because `thread_create` takes a C function pointer and a core module has no function-pointer type. Pure |
 | `sharedBase()` -> usize (30) | `extern uint64_t orin_shared[128]` / `@orin_shared = global [128 x i64]` | the address of the process-wide zero-initialised block of 128 words (1,024 bytes), the shared counterpart of `heapBase()`. Layout in 2.3. Executables only, like `heapBase`. Pure (an address) |
 
 **Considered and not needed:** an atomic or compare-and-swap operation (all cross-thread state is under the runtime lock or a monitor; the one CAS
@@ -310,7 +318,7 @@ Added: `HK_REVOKE_GRANTS` (12, revoke every live grant of this task: the loop of
 `HK_FREE_NETBUF` (14, C4's `t_netbuf`), `HK_SITE_FOLD` (15, `site_fold`, census builds only). `HK_FOLD_STATS` and `HK_FOLD_LIVE` stay (the totals live in
 C until R3f). The four L0-shaped hooks are removed once `plat` replaces them (R3e.1). Each remaining hook disappears with the shell it serves (R3c, R3f).
 
-#### 2.3 The shared block `orin_shared` (word offsets pinned by `_Static_assert`s and named constants in `task.or`)
+#### 2.3 The shared block `orin_shared` (word offsets pinned by `_Static_assert`s on the `OrinShared` struct in `orin_runtime.h`; the named constants of the users go with them)
 
 | words | content (read and written only between `plat(RUNTIME_LOCK)` and `plat(RUNTIME_UNLOCK)`) |
 |---:|---|
@@ -321,7 +329,7 @@ C until R3f). The four L0-shaped hooks are removed once `plat` replaces them (R3
 
 `orin_shared` is defined in `orin_runtime.c` like `orin_heap` and listed in `bootstrap/seed/runtime/core-only-symbols.txt`; R3f makes the backends emit it.
 
-#### 2.4 Per-task state in the heap block (the reserved bytes 336..503 of Addendum A section 5; the block size does not change)
+#### 2.4 Per-task state in the heap block (the reserved bytes 336..503 of Addendum A section 5; the block size does not change; named in `runtime/core/heap.or` as `H_TASK` .. `H_SCRATCH`, pinned by `_Static_assert`s in `orin_runtime.h`)
 
 | offset | field | was |
 |---:|---|---|
@@ -486,6 +494,6 @@ commit of the step it affects, so it can be reverted alone.
 
 R3e code starts only after (1) the concurrency PR stack #175, #187 and #189 and the independent #184, and (2) #191, are merged to main, and (3) after
 R3d.7 (the seed refresh). R3e rewrites the lines those changes edit (`taskops.or`, the C tasks section, the snapshot, `update_seed.sh`), and the
-tables of this addendum must be re-derived from the merged tree before R3e.0 (`taskOpCount` 37, L0 at 1,163 lines). R3d.6 (the C preamble in place of
+tables of this addendum must be re-derived from the merged tree before R3e.0 (`taskOpCount` 37, L0 at 1,167 lines; done, see the status). R3d.6 (the C preamble in place of
 the header inlines) should be in too, since both edit `backends/c/function.or` *(recommendation, not a dependency)*. R3c precedes R3e.5 only. Until
 then this addendum is the only R3e change: nothing in `runtime/`, `compiler/` or `tools/` moves.

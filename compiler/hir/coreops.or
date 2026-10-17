@@ -45,23 +45,35 @@
 // |    |          |                                           | process environment and stderr, the runtime lock, the      |
 // |    |          |                                           | process-wide totals of finished tasks and the allocation-  |
 // |    |          |                                           | site census. See `orin_core_hook` for the list             |
+// | 28 | plat     | orin_platform_<name>(a, b, c) (L0)        | (k, a, b, c: usize) -> usize: call L0 function k of the closed  |
+// |    |          |                                           | table `platOpName` (20 functions: threads, monitors, process). |
+// |    |          |                                           | `k` must be a literal below `platOpCount()` (E0404 otherwise); |
+// |    |          |                                           | words in, the `int` / `int64_t` / pointer result as a word (a  |
+// |    |          |                                           | C `int` sign-extended), 0 for a void function. Not pure, may   |
+// |    |          |                                           | write any memory, thread_exit and exit do not return (R3e.0)   |
+// | 29 | fnAddr   | `&<C-ABI wrapper of the entry>`           | (k: usize) -> usize: the address of the wrapper (mir/rt.or    |
+// |    |          |                                           | `RtWrap`) of the L1 entry k, a literal naming an entry in      |
+// |    |          |                                           | `fnAddrEntries()` (type `void(void *)`). Pure                  |
+// | 30 | sharedBase | `extern uint64_t orin_shared[128]`      | () -> usize, the address of the process-wide zero-initialised  |
+// |    |          |                                           | block of 128 words (1,024 bytes), the shared counterpart of    |
+// |    |          |                                           | heapBase (layout: spec 19 "R3e.0"; executables only). Pure     |
 //
 // Loads and stores are native-endian and need no alignment (both backends emit an unaligned access). The memory
 // operations map to the L0 functions of runtime/platform/orin_platform.h; the LLVM backend emits the same behaviour with
 // libc malloc / free and the LLVM memory intrinsics (L0's functions are static inline in a C header). Effects (ADR-0031):
 // every core operation that touches memory is conservative: a load reads mutable memory, the others write it, so none of them is pure.
 // The bit operations `and .. shr`, `expect`, `cfg` and the wrapping arithmetic `wadd .. wmul` touch no memory and are pure (`coreOpPure`);
-// heapBase only yields an address.
+// heapBase, sharedBase and fnAddr only yield an address; `plat` calls into L0 and is neither pure nor a load.
 
 export function coreOpCount(): usize {
-  return 28;
+  return 31;
 }
 
 function names(): string[] {
   return [
     "load8", "load32", "load64", "loadF64", "store8", "store32", "store64", "storeF64", "memAlloc", "memFree", "memCopy",
     "memSet", "addrOf", "and", "or", "xor", "shl", "shr", "expect", "cfg", "heapBase", "memRealloc", "memMove", "memCmp",
-    "wadd", "wsub", "wmul", "hook"
+    "wadd", "wsub", "wmul", "hook", "plat", "fnAddr", "sharedBase"
   ];
 }
 
@@ -89,7 +101,7 @@ export function coreOpRet(k: usize): int {
   if (k == 3) {
     return 2;
   }
-  if (k == 0 || k == 1 || k == 2 || k == 8 || k == 12 || k >= 13 && k <= 21 || k == 23 || k >= 24 && k <= 27) {
+  if (k == 0 || k == 1 || k == 2 || k == 8 || k == 12 || k >= 13 && k <= 21 || k == 23 || k >= 24 && k <= 30) {
     return 1;
   }
   return 0;
@@ -105,5 +117,65 @@ export function coreOpReads(k: usize): bool {
 // wrapping arithmetic.
 // They are not I/O (check/purity.or) and may appear in a pure function.
 export function coreOpPure(k: usize): bool {
-  return k >= 13 && k <= 19 || k >= 24 && k <= 26;
+  return k >= 13 && k <= 19 || k >= 24 && k <= 26 || k == 29 || k == 30;
 }
+
+// ---------------------------------------------------------------- the closed table of `plat` (ADR-0052 Addendum B section 2.1)
+
+// The L0 functions (runtime/platform/orin_platform.h) that `plat(k, a, b, c)` can call, by k: the symbol is `orin_platform_<name>`.
+// Threads 0..3, monitors 4..13, process 14..19. Nothing else of L0 is reachable from Orin code, and `k` is a literal, so there is no
+// computed call.
+export function platOpCount(): usize {
+  return 20;
+}
+
+function platNames(): string[] {
+  return [
+    "thread_create", "thread_join", "thread_exit", "thread_id", "monitor_new", "monitor_free", "monitor_lock", "monitor_unlock",
+    "monitor_wait", "monitor_wait_until", "monitor_notify", "monitor_get", "monitor_set", "monitor_grow", "runtime_lock",
+    "runtime_unlock", "cpu_count", "getenv", "write_line", "exit"
+  ];
+}
+
+// The C and LLVM types of the L0 function k as "<parameters>><result>", one letter each. Parameters: `i` a 64-bit integer (`int64_t`,
+// `uint64_t`, `size_t`: i64), `n` a C `int` (i32, the low 32 bits of the word), `p` a pointer (ptr; the word is an address), `f` a function pointer (`void (*)(void *)`, ptr).
+// Result: `v` void (the operation gives 0), `i` a 64-bit integer, `n` a C `int` (sign-extended to the word), `p` a pointer (its
+// address). thread_exit and exit never return.
+function platSigs(): string[] {
+  return [
+    "fp>i", "ip>n", ">v", ">i", "i>i", "i>n", "i>n", "i>n", "in>n", "ini>n", "inn>n", "iip>n", "iii>n", "ii>n", ">v", ">v", ">i",
+    "p>p", "npi>v", "n>v"
+  ];
+}
+
+// The name of the L0 function k without the prefix `orin_platform_`; "" for an unknown k.
+export function platOpName(k: usize): string {
+  const ns = platNames();
+  return k < ns.length ? ns[k] : "";
+}
+
+// The parameter letters of the L0 function k ("" for an unknown k or a function without parameters).
+export function platOpParams(k: usize): string {
+  const ss = platSigs();
+  return k < ss.length ? ss[k].split(">")[0] : "";
+}
+
+// The result letter of the L0 function k (`v`, `i`, `n` or `p`); "" for an unknown k.
+export function platOpResult(k: usize): string {
+  const ss = platSigs();
+  return k < ss.length ? ss[k].split(">")[1] : "";
+}
+
+// True for the L0 functions that do not return (thread_exit, exit).
+export function platOpNoReturn(k: usize): bool {
+  return k == 2 || k == 19;
+}
+
+// The entry numbers of mir/rt.or that `fnAddr(k)` accepts: the entries whose C-ABI wrapper has the type `void(void *)`. Today the
+// probe target of std:coreprobe (the task entry joins in R3e.4). mir/rt.or checks the list against its wrapper table (`rtFnAddrOk`).
+export function fnAddrEntries(): usize[] {
+  return [RT_FN_PROBE_ENTRY];
+}
+
+// The entry number of `$rt/coreprobe.probeEntry` (mir/rt.or `RT_CORE_PROBE_FN`; a unit test pins the equality).
+export const RT_FN_PROBE_ENTRY: usize = 55;

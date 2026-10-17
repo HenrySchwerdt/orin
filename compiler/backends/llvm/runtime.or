@@ -3,6 +3,7 @@
 // runtime/core/orin_runtime_llvm.c) and the declarations of the C runtime functions the IR calls by symbol.
 
 import { MProgram } from "../../mir";
+import { coreOpCount, platOpCount, platOpName, platOpParams, platOpResult, platOpNoReturn } from "../../hir";
 import { u } from "./text";
 
 // ---------------------------------------------------------------- trap messages
@@ -147,7 +148,7 @@ export function factsDeclare(): string {
 export function coreOpsUsed(prog: MProgram): bool[] {
   let used: bool[] = [];
   let k: usize = 0;
-  while (k < 28) {
+  while (k < coreOpCount()) {
     used.push(false);
     k += 1;
   }
@@ -198,7 +199,74 @@ export function coreDeclares(prog: MProgram): string {
   if (used[27]) {
     d += "declare i64 @orin_core_hook(i64, i64, i64, i64)\n";
   }
+  if (used[30]) {
+    d += "@orin_shared = external global [128 x i64]\n";
+  }
+  if (used[28]) {
+    const plat = platOpsUsed(prog);
+    let k: usize = 0;
+    while (k < plat.length) {
+      if (plat[k]) {
+        d += platDeclare(k);
+      }
+      k += 1;
+    }
+  }
   return d;
+}
+
+// The L0 functions (hir/coreops.or `platOp*`) the program calls through `plat`, by table index.
+export function platOpsUsed(prog: MProgram): bool[] {
+  let used: bool[] = [];
+  let k: usize = 0;
+  while (k < platOpCount()) {
+    used.push(false);
+    k += 1;
+  }
+  for (const f of prog.functions) {
+    for (const b of f.blocks) {
+      for (const ins of b.instrs) {
+        match (ins) {
+          IBuiltin(_, op, args) => {
+            match (op) {
+              BCore(n) => {
+                if (n == 28 && args.length > 0) {
+                  const lit: int = match (args[0]) {
+                    OUsize(v) => v,
+                    OInt(v) => v,
+                    _ => -1,
+                  };
+                  if (lit >= 0 && lit.toUsize() < used.length) {
+                    used[lit.toUsize()] = true;
+                  }
+                }
+              },
+              _ => {},
+            }
+          },
+          _ => {},
+        }
+      }
+    }
+  }
+  return used;
+}
+
+// The declaration of the L0 function `k` of the `plat` table. No `readnone` / `readonly` / `argmemonly` / `nounwind` (ADR-0052
+// Addendum B section 6, risks 2 and 3: a call is an opaque barrier for memory, and thread_exit must unwind through generated frames);
+// tools/check_platform_boundary.sh lints this.
+function platDeclare(k: usize): string {
+  const ps = platOpParams(k);
+  let tys: string[] = [];
+  let i: usize = 0;
+  while (i < ps.length) {
+    const c = ps.substring(i, i + 1);
+    tys.push(c == "n" ? "i32" : (c == "i" ? "i64" : "ptr"));
+    i += 1;
+  }
+  const r = platOpResult(k);
+  const rt = r == "v" ? "void" : (r == "n" ? "i32" : (r == "i" ? "i64" : "ptr"));
+  return "declare " + rt + " @orin_platform_" + platOpName(k) + "(" + tys.join(", ") + ")" + (platOpNoReturn(k) ? " noreturn" : "") + "\n";
 }
 
 export function declares(): string {
