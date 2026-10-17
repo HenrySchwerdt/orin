@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Generate the two B-tree sorted maps of library/std/collections.or from tools/sorted_map.tmpl.
 
-`SortedMap<V>` (int keys) and `SortedStringMap<V>` (string keys) are the same algorithm; Orin has no equality or
-ordering on type parameters (docs/std.md "Limitations"), so the key type and its comparisons are template
-parameters and the two classes are generated, not copied by hand. The generated region of library/std/collections.or is
+`SortedMap<V>` (int keys), `SortedStringMap<V>` (string keys) and the generic `OrderedMap<K extends Ord, V>` (ADR-0034)
+are the same algorithm; the specialised two keep their direct int / string comparisons (no instance dispatch, and they
+predate `Ord`), so the key type and its comparisons are template parameters and the classes are generated, not copied by hand. The generated region of library/std/collections.or is
 between the markers `// BEGIN GENERATED` and `// END GENERATED`.
 
 Usage: python3 tools/gen_sorted_map.py [--check]   (--check: exit 1 if collections.or is stale)
@@ -20,13 +20,20 @@ INT = {
     "CLASS": "SortedMap", "P": "Int", "K": "int", "ENTRY": "SortedEntry", "ZERO": "0",
     "INC": "isStrictlyIncreasing",
     "ops": {"LT": "<", "LE": "<=", "GT": ">", "GE": ">=", "EQ": "=="},
-    "cmp": False,
+    "cmp": False, "TPV": "V", "AV": "V", "TPK": "",
 }
 STR = {
     "CLASS": "SortedStringMap", "P": "Str", "K": "string", "ENTRY": "SortedStringEntry", "ZERO": '""',
     "INC": "isStrictlyIncreasingStrings",
     "ops": {"LT": "<", "LE": "<=", "GT": ">", "GE": ">=", "EQ": "=="},
-    "cmp": True,
+    "cmp": True, "TPV": "V", "AV": "V", "TPK": "",
+}
+# Generic version (ADR-0034 slice 2): the key is a type parameter bounded by the built-in `Ord`, so `<`, `==` ... work on it.
+GEN = {
+    "CLASS": "OrderedMap", "P": "Ord", "K": "K", "ENTRY": "OrderedEntry", "ZERO": "",
+    "INC": "isStrictlyIncreasingOrd",
+    "ops": {"LT": "<", "LE": "<=", "GT": ">", "GE": ">=", "EQ": "=="},
+    "cmp": False, "TPV": "K extends Ord, V", "AV": "K, V", "TPK": "<K extends Ord>",
 }
 MACROS = ("LT", "LE", "GT", "GE", "EQ")
 
@@ -75,7 +82,7 @@ def expand_macros(s, inst):
 
 def render(inst, tmpl):
     s = tmpl
-    for k in ("CLASS", "P", "K", "ENTRY", "ZERO", "INC"):
+    for k in ("CLASS", "P", "K", "ENTRY", "ZERO", "INC", "TPV", "AV", "TPK"):
         s = s.replace("@%s@" % k, inst[k])
     s = expand_macros(s, inst)
     # an expanded macro that is a whole `if (..)` or contract condition keeps its own parentheses: harmless
@@ -84,7 +91,7 @@ def render(inst, tmpl):
 
 def generated():
     tmpl = open(os.path.join(ROOT, "tools", "sorted_map.tmpl"), encoding="utf-8").read()
-    return BEGIN + render(INT, tmpl) + render(STR, tmpl) + END
+    return BEGIN + render(INT, tmpl) + render(STR, tmpl) + render(GEN, tmpl) + END
 
 
 def main():

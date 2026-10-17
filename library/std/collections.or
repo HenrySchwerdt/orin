@@ -107,6 +107,19 @@ export function isStrictlyIncreasingStrings(xs: string[]): bool {
   return true;
 }
 
+// isStrictlyIncreasingOrd(xs): xs is strictly increasing under the key type's `Ord` order (the generic `isStrictlyIncreasing`).
+// Loop-based.
+export function isStrictlyIncreasingOrd<T extends Ord>(xs: T[]): bool {
+  let i: usize = 1;
+  while (i < xs.length) {
+    if (xs[i - 1] >= xs[i]) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
 // ------------------------------------------------------------------------------------------ IntSet
 
 // A set of ints on top of `Map<int, bool>`. Invariants: the map's size matches its key list and every stored flag
@@ -235,6 +248,149 @@ export class IntSet {
   @Ensures(result.size() + this.intersection(other).size() == this.size())
   difference(other: IntSet): IntSet {
     let out = new IntSet();
+    const xs = this.items.keys();
+    let i: usize = 0;
+    while (i < xs.length) {
+      if (!other.has(xs[i])) {
+        out.add(xs[i]);
+      }
+      i += 1;
+    }
+    return out;
+  }
+}
+
+// ------------------------------------------------------------------------------------------ Set<T>
+
+// The generic set (ADR-0034, slice 2): any `Hash` element type, i.e. the integers, `bool`, `string`, records, unions, `Option`,
+// `Result` and arrays of those (derived), and classes with `hash` / `equals` (explicit). `Set<int>` and `Set<string>` do what
+// `IntSet` / `StringSet` do, with the same algorithm (a `Map<T, bool>`, expected O(1)), and unlike them the contracts state value
+// equality: after `add(x)` the set contains a value equal to x. Invariants as for `IntSet`.
+@Invariant(this.items.size == this.items.keys().length)
+@Invariant(allTrue(this.items.values()))
+export class Set<T extends Hash> {
+  private items: Map<T, bool> = new Map<T, bool>();
+
+  // size(): number of members. O(1).
+  @Ensures(result == this.items.keys().length)
+  size(): usize {
+    return this.items.size;
+  }
+
+  // isEmpty(): no members. O(1).
+  @Ensures(result == (this.size() == 0))
+  isEmpty(): bool {
+    return this.items.size == 0;
+  }
+
+  // has(x): is a value equal to x a member? Expected O(1).
+  @Ensures(result ==> this.size() > 0)
+  has(x: T): bool {
+    return this.items.has(x);
+  }
+
+  // add(x): insert x; true when no equal value was a member (the size grows by 1), false when one already was. Expected O(1).
+  @Ensures(this.has(x))
+  @Ensures(result == !old(this.has(x)))
+  @Ensures(result ==> this.size() == old(this.size()) + 1)
+  @Ensures(!result ==> this.size() == old(this.size()))
+  add(x: T): bool {
+    if (this.items.has(x)) {
+      return false;
+    }
+    this.items.set(x, true);
+    return true;
+  }
+
+  // remove(x): delete the member equal to x; true when there was one (the size shrinks by 1). Expected O(1).
+  @Ensures(!this.has(x))
+  @Ensures(result == old(this.has(x)))
+  @Ensures(result ==> this.size() == old(this.size()) - 1)
+  @Ensures(!result ==> this.size() == old(this.size()))
+  remove(x: T): bool {
+    if (!this.items.has(x)) {
+      return false;
+    }
+    this.items.delete(x);
+    return true;
+  }
+
+  // clear(): remove all members. O(1).
+  @Ensures(this.size() == 0)
+  clear(): void {
+    this.items = new Map<T, bool>();
+  }
+
+  // toArray(): the members in insertion order (not sorted). O(n).
+  @Ensures(result.length == this.size())
+  @Ensures(this.size() > 0 ==> this.has(result[0]))
+  toArray(): T[] {
+    return this.items.keys();
+  }
+
+  // isSubsetOf(other): every member of this is a member of other. O(n).
+  @Ensures(result ==> this.size() <= other.size())
+  @Ensures(this.size() == 0 ==> result)
+  isSubsetOf(other: Set<T>): bool {
+    if (this.items.size > other.size()) {
+      return false;
+    }
+    const xs = this.items.keys();
+    let i: usize = 0;
+    while (i < xs.length) {
+      if (!other.has(xs[i])) {
+        return false;
+      }
+      i += 1;
+    }
+    return true;
+  }
+
+  // union(other): the members of either. O(n + m).
+  @Ensures(this.isSubsetOf(result) && other.isSubsetOf(result))
+  @Ensures(result.size() >= this.size() && result.size() <= this.size() + other.size())
+  union(other: Set<T>): Set<T> {
+    // start from the larger set (a copy-on-write value copy) and insert only the smaller one's members
+    let out = this;
+    let small = other;
+    if (other.size() > this.items.size) {
+      out = other;
+      small = this;
+    }
+    const xs = small.toArray();
+    let i: usize = 0;
+    while (i < xs.length) {
+      out.add(xs[i]);
+      i += 1;
+    }
+    return out;
+  }
+
+  // intersection(other): the members of both. O(min(n, m)).
+  @Ensures(result.isSubsetOf(this) && result.isSubsetOf(other))
+  @Ensures(result.size() <= this.size() && result.size() <= other.size())
+  intersection(other: Set<T>): Set<T> {
+    // walk the smaller set and probe the larger one
+    let out = new Set<T>();
+    const walk = this.items.size <= other.size() ? this : other;
+    const probe = this.items.size <= other.size() ? other : this;
+    const xs = walk.toArray();
+    let i: usize = 0;
+    while (i < xs.length) {
+      if (probe.has(xs[i])) {
+        out.add(xs[i]);
+      }
+      i += 1;
+    }
+    return out;
+  }
+
+  // difference(other): the members of this that are not in other. O(n).
+  @Ensures(result.isSubsetOf(this))
+  @Ensures(result.intersection(other).isEmpty())
+  @Ensures(result.size() + this.intersection(other).size() == this.size())
+  difference(other: Set<T>): Set<T> {
+    let out = new Set<T>();
     const xs = this.items.keys();
     let i: usize = 0;
     while (i < xs.length) {
@@ -675,10 +831,8 @@ export function btreeIntOrderOk<V>(nodes: IntNode<V>[], root: usize): bool {
     return false;
   }
   let ids: usize[] = [root];
-  let loFlags: bool[] = [false];
-  let los: int[] = [0];
-  let hiFlags: bool[] = [false];
-  let his: int[] = [0];
+  let los: Option<int>[] = [None];
+  let his: Option<int>[] = [None];
   let visited: usize = 0;
   while (ids.length > 0) {
     visited += 1;
@@ -686,9 +840,7 @@ export function btreeIntOrderOk<V>(nodes: IntNode<V>[], root: usize): bool {
       return false;
     }
     const id = ids.pop().unwrap();
-    const hasLo = loFlags.pop().unwrap();
     const lo = los.pop().unwrap();
-    const hasHi = hiFlags.pop().unwrap();
     const hi = his.pop().unwrap();
     const kc = nodes[id].keys.length;
     let j: usize = 0;
@@ -699,10 +851,10 @@ export function btreeIntOrderOk<V>(nodes: IntNode<V>[], root: usize): bool {
       j += 1;
     }
     if (kc > 0) {
-      if (hasLo && (nodes[id].keys[0] <= lo)) {
+      if (lo.isSome() && (nodes[id].keys[0] <= lo.unwrap())) {
         return false;
       }
-      if (hasHi && (nodes[id].keys[kc - 1] >= hi)) {
+      if (hi.isSome() && (nodes[id].keys[kc - 1] >= hi.unwrap())) {
         return false;
       }
     }
@@ -717,18 +869,14 @@ export function btreeIntOrderOk<V>(nodes: IntNode<V>[], root: usize): bool {
       }
       ids.push(nodes[id].kids[c]);
       if (c == 0) {
-        loFlags.push(hasLo);
         los.push(lo);
       } else {
-        loFlags.push(true);
-        los.push(nodes[id].keys[c - 1]);
+        los.push(Some(nodes[id].keys[c - 1]));
       }
       if (c == kc) {
-        hiFlags.push(hasHi);
         his.push(hi);
       } else {
-        hiFlags.push(true);
-        his.push(nodes[id].keys[c]);
+        his.push(Some(nodes[id].keys[c]));
       }
       c += 1;
     }
@@ -1279,7 +1427,7 @@ export class SortedMap<V> {
   // popFirst(): remove the entry with the smallest key and return it, None when empty. O(t log_t n).
   @Ensures(result.isSome() == (old(this.size()) > 0))
   @Ensures(result.isSome() ==> this.size() == old(this.size()) - 1 && !this.has(result.unwrap().key))
-  @Ensures(result.isSome() ==> (result.unwrap().key == old(this.firstKey().unwrapOr(0))))
+  @Ensures(result.isSome() ==> (result.unwrap().key == old(this.firstKey()).unwrap()))
   @Ensures(result.isSome() && this.size() > 0 ==> (this.firstKey().unwrap() > result.unwrap().key))
   popFirst(): Option<SortedEntry<V>> {
     const f = this.firstKey();
@@ -1293,7 +1441,7 @@ export class SortedMap<V> {
   // popLast(): remove the entry with the largest key and return it, None when empty. O(t log_t n).
   @Ensures(result.isSome() == (old(this.size()) > 0))
   @Ensures(result.isSome() ==> this.size() == old(this.size()) - 1 && !this.has(result.unwrap().key))
-  @Ensures(result.isSome() ==> (result.unwrap().key == old(this.lastKey().unwrapOr(0))))
+  @Ensures(result.isSome() ==> (result.unwrap().key == old(this.lastKey()).unwrap()))
   @Ensures(result.isSome() && this.size() > 0 ==> (this.lastKey().unwrap() < result.unwrap().key))
   popLast(): Option<SortedEntry<V>> {
     const l = this.lastKey();
@@ -1430,10 +1578,8 @@ export function btreeStrOrderOk<V>(nodes: StrNode<V>[], root: usize): bool {
     return false;
   }
   let ids: usize[] = [root];
-  let loFlags: bool[] = [false];
-  let los: string[] = [""];
-  let hiFlags: bool[] = [false];
-  let his: string[] = [""];
+  let los: Option<string>[] = [None];
+  let his: Option<string>[] = [None];
   let visited: usize = 0;
   while (ids.length > 0) {
     visited += 1;
@@ -1441,9 +1587,7 @@ export function btreeStrOrderOk<V>(nodes: StrNode<V>[], root: usize): bool {
       return false;
     }
     const id = ids.pop().unwrap();
-    const hasLo = loFlags.pop().unwrap();
     const lo = los.pop().unwrap();
-    const hasHi = hiFlags.pop().unwrap();
     const hi = his.pop().unwrap();
     const kc = nodes[id].keys.length;
     let j: usize = 0;
@@ -1454,10 +1598,10 @@ export function btreeStrOrderOk<V>(nodes: StrNode<V>[], root: usize): bool {
       j += 1;
     }
     if (kc > 0) {
-      if (hasLo && (compareStrings(nodes[id].keys[0], lo) <= 0)) {
+      if (lo.isSome() && (compareStrings(nodes[id].keys[0], lo.unwrap()) <= 0)) {
         return false;
       }
-      if (hasHi && (compareStrings(nodes[id].keys[kc - 1], hi) >= 0)) {
+      if (hi.isSome() && (compareStrings(nodes[id].keys[kc - 1], hi.unwrap()) >= 0)) {
         return false;
       }
     }
@@ -1472,18 +1616,14 @@ export function btreeStrOrderOk<V>(nodes: StrNode<V>[], root: usize): bool {
       }
       ids.push(nodes[id].kids[c]);
       if (c == 0) {
-        loFlags.push(hasLo);
         los.push(lo);
       } else {
-        loFlags.push(true);
-        los.push(nodes[id].keys[c - 1]);
+        los.push(Some(nodes[id].keys[c - 1]));
       }
       if (c == kc) {
-        hiFlags.push(hasHi);
         his.push(hi);
       } else {
-        hiFlags.push(true);
-        his.push(nodes[id].keys[c]);
+        his.push(Some(nodes[id].keys[c]));
       }
       c += 1;
     }
@@ -2034,7 +2174,7 @@ export class SortedStringMap<V> {
   // popFirst(): remove the entry with the smallest key and return it, None when empty. O(t log_t n).
   @Ensures(result.isSome() == (old(this.size()) > 0))
   @Ensures(result.isSome() ==> this.size() == old(this.size()) - 1 && !this.has(result.unwrap().key))
-  @Ensures(result.isSome() ==> (compareStrings(result.unwrap().key, old(this.firstKey().unwrapOr(""))) == 0))
+  @Ensures(result.isSome() ==> (compareStrings(result.unwrap().key, old(this.firstKey()).unwrap()) == 0))
   @Ensures(result.isSome() && this.size() > 0 ==> (compareStrings(this.firstKey().unwrap(), result.unwrap().key) > 0))
   popFirst(): Option<SortedStringEntry<V>> {
     const f = this.firstKey();
@@ -2048,7 +2188,7 @@ export class SortedStringMap<V> {
   // popLast(): remove the entry with the largest key and return it, None when empty. O(t log_t n).
   @Ensures(result.isSome() == (old(this.size()) > 0))
   @Ensures(result.isSome() ==> this.size() == old(this.size()) - 1 && !this.has(result.unwrap().key))
-  @Ensures(result.isSome() ==> (compareStrings(result.unwrap().key, old(this.lastKey().unwrapOr(""))) == 0))
+  @Ensures(result.isSome() ==> (compareStrings(result.unwrap().key, old(this.lastKey()).unwrap()) == 0))
   @Ensures(result.isSome() && this.size() > 0 ==> (compareStrings(this.lastKey().unwrap(), result.unwrap().key) < 0))
   popLast(): Option<SortedStringEntry<V>> {
     const l = this.lastKey();
@@ -2075,6 +2215,753 @@ export class SortedStringMap<V> {
   @Ensures(this.size() == 0)
   clear(): void {
     this.nodes = [StrNode<V> { keys: [], vals: [], kids: [] }];
+    this.root = 0;
+    this.free = [];
+    this.count = 0;
+  }
+}
+
+// ------------------------------------------------------------------------------------------ OrderedMap
+
+// One node of the B-tree: `keys` sorted, `vals` parallel to them, `kids` empty for a leaf, else keys.length + 1
+// child ids (indices into the arena `nodes` of the map).
+export type OrdNode<K, V> = { keys: K[]; vals: V[]; kids: usize[]; };
+
+// An entry returned by `OrderedMap.popFirst` / `popLast`.
+export type OrderedEntry<K, V> = { key: K; value: V; };
+
+// The first index whose key is >= k (keys.length when there is none). Binary search, O(log keys.length).
+@Ensures(result <= keys.length)
+@Ensures(result < keys.length ==> (keys[result] >= k))
+@Ensures(result > 0 ==> (keys[result - 1] < k))
+export function lowerBoundOrd<K extends Ord>(keys: K[], k: K): usize {
+  let lo: usize = 0;
+  let hi: usize = keys.length;
+  while (lo < hi) {
+    const mid = lo + (hi - lo) / 2;
+    if ((keys[mid] < k)) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  return lo;
+}
+
+// Is `nodes` a well-formed B-tree arena of minimum degree t rooted at `root`, with free list `free`? Checked
+// iteratively with an explicit stack: every node id is in range and reached exactly once (no dangling or shared
+// ids, no cycles), keys and values have the same length, a leaf has no children and an inner node has one more
+// child than keys (and at least one key), every non-root node holds t-1 .. 2t-1 keys and the root at most 2t-1,
+// all leaves have the same depth, the free list holds distinct ids of unreachable nodes, and every arena slot is
+// either reachable or free.
+export function btreeOrdShapeOk<K extends Ord, V>(nodes: OrdNode<K, V>[], root: usize, t: usize, free: usize[]): bool {
+  const n = nodes.length;
+  if (t < 2 || root >= n) {
+    return false;
+  }
+  let seen: bool[] = [];
+  let i: usize = 0;
+  while (i < n) {
+    seen.push(false);
+    i += 1;
+  }
+  i = 0;
+  while (i < free.length) {
+    if (free[i] >= n || seen[free[i]]) {
+      return false;
+    }
+    seen[free[i]] = true;
+    i += 1;
+  }
+  let ids: usize[] = [root];
+  let depths: usize[] = [0];
+  let leafDepth: int = -1;
+  let reachable: usize = 0;
+  while (ids.length > 0) {
+    const id = ids.pop().unwrap();
+    const d = depths.pop().unwrap();
+    if (seen[id]) {
+      return false;
+    }
+    seen[id] = true;
+    reachable += 1;
+    const kc = nodes[id].keys.length;
+    if (nodes[id].vals.length != kc || kc > 2 * t - 1) {
+      return false;
+    }
+    if (id != root && kc < t - 1) {
+      return false;
+    }
+    const kk = nodes[id].kids.length;
+    if (kk == 0) {
+      if (leafDepth < 0) {
+        leafDepth = d.toInt();
+      } else if (leafDepth != d.toInt()) {
+        return false;
+      }
+    } else {
+      if (kk != kc + 1 || kc == 0) {
+        return false;
+      }
+      let c: usize = 0;
+      while (c < kk) {
+        if (nodes[id].kids[c] >= n) {
+          return false;
+        }
+        ids.push(nodes[id].kids[c]);
+        depths.push(d + 1);
+        c += 1;
+      }
+    }
+  }
+  return reachable + free.length == n;
+}
+
+// Are the keys ordered? Inside every node strictly increasing, and every key of a child lies strictly between the
+// separator keys around it in the parent (inherited bounds), which together say the in-order sequence is strictly
+// increasing. Iterative; tolerates a broken shape (out-of-range ids, revisits) by answering false.
+export function btreeOrdOrderOk<K extends Ord, V>(nodes: OrdNode<K, V>[], root: usize): bool {
+  if (root >= nodes.length) {
+    return false;
+  }
+  let ids: usize[] = [root];
+  let los: Option<K>[] = [None];
+  let his: Option<K>[] = [None];
+  let visited: usize = 0;
+  while (ids.length > 0) {
+    visited += 1;
+    if (visited > nodes.length) {
+      return false;
+    }
+    const id = ids.pop().unwrap();
+    const lo = los.pop().unwrap();
+    const hi = his.pop().unwrap();
+    const kc = nodes[id].keys.length;
+    let j: usize = 0;
+    while (j < kc) {
+      if (j > 0 && (nodes[id].keys[j - 1] >= nodes[id].keys[j])) {
+        return false;
+      }
+      j += 1;
+    }
+    if (kc > 0) {
+      if (lo.isSome() && (nodes[id].keys[0] <= lo.unwrap())) {
+        return false;
+      }
+      if (hi.isSome() && (nodes[id].keys[kc - 1] >= hi.unwrap())) {
+        return false;
+      }
+    }
+    const kk = nodes[id].kids.length;
+    if (kk > 0 && kk != kc + 1) {
+      return false;
+    }
+    let c: usize = 0;
+    while (c < kk) {
+      if (nodes[id].kids[c] >= nodes.length) {
+        return false;
+      }
+      ids.push(nodes[id].kids[c]);
+      if (c == 0) {
+        los.push(lo);
+      } else {
+        los.push(Some(nodes[id].keys[c - 1]));
+      }
+      if (c == kc) {
+        his.push(hi);
+      } else {
+        his.push(Some(nodes[id].keys[c]));
+      }
+      c += 1;
+    }
+  }
+  return true;
+}
+
+// The number of keys stored in the tree below `root` (iterative; a revisit or bad id stops the walk early).
+export function btreeOrdKeyCount<K extends Ord, V>(nodes: OrdNode<K, V>[], root: usize): usize {
+  if (root >= nodes.length) {
+    return 0;
+  }
+  let ids: usize[] = [root];
+  let total: usize = 0;
+  let visited: usize = 0;
+  while (ids.length > 0) {
+    visited += 1;
+    if (visited > nodes.length) {
+      return total;
+    }
+    const id = ids.pop().unwrap();
+    total += nodes[id].keys.length;
+    let c: usize = 0;
+    while (c < nodes[id].kids.length) {
+      if (nodes[id].kids[c] < nodes.length) {
+        ids.push(nodes[id].kids[c]);
+      }
+      c += 1;
+    }
+  }
+  return total;
+}
+
+// Height of the tree: the number of levels (1 for a single leaf root). Follows the first child down. O(height).
+export function btreeOrdHeight<K extends Ord, V>(nodes: OrdNode<K, V>[], root: usize): usize {
+  let h: usize = 1;
+  let id = root;
+  while (id < nodes.length && nodes[id].kids.length > 0 && h <= nodes.length) {
+    id = nodes[id].kids[0];
+    h += 1;
+  }
+  return h;
+}
+
+// The fewest keys a tree of minimum degree t and the given height can hold: the root has 1 key, every other node
+// at least t-1, so level d >= 1 has >= 2 t^(d-1) nodes and the total is 2 t^(h-1) - 1 (height 1: 1 key, but the
+// root leaf may also be empty, so 0 is returned for an empty tree by the caller). This is why height is O(log_t n).
+@Requires(t >= 2 && h >= 1)
+export function btreeMinKeysOrd(h: usize, t: usize): usize {
+  let p: usize = 1;
+  let d: usize = 1;
+  while (d < h) {
+    p *= t;
+    d += 1;
+  }
+  return 2 * p - 1;
+}
+
+// All keys in order, by an explicit-stack in-order walk (the stack holds a node id and how many of its children
+// were visited). O(n).
+export function btreeOrdKeys<K extends Ord, V>(nodes: OrdNode<K, V>[], root: usize): K[] {
+  let out: K[] = [];
+  let ids: usize[] = [root];
+  let js: usize[] = [0];
+  while (ids.length > 0) {
+    const top = ids.length - 1;
+    const id = ids[top];
+    const j = js[top];
+    const kc = nodes[id].keys.length;
+    if (nodes[id].kids.length == 0) {
+      let a: usize = 0;
+      while (a < kc) {
+        out.push(nodes[id].keys[a]);
+        a += 1;
+      }
+      ids.pop();
+      js.pop();
+    } else {
+      if (j > 0 && j - 1 < kc) {
+        out.push(nodes[id].keys[j - 1]);
+      }
+      if (j <= kc) {
+        js[top] = j + 1;
+        ids.push(nodes[id].kids[j]);
+        js.push(0);
+      } else {
+        ids.pop();
+        js.pop();
+      }
+    }
+  }
+  return out;
+}
+
+// All values in key order (same walk as `btreeOrdKeys`). O(n).
+export function btreeOrdVals<K extends Ord, V>(nodes: OrdNode<K, V>[], root: usize): V[] {
+  let out: V[] = [];
+  let ids: usize[] = [root];
+  let js: usize[] = [0];
+  while (ids.length > 0) {
+    const top = ids.length - 1;
+    const id = ids[top];
+    const j = js[top];
+    const kc = nodes[id].keys.length;
+    if (nodes[id].kids.length == 0) {
+      let a: usize = 0;
+      while (a < kc) {
+        out.push(nodes[id].vals[a]);
+        a += 1;
+      }
+      ids.pop();
+      js.pop();
+    } else {
+      if (j > 0 && j - 1 < kc) {
+        out.push(nodes[id].vals[j - 1]);
+      }
+      if (j <= kc) {
+        js[top] = j + 1;
+        ids.push(nodes[id].kids[j]);
+        js.push(0);
+      } else {
+        ids.pop();
+        js.pop();
+      }
+    }
+  }
+  return out;
+}
+
+// An ordered map from K keys to values of type V: a B-tree of minimum degree t (every node but the root holds
+// t-1 .. 2t-1 keys, all leaves at the same depth) whose nodes live in an arena (`nodes`) and refer to each other
+// by index, so the structure is a plain value (copy-on-write arrays, no pointers, no parent links). `free` lists
+// the arena slots of merged-away nodes for reuse. Insertion splits full nodes on the way down and deletion makes
+// every node it enters hold at least t keys (borrow from a sibling or merge), so both run in one root-to-leaf pass.
+//
+// Invariants (`@Invariant`, checked after every public method by `orin test` / `--check-contracts`): the arena is a
+// valid B-tree of degree t (shape, occupancy, equal leaf depth, no dangling or shared ids, consistent free list),
+// keys are ordered (sorted within nodes and bounded by the separators above them) and the stored count equals the
+// number of keys. Complexity: has/get/put/remove/floorKey/ceilKey/firstKey/lastKey/popFirst/popLast O(t log_t n)
+// (a binary search of O(log t) in each of O(log_t n) nodes, plus O(t) to shift keys inside one node per level on
+// updates); size/isEmpty O(1); keyArray/valueArray O(n); `height()` <= 1 + log_t((n+1)/2). Use t = 16 unless you
+// have measured otherwise; `minDegree` 2 gives the smallest nodes and deepest trees (useful for tests).
+@Invariant(this.t >= 2)
+@Invariant(btreeOrdShapeOk(this.nodes, this.root, this.t, this.free))
+@Invariant(btreeOrdOrderOk(this.nodes, this.root))
+@Invariant(btreeOrdKeyCount(this.nodes, this.root) == this.count)
+export class OrderedMap<K extends Ord, V> {
+  private t: usize;
+  private nodes: OrdNode<K, V>[] = [OrdNode<K, V> { keys: [], vals: [], kids: [] }];
+  private root: usize = 0;
+  private free: usize[] = [];
+  private count: usize = 0;
+
+  // new OrderedMap<K, V>(minDegree): an empty map; every node but the root keeps minDegree-1 .. 2*minDegree-1 keys.
+  @Requires(minDegree >= 2)
+  constructor(minDegree: usize) {
+    this.t = minDegree;
+  }
+
+  // size(): number of entries. O(1).
+  @Ensures(result == this.count)
+  size(): usize {
+    return this.count;
+  }
+
+  // isEmpty(): no entries. O(1).
+  @Ensures(result == (this.size() == 0))
+  isEmpty(): bool {
+    return this.count == 0;
+  }
+
+  // height(): number of levels of the tree (1 for the root leaf). It is logarithmic: a tree with this many levels
+  // holds at least 2 t^(h-1) - 1 keys, so n keys need at most about log_t(n/2) + 1 levels. O(height).
+  @Ensures(result >= 1)
+  @Ensures(this.count > 0 ==> btreeMinKeysOrd(result, this.t) <= this.count)
+  height(): usize {
+    return btreeOrdHeight(this.nodes, this.root);
+  }
+
+  // has(k): is there an entry for k? O(t log_t n).
+  @Ensures(result ==> this.size() > 0)
+  has(k: K): bool {
+    let x = this.root;
+    while (true) {
+      const i = lowerBoundOrd(this.nodes[x].keys, k);
+      if (i < this.nodes[x].keys.length && (this.nodes[x].keys[i] == k)) {
+        return true;
+      }
+      if (this.nodes[x].kids.length == 0) {
+        return false;
+      }
+      x = this.nodes[x].kids[i];
+    }
+    return false;
+  }
+
+  // get(k): the value for k, None when absent. O(t log_t n).
+  @Ensures(result.isSome() == this.has(k))
+  get(k: K): Option<V> {
+    let x = this.root;
+    while (true) {
+      const i = lowerBoundOrd(this.nodes[x].keys, k);
+      if (i < this.nodes[x].keys.length && (this.nodes[x].keys[i] == k)) {
+        return Some(this.nodes[x].vals[i]);
+      }
+      if (this.nodes[x].kids.length == 0) {
+        return None;
+      }
+      x = this.nodes[x].kids[i];
+    }
+    return None;
+  }
+
+  // A fresh arena slot (reusing a freed one) holding the given node contents.
+  private alloc(keys: K[], vals: V[], kids: usize[]): usize {
+    if (this.free.length > 0) {
+      const id = this.free.pop().unwrap();
+      this.nodes[id] = OrdNode<K, V> { keys: keys, vals: vals, kids: kids };
+      return id;
+    }
+    this.nodes.push(OrdNode<K, V> { keys: keys, vals: vals, kids: kids });
+    return this.nodes.length - 1;
+  }
+
+  // Empties an arena slot and puts it on the free list.
+  private release(id: usize): void {
+    this.nodes[id] = OrdNode<K, V> { keys: [], vals: [], kids: [] };
+    this.free.push(id);
+  }
+
+  private insertKey(id: usize, pos: usize, k: K, v: V): void {
+    this.nodes[id].keys.push(k);
+    this.nodes[id].vals.push(v);
+    let j = this.nodes[id].keys.length - 1;
+    while (j > pos) {
+      this.nodes[id].keys[j] = this.nodes[id].keys[j - 1];
+      this.nodes[id].vals[j] = this.nodes[id].vals[j - 1];
+      j -= 1;
+    }
+    this.nodes[id].keys[pos] = k;
+    this.nodes[id].vals[pos] = v;
+  }
+
+  private removeKey(id: usize, pos: usize): void {
+    let j = pos;
+    while (j + 1 < this.nodes[id].keys.length) {
+      this.nodes[id].keys[j] = this.nodes[id].keys[j + 1];
+      this.nodes[id].vals[j] = this.nodes[id].vals[j + 1];
+      j += 1;
+    }
+    this.nodes[id].keys.pop();
+    this.nodes[id].vals.pop();
+  }
+
+  private insertKid(id: usize, pos: usize, kid: usize): void {
+    this.nodes[id].kids.push(kid);
+    let j = this.nodes[id].kids.length - 1;
+    while (j > pos) {
+      this.nodes[id].kids[j] = this.nodes[id].kids[j - 1];
+      j -= 1;
+    }
+    this.nodes[id].kids[pos] = kid;
+  }
+
+  private removeKid(id: usize, pos: usize): void {
+    let j = pos;
+    while (j + 1 < this.nodes[id].kids.length) {
+      this.nodes[id].kids[j] = this.nodes[id].kids[j + 1];
+      j += 1;
+    }
+    this.nodes[id].kids.pop();
+  }
+
+  // Splits the full child number i of node x around its median key, which moves up into x.
+  private splitChild(x: usize, i: usize): void {
+    const t = this.t;
+    const y = this.nodes[x].kids[i];
+    const yk = this.nodes[y].keys;
+    const yv = this.nodes[y].vals;
+    const yc = this.nodes[y].kids;
+    const med = yk[t - 1];
+    const medv = yv[t - 1];
+    let zc: usize[] = [];
+    if (yc.length > 0) {
+      zc = yc.slice(t, yc.length);
+      this.nodes[y].kids = yc.slice(0, t);
+    }
+    const z = this.alloc(yk.slice(t, yk.length), yv.slice(t, yv.length), zc);
+    this.nodes[y].keys = yk.slice(0, t - 1);
+    this.nodes[y].vals = yv.slice(0, t - 1);
+    this.insertKey(x, i, med, medv);
+    this.insertKid(x, i + 1, z);
+  }
+
+  // put(k, v): set the value for k; true when k was new (the size grows by 1), false when an existing value was
+  // replaced. One root-to-leaf pass that splits full nodes on the way down. O(t log_t n).
+  @Ensures(this.has(k) && this.get(k).isSome())
+  @Ensures(result == !old(this.has(k)))
+  @Ensures(result ==> this.size() == old(this.size()) + 1)
+  @Ensures(!result ==> this.size() == old(this.size()))
+  put(k: K, v: V): bool {
+    const maxKeys = 2 * this.t - 1;
+    if (this.nodes[this.root].keys.length == maxKeys) {
+      const nr = this.alloc([], [], [this.root]);
+      this.root = nr;
+      this.splitChild(nr, 0);
+    }
+    let x = this.root;
+    while (true) {
+      const i = lowerBoundOrd(this.nodes[x].keys, k);
+      if (i < this.nodes[x].keys.length && (this.nodes[x].keys[i] == k)) {
+        this.nodes[x].vals[i] = v;
+        return false;
+      }
+      if (this.nodes[x].kids.length == 0) {
+        this.insertKey(x, i, k, v);
+        this.count += 1;
+        return true;
+      }
+      let ci = i;
+      if (this.nodes[this.nodes[x].kids[i]].keys.length == maxKeys) {
+        this.splitChild(x, i);
+        const m = this.nodes[x].keys[i];
+        if ((k == m)) {
+          this.nodes[x].vals[i] = v;
+          return false;
+        }
+        if ((k > m)) {
+          ci = i + 1;
+        }
+      }
+      x = this.nodes[x].kids[ci];
+    }
+    return false;
+  }
+
+  // Child number ci of x has t-1 keys: give it one more from a sibling (rotation through x) or merge it with a
+  // sibling. Returns the id of the child to descend into afterwards. May shrink the root.
+  private fill(x: usize, ci: usize): usize {
+    const t = this.t;
+    const len = this.nodes[x].keys.length;
+    const c = this.nodes[x].kids[ci];
+    if (ci > 0 && this.nodes[this.nodes[x].kids[ci - 1]].keys.length >= t) {
+      const l = this.nodes[x].kids[ci - 1];
+      const ll = this.nodes[l].keys.length;
+      this.insertKey(c, 0, this.nodes[x].keys[ci - 1], this.nodes[x].vals[ci - 1]);
+      this.nodes[x].keys[ci - 1] = this.nodes[l].keys[ll - 1];
+      this.nodes[x].vals[ci - 1] = this.nodes[l].vals[ll - 1];
+      if (this.nodes[l].kids.length > 0) {
+        this.insertKid(c, 0, this.nodes[l].kids[this.nodes[l].kids.length - 1]);
+        this.nodes[l].kids.pop();
+      }
+      this.nodes[l].keys.pop();
+      this.nodes[l].vals.pop();
+      return c;
+    }
+    if (ci < len && this.nodes[this.nodes[x].kids[ci + 1]].keys.length >= t) {
+      const r = this.nodes[x].kids[ci + 1];
+      this.insertKey(c, this.nodes[c].keys.length, this.nodes[x].keys[ci], this.nodes[x].vals[ci]);
+      this.nodes[x].keys[ci] = this.nodes[r].keys[0];
+      this.nodes[x].vals[ci] = this.nodes[r].vals[0];
+      this.removeKey(r, 0);
+      if (this.nodes[r].kids.length > 0) {
+        this.nodes[c].kids.push(this.nodes[r].kids[0]);
+        this.removeKid(r, 0);
+      }
+      return c;
+    }
+    if (ci < len) {
+      this.mergeChildren(x, ci);
+      return c;
+    }
+    const left = this.nodes[x].kids[ci - 1];
+    this.mergeChildren(x, ci - 1);
+    return left;
+  }
+
+  // Merges child i+1 of x and the separator key i into child i; releases child i+1. If x was the root and ends up
+  // without keys, its only child becomes the root.
+  private mergeChildren(x: usize, i: usize): void {
+    const y = this.nodes[x].kids[i];
+    const z = this.nodes[x].kids[i + 1];
+    this.nodes[y].keys.push(this.nodes[x].keys[i]);
+    this.nodes[y].vals.push(this.nodes[x].vals[i]);
+    let a: usize = 0;
+    while (a < this.nodes[z].keys.length) {
+      this.nodes[y].keys.push(this.nodes[z].keys[a]);
+      this.nodes[y].vals.push(this.nodes[z].vals[a]);
+      a += 1;
+    }
+    let b: usize = 0;
+    while (b < this.nodes[z].kids.length) {
+      this.nodes[y].kids.push(this.nodes[z].kids[b]);
+      b += 1;
+    }
+    this.removeKey(x, i);
+    this.removeKid(x, i + 1);
+    this.release(z);
+    if (x == this.root && this.nodes[x].keys.length == 0) {
+      this.root = y;
+      this.release(x);
+    }
+  }
+
+  // remove(k): delete the entry for k and return its value, None when absent. One root-to-leaf pass (CLRS
+  // top-down deletion): a node is only entered when it has at least t keys, so removing from a leaf never
+  // underflows. A key in an inner node is replaced by its predecessor or successor (or the children are merged) and
+  // that key is deleted further down. O(t log_t n).
+  @Ensures(!this.has(k))
+  @Ensures(result.isSome() == old(this.has(k)))
+  @Ensures(result.isSome() ==> this.size() == old(this.size()) - 1)
+  @Ensures(result.isNone() ==> this.size() == old(this.size()))
+  remove(k: K): Option<V> {
+    const t = this.t;
+    let x = this.root;
+    let target = k;
+    let removed: Option<V> = None;
+    let saved = false;
+    while (true) {
+      const len = this.nodes[x].keys.length;
+      const i = lowerBoundOrd(this.nodes[x].keys, target);
+      const isLeaf = this.nodes[x].kids.length == 0;
+      if (i < len && (this.nodes[x].keys[i] == target)) {
+        if (isLeaf) {
+          if (!saved) {
+            removed = Some(this.nodes[x].vals[i]);
+          }
+          this.removeKey(x, i);
+          this.count -= 1;
+          return removed;
+        }
+        if (!saved) {
+          removed = Some(this.nodes[x].vals[i]);
+          saved = true;
+        }
+        const y = this.nodes[x].kids[i];
+        const z = this.nodes[x].kids[i + 1];
+        if (this.nodes[y].keys.length >= t) {
+          let w = y;
+          while (this.nodes[w].kids.length > 0) {
+            w = this.nodes[w].kids[this.nodes[w].kids.length - 1];
+          }
+          const last = this.nodes[w].keys.length - 1;
+          this.nodes[x].keys[i] = this.nodes[w].keys[last];
+          this.nodes[x].vals[i] = this.nodes[w].vals[last];
+          target = this.nodes[w].keys[last];
+          x = y;
+        } else if (this.nodes[z].keys.length >= t) {
+          let w = z;
+          while (this.nodes[w].kids.length > 0) {
+            w = this.nodes[w].kids[0];
+          }
+          this.nodes[x].keys[i] = this.nodes[w].keys[0];
+          this.nodes[x].vals[i] = this.nodes[w].vals[0];
+          target = this.nodes[w].keys[0];
+          x = z;
+        } else {
+          this.mergeChildren(x, i);
+          x = y;
+        }
+      } else {
+        if (isLeaf) {
+          return removed;
+        }
+        const c = this.nodes[x].kids[i];
+        if (this.nodes[c].keys.length < t) {
+          x = this.fill(x, i);
+        } else {
+          x = c;
+        }
+      }
+    }
+    return removed;
+  }
+
+  // firstKey(): the smallest key, None when empty. O(height).
+  @Ensures(result.isSome() == (this.size() > 0))
+  @Ensures(result.isSome() ==> this.has(result.unwrap()))
+  firstKey(): Option<K> {
+    if (this.count == 0) {
+      return None;
+    }
+    let x = this.root;
+    while (this.nodes[x].kids.length > 0) {
+      x = this.nodes[x].kids[0];
+    }
+    return Some(this.nodes[x].keys[0]);
+  }
+
+  // lastKey(): the largest key, None when empty. O(height).
+  @Ensures(result.isSome() == (this.size() > 0))
+  @Ensures(result.isSome() ==> this.has(result.unwrap()))
+  lastKey(): Option<K> {
+    if (this.count == 0) {
+      return None;
+    }
+    let x = this.root;
+    while (this.nodes[x].kids.length > 0) {
+      x = this.nodes[x].kids[this.nodes[x].kids.length - 1];
+    }
+    return Some(this.nodes[x].keys[this.nodes[x].keys.length - 1]);
+  }
+
+  // floorKey(k): the greatest key <= k, None when there is none. One descent. O(t log_t n).
+  @Ensures(result.isSome() ==> (result.unwrap() <= k) && this.has(result.unwrap()))
+  @Ensures(result.isNone() ==> this.firstKey().isNone() || (this.firstKey().unwrap() > k))
+  floorKey(k: K): Option<K> {
+    let best: Option<K> = None;
+    let x = this.root;
+    while (true) {
+      const i = lowerBoundOrd(this.nodes[x].keys, k);
+      if (i < this.nodes[x].keys.length && (this.nodes[x].keys[i] == k)) {
+        return Some(k);
+      }
+      if (i > 0) {
+        best = Some(this.nodes[x].keys[i - 1]);
+      }
+      if (this.nodes[x].kids.length == 0) {
+        return best;
+      }
+      x = this.nodes[x].kids[i];
+    }
+    return best;
+  }
+
+  // ceilKey(k): the smallest key >= k, None when there is none. One descent. O(t log_t n).
+  @Ensures(result.isSome() ==> (result.unwrap() >= k) && this.has(result.unwrap()))
+  @Ensures(result.isNone() ==> this.lastKey().isNone() || (this.lastKey().unwrap() < k))
+  ceilKey(k: K): Option<K> {
+    let best: Option<K> = None;
+    let x = this.root;
+    while (true) {
+      const i = lowerBoundOrd(this.nodes[x].keys, k);
+      if (i < this.nodes[x].keys.length) {
+        if ((this.nodes[x].keys[i] == k)) {
+          return Some(k);
+        }
+        best = Some(this.nodes[x].keys[i]);
+      }
+      if (this.nodes[x].kids.length == 0) {
+        return best;
+      }
+      x = this.nodes[x].kids[i];
+    }
+    return best;
+  }
+
+  // popFirst(): remove the entry with the smallest key and return it, None when empty. O(t log_t n).
+  @Ensures(result.isSome() == (old(this.size()) > 0))
+  @Ensures(result.isSome() ==> this.size() == old(this.size()) - 1 && !this.has(result.unwrap().key))
+  @Ensures(result.isSome() ==> (result.unwrap().key == old(this.firstKey()).unwrap()))
+  @Ensures(result.isSome() && this.size() > 0 ==> (this.firstKey().unwrap() > result.unwrap().key))
+  popFirst(): Option<OrderedEntry<K, V>> {
+    const f = this.firstKey();
+    if (f.isNone()) {
+      return None;
+    }
+    const v = this.remove(f.unwrap()).unwrap();
+    return Some(OrderedEntry<K, V> { key: f.unwrap(), value: v });
+  }
+
+  // popLast(): remove the entry with the largest key and return it, None when empty. O(t log_t n).
+  @Ensures(result.isSome() == (old(this.size()) > 0))
+  @Ensures(result.isSome() ==> this.size() == old(this.size()) - 1 && !this.has(result.unwrap().key))
+  @Ensures(result.isSome() ==> (result.unwrap().key == old(this.lastKey()).unwrap()))
+  @Ensures(result.isSome() && this.size() > 0 ==> (this.lastKey().unwrap() < result.unwrap().key))
+  popLast(): Option<OrderedEntry<K, V>> {
+    const l = this.lastKey();
+    if (l.isNone()) {
+      return None;
+    }
+    const v = this.remove(l.unwrap()).unwrap();
+    return Some(OrderedEntry<K, V> { key: l.unwrap(), value: v });
+  }
+
+  // keyArray(): all keys in increasing order. O(n).
+  @Ensures(result.length == this.size() && isStrictlyIncreasingOrd(result))
+  keyArray(): K[] {
+    return btreeOrdKeys(this.nodes, this.root);
+  }
+
+  // valueArray(): all values in key order. O(n).
+  @Ensures(result.length == this.size())
+  valueArray(): V[] {
+    return btreeOrdVals(this.nodes, this.root);
+  }
+
+  // clear(): remove all entries. O(1).
+  @Ensures(this.size() == 0)
+  clear(): void {
+    this.nodes = [OrdNode<K, V> { keys: [], vals: [], kids: [] }];
     this.root = 0;
     this.free = [];
     this.count = 0;
@@ -2268,5 +3155,153 @@ export class PriorityQueue<T> {
     this.prios = [];
     this.seqs = [];
     this.vals = [];
+  }
+}
+
+// ------------------------------------------------------------------------------------------ MinHeap<T>
+
+// Does the entry (a, s1) leave before (b, s2)? Smaller value first; equal values by insertion number.
+function leavesBeforeOrd<T extends Ord>(a: T, s1: int, b: T, s2: int): bool {
+  return a < b || (a == b && s1 < s2);
+}
+
+// isMinHeap4Ord(vals, seqs): every entry leaves strictly before its up to four children (the generic `isMinHeap4`).
+export function isMinHeap4Ord<T extends Ord>(vals: T[], seqs: int[]): bool {
+  if (vals.length != seqs.length) {
+    return false;
+  }
+  let i: usize = 1;
+  while (i < vals.length) {
+    const p = (i - 1) / 4;
+    if (!leavesBeforeOrd(vals[p], seqs[p], vals[i], seqs[i])) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+// A min-priority queue of values ordered by their own `Ord` instance (ADR-0034, slice 2): `pop` returns the smallest value, and
+// among equal values the one pushed first. The same 4-ary implicit heap as `PriorityQueue<T>` (sifting a hole, parallel arrays),
+// with the value itself as the key instead of a separate `int` priority. Invariants: the arrays have the same length, they form
+// a heap and every insertion number is below the counter `nextSeq`. Contracts state value equality: `pop` returns exactly the
+// value `peek` showed, and it is `<=` every value still queued.
+@Invariant(this.vals.length == this.seqs.length)
+@Invariant(isMinHeap4Ord(this.vals, this.seqs))
+@Invariant(seqsBelow(this.seqs, this.nextSeq))
+@Invariant(this.nextSeq >= 0)
+export class MinHeap<T extends Ord> {
+  private vals: T[] = [];
+  private seqs: int[] = [];
+  private nextSeq: int = 0;
+
+  // size(): number of queued values. O(1).
+  @Ensures(result == this.vals.length)
+  size(): usize {
+    return this.vals.length;
+  }
+
+  // isEmpty(): nothing queued. O(1).
+  @Ensures(result == (this.size() == 0))
+  isEmpty(): bool {
+    return this.vals.length == 0;
+  }
+
+  // peek(): the value `pop` would return, None when empty. O(1).
+  @Ensures(result.isSome() == (this.size() > 0))
+  peek(): Option<T> {
+    if (this.vals.length == 0) {
+      return None;
+    }
+    return Some(this.vals[0]);
+  }
+
+  // allAtLeast(x): every queued value is >= x. O(n).
+  @Ensures(this.size() == 0 ==> result)
+  @Ensures(result && this.size() > 0 ==> this.peek().unwrap() >= x)
+  allAtLeast(x: T): bool {
+    let i: usize = 0;
+    while (i < this.vals.length) {
+      if (this.vals[i] < x) {
+        return false;
+      }
+      i += 1;
+    }
+    return true;
+  }
+
+  // push(x): queue a value. O(log_4 n) comparisons, no allocation besides array growth.
+  @Ensures(this.size() == old(this.size()) + 1)
+  @Ensures(this.peek().unwrap() <= x)
+  @Ensures(this.peek().unwrap() == x || this.peek().unwrap() == old(this.peek()).unwrap())
+  @Ensures(this.allAtLeast(this.peek().unwrap()))
+  push(x: T): void {
+    const s = this.nextSeq;
+    this.nextSeq += 1;
+    let i = this.vals.length;
+    this.vals.push(x);
+    this.seqs.push(s);
+    while (i > 0) {
+      const par = (i - 1) / 4;
+      if (!leavesBeforeOrd(x, s, this.vals[par], this.seqs[par])) {
+        break;
+      }
+      this.vals[i] = this.vals[par];
+      this.seqs[i] = this.seqs[par];
+      i = par;
+    }
+    this.vals[i] = x;
+    this.seqs[i] = s;
+  }
+
+  // pop(): remove and return the smallest value (the earliest pushed among equals); None when empty. The result is equal to the
+  // value `peek` showed and is <= every value still queued. O(log_4 n) levels, up to 4 comparisons each.
+  @Ensures(result.isSome() == (old(this.size()) > 0))
+  @Ensures(result.isSome() ==> this.size() == old(this.size()) - 1)
+  @Ensures(result.isSome() ==> result.unwrap() == old(this.peek()).unwrap())
+  @Ensures(result.isSome() ==> this.allAtLeast(result.unwrap()))
+  @Ensures(result.isNone() ==> this.size() == 0)
+  pop(): Option<T> {
+    if (this.vals.length == 0) {
+      return None;
+    }
+    const top = this.vals[0];
+    const lv = this.vals.pop().unwrap();
+    const ls = this.seqs.pop().unwrap();
+    const n = this.vals.length;
+    if (n > 0) {
+      let i: usize = 0;
+      while (true) {
+        const c = 4 * i + 1;
+        if (c >= n) {
+          break;
+        }
+        const end = c + 4 < n ? c + 4 : n;
+        let m = c;
+        let k = c + 1;
+        while (k < end) {
+          if (leavesBeforeOrd(this.vals[k], this.seqs[k], this.vals[m], this.seqs[m])) {
+            m = k;
+          }
+          k += 1;
+        }
+        if (!leavesBeforeOrd(this.vals[m], this.seqs[m], lv, ls)) {
+          break;
+        }
+        this.vals[i] = this.vals[m];
+        this.seqs[i] = this.seqs[m];
+        i = m;
+      }
+      this.vals[i] = lv;
+      this.seqs[i] = ls;
+    }
+    return Some(top);
+  }
+
+  // clear(): drop all values. O(1).
+  @Ensures(this.size() == 0)
+  clear(): void {
+    this.vals = [];
+    this.seqs = [];
   }
 }
