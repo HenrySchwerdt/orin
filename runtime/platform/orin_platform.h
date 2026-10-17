@@ -491,11 +491,13 @@ int64_t orin_platform_path_real(const char *abs, size_t alen, char *out, size_t 
  * ORIN_PLATFORM_EPERM BEFORE any system call. Timeouts are mandatory: 0..ORIN_PLATFORM_NET_MAXMS, never infinite.
  * A scope is a host pattern ("*" = any, "*.sfx" = names ending in ".sfx", else the exact text, ASCII case-insensitive;
  * for listening the text is an address literal) and a port range lo..hi. Names and addresses containing '*' are invalid.
- * Results of waiting calls are one of: 0 (done), ORIN_PLATFORM_NET_EOF / _TIMEOUT / _RESET, or an errno-style code. */
+ * Results of waiting calls are one of: 0 (done), ORIN_PLATFORM_NET_EOF / _TIMEOUT / _RESET / _CANCELLED, or an errno-style code.
+ * Every wait (accept, connect, recv, send) also observes the WAKE SOURCE bound to the calling thread, see below. */
 #define ORIN_PLATFORM_EPERM 1
 #define ORIN_PLATFORM_NET_EOF 1001 /* orderly end of the stream (recv) */
 #define ORIN_PLATFORM_NET_TIMEOUT 1002
 #define ORIN_PLATFORM_NET_RESET 1003 /* connection reset / aborted / broken pipe */
+#define ORIN_PLATFORM_NET_CANCELLED 1004 /* the wake source bound to the thread was set (orin_platform_wake_*) */
 #define ORIN_PLATFORM_NET_MAXMS 3600000
 #define ORIN_PLATFORM_NET_MAGIC 0x4e455431u
 enum { ORIN_PLATFORM_NET_GRANT = 1, ORIN_PLATFORM_NET_LISTENER = 2, ORIN_PLATFORM_NET_STREAM = 3 };
@@ -536,6 +538,8 @@ int orin_platform_tcp_listen(const orin_platform_net *grant, const char *addr, s
 
 /*@ requires \valid(out) && \valid(peer + (0..pcap-1)) && \valid(peer_port);
     ensures listener not live / denied ==> \result == EPERM, no system call;
+    ensures the bound wake source (or an ancestor) is set before or during the wait ==> \result == ORIN_PLATFORM_NET_CANCELLED, no
+            connection was accepted (it stays in the kernel's queue);
     ensures \result == ORIN_PLATFORM_NET_TIMEOUT ==> no connection arrived within timeout_ms;
     ensures \result == 0 ==> *out is a STREAM (opt & 1: TCP_NODELAY), peer[0..] the NUL-terminated numeric address of the
             peer (truncated to pcap - 1) and *peer_port its port; \result != 0 ==> *out untouched;
@@ -546,14 +550,18 @@ int orin_platform_tcp_accept(const orin_platform_net *listener, int timeout_ms, 
 /*@ requires \valid(out) && (hl == 0 || host[0..hl-1] readable);
     ensures grant not live / denied / CONNECT scope does not cover host:port ==> \result == EPERM, no system call;
     ensures \result == 0 ==> *out is a STREAM connected to host:port within timeout_ms (opt & 1: TCP_NODELAY); a name is
-            resolved by the OS resolver first (that lookup is not bounded by timeout_ms); \result == NET_TIMEOUT or an
-            errno-style code (ECONNREFUSED, ...) otherwise, *out untouched;
+            resolved by the OS resolver first (that lookup is neither bounded by timeout_ms nor interruptible); timeout_ms bounds
+            the WHOLE connect, all addresses together, not each address;
+    ensures the bound wake source (or an ancestor) is set before the lookup or during a wait ==> \result == NET_CANCELLED, no socket
+            is left open; \result == NET_TIMEOUT or an errno-style code (ECONNREFUSED, ...) otherwise, *out untouched;
     assigns *out, the network; */
 int orin_platform_tcp_connect(const orin_platform_net *grant, const char *host, size_t hl, int port, int timeout_ms, int opt,
                               orin_platform_net *out);
 
 /*@ requires \valid(out_len) && (cap == 0 || \valid(buf + (0..cap-1)));
     ensures stream not live / denied ==> \result == EPERM, no system call; cap == 0 ==> EINVAL;
+    ensures the bound wake source (or an ancestor) is set before or during the wait ==> \result == NET_CANCELLED, *out_len == 0, no
+            byte was read (the kernel keeps them);
     ensures \result == 0 ==> 1 <= *out_len <= cap and buf[0..*out_len-1] holds the next bytes; \result in {NET_EOF, NET_TIMEOUT,
             NET_RESET} or an errno-style code ==> *out_len == 0; nothing outside buf[0..cap-1] is written;
     assigns buf[0..cap-1], *out_len, the network; */
@@ -561,6 +569,7 @@ int orin_platform_stream_recv(const orin_platform_net *s, char *buf, size_t cap,
 
 /*@ requires \valid(out_sent) && (len == 0 || data[0..len-1] readable);
     ensures stream not live / denied ==> \result == EPERM, no system call;
+    ensures the bound wake source (or an ancestor) is set before or during the wait ==> \result == NET_CANCELLED, *out_sent == 0;
     ensures \result == 0 ==> 0 <= *out_sent <= len bytes were handed to the OS (a partial write is normal; the caller
             sends the tail again); \result == NET_TIMEOUT ==> the socket stayed unwritable for timeout_ms (*out_sent == 0);
             \result == NET_RESET ==> the peer is gone (no SIGPIPE is raised);
@@ -579,10 +588,55 @@ int orin_platform_net_close(orin_platform_net *h);
 
 /*@ requires \valid(out + (0..cap-1)) && \valid(out_len) && (nlen == 0 || name[0..nlen-1] readable);
     ensures grant not live / denied / CONNECT scope does not cover name (any port) ==> EPERM, no system call;
+    ensures the bound wake source is set before the lookup ==> NET_CANCELLED; once started, getaddrinfo is NOT interruptible: it runs
+            to the OS resolver's own end (the one blocking call of this layer that no wake source or timeout reaches);
     ensures \result == 0 ==> out[0..*out_len-1] holds the numeric addresses of name, each followed by '\n' (IPv4 and IPv6,
             duplicates removed, as many as fit), *out_len <= cap; \result == ENOENT when the name does not resolve;
     assigns out[0..cap-1], *out_len, the network (DNS); */
 int orin_platform_dns_resolve(const orin_platform_net *grant, const char *name, size_t nlen, char *out, size_t cap, size_t *out_len);
+
+/* ---------------------------------------------------------------- wake sources (ADR-0017 Addendum D)
+ * A wake source is a cancellation token that blocked network waits observe. It is a record of this layer with a flag and a
+ * descriptor (eventfd, a pipe off Linux) that is created the first time a wait polls it. A thread BINDS one source; the waits of
+ * orin_platform_tcp_accept / _connect / _stream_recv / _stream_send poll it together with their socket and return
+ * ORIN_PLATFORM_NET_CANCELLED when it is set, also when it was set before the call (checked first, so a cancelled task never
+ * starts new network work). Sources form a tree: a source opened while another is bound is its child, and a wait observes the
+ * child and every ancestor (at most ORIN_PLATFORM_WAKE_DEPTH + 1 levels). A source stays set (cancellation is permanent).
+ * Handles are `generation << 32 | (index + 1)`: a closed source's handle never names a later source that reuses its slot
+ * (the generation changes on close), so a token kept after its scope ended can neither signal nor be mistaken for another.
+ * Thread safe: one internal lock; a source must be closed only when no thread still waits on it (std:task closes it after
+ * every task of its scope has ended). */
+#define ORIN_PLATFORM_WAKE_DEPTH 32
+
+/*@ ensures \result == 0 ==> no source was made (the table is full, or the bound source already has WAKE_DEPTH ancestors); nothing bound;
+    ensures \result > 0 ==> \result names a fresh live, unset source whose parent is the source bound before the call (0 = none), and
+            it is now bound to the calling thread; no descriptor is made yet;
+    assigns the table, the calling thread's binding; */
+int64_t orin_platform_wake_open(void);
+
+/*@ ensures h is not a live handle (never opened, forged, closed already, or from an earlier generation) ==> \result == ORIN_PLATFORM_EINVAL,
+            nothing happens;
+    ensures \result == 0 ==> the source is gone, its descriptor closed, its slot reusable under a new generation; when it was bound
+            to the calling thread, the thread is bound to its parent again;
+    assigns the table, the calling thread's binding; */
+int64_t orin_platform_wake_close(int64_t h);
+
+/*@ ensures \result == 1 ==> h was live and unset and is set now: every wait observing it or a descendant, now or later, returns
+            NET_CANCELLED;
+    ensures \result == 0 ==> nothing changed (h is stale or forged, or the source was already set); signalling is idempotent;
+    assigns the source's flag and descriptor; */
+int64_t orin_platform_wake_signal(int64_t h);
+
+/*@ ensures \result == 2 ==> h is not a live handle; \result == 1 ==> h or an ancestor is set; \result == 0 ==> neither; assigns \nothing; */
+int64_t orin_platform_wake_check(int64_t h);
+
+/*@ ensures \result == the handle bound to the calling thread before the call (0 = none); the thread is bound to h (0 unbinds). A
+            handle that is not live binds as "nothing" (waits ignore it); a new thread starts unbound;
+    assigns the calling thread's binding; */
+int64_t orin_platform_wake_bind(int64_t h);
+
+/*@ ensures \result == the handle bound to the calling thread (0 = none); assigns \nothing; */
+int64_t orin_platform_wake_bound(void);
 
 #ifdef __cplusplus
 }

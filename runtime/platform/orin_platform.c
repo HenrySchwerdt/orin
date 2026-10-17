@@ -14,6 +14,9 @@
 #include <spawn.h>
 #include <stdio.h>
 #include <sys/socket.h>
+#ifdef __linux__
+#include <sys/eventfd.h>
+#endif
 #include <sys/stat.h>
 #include <dirent.h>
 #include <sys/wait.h>
@@ -899,13 +902,148 @@ static int net_make(int fd, unsigned kind, int opt, orin_platform_net *out) {
     return 0;
 }
 
-/* Waits until fd is ready for `ev`: 0, NET_TIMEOUT, EINVAL for a bad timeout, or an errno. */
+/* ---- wake sources (ADR-0017 Addendum D): a cancellation token that a blocked network wait polls together with its socket.
+ * A record is a flag plus a lazily created eventfd (a pipe off Linux); records form a tree (a nested scope's token is a child of
+ * the token its task is bound to), a wait polls the whole chain. Handles are `generation << 32 | (index + 1)`. */
+enum { WAKE_MAX = 1 << 16, WAKE_DEPTH = 32 };
+typedef struct {
+    int rd, wr, live, set, depth;
+    uint32_t gen;
+    int64_t parent;
+} Wake;
+static Wake g_wake[WAKE_MAX];
+static uint32_t g_wake_hi, g_wake_free[WAKE_MAX], g_wake_nfree;
+static pthread_mutex_t g_wk = PTHREAD_MUTEX_INITIALIZER;
+static __thread int64_t t_wake; /* the token the calling thread's waits observe, 0 = none */
+
+static Wake *wake_ref(int64_t h) { /* under g_wk */
+    uint32_t i = (uint32_t)((uint64_t)h & 0xffffffffu) - 1u;
+    return h > 0 && i < g_wake_hi && g_wake[i].live && g_wake[i].gen == (uint32_t)((uint64_t)h >> 32) ? &g_wake[i] : NULL;
+}
+
+static int64_t wake_handle(const Wake *w) { return (int64_t)(((uint64_t)w->gen << 32) | (uint64_t)(w - g_wake + 1)); }
+
+static void wake_poke(const Wake *w) {
+    uint64_t one = 1;
+    ssize_t n = write(w->wr, &one, w->rd == w->wr ? sizeof one : 1);
+    (void)n;
+}
+
+static int wake_fd(Wake *w) { /* under g_wk: the readable end, created on first use; -1 when no descriptor is left */
+    if (w->rd < 0) {
+#ifdef __linux__
+        w->rd = w->wr = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+#else
+        int p[2];
+        if (pipe(p) == 0) {
+            for (int i = 0; i < 2; i++) fcntl(p[i], F_SETFL, fcntl(p[i], F_GETFL) | O_NONBLOCK), fcntl(p[i], F_SETFD, FD_CLOEXEC);
+            w->rd = p[0], w->wr = p[1];
+        }
+#endif
+        if (w->rd >= 0 && w->set) wake_poke(w);
+    }
+    return w->rd;
+}
+
+/* under g_wk: 1 when the token or an ancestor is set, else 0; with fds the readable ends of the chain go to fds[0..*n-1], -1 on EMFILE */
+static int wake_walk(int64_t h, int *fds, int *n) {
+    int set = 0;
+    for (Wake *w; (w = wake_ref(h)) != NULL; h = w->parent) {
+        set |= w->set;
+        if (fds && (fds[*n] = wake_fd(w)) < 0) return -1;
+        if (fds) ++*n;
+    }
+    return set;
+}
+
+int64_t orin_platform_wake_open(void) {
+    pthread_mutex_lock(&g_wk);
+    Wake *p = wake_ref(t_wake);
+    uint32_t i = g_wake_nfree ? g_wake_free[g_wake_nfree - 1] : g_wake_hi;
+    if (i >= WAKE_MAX || (p && p->depth >= WAKE_DEPTH)) {
+        pthread_mutex_unlock(&g_wk);
+        return 0;
+    }
+    if (g_wake_nfree) g_wake_nfree--;
+    else g_wake_hi++;
+    Wake *w = &g_wake[i];
+    w->rd = w->wr = -1, w->live = 1, w->set = 0, w->parent = p ? t_wake : 0, w->depth = p ? p->depth + 1 : 0;
+    t_wake = wake_handle(w);
+    pthread_mutex_unlock(&g_wk);
+    return t_wake;
+}
+
+int64_t orin_platform_wake_close(int64_t h) {
+    pthread_mutex_lock(&g_wk);
+    Wake *w = wake_ref(h);
+    if (!w) {
+        pthread_mutex_unlock(&g_wk);
+        return ORIN_PLATFORM_EINVAL;
+    }
+    if (t_wake == h) t_wake = w->parent;
+    if (w->rd >= 0) close(w->rd);
+    if (w->wr >= 0 && w->wr != w->rd) close(w->wr);
+    w->live = 0, w->gen = (w->gen + 1) & 0x7fffffffu;
+    g_wake_free[g_wake_nfree++] = (uint32_t)(w - g_wake);
+    pthread_mutex_unlock(&g_wk);
+    return 0;
+}
+
+int64_t orin_platform_wake_signal(int64_t h) {
+    pthread_mutex_lock(&g_wk);
+    Wake *w = wake_ref(h);
+    int64_t changed = w && !w->set;
+    if (changed && (w->set = 1, w->wr >= 0)) wake_poke(w);
+    pthread_mutex_unlock(&g_wk);
+    return changed;
+}
+
+int64_t orin_platform_wake_check(int64_t h) {
+    pthread_mutex_lock(&g_wk);
+    int64_t r = wake_ref(h) ? wake_walk(h, NULL, NULL) : 2;
+    pthread_mutex_unlock(&g_wk);
+    return r;
+}
+
+int64_t orin_platform_wake_bind(int64_t h) {
+    int64_t prev = t_wake;
+    t_wake = h;
+    return prev;
+}
+
+int64_t orin_platform_wake_bound(void) { return t_wake; }
+
+static int net_cancelled(void) { /* 1 when the bound token or an ancestor is set */
+    if (!t_wake) return 0;
+    pthread_mutex_lock(&g_wk);
+    int r = wake_walk(t_wake, NULL, NULL);
+    pthread_mutex_unlock(&g_wk);
+    return r;
+}
+
+/* Waits until fd is ready for `ev`: 0, NET_TIMEOUT, NET_CANCELLED (the bound token is set before or while waiting), EINVAL for a
+ * bad timeout, or an errno (EMFILE when the wake descriptor cannot be made). */
 static int net_wait(int fd, short ev, int ms) {
     if (ms < 0 || ms > ORIN_PLATFORM_NET_MAXMS) return ORIN_PLATFORM_EINVAL;
-    struct pollfd p = {fd, ev, 0};
-    int r;
-    while ((r = poll(&p, 1, ms)) < 0 && errno == EINTR) {}
-    return r < 0 ? errno : r == 0 ? ORIN_PLATFORM_NET_TIMEOUT : 0;
+    struct pollfd p[WAKE_DEPTH + 2];
+    int wf[WAKE_DEPTH + 1], n = 0, r = 0;
+    p[0].fd = fd, p[0].events = ev, p[0].revents = 0;
+    if (t_wake) {
+        pthread_mutex_lock(&g_wk);
+        r = wake_walk(t_wake, wf, &n);
+        pthread_mutex_unlock(&g_wk);
+        if (r) return r < 0 ? EMFILE : ORIN_PLATFORM_NET_CANCELLED;
+    }
+    for (int i = 0; i < n; i++) p[i + 1].fd = wf[i], p[i + 1].events = POLLIN, p[i + 1].revents = 0;
+    while ((r = poll(p, (nfds_t)(n + 1), ms)) < 0 && errno == EINTR) {}
+    if (r < 0) return errno;
+    return net_cancelled() ? ORIN_PLATFORM_NET_CANCELLED : r == 0 ? ORIN_PLATFORM_NET_TIMEOUT : 0;
+}
+
+/* what is left of a wait of `ms` that began at t0 (ms when the clock fails: the operation then keeps its per-wait bound) */
+static int net_left(int64_t t0, int ms) {
+    int64_t now = orin_platform_monotonic_millis(), left = ms - (now - t0);
+    return ms < 0 || ms > ORIN_PLATFORM_NET_MAXMS || now < 0 || t0 < 0 ? ms : left < 0 ? 0 : left > ms ? ms : (int)left;
 }
 
 static int net_err(int e) {
@@ -962,14 +1100,15 @@ int orin_platform_tcp_connect(const orin_platform_net *g, const char *host, size
                               orin_platform_net *out) {
     if (net_ok(g, ORIN_PLATFORM_NET_GRANT) || !net_scope(g, ORIN_PLATFORM_NET_CONNECT, host, hl, port)) return ORIN_PLATFORM_EPERM;
     struct addrinfo *ai, *a;
-    int e = port < 1 || port > 65535 ? EINVAL : net_lookup(host, hl, port, 0, &ai);
+    int e = net_cancelled() ? ORIN_PLATFORM_NET_CANCELLED : port < 1 || port > 65535 ? EINVAL : net_lookup(host, hl, port, 0, &ai);
     if (e) return e;
     int fd = -1;
-    for (a = ai, e = ENOENT; a && fd < 0; a = a->ai_next) {
+    int64_t t0 = orin_platform_monotonic_millis(); /* timeout_ms bounds the whole connect, not each address */
+    for (a = ai, e = ENOENT; a && fd < 0 && e != ORIN_PLATFORM_NET_CANCELLED; a = a->ai_next) {
         int s = socket(a->ai_family, SOCK_STREAM, 0), fl = s < 0 ? -1 : fcntl(s, F_GETFL);
         if (fl >= 0 && fcntl(s, F_SETFL, fl | O_NONBLOCK) == 0 && (connect(s, a->ai_addr, a->ai_addrlen) == 0 || errno == EINPROGRESS)) {
             socklen_t n = sizeof e;
-            int w = net_wait(s, POLLOUT, timeout_ms), soe = 0;
+            int w = net_wait(s, POLLOUT, net_left(t0, timeout_ms)), soe = 0;
             if (w == 0 && getsockopt(s, SOL_SOCKET, SO_ERROR, &soe, &n) == 0 && soe == 0) fd = s;
             else e = net_err(w ? w : soe), close(s);
         } else e = errno, s >= 0 ? close(s) : 0;
@@ -1016,7 +1155,7 @@ int orin_platform_dns_resolve(const orin_platform_net *g, const char *name, size
     if (net_ok(g, ORIN_PLATFORM_NET_GRANT) || !net_scope(g, ORIN_PLATFORM_NET_CONNECT, name, nlen, (int)g->sc[1].lo))
         return ORIN_PLATFORM_EPERM;
     struct addrinfo *ai, *a;
-    int e = net_lookup(name, nlen, 0, 0, &ai);
+    int e = net_cancelled() ? ORIN_PLATFORM_NET_CANCELLED : net_lookup(name, nlen, 0, 0, &ai); /* getaddrinfo itself cannot be interrupted */
     for (a = e ? NULL : ai; a; a = a->ai_next) {
         char t[64];
         if (getnameinfo(a->ai_addr, a->ai_addrlen, t, sizeof t, NULL, 0, NI_NUMERICHOST)) continue;
