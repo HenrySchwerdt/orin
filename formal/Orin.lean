@@ -22,6 +22,10 @@ import Orin.SimArr
 import Orin.Hole
 import Orin.Sound
 import Orin.Top
+import Orin.Typed
+import Orin.TypedOps
+import Orin.TypedSound
+import Orin.TypedTop
 import Orin.Examples
 import Orin.Forward
 import Orin.Frozen
