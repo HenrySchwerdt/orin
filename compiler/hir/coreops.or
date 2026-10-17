@@ -1,8 +1,8 @@
 // The core operations of the runtime core dialect (ADR-0013, ADR-0052 step R3a, spec 19 section 4): ONE builtin
 // `BCore(k)` whose number k selects the operation. They give Orin code raw access to memory so that the C object model of
 // runtime/core can be rewritten in Orin (R3b..R3f). An address is a plain `usize`; there is no new type and no operation
-// that turns an address back into a reference. They are reachable only through the internal module `std:fsraw`, which only
-// library code can import (E0301 for user code); a later step narrows that gate to the runtime modules.
+// that turns an address back into a reference. They are reachable only through the internal module `std:core`, which only
+// the modules of the embedded runtime root `$rt` (runtime/core/*.or) can import (E0301 otherwise; ADR-0052 Addendum A).
 //
 // | k  | name     | C                                         | arguments -> result                                       |
 // |----|----------|-------------------------------------------|-----------------------------------------------------------|
@@ -14,36 +14,54 @@
 // | 5  | store32  | 4-byte store of the low 32 bits           | (addr, v: usize) -> void                                  |
 // | 6  | store64  | 8-byte store                              | (addr, v: usize) -> void                                  |
 // | 7  | storeF64 | 8-byte store of an IEEE double            | (addr, v: float) -> void                                  |
-// | 8  | memAlloc | orin_platform_alloc                       | (n: usize) -> usize (never 0; n = 0 allocates 1 byte)     |
+// | 8  | memAlloc | orin_platform_alloc                       | (n: usize) -> usize (never 0; n = 0 allocates 1 byte;     |
+// |    |          |                                           | traps "out of memory" when the allocation fails)          |
 // | 9  | memFree  | orin_platform_free                        | (addr) -> void                                            |
 // | 10 | memCopy  | orin_platform_mem_copy                    | (dst, src, n) -> void (the ranges must not overlap)       |
 // | 11 | memSet   | orin_platform_mem_set                     | (dst, byte: usize (low 8 bits), n) -> void                |
 // | 12 | addrOf   | pointer to usize                          | (x: string | array | record) -> usize, the object      |
 // |    |          |                                           | address; reads x, the reference count does not change     |
+// | 13 | and      | `&`                                       | (a, b: usize) -> usize                                    |
+// | 14 | or       | `|`                                       | (a, b: usize) -> usize                                    |
+// | 15 | xor      | `^`                                       | (a, b: usize) -> usize                                    |
+// | 16 | shl      | `<<`; a shift of 64 or more gives 0       | (a, n: usize) -> usize                                    |
+// | 17 | shr      | `>>`; a shift of 64 or more gives 0       | (a, n: usize) -> usize (logical)                          |
+// | 18 | expect   | __builtin_expect / llvm.expect.i1         | (b: bool, likely: bool) -> bool, b itself; a branch hint  |
+// |    |          |                                           | (`likely` must be a literal for the hint to apply)        |
+// | 19 | cfg      | ORIN_CFG_* macro constants / literals     | (k: usize) -> usize: 0 free lists on, 1 hot counters,     |
+// |    |          |                                           | 2 site census; any other k gives 0                        |
+// | 20 | heapBase | `__thread OrinHeap orin_heap` (1024 bytes)| () -> usize, the address of the per-thread heap block of  |
+// |    |          |                                           | 128 zero-initialised words (spec 19 "R3d.1" lists the     |
+// |    |          |                                           | field offsets; executables only)                          |
+// | 21 | memRealloc | orin_platform_realloc                   | (addr, n: usize) -> usize (never 0; traps "out of memory" |
+// |    |          |                                           | when it fails, the old block is then still valid)         |
+// | 22 | memMove  | orin_platform_mem_move                    | (dst, src, n) -> void (the ranges may overlap)            |
+// | 23 | memCmp   | orin_platform_mem_cmp                     | (a, b, n) -> int: -1, 0 or 1 by the first differing byte  |
 //
 // Loads and stores are native-endian and need no alignment (both backends emit an unaligned access). The memory
 // operations map to the L0 functions of runtime/platform/orin_platform.h; the LLVM backend emits the same behaviour with
 // libc malloc / free and the LLVM memory intrinsics (L0's functions are static inline in a C header). Effects (ADR-0031):
-// every core operation is conservative: a load reads mutable memory, the others write it, so none of them is pure.
+// every core operation that touches memory is conservative: a load reads mutable memory, the others write it, so none of them is pure.
+// The bit operations `and .. shr`, `expect` and `cfg` touch no memory and are pure (`coreOpPure`); heapBase only yields an address.
 
 export function coreOpCount(): usize {
-  return 13;
+  return 24;
 }
 
 function names(): string[] {
   return [
     "load8", "load32", "load64", "loadF64", "store8", "store32", "store64", "storeF64", "memAlloc", "memFree", "memCopy",
-    "memSet", "addrOf"
+    "memSet", "addrOf", "and", "or", "xor", "shl", "shr", "expect", "cfg", "heapBase", "memRealloc", "memMove", "memCmp"
   ];
 }
 
-// The name std:fsraw exports operation k under; "" for an unknown k.
+// The name std:core exports operation k under; "" for an unknown k.
 export function coreOpName(k: usize): string {
   const ns = names();
   return k < ns.length ? ns[k] : "";
 }
 
-// The operation called `name` in std:fsraw.
+// The operation called `name` in std:core.
 export function coreOpFromName(name: string): Option<usize> {
   const ns = names();
   let i: usize = 0;
@@ -61,14 +79,20 @@ export function coreOpRet(k: usize): int {
   if (k == 3) {
     return 2;
   }
-  if (k == 0 || k == 1 || k == 2 || k == 8 || k == 12) {
+  if (k == 0 || k == 1 || k == 2 || k == 8 || k == 12 || k >= 13 && k <= 21 || k == 23) {
     return 1;
   }
   return 0;
 }
 
-// True for a load (reads memory, writes nothing); false for the operations that write or allocate. addrOf touches no
-// memory at all and is counted as a read.
+// True for a load (reads memory, writes nothing); false for the operations that write or allocate. addrOf and heapBase touch no
+// memory themselves and are counted as reads, memCmp reads two ranges.
 export function coreOpReads(k: usize): bool {
-  return k <= 3 || k == 12;
+  return k <= 3 || k == 12 || k == 20 || k == 23;
+}
+
+// True for the operations without any effect and without a dependence on memory: the bit operations, `expect` and `cfg`.
+// They are not I/O (check/purity.or) and may appear in a pure function.
+export function coreOpPure(k: usize): bool {
+  return k >= 13 && k <= 19;
 }

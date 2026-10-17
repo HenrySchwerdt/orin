@@ -3,7 +3,7 @@
 // repository root; every command starts with `cd <root>`, like the Python script's `cwd=ROOT`.
 
 import { FsGrant, exists, listDir, readFile } from "std:fs";
-import { shq, sortedStrings, reprStr, reprBytes, cutBytes } from "./text";
+import { shq, strip, sortedStrings, reprStr, reprBytes, cutBytes } from "./text";
 import { Options } from "./cli";
 
 export const OUT: string = "build/diff";
@@ -82,26 +82,67 @@ export type Pipe = {
   timeouts: int[];
 };
 
+// The words of `key` (`<world>.<kind>`) in the runtime source list `text` (tools/runtime-sources.txt, the one place that names
+// the runtime files; tools/runtime_files.sh reads it too). Lines are `key = word ...`, `#` starts a comment line.
+export function listWords(text: string, key: string): string[] {
+  for (const line of text.split("\n")) {
+    const eq = line.indexOf("=");
+    if (!line.startsWith("#") && eq.isSome() && strip(line.substring(0, eq.unwrap())) == key) {
+      let words: string[] = [];
+      for (const w of line.substring(eq.unwrap() + 1, line.length).split(" ")) {
+        if (w != "") {
+          words.push(strip(w));
+        }
+      }
+      return words;
+    }
+  }
+  return [];
+}
+
+// The `-I` flags of a world (`core`: the live runtime, `legacy`: the frozen snapshot bootstrap/seed/runtime/).
+export function includeFlags(text: string, world: string): string[] {
+  let flags: string[] = [];
+  for (const d of listWords(text, world + ".include")) {
+    flags.push("-I");
+    flags.push(d);
+  }
+  return flags;
+}
+
 // C compiler command and flags of a side: clang -O2 for the LLVM side, `--cc` -O1 otherwise; sanitizers on both.
-export function ccBase(o: Options, llvm: bool): string[] {
+export function ccBase(o: Options, llvm: bool, world: string): string[] {
   let cc: string[] = [];
   if (llvm) {
-    cc = ["clang", "-O2", "-w", "-I", "runtime/core"];
+    cc = ["clang", "-O2", "-w"];
   } else {
-    cc = [o.cc, "-O1", "-w", "-I", "runtime/core"];
+    cc = [o.cc, "-O1", "-w"];
   }
+  cc = cc.concat(includeFlags(o.rtList, world));
   if (o.sanitize) {
     cc = cc.concat(["-fsanitize=address,undefined", "-fno-omit-frame-pointer"]);
   }
   return cc;
 }
 
-export function runtimeSources(llvm: bool): string[] {
-  let srcs = ["runtime/core/orin_runtime.c", "runtime/platform/orin_platform.c"];
+export function runtimeSources(o: Options, llvm: bool, world: string): string[] {
+  let srcs = listWords(o.rtList, world + ".sources");
   if (llvm) {
-    srcs.push("runtime/core/orin_runtime_llvm.c");
+    srcs = srcs.concat(listWords(o.rtList, world + ".llvm"));
   }
   return srcs;
+}
+
+// True when the flags of the alternative side select the legacy world (the C runtime path, `--c-builtins`): that side is
+// linked with the frozen runtime snapshot (ADR-0052 Addendum A section 4), so `--mode builtins` compares the new world
+// against the legacy world: same program, same compiler, different runtime.
+export function isLegacy(extra: string[]): bool {
+  for (const f of extra) {
+    if (f == "--c-builtins") {
+      return true;
+    }
+  }
+  return false;
 }
 
 export function pipeline(o: Options, p: Program, tag: string, extra: string[], llvm: bool): Pipe {
@@ -112,9 +153,10 @@ export function pipeline(o: Options, p: Program, tag: string, extra: string[], l
   const ccerr = stem + ".ccerr";
   const rout = stem + ".rout";
   const cd = "cd " + shq(o.root) + " && ";
+  const world = isLegacy(extra) ? "legacy" : "core";
   const compile = cd + words([compilerPath(o.orinc), "compile", p.entry, "-o", cFile].concat(extra))
     + " >/dev/null 2>" + shq(cerr) + " </dev/null";
-  const build = cd + words(ccBase(o, llvm).concat([cFile]).concat(runtimeSources(llvm)).concat(["-lm", "-o", exe]))
+  const build = cd + words(ccBase(o, llvm, world).concat([cFile]).concat(runtimeSources(o, llvm, world)).concat(["-lm", "-o", exe]))
     + " >/dev/null 2>" + shq(ccerr) + " </dev/null";
   const run = cd + shq("./" + exe) + " >" + shq(rout) + " 2>/dev/null </dev/null";
   return Pipe {

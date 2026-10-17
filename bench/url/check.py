@@ -5,8 +5,11 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "tools"))
+from runtime_files import rt_inc, rt_src, rt_llvm  # the runtime source list: tools/runtime-sources.txt
 
 
 def run(args):
@@ -17,11 +20,11 @@ def build(orin, source, target, backend, contracts, sanitize):
     generated = target.with_suffix(".ll" if backend == "llvm" else ".c")
     flags = ["--check-contracts"] if contracts else []
     run([orin, "compile", str(source), "-o", str(generated), "--backend=" + backend] + flags)
-    sources = [str(generated), "runtime/core/orin_runtime.c", "runtime/platform/orin_platform.c"]
+    sources = [str(generated), *rt_src()]
     if backend == "llvm":
-        sources.append("runtime/core/orin_runtime_llvm.c")
+        sources.extend(rt_llvm())
     sanitizer = ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"] if sanitize else []
-    run(["clang", "-O2", "-w", "-I", "runtime/core"] + sanitizer + sources + ["-lm", "-o", str(target)])
+    run(["clang", "-O2", "-w", *rt_inc()] + sanitizer + sources + ["-lm", "-o", str(target)])
 
 
 def main():

@@ -13,13 +13,21 @@ A structured fragment of MIR (`compiler/mir/mir.or`, `docs/mir.md`) over the mac
 * ownership-*transferring* operations (`move`, `structNew`, `setField`, `putField`,
   `takeField`) move a count without touching the reference count;
 * control flow is structured: `Code` is straight-line code with `ite` (if/else with a
-  continuation).  Loops and calls are not modelled.
+  continuation) and `loop` (while).  Calls are not modelled in this file.
 
 The concrete machine knows nothing about ownership states; `bad` is still only "access to a
 non-live location or in-place store into an object whose count is not 1".
 -/
 
 namespace Orin
+
+/-- Parameter modes (`MFunction.paramOwned`, `docs/mir.md`): a scalar, a reference borrowed from the
+caller for the whole call, or an owned reference (one count handed over by the caller). -/
+inductive PM where
+  | scalar
+  | borrowed
+  | owned
+  deriving DecidableEq, Repr
 
 /-- Straight-line MIR core instructions (`ite` lives in `Code`). -/
 inductive MI where
@@ -35,7 +43,8 @@ inductive MI where
   | release (x : Nat)
   /-- allocation of a fresh count-1 object with `n` scalar-zero slots; `d` becomes `Unique`.
   `IStructNew d slots` is the macro `Code.structNew`: `alloc d |slots|` followed by one
-  `setField d i yᵢ` per operand (operands consumed left to right). -/
+  `putField d i yᵢ` per operand (operands consumed left to right; the checker opens a hole for every
+  slot of a fresh object and each `putField` closes one). -/
   | alloc (d n : Nat)
   /-- `IGetField d o i`; `isRef` is the static class of `d` (reference: borrowed result;
   scalar: plain value) -/
@@ -48,12 +57,30 @@ inductive MI where
   | putField (x i s : Nat)
   /-- `IMakeUnique x` -/
   | makeUnique (x : Nat)
+  /-- `IArrayLen d a`: `d` receives the length of the array (the number of slots) -/
+  | arrayLen (d a : Nat)
+  /-- `IArrayGet d a i`: bounds-checked element read; the index is the scalar local `i`
+  (`getField` with a run-time index; out of range = `trap`) -/
+  | arrayGet (d a i : Nat) (isRef : Bool)
+  /-- `IArraySet x i v`: bounds-checked in-place element store (`setField` with a run-time index) -/
+  | arraySet (x i v : Nat)
+  /-- `IArrayNew d nl`: fresh count-1 array of `n` zero elements, `n` the scalar local `nl`
+  (a negative length traps) -/
+  | arrayNew (d nl : Nat)
 
 /-- Structured code: straight line, with if/else and a continuation after the join. -/
 inductive Code where
   | nil : Code
   | op (i : MI) (k : Code) : Code
   | ite (c : Nat) (t e k : Code) : Code
+  /-- `while`: test the scalar local `c`; `0` runs the body `t` and tests again, anything else
+  leaves the loop and continues with `k`.  (The condition is recomputed at the end of the body;
+  a MIR header block that computes it is duplicated in front of the loop.) -/
+  | loop (c : Nat) (t k : Code) : Code
+  /-- `ICall d f args`: call function `f` of the program with the operands `args`; the result
+  goes to the local `d`.  The machine step of a call is `cstep` (`Call.lean`); the single-frame
+  `mstep` treats a call as a stop. -/
+  | call (d f : Nat) (args : List Nat) (k : Code) : Code
 
 namespace Code
 
@@ -61,11 +88,13 @@ def app : Code → Code → Code
   | .nil, k => k
   | .op i c, k => .op i (app c k)
   | .ite c t e k', k => .ite c t e (app k' k)
+  | .loop c t k', k => .loop c t (app k' k)
+  | .call d f args k', k => .call d f args (app k' k)
 
 /-- operands stored into slots `i, i+1, …` of the fresh object `d` -/
 def storeAll (d : Nat) : Nat → List Nat → Code → Code
   | _, [], k => k
-  | i, y :: ys, k => .op (.setField d i y) (storeAll d (i + 1) ys k)
+  | i, y :: ys, k => .op (.putField d i y) (storeAll d (i + 1) ys k)
 
 /-- `IStructNew d ys`: allocate, then move each operand into its slot. -/
 def structNew (d : Nat) (ys : List Nat) (k : Code) : Code :=
@@ -104,7 +133,7 @@ def opAllocN (s : St) (d n : Nat) : Res St :=
 destination must receive a scalar, a reference destination a reference (`ill` otherwise: type
 confusion, or a read of an emptied/`hole` slot, which the hole discipline of the verifier is
 meant to exclude). -/
-def opGetField (s : St) (d o i : Nat) (isRef : Bool) : Res St :=
+def opGetFieldE (oob : Res St) (s : St) (d o i : Nat) (isRef : Bool) : Res St :=
   if d < s.locals.length ∧ o < s.locals.length then
     match s.get o with
     | .int _ => .ill
@@ -113,7 +142,7 @@ def opGetField (s : St) (d o i : Nat) (isRef : Bool) : Res St :=
       | none => .bad .dead
       | some ob =>
         match ob.fields[i]? with
-        | none => .trap
+        | none => oob
         | some w =>
           match isRef, w with
           | false, .ref _ => .ill
@@ -121,9 +150,14 @@ def opGetField (s : St) (d o i : Nat) (isRef : Bool) : Res St :=
           | _, _ => .ok (s.setL d w)
   else .ill
 
+/-- struct field read: an index at or beyond the arity of the struct is an ill-shaped access
+(`ill`; the shape check of `Typed.lean` rules it out).  Array element reads (`opArrayGet`) use the
+same lookup with a bounds *trap* instead. -/
+def opGetField (s : St) (d o i : Nat) (isRef : Bool) : Res St := opGetFieldE .ill s d o i isRef
+
 /-- `ISetField`/`IPutField`: in-place update of a count-1 object; the stored value is
 *moved* (no retain); the old slot value is released. -/
-def opSetField (s : St) (x i v : Nat) : Res St :=
+def opSetFieldE (oob : Res St) (s : St) (x i v : Nat) : Res St :=
   if x < s.locals.length ∧ v < s.locals.length then
     match s.get x with
     | .int _ => .ill
@@ -133,12 +167,15 @@ def opSetField (s : St) (x i v : Nat) : Res St :=
       | some ob =>
         if ob.rc ≠ 1 then .bad .shared else
         match ob.fields[i]? with
-        | none => .trap
+        | none => oob
         | some old =>
           .ok { s.clr v with
                 heap := s.heap.setObj l { ob with fields := ob.fields.set i (s.get v) },
                 pending := old :: s.pending }
   else .ill
+
+/-- struct slot store: an index at or beyond the arity is `ill` (array stores trap instead). -/
+def opSetField (s : St) (x i v : Nat) : Res St := opSetFieldE .ill s x i v
 
 /-- `ITakeField`: the (reference) slot is emptied (`int 0`), its value moves into `d`. -/
 def opTakeField (s : St) (d x i : Nat) : Res St :=
@@ -151,13 +188,67 @@ def opTakeField (s : St) (d x i : Nat) : Res St :=
       | some ob =>
         if ob.rc ≠ 1 then .bad .shared else
         match ob.fields[i]? with
-        | none => .trap
+        | none => .ill
         | some old =>
           match old with
           | .int _ => .ill
           | .ref _ =>
             .ok { s.setL d old with
                   heap := s.heap.setObj l { ob with fields := ob.fields.set i (.int 0) } }
+  else .ill
+
+/-- Array access with a run-time index: a negative index is a `trap` and never a `bad`; the
+array itself is inspected first (a dead array is `bad dead`, a scalar is `ill`), then the bounds
+check fires. -/
+def opArrayGet (s : St) (d a i : Nat) (isRef : Bool) : Res St :=
+  if i < s.locals.length then
+    match s.get i with
+    | .ref _ => .ill
+    | .int n =>
+      if 0 ≤ n then opGetFieldE .trap s d a n.toNat isRef
+      else if d < s.locals.length ∧ a < s.locals.length then
+        match s.get a with
+        | .int _ => .ill
+        | .ref l =>
+          match s.heap.objs l with
+          | none => .bad .dead
+          | some _ => .trap
+      else .ill
+  else .ill
+
+def opArraySet (s : St) (x i v : Nat) : Res St :=
+  if i < s.locals.length then
+    match s.get i with
+    | .ref _ => .ill
+    | .int n =>
+      if 0 ≤ n then opSetFieldE .trap s x n.toNat v
+      else if x < s.locals.length ∧ v < s.locals.length then
+        match s.get x with
+        | .int _ => .ill
+        | .ref l =>
+          match s.heap.objs l with
+          | none => .bad .dead
+          | some ob => if ob.rc ≠ 1 then .bad .shared else .trap
+      else .ill
+  else .ill
+
+def opArrayLen (s : St) (d a : Nat) : Res St :=
+  if d < s.locals.length ∧ a < s.locals.length then
+    match s.get a with
+    | .int _ => .ill
+    | .ref l =>
+      match s.heap.objs l with
+      | none => .bad .dead
+      | some ob => .ok (s.setL d (.int ob.fields.length))
+  else .ill
+
+def opArrayNew (s : St) (d nl : Nat) : Res St :=
+  if nl < s.locals.length then
+    match s.get nl with
+    | .ref _ => .ill
+    | .int n =>
+      if 0 ≤ n then opAllocN s d n.toNat
+      else if d < s.locals.length then .trap else .ill
   else .ill
 
 def Res.liftC (rest : Code) : Res St → Res (Code × St)
@@ -179,6 +270,10 @@ def mop (s : St) : MI → Res St
   | .takeField d x j => opTakeField s d x j
   | .putField x j y => opSetField s x j y
   | .makeUnique x => opMakeUnique s x
+  | .arrayLen d a => opArrayLen s d a
+  | .arrayGet d a i r => opArrayGet s d a i r
+  | .arraySet x i v => opArraySet s x i v
+  | .arrayNew d nl => opArrayNew s d nl
 
 def mexec (i : MI) (rest : Code) (s : St) : Res (Code × St) :=
   Res.liftC rest (mop s i)
@@ -196,6 +291,14 @@ def mstep (c : Code × St) : Option (Res (Code × St)) :=
         match c.2.get cnd with
         | .int 0 => some (.ok (t.app k, c.2))
         | .int _ => some (.ok (e.app k, c.2))
+        | .ref _ => some .ill
+      else some .ill
+    | .call .. => none
+    | .loop cnd t k =>
+      if cnd < c.2.locals.length then
+        match c.2.get cnd with
+        | .int 0 => some (.ok (t.app (.loop cnd t k), c.2))
+        | .int _ => some (.ok (k, c.2))
         | .ref _ => some .ill
       else some .ill
 

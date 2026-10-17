@@ -63,23 +63,24 @@ theorem setObj_other (H : Heap) (l : Nat) (o : Obj) (k : Nat) (hk : k ≠ l) :
     (H.setObj l o).objs k = H.objs k := by
   rw [setObj_objs]; simp [hk]
 
-theorem op_set_core {x i v : Nat} {a1 : List AS} (hI : Inv ext a s) (hx : x < a.length)
+theorem op_set_core {x i v : Nat} {a1 : List AS} (oob : Res St)
+    (hoob : (∀ k, oob ≠ .bad k) ∧ ∀ s', oob ≠ .ok s') (hI : Inv ext a s) (hx : x < a.length)
     (hxv : x ≠ v) (hu : gk a x = .unique) (hv : v < a.length)
     (hcons : (gk a v = .init ∧ a1 = a) ∨ ((gk a v).counted = true ∧ a1 = killK a v)) :
-    OpSafe ext (killB x a1) (opSetField s x i v) := by
+    OpSafe ext (killB x a1) (opSetFieldE oob s x i v) := by
   have hxl : x < s.locals.length := hI.len ▸ hx
   have hvl : v < s.locals.length := hI.len ▸ hv
   obtain ⟨l, ob, hl, hob, hrc⟩ := (hI.cl x).uniq hu
   cases hold : ob.fields[i]? with
   | none =>
-    have hop : opSetField s x i v = .trap := by
-      simp [opSetField, hxl, hvl, hl, hob, hrc, hold]
+    have hop : opSetFieldE oob s x i v = oob := by
+      simp [opSetFieldE, hxl, hvl, hl, hob, hrc, hold]
     refine ⟨?_, fun s' hs => ?_⟩
-    · intro k hh; rw [hop] at hh; cases hh
-    · rw [hop] at hs; cases hs
+    · intro k hh; rw [hop] at hh; exact hoob.1 k hh
+    · rw [hop] at hs; exact (hoob.2 s' hs).elim
   | some old =>
-    have hop : opSetField s x i v = .ok (setSt s l ob i v old) := by
-      simp [opSetField, hxl, hvl, hl, hob, hrc, hold, setSt]
+    have hop : opSetFieldE oob s x i v = .ok (setSt s l ob i v old) := by
+      simp [opSetFieldE, hxl, hvl, hl, hob, hrc, hold, setSt]
     refine ⟨?_, fun s' hs => ?_⟩
     · intro k hh; rw [hop] at hh; cases hh
     rw [hop] at hs
@@ -210,28 +211,33 @@ theorem consume_spec {a : List AS} {v : Nat} {a1 : List AS} (h : consume a v = s
     · right; exact ⟨rfl, h.symm⟩
   · simp at h
 
-theorem op_setField {x i v : Nat} (hI : Inv ext a s)
-    (h : stepL np a (.setField x i v) = some a') : OpSafe ext a' (opSetField s x i v) := by
-  simp only [stepL] at h
+theorem op_setFieldE {x i v : Nat} (oob : Res St)
+    (hoob : (∀ k, oob ≠ .bad k) ∧ ∀ s', oob ≠ .ok s') (hI : Inv ext a s)
+    (h : stepL np a (.setField x i v) = some a') : OpSafe ext a' (opSetFieldE oob s x i v) := by
+  simp only [stepL, stepSet] at h
   split at h
   · rename_i hc
     obtain ⟨hx, hxv, hu⟩ := hc
     obtain ⟨a1, h1, h2⟩ := Option.map_eq_some_iff.mp h
     subst h2
     obtain ⟨hv, hcons⟩ := consume_spec h1
-    exact op_set_core hI hx hxv hu hv hcons
+    exact op_set_core oob hoob hI hx hxv hu hv hcons
   · simp at h
+
+theorem op_setField {x i v : Nat} (hI : Inv ext a s)
+    (h : stepL np a (.setField x i v) = some a') : OpSafe ext a' (opSetField s x i v) :=
+  op_setFieldE .ill oob_ill_ok hI h
 
 theorem op_putField {x i v : Nat} (hI : Inv ext a s)
     (h : stepL np a (.putField x i v) = some a') : OpSafe ext a' (opSetField s x i v) := by
-  simp only [stepL] at h
+  simp only [stepL, stepSet] at h
   split at h
   · rename_i hc
     obtain ⟨hx, hxv, hu⟩ := hc
     obtain ⟨a1, h1, h2⟩ := Option.map_eq_some_iff.mp h
     subst h2
     obtain ⟨hv, hcons⟩ := consume_spec h1
-    exact op_set_core hI hx hxv hu hv hcons
+    exact op_set_core .ill oob_ill_ok hI hx hxv hu hv hcons
   · simp at h
 
 /-- state after a successful `opTakeField` -/
@@ -251,7 +257,7 @@ theorem op_takeField {d x i : Nat} (hI : Inv ext a s)
     obtain ⟨l, ob, hl, hob, hrc⟩ := (hI.cl x).uniq hu
     cases hold : ob.fields[i]? with
     | none =>
-      have hop : opTakeField s d x i = .trap := by
+      have hop : opTakeField s d x i = .ill := by
         simp [opTakeField, hdl, hxl, hl, hob, hrc, hold]
       refine ⟨?_, fun s' hs => ?_⟩
       · intro k hh; rw [hop] at hh; cases hh

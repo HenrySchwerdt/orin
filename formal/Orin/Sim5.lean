@@ -76,7 +76,7 @@ def allocSt (s : St) (d n : Nat) : St :=
 
 theorem op_alloc {d n : Nat} (hI : Inv ext a s)
     (h : stepL np a (.alloc d n) = some a') : OpSafe ext a' (opAllocN s d n) := by
-  simp only [stepL] at h
+  simp only [stepL, stepAlloc] at h
   split at h
   · rename_i hc
     obtain ⟨hd, _⟩ := hc
@@ -161,9 +161,17 @@ theorem def_uncounted {d : Nat} (hI : Inv ext a s) (hd : d < a.length) (k : AS)
       (defK_hk1 a a d _ (hI.len ▸ hdl) (fun i => Or.inl rfl))
       (hU_same rfl) (hD_same rfl) (hDp_same rfl) i hi
 
-theorem op_getField {d o i : Nat} {r : Bool} (hI : Inv ext a s)
-    (h : stepL np a (.getField d o i r) = some a') : OpSafe ext a' (opGetField s d o i r) := by
-  simp only [stepL] at h
+/-- the out-of-range outcomes (`ill`, `trap`) are neither `bad` nor `ok` -/
+theorem oob_ill_ok : (∀ k, (Res.ill : Res St) ≠ .bad k) ∧ ∀ s', (Res.ill : Res St) ≠ .ok s' :=
+  ⟨(fun _ hh => by cases hh), (fun _ hh => by cases hh)⟩
+
+theorem oob_trap_ok : (∀ k, (Res.trap : Res St) ≠ .bad k) ∧ ∀ s', (Res.trap : Res St) ≠ .ok s' :=
+  ⟨(fun _ hh => by cases hh), (fun _ hh => by cases hh)⟩
+
+theorem op_getFieldE {d o i : Nat} {r : Bool} (oob : Res St) (hoob : (∀ k, oob ≠ .bad k) ∧ ∀ s', oob ≠ .ok s')
+    (hI : Inv ext a s)
+    (h : stepL np a (.getField d o i r) = some a') : OpSafe ext a' (opGetFieldE oob s d o i r) := by
+  simp only [stepL, stepGet] at h
   split at h
   · rename_i hc
     obtain ⟨hd, ho, _, hrefo⟩ := hc
@@ -181,15 +189,15 @@ theorem op_getField {d o i : Nat} {r : Bool} (hI : Inv ext a s)
     rcases hcase with ⟨w, hw⟩ | hnone
     · have hwmem : w ∈ obj.fields := List.mem_of_getElem? hw
       by_cases hok : (r = false ∧ (∃ l, w = .ref l)) ∨ (r = true ∧ (∃ n, w = .int n))
-      · have hop : opGetField s d o i r = .ill := by
+      · have hop : opGetFieldE oob s d o i r = .ill := by
           rcases hok with ⟨hr, l, hl⟩ | ⟨hr, n, hn⟩
-          · subst hr; subst hl; simp [opGetField, hdl, hol, hlo, hobj, hw]
-          · subst hr; subst hn; simp [opGetField, hdl, hol, hlo, hobj, hw]
+          · subst hr; subst hl; simp [opGetFieldE, hdl, hol, hlo, hobj, hw]
+          · subst hr; subst hn; simp [opGetFieldE, hdl, hol, hlo, hobj, hw]
         refine ⟨?_, fun s' hs => ?_⟩
         · intro k hh; rw [hop] at hh; cases hh
         · rw [hop] at hs; cases hs
-      · have hop : opGetField s d o i r = .ok (s.setL d w) := by
-          cases r <;> cases w <;> simp_all [opGetField, hdl, hol, hlo, hobj, hw]
+      · have hop : opGetFieldE oob s d o i r = .ok (s.setL d w) := by
+          cases r <;> cases w <;> simp_all [opGetFieldE, hdl, hol, hlo, hobj, hw]
         refine ⟨?_, fun s' hs => ?_⟩
         · intro k hh; rw [hop] at hh; cases hh
         rw [hop] at hs
@@ -273,11 +281,15 @@ theorem op_getField {d o i : Nat} {r : Bool} (hI : Inv ext a s)
               | _ => rw [hk] at hrefo; simp [AS.isRef] at hrefo
             · exact hcl i' hi'
           · simp at h
-    · have hop : opGetField s d o i r = .trap := by
-        simp [opGetField, hdl, hol, hlo, hobj, hnone]
+    · have hop : opGetFieldE oob s d o i r = oob := by
+        simp [opGetFieldE, hdl, hol, hlo, hobj, hnone]
       refine ⟨?_, fun s' hs => ?_⟩
-      · intro k hh; rw [hop] at hh; cases hh
-      · rw [hop] at hs; cases hs
+      · intro k hh; rw [hop] at hh; exact hoob.1 k hh
+      · rw [hop] at hs; exact (hoob.2 s' hs).elim
   · simp at h
+
+theorem op_getField {d o i : Nat} {r : Bool} (hI : Inv ext a s)
+    (h : stepL np a (.getField d o i r) = some a') : OpSafe ext a' (opGetField s d o i r) :=
+  op_getFieldE .ill oob_ill_ok hI h
 
 end Orin
