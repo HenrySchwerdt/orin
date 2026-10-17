@@ -189,7 +189,7 @@ The test runner understands `// flags: --check-contracts` and `// stderr: text` 
 (`tools/run_tests.py`; for an error test `// stderr:` is matched against the compiler's output, which pins the
 text of an E0416 message).
 
-## `orin verify --contracts [--format=json] [--z3 PATH] [--strict] entry.or` (phase 2, ADR-0031 B/C, ADR-0036)
+## `orin verify --contracts [--format=json] [--z3 PATH] [--timeout-ms N] [--retry-ms N] [--rlimit N] [--strict] entry.or` (phase 2, ADR-0031 B/C, ADR-0036)
 
 Generates verification conditions and discharges them with z3 (`z3 -in`, SMT-LIB 2; install with
 `pip install z3-solver` or your package manager). Query files are kept in `build/contracts-vc/` (`qN.smt2`, the solver's
@@ -198,6 +198,21 @@ answer in `qN.out`; a bounded counterexample search writes `qNb.smt2`). Per clau
 reason; never upgraded to VERIFIED). Exit status 1 if any clause is REFUTED (or, with `--strict`, UNKNOWN). The units of
 the program are verified; the std modules it imports (`$stdlib/..`) are *read* for their contracts (modular calls) but not
 verified. To verify a std module, give it as the entry (a copy with a `main`, see "Measuring" in docs/assurance.md).
+
+**Solver budget.** Almost all of the run time is z3 queries that end in `unknown`, so the budget decides the speed:
+`--timeout-ms N` is the wall time of the first query of an obligation (default 4000), `--retry-ms N` the wall time of the
+bounded counterexample search that follows an `unknown` (default 1000, 0 = no retry; `rawProve` in `compiler/vc/vc.or`) and
+`--rlimit N` z3's deterministic resource limit (`rlimit=N`, default 0 = none) on top of the wall time. The hard limit of
+z3 (`-T`) is the wall time rounded up to seconds plus 2. Measured on the compiler (z3 4.8.12): between 1 s and 4 s a query
+is almost never solved (of 4 700 solved first queries 25 took more than 2 s), and the retry with 4 s gave 26 counterexamples and 8
+proofs in 900 runs for 45 % of the z3 time; the retry cap of 1 s (the default) and also `--timeout-ms 2000` changed no status on the
+modules measured (opt, lower, check, vc, loader, syntax), and `--timeout-ms 2000` halves the time of `opt`. The first
+query keeps 4 s by default because a rare slow proof is lost under a lower budget (`i32_square` in
+tests/contracts/verify_int_widths.or needs about 2.3 s and turns UNKNOWN at 2 s on a loaded machine): use
+`--timeout-ms 2000` for quick runs. A wall-time limit makes a result depend on
+the load of the machine; `--rlimit` does not, but z3 counts resource units unevenly (about 1.5 million per second on solved
+queries, much fewer on a query stuck in quantifier instantiation, which then runs to the wall time), so it is a cap for
+reproducible runs, not a replacement for the wall time.
 
 ### What is reported
 
@@ -280,7 +295,7 @@ Overflow inside a contract is ignored (unbounded integers).
 - **REFUTED** is `sat` with a counterexample that is real: the path to the clause used no abstraction. The counterexample lists
   the parameters (and `this`) at entry: scalars, string and array lengths with their first elements, record fields, `Option`
   / `Result` / union variants.
-- **UNKNOWN** when the solver says `unknown` or times out (4 s soft, 15 s hard), the fragment does not cover the code (the
+- **UNKNOWN** when the solver says `unknown` or times out (`--timeout-ms`, 2 s by default), the fragment does not cover the code (the
   reason names the construct), or the only `sat` models go through an abstraction: a loop without a sufficient invariant
   ("loop without invariant: i, s is unconstrained after the loop"), the size of a `Map`, derived string contents, or **the
   result of a call that is only known through its contract** (a pure function is an uninterpreted function, a mutating method

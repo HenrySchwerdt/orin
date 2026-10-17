@@ -1,7 +1,7 @@
 #!/bin/sh
 # Orin installer (POSIX sh). Installs a release package from GitHub into ~/.orin.
 #
-#   curl -fsSL https://raw.githubusercontent.com/HenrySchwerdt/orin/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/orin-lang/orin-lang/main/install.sh | sh
 #   curl -fsSL .../install.sh | sh -s -- --uninstall
 #
 # Environment:
@@ -11,7 +11,7 @@
 #   ORIN_BIN_DIR       directory that gets an `orin` symlink (default: ~/.local/bin, only if it is on PATH)
 #   ORIN_INSTALL_FROM  path to a local orin-<version>-<platform>.tar.gz instead of downloading
 #                      (checksum is verified against <file>.sha256 or SHA256SUMS beside it when present)
-#   ORIN_BASE_URL      release download base (default: https://github.com/HenrySchwerdt/orin/releases/download);
+#   ORIN_BASE_URL      release download base (default: https://github.com/orin-lang/orin-lang/releases/download);
 #                      file:// works, which is how the tests run
 #   ORIN_PLATFORM      override platform detection (linux-x86_64, linux-aarch64, macos-arm64, macos-x86_64)
 #   CC                 C compiler to look for (default: cc)
@@ -22,7 +22,7 @@
 # the install before anything under ORIN_HOME is touched. The script never edits shell profiles.
 set -eu
 
-REPO=${ORIN_REPO:-HenrySchwerdt/orin}
+REPO=${ORIN_REPO:-orin-lang/orin-lang}
 BASE_URL=${ORIN_BASE_URL:-https://github.com/$REPO/releases/download}
 API_URL=${ORIN_API_URL:-https://api.github.com/repos/$REPO/releases}
 HOME_DIR=${ORIN_HOME:-${HOME:-}/.orin}

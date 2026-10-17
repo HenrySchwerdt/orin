@@ -203,7 +203,7 @@ tests/next/run/contract_quality_nonstrict.or, tests/next/run/contract_quality_st
 
 **CON-10. Static verification.** `orin verify --contracts entry.or` discharges `ensures`, `call-precondition`, `invariant`,
 `bounds`, `unwrap` and `loop-invariant` obligations with z3 and reports VERIFIED, REFUTED (real counterexample) or UNKNOWN
-(never upgraded); `@Decreases` is always UNKNOWN. Exit status is 1 if a clause is REFUTED. Findings W0460 (tautology),
+(never upgraded; the solver budget is set with `--timeout-ms`, `--retry-ms` and `--rlimit`, docs/contracts.md); `@Decreases` is always UNKNOWN. Exit status is 1 if a clause is REFUTED. Findings W0460 (tautology),
 W0461 (unsatisfiable `@Requires`), W0462 (`@Ensures` follows from `@Requires`) are reported as warnings. The expected status
 per function is the `// expect:` header of each input.
 Tests: tests/contracts/verify_basic.or, tests/contracts/verify_arrays.or, tests/contracts/verify_classes.or,

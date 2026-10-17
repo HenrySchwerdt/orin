@@ -5,6 +5,11 @@ source with signature, errors/absence, behaviour and complexity (the spec 08 val
 page is the map. `orin mcp` `inspect` answers `std:path.join`, `std:json/legacy.parse`, `std:json.parseDocument`, ... from its built-in
 API table (`compiler/mcp/apitable.or`).
 
+Importing (ADR-0048 addendum): `import { fromString } from "std:bytes";` brings single names, `import { empty as emptyBytes } from "std:bytes";` renames one,
+and `import * as bytes from "std:bytes";` binds a compile-time namespace, so `bytes.fromString(..)`, `bytes.Bytes` and `bytes.empty()` need no prefix in the name and
+cannot clash with `html.empty()`. The namespace is no value, and a local or parameter named like it is E0304 (name grants `grant` / `proc` when `fs` is a namespace).
+The examples below use the namespace form for bytes, encoding, html, path, json, fs, time and url.
+
 | Module | Implemented in | Status |
 |---|---|---|
 | `std:host` | Orin, `library/std/host.or` over the grant primitives of `std:fsraw` | the root of authority: `Host`, scope functions that derive grants (ADR-0027); **unstable** until the I/O freeze |
@@ -712,10 +717,12 @@ function main(host: Host): void {
 | `send(s, data, timeout: Duration)` / `sendAll(s, data, timeout: Duration)` | one attempt (partial write reported) / all bytes, deadline for the whole call |
 | `shutdownWrite(s)` | half-close (FIN); a graceful close is this, a bounded drain with `recv`, then the scope ends |
 | `StreamReader(cap)`: `readExact(s, n, ms)`, `readUntil(s, delim, limit, ms)`, `readSome`, `buffered`, `unread`, `take` | read-ahead buffer next to the stream (a stream cannot be stored); results `Filled | FillClosed | FillLimit | FillTimeout | FillError`; at most `cap` bytes are ever buffered, `readUntil` receives at most `limit - buffered` bytes at a time; the ms is a deadline for the whole call |
+| `recvUntil / sendUntil / sendAllUntil(s, .., deadline: Deadline)`, `StreamReader.readExactUntil / readDelimitedUntil`, `withAcceptedUntil`, `acceptDetachedUntil`, `withConnectionUntil / useConnectionUntil` | ADR-0017 Addendum D: the same operations on an ABSOLUTE `Deadline` (std:time) that any number of calls can share, so one deadline covers a whole exchange of many small reads and writes |
+| `withListenerNet`, `withConnectionBeside` | value-returning twins of `useListenerNet` / `useConnectionBeside` |
 | `monotonicMillis(s)` | monotonic clock via a live stream (deadlines without a clock grant); not `time.nowMillis` (the wall clock) |
 | `resolve(net, name): Result<string[], NetError>` | numeric addresses; the grant's scope must cover `name` |
 | `parsePeer(text): Result<Peer, NetError>` | `"1.2.3.4:5"` / `"[::1]:5"`; `Err(InvalidPeer)` with the byte offset for anything else (no port-0 sentinel) |
-| `NetError { kind, code, offset }`, `netErrorMessage(e)`, `netErrorFromCode(code)`, `isDenied / isTimeout / isReset(e)` | `NetErrorKind = Denied \| Closed \| Timeout \| Reset \| InvalidArgument \| InvalidPeer \| Os` |
+| `NetError { kind, code, offset }`, `netErrorMessage(e)`, `netErrorFromCode(code)`, `isDenied / isTimeout / isReset(e)` | `NetErrorKind = Denied \| Closed \| Timeout \| Cancelled \| Reset \| InvalidArgument \| InvalidPeer \| Os`; `Cancelled` = the task's scope was cancelled while it waited (`Scope.cancel()` / `CancelToken` of std:task): accept, connect, recv and send wake at once, later calls fail at once; name resolution (`getaddrinfo`) is the one wait that is not interruptible |
 | `Peer { host, port }`, `portOf(ln)` | values |
 
 **Security properties.** *Statically* (checker, MIR verifier): every network function needs a `NetGrant` / `Listener` /
@@ -897,6 +904,7 @@ Inputs below 8,192 elements, and every input with `ORIN_THREADS=1`, run on the c
 | E0484 | every function given to a parallel operation is an arrow function or a named function and **pure** (no I/O, no impure call, no call of a function value); the message names the effect and where it happens |
 | E0485 | the reducer of a parallel `reduce` is a built-in associative operator: `+` (integers, floats, strings), `*`, `&&`, `||`, min / max (`a < b ? a : b` and the other orders and comparisons, `Math.min` / `Math.max`), parameters in either order. A user-defined reducer needs a proved associativity law (ADR-0039 §3.2), a later step |
 | E0486 | the input element type is a scalar (integers, floats, `bool`) or a record whose fields are all scalars. The workers read the input without copying it, which needs elements without counted references until borrow inference exists (ADR-0039 §4). Stages may produce any type (`map(x => x.toString())` is fine) |
+| E0487 | (library code: the primitives of `std:fsraw`) a `Listener` is moved into a task, or a `Stream` is cloned. A `NetGrant` is delegated (`spawnNet`), an accepted `Stream` is moved (`acceptDetached`, `spawnAccepted`, ADR-0017 Addendum C), a `Listener` stays in the task that bound it |
 | W0480 | a parallel float `reduce` (`+`, `*`, min, max): float arithmetic is not associative, so the result may differ from the sequential `reduce` in the last bits (it is the same everywhere else) |
 | W0481 | a parallel integer `reduce` with signed `+`, or with `*`: a chunk's partial result can overflow (and trap) where the sequential fold does not, or the reverse. Unsigned `+` cannot differ (every partial sum is at most the total), so it gives no warning |
 

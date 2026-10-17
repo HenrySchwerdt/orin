@@ -242,9 +242,9 @@ that R3b makes redundant _(inference)_).
 | Item | Today | Needed |
 |---|---|---|
 | Org move to `orin-lang/orin-lang` | PR #150 prepared | M0. All URLs in `install.sh`, docs, `dist/`, workflow, VS Code manifest follow |
-| Homebrew tap `orin-lang/homebrew-orin` | PR #149 | M0. Note ADR-0047 section 6 names `HenrySchwerdt/homebrew-orin`; the ADR text needs the new owner |
+| Homebrew tap `orin-lang/homebrew-orin` | PR #149 | M0 |
 | Platforms | linux-x86_64, macos-arm64 published; linux-aarch64 and macos-x86_64 built by the workflow but absent from alpha.2; Windows only via WSL2 | D4 |
-| Release workflow | always `--prerelease`, title "(experimental)" (`release.yml` line ~113) | Make pre-release status depend on the tag (`-alpha`, `-beta`, `-rc` suffix); 1.0.0 publishes a normal release. S |
+| Release workflow | **Done:** pre-release status follows the tag suffix (`-alpha`, `-beta`, `-rc`); 1.0.0 publishes a normal release (`release.yml`). Note: `0.1.0-beta.1` is a pre-freeze beta; 1.0.0-beta waits for M4 | Keep as is. S |
 | Notarisation and signing | not notarised | Not required for 1.0; document the quarantine workaround (already in install.md). Owner may want it for the Homebrew cask path |
 | Toolchain requirements | needs a C compiler; LLVM optional and not bundled; Z3 for verification | Document precisely; `orin doctor` already reports them. Bundling LLVM is post-1.0 |
 | musl / static Linux | glibc only | Post-1.0 |
@@ -269,12 +269,15 @@ R4 refinement proofs, `@NoTrap` modes beyond Stage A, lineage.
 | Item | Today | Needed |
 |---|---|---|
 | Language reference | `spec/` is a design RFC ("pre-implementation specification (v0.1)", `spec/spec.md`); no normative, traceable reference exists (roadmap.md step 4 lists one) **Draft written (2026-10-17):** [docs/reference](../reference/README.md), 10 chapters, each rule cites its tests, gaps listed per chapter, `tools/check_reference.py` checks the citations; review and gap-closing remain. | Write a reference from the implemented language: grammar, types, semantics, errors, each rule traced to a test. Size L. Prerequisite for the freeze claim |
-| Tutorial / website | none found (`docs/ts-developers.md` says it is "not a tutorial") | Tutorial (getting started, a CLI tool, a service, tests, contracts) and a static site. Hosting under the new org is an owner decision |
+| Tutorial / website | **In progress:** tutorial in [docs/tutorial](../tutorial/README.md), plus [getting started](../getting-started.md); no website yet (`docs/ts-developers.md` says it is "not a tutorial") | Tutorial (getting started, a CLI tool, a service, tests, contracts) and a static site. Hosting under the new org is an owner decision |
 | Std reference | hand-written `docs/std*.md` and `apitable.or` | Generated from source (ADR-0048 section 8) |
 | Honest limits | [known-limitations.md](../known-limitations.md), [tcb.md](../tcb.md) have known staleness | Gate R4: reconcile README, std.md, limits, TCB, install |
-| Stability policy page | none | Section 3.9 content as a page |
+| Stability policy page | **Done:** [docs/stability.md](../stability.md) | Keep in step with 3.9 and the std freeze |
 
 ### 3.9 Stability policy
+
+Published as [docs/stability.md](../stability.md). Note: `0.1.0-beta.1` is a pre-freeze beta; the syntax/std freeze (M4) is
+not complete, so `1.0.0-beta.1` (D10) is still reserved for M4.
 
 Proposed (D6, D10):
 - Semantic versioning from 1.0.0: patch = fixes, minor = additive, major = breaking.

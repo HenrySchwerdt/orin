@@ -32,6 +32,8 @@ Outside modules, import only from the module API:
 import { findUser } from "./users";
 ```
 
+A name can be imported under another name (`import { findUser as lookup } from "./users";`), and a module can be imported as a compile-time namespace (`import * as users from "./users";`, then `users.findUser(..)` and `users.User`). A namespace is not a value, and a local or parameter named like it is an error, so a short std name such as `bytes.empty()` never clashes with the importer's own names (ADR-0048 addendum).
+
 Importing `./users/repository` from outside `users` MUST fail even if that path exists. Internal declarations and files are private by default. Export lists and explicit dependencies allow a reviewer and agent to understand module contracts without scanning all implementation files.
 
 ## Dependency graph

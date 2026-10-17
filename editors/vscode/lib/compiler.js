@@ -6,7 +6,7 @@
 
 const path = require("path");
 
-const INSTALL_DOCS_URL = "https://github.com/HenrySchwerdt/orin/blob/main/docs/install.md";
+const INSTALL_DOCS_URL = "https://github.com/orin-lang/orin-lang/blob/main/docs/install.md";
 
 /**
  * Parse the output of `orin --version`. Releases print the bare package version
