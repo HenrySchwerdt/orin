@@ -243,7 +243,8 @@ Each assumption is a separate commit (R3d.0) and can be reverted alone if the ow
 
 ## Addendum B: R3e design (task interface)
 
-Status: proposed (2026-10-17). Design only; no code. Structure and depth follow Addendum A. *(inference)* marks a conclusion from the code, not
+Status: accepted (2026-10-17; the owner delegated the open decisions to the project coordinator, which took every recommendation of
+section 8). Design only; no code. Structure and depth follow Addendum A. *(inference)* marks a conclusion from the code, not
 something the code states. Basis: `origin/main` d0a17a96 (R3d.5 done) plus the open concurrency work, read from its branches (PR number to head
 branch by `gh api repos/henryschwerdt/orin/pulls/N`): #175 `claude/project-thread-5wtl8u-c4` (C4), #187 `...-c3` (C3, base c4), #189 `...-c5`
 (C5, base c3), #184 `...-gm` (ADR-0040), #191 `claude/adr0048-fs`. What each means for R3e is in section 7. Open questions: section 8.
@@ -457,7 +458,8 @@ R3e.0 and R3e.1 can ship together if the result stays inside the budget; R3e.2 a
 
 ### 8. Open questions for the project owner
 
-Working assumption until the owner answers: the recommendations below; each is a separate commit of the step it affects.
+Decided 2026-10-17: every recommendation below is taken (the owner delegated the decision; see the status line). Each is still a separate
+commit of the step it affects, so it can be reverted alone.
 
 1. **Reaching L0 from `$rt`.** Recommend the `plat(k, ...)` operation with a closed table (20 functions) over more `hook` numbers: a monitor operation is
    on the channel hot path (`bench/tasks` 1.5 us per message) and a hook adds a call and a `switch` in C that R3f has to delete again, while `plat` is
