@@ -14,7 +14,7 @@ local still holds.  In the machine of `Machine.lean`/`Mir.lean` this holds for a
   pending list; a counted local that holds the object is a second owner, which `WF` excludes.
 
 So the length of the array behind a counted local survives every step of the machine
-(`step_len`); only the local itself can go (released, moved, overwritten), which the abstract
+(`mstep_len`); only the local itself can go (released, moved, overwritten), which the abstract
 `Chg` of the analysis accounts for.
 -/
 
@@ -250,7 +250,7 @@ theorem drain_len {ext : List Val} {a : List AS} (hI : Inv ext a s) (h : drain s
 /-- **No step of the machine changes the length of the array behind a counted local.**  (The
 local itself may be released, moved or overwritten by the step; the array is not freed and keeps its
 number of slots.) -/
-theorem step_len {ext : List Val} {a : List AS} (hI : Inv ext a s) {code : Code} {c' : Code × St}
+theorem mstep_len {ext : List Val} {a : List AS} (hI : Inv ext a s) {code : Code} {c' : Code × St}
     (h : mstep (code, s) = some (.ok c')) {y l : Nat} (hy : (gk a y).counted = true)
     (hyl : s.get y = .ref l) {o : Obj} (ho : s.heap.objs l = some o) :
     ∃ o', c'.2.heap.objs l = some o' ∧ o'.fields.length = o.fields.length := by

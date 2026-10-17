@@ -65,9 +65,10 @@ Array contents are not tracked. A ghost bit `ctd x` says that the local holds a 
 | `RangeCfg.lean` | `Fn`, `Reach`, `PostFix`, `postfix_sound` |
 | `RangeFix.lean` | the worklist: `WReach`, `WInv`, `feed_spec`, `fix_sound` (when the iteration ends, for **every** pop order, threshold list and widening delay) |
 | `RangeNarrow.lean` | `NarrowRel`, `narrow_sound` (strong induction on the block index), `accessOk`, `inRange_sound` (U1), `u1_sound`, `range_accepted`, `u1_machine`, kernel-evaluated examples |
+| `RangeTerm.lean` | termination: `Valid` (bounds stay in the lattice, `valid_step`, `valid_outEdge`), the measure (blocks without state, changes before widening, position of the bounds among the thresholds, length of the worklist), `feed_dec`, `wstep_dec`, `fix_acc`, `fix_total` (the iteration reaches an empty worklist, whatever the pop order, and the table is sound), `fix_every_run_ends`, `u1_total` |
 | `CallGen.lean` | `Site`, `StkW`, `GoodW`: the call-machine invariant with explicit call-site data; `goodW_step`, `goodW_reach` |
 | `CallLink.lean` | `callRI`, `RetGenOK`, `ret_genok`, `RetGenOK.exec`, `prog_ret_genok`: the contract `GenOK` of a call derived from the ownership model |
-| `OpLen.lean` | `mop_len`, `drain_len`, `step_len`: no builtin and no release step changes the length of an array behind a counted local |
+| `OpLen.lean` | `mop_len`, `drain_len`, `mstep_len`: no builtin and no release step changes the length of an array behind a counted local |
 
 Headline statement: `range_accepted` + `u1_sound`: for a function whose worklist iteration ended
 and whose narrowing round ran, an instruction that `accessOk` accepts at its program point
@@ -75,6 +76,17 @@ and whose narrowing round ran, an instruction that `accessOk` accepts at its pro
 reaches it: the array local holds a live array with `n` slots and the index is a value in `[0, n)`
 (`InBounds`); `u1_machine` turns that into `iv.toNat < ob.fields.length` for the machine state, so
 the bounds check of `opArrayGet` (`arrayGet_oob`) cannot fire.
+
+Termination (`fix_total`, `u1_total`): on a function that meets `FnOk`, **every** run of the worklist
+iteration ends (`fix_acc`: the step relation is well-founded on the reachable configurations; a
+configuration with a queued block always has a successor), for every pop order, threshold list `thr`
+and delay `wa` (so for `WIDEN_AFTER = 2` and the thresholds of `thresholds(f)` of `range.or`, whatever
+they are). The measure is the lexicographic tuple (blocks without in-state, changes the blocks may
+still have before they widen, position of the bounds in the finite set of thresholds, length of the
+worklist). The invariant `Valid` (a lower bound is never below the floor of its class, an upper bound
+never above `BIG`; `valid_step`, `valid_edgeIv`) is what makes a widened bound move strictly, and
+needs `ArrOk` for `arrayNew`. The narrowing round (a finite pass) is not part of the theorem: it is
+given by `NarrowRel`.
 
 ### Abstractions (every one stated)
 
@@ -96,7 +108,7 @@ the bounds check of `opArrayGet` (`arrayGet_oob`) cannot fire.
   and that only the owned operands and the result local are cleared or written. For builtins and field
   operations `OpLen.lean` proves the facts the contract rests on, for the machine's own instructions:
   `mop_len` (no instruction frees an object or changes its number of slots), `drain_len` (a release step
-  never frees the object of a counted local), `step_len` (no step changes the length of an array behind
+  never frees the object of a counted local), `mstep_len` (no step changes the length of an array behind
   a counted local). Remaining, stated: (a) the descriptor of a builtin (`dst`, `men`, `kept`) is not tied
   per instruction to the machine's `MI` (only the length/liveness facts are); (b) the type discipline of
   the result: `RetGenOK` takes `hcls` (an owned operand is a reference-class local) and `hres` (the
@@ -112,9 +124,12 @@ the bounds check of `opArrayGet` (`arrayGet_oob`) cannot fire.
 * **Branch.** A two-way branch on a bool local; edge 0 is taken when the local is nonzero. Other
   terminators are `other ss`, any listed successor.
 * **Worklist.** The pop order is any (the implementation pops the last); `thr` and the widening delay
-  `wa` are parameters (the implementation derives them from the function). Termination is not modelled
-  (partial correctness: a run that does not end yields no table and justifies nothing). `joinMoved` is
-  the implementation's `changed` flag.
+  `wa` are parameters (the implementation derives them from the function). **Termination is proved**
+  (`RangeTerm.lean`, below) for every pop order, every threshold list and every delay, so `fix_sound`
+  is total correctness on a well-formed function. `joinMoved` is the implementation's `changed` flag.
+  The termination theorem needs the shape of the function (`FnOk`: the entry block exists, every
+  successor is a block, every array literal is below `BIG`): the first two are what `wf.or` checks,
+  the third is a bound the model needs because `arrayNew d n` takes any `Nat`.
 * **Narrowing** is stated by its defining equation (`NarrowRel`): block `b` sees the new states of the
   earlier blocks and the old states of the others.
 * **Well-formedness the proofs take from `wf.or`**: the index operand of an access is a scalar

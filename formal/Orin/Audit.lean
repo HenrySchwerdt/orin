@@ -129,4 +129,12 @@ import Orin
 #print axioms Orin.prog_ret_genok
 #print axioms Orin.mop_len
 #print axioms Orin.drain_len
-#print axioms Orin.step_len
+#print axioms Orin.mstep_len
+#print axioms Orin.Range.valid_step
+#print axioms Orin.Range.valid_outEdge
+#print axioms Orin.Range.feed_dec
+#print axioms Orin.Range.wstep_dec
+#print axioms Orin.Range.fix_acc
+#print axioms Orin.Range.fix_total
+#print axioms Orin.Range.fix_every_run_ends
+#print axioms Orin.Range.u1_total
