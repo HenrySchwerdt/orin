@@ -346,7 +346,7 @@ larger than that bar, which is why the argument rests on the counters and on the
 ## Cost of the field bounds checks (shape-confusion backstop)
 
 Change measured: every struct/variant slot access checks `kind == struct && index < nslots` (runtime inline
-accessors, `orin_mir_struct_*`, LLVM `@orinl_slot`), array slot access and push check `kind == array`;
+accessors, `orinc_mir_struct_*`, LLVM `@orinl_slot`), array slot access and push check `kind == array`;
 initialising stores into a fresh `orin_struct_new` stay unchecked (docs/assurance.md F-shape). Same machine as above.
 
 Method: the base (the commit before the change) and the changed tree were bootstrapped separately.

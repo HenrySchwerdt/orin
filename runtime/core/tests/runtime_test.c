@@ -135,8 +135,8 @@ static void test_deep_chain(void) {
 }
 
 static void test_misc(void) {
-    CHECK(orin_add_i(1, 2) == 3 && orin_div_i(-7, 2) == -3 && orin_rem_i(-7, 2) == -1);
-    CHECK(orin_int_to_usize(5) == 5 && orin_usize_to_int(5) == 5);
+    /* The checked arithmetic of generated code is defined by the compiler's preamble (compiler/backends/c/preamble.or, ADR-0052 R3d.6);
+     * its results and traps are covered by tests/run and the conformance suite, not here. */
     OrinObj *none = orin_none();
     CHECK(none->rc < 0 && orin_nullary(1) == none);
     orin_release(none); /* no-op on immortal */

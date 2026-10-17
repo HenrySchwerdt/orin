@@ -76,16 +76,12 @@ typedef struct OrinStruct {
 
 #define ORIN_SLOT(p) ((uint64_t)(uintptr_t)(p)) /* reference -> slot */
 
-/* float <-> slot: the 64-bit pattern of the double (ADR-0018). */
+/* float -> slot: the 64-bit pattern of the double (ADR-0018). Generated code has its own orinc_f2s / orinc_s2f
+ * (compiler/backends/c/preamble.or). */
 static inline uint64_t orin_f2s(double d) {
     union { double d; uint64_t u; } v;
     v.d = d;
     return v.u;
-}
-static inline double orin_s2f(uint64_t u) {
-    union { double d; uint64_t u; } v;
-    v.u = u;
-    return v.d;
 }
 #define ORIN_REF(s) ((OrinObj *)(uintptr_t)(s)) /* slot -> reference */
 
@@ -231,24 +227,8 @@ typedef struct OrinStats {
 #define ORIN_STAT_ON 0
 #endif
 
-/* Build configuration as seen by the core operation cfg(k) (ADR-0052 Addendum A section 2; compiler/hir/coreops.or): 0 free lists
- * on (off under ASan / MSan or -DORIN_NO_FREELIST), 1 hot counters, 2 allocation-site census. Constants, so Orin code folds them. */
-#if defined(ORIN_NO_FREELIST) || defined(__SANITIZE_ADDRESS__)
-#define ORIN_CFG_FREELIST 0
-#elif defined(__has_feature)
-#if __has_feature(address_sanitizer) || __has_feature(memory_sanitizer)
-#define ORIN_CFG_FREELIST 0
-#endif
-#endif
-#ifndef ORIN_CFG_FREELIST
-#define ORIN_CFG_FREELIST 1
-#endif
-#define ORIN_CFG_STATS ORIN_STAT_ON
-#ifdef ORIN_SITE_STATS
-#define ORIN_CFG_SITES 1
-#else
-#define ORIN_CFG_SITES 0
-#endif
+/* The build configuration seen by the core operation cfg(k) (ORIN_CFG_FREELIST / STATS / SITES) is defined by the preamble of the
+ * generated code (compiler/backends/c/preamble.or), not here: no C shell reads it. */
 
 /* The per-thread heap block (ADR-0052 Addendum A section 5, step R3d.1): ALL allocator state of a thread / task (ADR-0017) in one
  * zero-initialised `__thread` object, so a new thread starts with empty lists and zeroed counters. It is the block the core operation
@@ -367,88 +347,13 @@ static inline OrinObj *orin_make_unique(OrinObj *o) {
     return orin_make_unique_slow(o);
 }
 
-/* ---------------------------------------------------------------- checked arithmetic */
-
-static inline int64_t orin_add_i(int64_t a, int64_t b) {
-    int64_t r;
-    if (ORIN_UNLIKELY(__builtin_add_overflow(a, b, &r))) orin_trap("integer overflow");
-    return r;
-}
-static inline int64_t orin_sub_i(int64_t a, int64_t b) {
-    int64_t r;
-    if (ORIN_UNLIKELY(__builtin_sub_overflow(a, b, &r))) orin_trap("integer overflow");
-    return r;
-}
-static inline int64_t orin_mul_i(int64_t a, int64_t b) {
-    int64_t r;
-    if (ORIN_UNLIKELY(__builtin_mul_overflow(a, b, &r))) orin_trap("integer overflow");
-    return r;
-}
-static inline int64_t orin_div_i(int64_t a, int64_t b) {
-    if (ORIN_UNLIKELY(b == 0)) orin_trap("division by zero");
-    if (ORIN_UNLIKELY(a == INT64_MIN && b == -1)) orin_trap("integer overflow");
-    return a / b;
-}
-static inline int64_t orin_rem_i(int64_t a, int64_t b) {
-    if (ORIN_UNLIKELY(b == 0)) orin_trap("modulo by zero");
-    if (ORIN_UNLIKELY(a == INT64_MIN && b == -1)) orin_trap("integer overflow");
-    return a % b;
-}
-static inline int64_t orin_neg_i(int64_t a) {
-    if (ORIN_UNLIKELY(a == INT64_MIN)) orin_trap("integer overflow");
-    return -a;
-}
-static inline uint64_t orin_add_u(uint64_t a, uint64_t b) {
-    uint64_t r;
-    if (ORIN_UNLIKELY(__builtin_add_overflow(a, b, &r))) orin_trap("usize overflow");
-    return r;
-}
-static inline uint64_t orin_sub_u(uint64_t a, uint64_t b) {
-    uint64_t r;
-    if (ORIN_UNLIKELY(__builtin_sub_overflow(a, b, &r))) orin_trap("usize underflow");
-    return r;
-}
-static inline uint64_t orin_mul_u(uint64_t a, uint64_t b) {
-    uint64_t r;
-    if (ORIN_UNLIKELY(__builtin_mul_overflow(a, b, &r))) orin_trap("usize overflow");
-    return r;
-}
-static inline uint64_t orin_div_u(uint64_t a, uint64_t b) {
-    if (ORIN_UNLIKELY(b == 0)) orin_trap("division by zero");
-    return a / b;
-}
-static inline uint64_t orin_rem_u(uint64_t a, uint64_t b) {
-    if (ORIN_UNLIKELY(b == 0)) orin_trap("modulo by zero");
-    return a % b;
-}
-static inline uint64_t orin_neg_u(uint64_t a) {
-    if (ORIN_UNLIKELY(a != 0)) orin_trap("usize underflow");
-    return 0;
-}
-static inline uint64_t orin_int_to_usize(int64_t a) {
-    if (ORIN_UNLIKELY(a < 0)) orin_trap("negative int to usize");
-    return (uint64_t)a;
-}
-static inline int64_t orin_usize_to_int(uint64_t a) {
-    if (ORIN_UNLIKELY(a > (uint64_t)INT64_MAX)) orin_trap("usize too large for int");
-    return (int64_t)a;
-}
+/* ---------------------------------------------------------------- integers
+ * The checked arithmetic of generated code (orinc_add_i, orinc_div_u, orinc_range_i, ...) is defined by the preamble the compiler
+ * emits (compiler/backends/c/preamble.or, ADR-0052 R3d.6); the runtime has no copy, no C shell calls it. */
 
 /* Fixed-width integers (ADR-0022). Types narrower than 64 bits live in int64_t locals; after an operation the
- * result is range-checked. Conversions trap when the value does not fit. Kinds: 0 i8, 1 i16, 2 i32, 3 i64, 4 isize,
+ * result is range-checked (orinc_range_i, orinc_conv_i, orinc_conv_u of the preamble). Conversions trap when the value does not fit. Kinds: 0 i8, 1 i16, 2 i32, 3 i64, 4 isize,
  * 5 u8, 6 u16, 7 u32, 8 u64, 9 usize (see orin_runtime.c). */
-static inline int64_t orin_range_i(int64_t v, int64_t lo, int64_t hi) {
-    if (ORIN_UNLIKELY(v < lo || v > hi)) orin_trap("integer overflow");
-    return v;
-}
-static inline int64_t orin_conv_i(int64_t v, int64_t lo, int64_t hi) {
-    if (ORIN_UNLIKELY(v < lo || v > hi)) orin_trap("integer conversion out of range");
-    return v;
-}
-static inline int64_t orin_conv_u(uint64_t v, int64_t hi) {
-    if (ORIN_UNLIKELY(v > (uint64_t)hi)) orin_trap("integer conversion out of range");
-    return (int64_t)v;
-}
 uint64_t orin_int_op(int64_t mode, uint64_t a, uint64_t b, int64_t kind); /* wrapping (0..2) / saturating (3..5) add sub mul */
 OrinObj *orin_int_chk(int64_t mode, uint64_t a, uint64_t b, int64_t kind); /* checked add sub mul: Option */
 OrinObj *orin_parse_int_k(OrinObj *s, int64_t kind);                      /* Option of the parsed integer */
@@ -610,11 +515,6 @@ static inline uint64_t *orin_array_slot_ptr(OrinObj *o, uint64_t i) {
     if (ORIN_UNLIKELY(i >= a->len)) orin_trap("index out of bounds");
     return &a->items[i];
 }
-/* Unchecked variants for IArrayGetU / IArraySetU (docs/mir.md v2.6, rule U1): the verifier has shown that an earlier access of the
- * same block already passed the kind check and the bounds check for this array and index, and that nothing since changed them.
- * These are the only helpers whose memory safety rests on a verified fact; `orin2 compile --assert-facts` runs orin_assert_array first. */
-static inline uint64_t orin_array_at_u(OrinObj *o, uint64_t i) { return ((OrinArray *)o)->items[i]; }
-static inline uint64_t *orin_array_slot_ptr_u(OrinObj *o, uint64_t i) { return &((OrinArray *)o)->items[i]; }
 OrinObj *orin_array_get(OrinObj *a, uint64_t i); /* Option<T> (element retained) */
 OrinObj *orin_array_slice(OrinObj *a, uint64_t from, uint64_t to);
 OrinObj *orin_array_concat(OrinObj *a, OrinObj *b);

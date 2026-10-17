@@ -65,7 +65,7 @@ component name.
 
 - **Statement.** Every struct-slot access has `index < nslots`, and every array element and string byte access has `index < len`
   of the object it reads, or the program traps before the access. An access emitted without the run-time check
-  (`IArrayGetU`, `IArraySetU`, C helpers `orin_array_at_u` / `orin_array_slot_ptr_u`, LLVM `inbounds` GEP) is allowed only where
+  (`IArrayGetU`, `IArraySetU`, C helpers `orinc_array_at_u` / `orinc_array_slot_ptr_u`, LLVM `inbounds` GEP) is allowed only where
   rule U1 holds (dominated-by-check, T2, or interval fact, T6, `compiler/verify/range.or` rules R1-R5).
 - **Safe outcome.** Bounds trap (exit 101) before the access; for an unchecked access, U1 is the only justification.
   `--assert-facts` re-runs the omitted checks (`orin_assert_array`, exit 70).

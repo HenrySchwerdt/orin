@@ -199,6 +199,18 @@ separator is raised through `process.exit(101)` after printing the same message.
     (`rtWraps`), because the C unit tests call them; the others (`rtPlain`) have none. Growth, fresh allocation and the copying path of
     `arrayExtend` are separate `noinline` functions (`rtCold`). Counters are updated exactly as the C versions did. Census builds kept the C
     versions until R3d.5. `rc.or` exports `retain` and `release`.
+  - **R3d.6 C preamble (done, ADR-0052 Addendum A section 3).** `compiler/backends/c/preamble.or` (`cInlines`, emitted by `cPreamble` into every
+    generated C unit and, for `--split N`, into both the header and the data unit) defines the object-model inlines that generated code calls:
+    retain / release / make_unique, the checked slot and array accessors, array push, the take / put / replace helpers of the MIR verifier's
+    Unique objects, checked arithmetic and range conversions, `str_len` / `array_len`, the `OrinV0..3` aggregate types, and the `ORIN_CFG_*` macro
+    constants that `cfg(k)` reads. They are the text `orin_runtime.h` and `orin_runtime_mir.h` had, under the prefix `orinc_` (the LLVM backend's
+    `orinl_*` counterpart), so the machine code is unchanged; the preamble relies on the header only for the object layout, the `ORIN_STAT` /
+    `ORIN_SITE_RC` hooks and the out-of-line entries. Both worlds get it, so `--c-builtins` output is unchanged in kind. `orin_runtime_mir.h` is
+    deleted; the header lost the arithmetic and range inlines, `orin_s2f`, `orin_array_at_u` / `orin_array_slot_ptr_u` and the `ORIN_CFG_*` block. It
+    keeps one copy of the inlines the C shells and their unit tests use (`orin_retain/dup/release/make_unique`, `orin_nullary/none/ok_void`,
+    `orin_struct_*`, `orin_tag`, `orin_str_len/data/char_code_at`, `orin_array_push/len/at/slot_ptr`, `orin_f2s`): `orin_runtime.c`,
+    `orin_runtime_io.h`, `orin_runtime_llvm.c` and `runtime/core/tests/*.c` are compiled without compiler output. R3f deletes them with the shells.
+    Executed instructions against the R3d.5 base: every benchmark within +-0.00 % on C and LLVM, `selfcompile` +0.03 %; `ORIN_STATS` identical.
   - **R3d.5 stats, live count and the census on the Orin object model (done, ADR-0052 Addendum A section 5).** (1) `runtime/core/stats.or`:
     `statsReport` (the `ORIN_STATS=1` line, byte for byte the one the C `stats_report` printed, assembled in a raw buffer so that no Orin
     object is allocated while the counters are read) and `liveCount`, entries 28 and 29 of `compiler/mir/rt.or` with the C-named wrappers

@@ -344,7 +344,7 @@ defined bounds trap): everything else is excluded by the ownership analysis alon
    proven: the Lean checker rejects it (`rootOf src ≠ d`). Either reject it in `rules.or`/`wf.or`
    (one comparison) or extend the invariant with a "leaked root" kind.
 2. **The role of the hole rules is null-dereference, not use-after-free.** `docs/mir.md` says a
-   hole "would leave a dangling slot". The runtime (`orin_mir_struct_take`) writes `0` into the
+   hole "would leave a dangling slot". The runtime (`orinc_mir_struct_take`) writes `0` into the
    slot, and `orin_release`/`orin_destroy` are null-safe (`if (o && o->rc > 0)` / `DEC`). The theorem
    needs none of the hole rules for `bad`; they guard reads of the emptied slot (a null
    dereference), which the model reports as `ill`, which is not proven absent (see above). The
