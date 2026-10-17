@@ -88,6 +88,10 @@ Path to 1.0 (milestones, gaps, owner decisions): [roadmaps/orin-1.0.md](roadmaps
      measured.
 7. Flagship: TypeScript tooling in Orin (3a). **Deferred** (project owner, 2026-10-13): starts only after the owner has set up a separate GitHub organisation for Orin, so the extra repositories do not land in the personal account.
 8. **WebAssembly target** (project owner, 2026-10-14, at the very end):
+   - **Status 2026-10-17: first target built,** [ADR-0055](decisions/0055-webassembly-target-orbit.md), [wasm.md](wasm.md):
+     `--target=wasm64-orbit` for the Orbit runtime (C backend, own freestanding L0 over `orbit:log/v1` / `orbit:clock/v1`
+     instead of wasi-libc, manifest from the effect analysis, E0523 for unavailable effects); the conformance suites run as
+     modules in CI (1002 passed, 32 skipped). The plan below was the starting point; where it differs, ADR-0055 decides.
    - **Toolchain:** the LLVM backend's `.ll` goes through `clang --target=wasm64-wasip1` (or `wasm32`) with
      wasi-libc.
    - **Prerequisite:** R3/R4 are done, so L0 is the only C and only L0 needs a second implementation.

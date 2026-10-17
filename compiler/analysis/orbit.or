@@ -1,0 +1,115 @@
+// The capability manifest of the `wasm64-orbit` target (ADR-0055; Orbit host ABI, section 6 "manifest").
+//
+// `orin compile <entry.or> -o out.c --target=wasm64-orbit` (C backend only) appends a manifest to the generated C: a
+// WebAssembly custom section `orbit.manifest` whose payload is the UTF-8 JSON
+//
+//     {"abi":1,"requires":["clock/v1","log/v1"],"producer":"orin <version>"}
+//
+// The manifest DESCRIBES what the module needs; it never authorises anything (the host decides what it grants).
+//
+// `requires` comes from the effect analysis behind `orin effects` (effects.or): the transitive effect set of the entry
+// point `main` (the same set `orin effects <entry> --summary` reports for it). The mapping, by primitive effect:
+//
+//   Console.Write, Stdio.Write                       -> "log/v1"
+//   Clock.Now                                        -> "clock/v1"
+//   Process.Exit, Process.Args, Stdio.Read,
+//   Host.Acquire                                     -> no capability: handled inside the guest (exit traps after recording
+//                                                       the status, the arguments are just ["main"], stdin is empty)
+//   Task.*, Channel.*                                -> no capability: the guest runs the tasks itself, one at a time, in its
+//                                                       one WebAssembly thread (ADR-0055); a program that needs two tasks
+//                                                       to run at once ends at run time with a "wasm64-orbit: deadlock"
+//                                                       message instead of failing to build
+//   Unknown.* (a call the analysis cannot resolve,  -> no error, but "clock/v1" is required too: the guest can import only
+//   such as a call of a function value)               log/v1 and clock/v1, so requiring both is the safe over-approximation
+//                                                       (a manifest must list every capability the module imports). The
+//                                                       unresolved call cannot reach anything else: the guest has no other
+//                                                       imports, so the import list, not the effect set, bounds what it can do
+//   anything else (Fs.*, Process.Spawn, Process.Narrow, Net.*, Stream.*)
+//                                                    -> NOT available on this target: error E0523, one diagnostic per effect,
+//                                                       located at the evidence the analysis has
+//
+// "log/v1" is ALWAYS required, even without Console.Write: a runtime trap prints its message to stderr, which the guest maps
+// to the log capability. So `requires` is at least ["log/v1"], plus "clock/v1" when Clock.Now is reachable; sorted, no
+// duplicates.
+//
+// The producer string is "orin": the compiler does not know its own version (orin.toml is not embedded).
+
+import { Diagnostic, diag } from "../diag";
+import { EffContext, EffView, buildReport, pathLines } from "./effectsum";
+import { isUnknownOp } from "./effects";
+
+export const ORBIT_TARGET: string = "wasm64-orbit";
+export const ORBIT_ERROR: string = "E0523";
+const ORBIT_PRODUCER: string = "orin";
+
+// "" for an effect that needs no capability, else the capability. `known` is false for an effect the target lacks.
+type CapMap = { known: bool; cap: string; };
+
+function capabilityOf(op: string): CapMap {
+  if (op == "Console.Write" || op == "Stdio.Write") {
+    return CapMap { known: true, cap: "log/v1" };
+  }
+  if (op == "Clock.Now") {
+    return CapMap { known: true, cap: "clock/v1" };
+  }
+  if (op == "Process.Exit" || op == "Process.Args" || op == "Stdio.Read" || op == "Host.Acquire"
+      || op.startsWith("Task.") || op.startsWith("Channel.")) {
+    return CapMap { known: true, cap: "" };
+  }
+  return CapMap { known: false, cap: "" };
+}
+
+export type OrbitPlan = {
+  requires: string[];      // sorted, no duplicates, always contains "log/v1"
+  errors: Diagnostic[];    // E0523, one per distinct unavailable effect
+};
+
+export function orbitPlan(c: EffContext): OrbitPlan {
+  let clock = false;
+  let errors: Diagnostic[] = [];
+  let seen: string[] = [];
+  const rep = buildReport(c);
+  for (const v of rep.entryEffects) {
+    const m = isUnknownOp(v.op) ? CapMap { known: true, cap: "clock/v1" } : capabilityOf(v.op);
+    if (m.known) {
+      if (m.cap == "clock/v1") {
+        clock = true;
+      }
+      continue;
+    }
+    if (seen.includes(v.op)) {
+      continue;
+    }
+    seen.push(v.op);
+    let d = diag(
+      ORBIT_ERROR,
+      v.start,
+      "`main` needs " + v.op + ", which the " + ORBIT_TARGET + " target does not provide",
+    );
+    d.notes = pathLines(v, "");
+    errors.push(d);
+  }
+  // sorted: the only capabilities are clock/v1 and log/v1 (no string ordering: the seed compiler lacks `<` on strings)
+  const requires: string[] = clock ? ["clock/v1", "log/v1"] : ["log/v1"];
+  return OrbitPlan { requires: requires, errors: errors };
+}
+
+// The JSON payload of the section.
+export function orbitManifestJson(requires: string[]): string {
+  let items: string[] = [];
+  for (const r of requires) {
+    items.push("\"" + r + "\"");
+  }
+  return "{\"abi\":1,\"requires\":[" + items.join(",") + "],\"producer\":\"" + ORBIT_PRODUCER + "\"}";
+}
+
+// The C text appended at the very end of the generated file. The JSON's quotes are escaped twice: once for the assembler
+// string of `.ascii` (\") and once for the C string literal (\\\").
+export function orbitManifestC(requires: string[]): string {
+  const json = orbitManifestJson(requires);
+  const asmEscaped = json.split("\"").join("\\\"");
+  const cEscaped = asmEscaped.split("\\").join("\\\\").split("\"").join("\\\"");
+  return "/* Orbit capability manifest (ADR-0055): describes requirements, never authorises */\n"
+      + "__asm__(\".section .custom_section.orbit.manifest,\\\"\\\",@\\n.ascii \\\"" + cEscaped
+      + "\\\"\\n.text\\n\");\n";
+}

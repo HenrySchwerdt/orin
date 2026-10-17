@@ -14,17 +14,16 @@
 // scope in one and the buffer of a channel in one; a buffer holds transfer tokens, never values.
 //
 //   scope(s => {
-//     const a = spawn(s, () => work(1));
-//     const b = spawn(s, () => work(2));
+//     const a = s.spawn(() => work(1));
+//     const b = s.spawn(() => work(2));
 //     return a.join() + b.join();
 //   })
 //
 // * `scope(body)` runs `body(s)` and, before it returns, joins every task spawned in it whether or not the body joined it:
 //   no task outlives its scope. If a task that nobody joined panicked, the scope panics (traps) after all tasks have ended.
-// * `spawn(s, f)` starts `f` as a task; `h.join()` waits for it and returns its result. A panic (trap) in a task ends only
+// * `s.spawn(f)` starts `f` as a task; `h.join()` waits for it and returns its result. A panic (trap) in a task ends only
 //   that task; `join` (or the end of the scope) turns it into a trap of the joining task with the message
-//   `task panicked: <message>`. A panic is never lost silently. Generic methods do not exist (E0460), so `spawn` is a
-//   function taking the scope, not a method of it.
+//   `task panicked: <message>`. A panic is never lost silently. `spawn` is a method of the scope; `T` may be void.
 // * `channel<T>(capacity)` makes a bounded channel; `ch.tx.send(v)` blocks while it is full, `ch.rx.recv()` blocks while it
 //   is empty and returns `None` once the channel is closed and drained. `tx.close()` ends the stream, `rx.close()`
 //   cancels it (a blocked or later `send` returns false). Each end can be copied and used by any number of tasks. Close both
@@ -207,7 +206,7 @@ export class Sender<T> {
   // send(v): blocks while the channel is full; true when `v` was handed to the channel (moved if it is uniquely owned,
   // copied otherwise); false when the channel is closed by either end, in which case `v` is dropped.
   send(v: T): bool {
-    const tok = putBox(v);
+    const tok = putBox<T>(v);
     const ch = this.ch;
     monLock(ch);
     const cap = monGet(ch, 0);
@@ -627,7 +626,48 @@ export class Scope {
     this.tab = tab;
   }
 
-  // token(): the scope's cancellation token, to hand to tasks (`spawn(s, () => ... token.cancel() ...)`). Traps if the scope has
+  // spawn<T>(f): starts `f` as a task of the scope and returns its handle; T may be void (ADR-0040). `f` and everything it
+  // captures move to the task (unique values) or are copied to it; the task cannot affect the spawner's values. A body that
+  // captures a resource handle is E0483, one that captures a `Scope` is E0481. Traps when the scope has ended or no thread
+  // can be started.
+  @Ensures(result.tab == this.tab)
+  spawn<T>(f: () => T): TaskHandle<T> {
+    const res = monNew(2);
+    monLock(this.tab);
+    const own = monGet(this.tab, LG_WAKE);
+    monUnlock(this.tab);
+    const wake = own != 0 ? own : wakeBound(); // a scope without a token of its own passes the spawner's on
+    const body: Thunk = () => runTask(f, wake, res);
+    const tok = putBox(body);
+    monLock(this.tab);
+    let lg = loadLedger(this.tab);
+    if (lg.closed) {
+      monUnlock(this.tab);
+      transitDrop(tok);
+      monFree(res);
+      taskTrap("spawn in a scope that has ended");
+    }
+    const idx = lg.add();
+    const need = entry(idx) + LG_STRIDE;
+    const have = monGet(this.tab, 3);
+    if (need > have) {
+      monGrow(this.tab, have * 2);
+      monSet(this.tab, 3, have * 2);
+    }
+    monSet(this.tab, 0, lg.count);
+    monSet(this.tab, entry(idx), 0);
+    monSet(this.tab, entry(idx) + 1, res);
+    monSet(this.tab, entry(idx) + 2, 0);
+    monUnlock(this.tab);
+    const th = taskSpawn(tok);
+    monLock(this.tab);
+    monSet(this.tab, entry(idx), th);
+    monNotifyAll(this.tab, 0);
+    monUnlock(this.tab);
+    return new TaskHandle<T>(this.tab, idx, res);
+  }
+
+  // token(): the scope's cancellation token, to hand to tasks (`s.spawn(() => ... token.cancel() ...)`). Traps if the scope has
   // none (the token table is full, or scopes are nested more than 32 deep).
   token(): CancelToken {
     return new CancelToken(scopeWake(this.tab));
@@ -678,7 +718,7 @@ export class TaskHandle<T> {
     const tok = monGet(this.res, 0);
     monUnlock(this.res);
     monFree(this.res);
-    return takeBox(tok);
+    return takeBox<T>(tok);
   }
 
   // joinUntil(deadline): waits for the task until the absolute monotonic deadline. Err(Timeout) if it has not ended by then (the
@@ -729,7 +769,7 @@ function tryJoin<T>(h: TaskHandle<T>): Option<T> {
   const tok = monGet(h.res, 0);
   monUnlock(h.res);
   monFree(h.res);
-  const v: T = takeBox(tok);
+  const v: T = takeBox<T>(tok);
   return Some(v);
 }
 
@@ -739,55 +779,22 @@ function runTask<T>(f: () => T, wake: usize, res: usize): void {
   wakeBind(wake);
   taskWatch(res);
   const r = f();
-  const tok = putBox(r);
+  const tok = putBox<T>(r);
   monLock(res);
   monSet(res, 0, tok);
   monUnlock(res);
 }
 
-// spawn<T>(s, f): starts `f` as a task of the scope and returns its handle. `f` and everything it captures move to the task
-// (unique values) or are copied to it; the task cannot affect the spawner's values. A body that captures a resource handle
-// is E0483, one that captures a `Scope` is E0481. Traps when the scope has ended or no thread can be started.
-@Ensures(result.tab == s.tab)
+// spawn(s, f): the function form of `s.spawn(f)`.
+@Deprecated("use s.spawn(f)")
 export function spawn<T>(s: Scope, f: () => T): TaskHandle<T> {
-  const res = monNew(2);
-  monLock(s.tab);
-  const own = monGet(s.tab, LG_WAKE);
-  monUnlock(s.tab);
-  const wake = own != 0 ? own : wakeBound(); // a scope without a token of its own passes the spawner's on
-  const body: Thunk = () => runTask(f, wake, res);
-  const tok = putBox(body);
-  monLock(s.tab);
-  let lg = loadLedger(s.tab);
-  if (lg.closed) {
-    monUnlock(s.tab);
-    transitDrop(tok);
-    monFree(res);
-    taskTrap("spawn in a scope that has ended");
-  }
-  const idx = lg.add();
-  const need = entry(idx) + LG_STRIDE;
-  const have = monGet(s.tab, 3);
-  if (need > have) {
-    monGrow(s.tab, have * 2);
-    monSet(s.tab, 3, have * 2);
-  }
-  monSet(s.tab, 0, lg.count);
-  monSet(s.tab, entry(idx), 0);
-  monSet(s.tab, entry(idx) + 1, res);
-  monSet(s.tab, entry(idx) + 2, 0);
-  monUnlock(s.tab);
-  const th = taskSpawn(tok);
-  monLock(s.tab);
-  monSet(s.tab, entry(idx), th);
-  monNotifyAll(s.tab, 0);
-  monUnlock(s.tab);
-  return new TaskHandle<T>(s.tab, idx, res);
+  return s.spawn(f);
 }
 
 // spawnDo(s, f): spawn for a body that returns nothing; join() then returns true.
+@Deprecated("use s.spawn(f), which accepts a void body (TaskHandle<void>)")
 export function spawnDo(s: Scope, f: () => void): TaskHandle<bool> {
-  return spawn(s, () => {
+  return s.spawn(() => {
     f();
     return true;
   });
@@ -916,42 +923,36 @@ export function scopeNet<R>(net: NetGrant, body: (s: Scope, g: NetGrant) => R): 
   return r;
 }
 
-// scopeDo(body), scopeFsDo, ...: the flavours for a body that returns nothing (a generic result cannot be void; std:fs and
-// std:host have the same pairs of `with*` / `use*`).
+// scopeDo(body), scopeFsDo, ...: the old flavours for a body that returns nothing. `scope` and `scopeFs` ... accept a void
+// body now (ADR-0040); these wrappers stay one release.
+@Deprecated("use scope(body) with a void body")
 export function scopeDo(body: (s: Scope) => void): void {
-  const tab = begin();
-  body(new Scope(tab));
-  finish(tab);
+  scope(body);
 }
 
+@Deprecated("use scopeFs(fs, body) with a void body")
 export function scopeFsDo(fs: FsGrant, body: (s: Scope, g: FsGrant) => void): void {
-  const tab = begin();
-  body(new Scope(tab), fs);
-  finish(tab);
+  scopeFs(fs, body);
 }
 
+@Deprecated("use scopeProcess(proc, body) with a void body")
 export function scopeProcessDo(proc: ProcessGrant, body: (s: Scope, g: ProcessGrant) => void): void {
-  const tab = begin();
-  body(new Scope(tab), proc);
-  finish(tab);
+  scopeProcess(proc, body);
 }
 
+@Deprecated("use scopeStdio(stdio, body) with a void body")
 export function scopeStdioDo(stdio: StdioGrant, body: (s: Scope, g: StdioGrant) => void): void {
-  const tab = begin();
-  body(new Scope(tab), stdio);
-  finish(tab);
+  scopeStdio(stdio, body);
 }
 
+@Deprecated("use scopeNet(net, body) with a void body")
 export function scopeNetDo(net: NetGrant, body: (s: Scope, g: NetGrant) => void): void {
-  const tab = begin();
-  body(new Scope(tab), net);
-  finish(tab);
+  scopeNet(net, body);
 }
 
+@Deprecated("use scopeClock(clock, body) with a void body")
 export function scopeClockDo(clock: ClockGrant, body: (s: Scope, g: ClockGrant) => void): void {
-  const tab = begin();
-  body(new Scope(tab), clock);
-  finish(tab);
+  scopeClock(clock, body);
 }
 
 // ------------------------------------------------------------------------------------------------------ delegating grants
@@ -1002,25 +1003,25 @@ function runNet<T>(tok: usize, body: (g: NetGrant) => T): T {
 export function spawnFs<T>(s: Scope, fs: FsGrant, body: (g: FsGrant) => T): TaskHandle<T> {
   const c = grantClone(fs);
   const tok = grantMove(c);
-  return spawn(s, () => runFs(tok, body));
+  return s.spawn(() => runFs(tok, body));
 }
 
 export function spawnProcess<T>(s: Scope, proc: ProcessGrant, body: (g: ProcessGrant) => T): TaskHandle<T> {
   const c = grantClone(proc);
   const tok = grantMove(c);
-  return spawn(s, () => runProcess(tok, body));
+  return s.spawn(() => runProcess(tok, body));
 }
 
 export function spawnStdio<T>(s: Scope, stdio: StdioGrant, body: (g: StdioGrant) => T): TaskHandle<T> {
   const c = grantClone(stdio);
   const tok = grantMove(c);
-  return spawn(s, () => runStdio(tok, body));
+  return s.spawn(() => runStdio(tok, body));
 }
 
 export function spawnClock<T>(s: Scope, clock: ClockGrant, body: (g: ClockGrant) => T): TaskHandle<T> {
   const c = grantClone(clock);
   const tok = grantMove(c);
-  return spawn(s, () => runClock(tok, body));
+  return s.spawn(() => runClock(tok, body));
 }
 
 // spawnNet(s, net, body): a task whose body gets a network grant of the authority of `net` (the same scope: listen address,
@@ -1030,7 +1031,7 @@ export function spawnClock<T>(s: Scope, clock: ClockGrant, body: (g: ClockGrant)
 export function spawnNet<T>(s: Scope, net: NetGrant, body: (g: NetGrant) => T): TaskHandle<T> {
   const c = grantClone(net);
   const tok = grantMove(c);
-  return spawn(s, () => runNet(tok, body));
+  return s.spawn(() => runNet(tok, body));
 }
 
 // ------------------------------------------------------------------------------------------------------ parallelMap
@@ -1050,7 +1051,7 @@ export function parallelMap<A, B>(xs: A[], f: (x: A) => B, parts: usize): B[] {
     while (lo < xs.length) {
       const hi = lo + size < xs.length ? lo + size : xs.length;
       const chunk = xs.slice(lo, hi);
-      hs.push(spawn(s, () => chunk.map(f)));
+      hs.push(s.spawn(() => chunk.map(f)));
       lo = hi;
     }
     let out: B[] = [];
@@ -1156,7 +1157,7 @@ function runPool<R>(chunks: usize, nw: usize, body: (k: usize) => R, until: bool
   w = 0;
   while (w < nw) {
     const me = w;
-    hs.push(spawn(s, () => poolWork(m, me, body, until, hit)));
+    hs.push(s.spawn(() => poolWork(m, me, body, until, hit)));
     w += 1;
   }
   let all: Done<R>[] = [];

@@ -238,19 +238,39 @@ as `rules`. JSON: `{"results":[{"function","file","line","kind","clause","rules"
 |---|---|---|---|
 | `int`/`i64`, `i8 i16 i32 u8 u16 u32 u64 isize usize` | `Int` with the exact range of the type | arithmetic results and conversions are in range on returning paths (A-INT); `usize` subtraction below 0 traps | floats, `i128` |
 | `bool`, `+ - * / %`, comparisons, `&& \|\| !`, `==>`, `?:` | Bool / Int; `/` and `%` truncate toward zero as in Orin | divisor non-zero on returning paths (A-DIV) | `wrapping*`, `checked*`, `saturating*` |
-| arrays `T[]` | datatype (data `Array Int T`, length); `length`, `xs[i]`, `xs[i] = v`, `push`, `pop` (also `xs.pop().unwrap()` as a statement or a `let` / assignment initialiser), `get`, `slice`, `concat`, `includes`, `indexOf`, `join`; `find` / `findIndex` exactly (the first match); `sort` and `reduce` partially (see "Method axioms") | index / slice range in bounds (obligation `bounds`) | `reduce` / `sort` results beyond the facts of "Method axioms"; `pop` inside another expression |
+| arrays `T[]` | datatype (data `Array Int T`, length); `length`, `xs[i]`, `xs[i] = v`, `push`, `pop`, `get`, `slice`, `concat`, `includes`, `indexOf`, `join`; `find` / `findIndex` exactly (the first match); `sort` and `reduce` partially (see "Method axioms") | index / slice range in bounds (obligation `bounds`) | `reduce` / `sort` results beyond the facts of "Method axioms" |
 | `every`, `some`, `map`, `filter` (pure lambda with an expression body) | quantifier over the indices; `map` / `filter` by their defining facts | well-definedness of the lambda body is part of a contract's goal | block-bodied lambdas; in code (not contracts) a lambda body with an index or call precondition |
 | `range(a, b).every(i => ..)` / `.some(..)`, `sum(xs)`, `sumBy(xs, f)` (`std:seq`) | bounded quantifier; recursive sum with the store lemma | | `sumBy` summands that need a block |
 | records, classes | datatype with one constructor; field read, write through nested places (`a.b.f = v`, `a[i].f = v`), `{ ...r, f: v }`; record `@Invariant`s of parameters and results are assumed (A3) | | generic records; the fields of recursive types (opaque) |
-| `Option<T>`, `Result<T, E>`, user unions | datatypes; `isSome`, `isNone`, `isOk`, `isErr`, `unwrap`, `unwrapOr`, `unwrapErr`, `Some`, `None`, `Ok`, `Err`, variant constructors, `match` (expression and statement) | `unwrap` needs the right variant (obligation `unwrap`) | nested patterns, `?`, `==` on these types |
+| `Option<T>`, `Result<T, E>`, user unions | datatypes; `isSome`, `isNone`, `isOk`, `isErr`, `unwrap`, `unwrapOr`, `unwrapErr`, `Some`, `None`, `Ok`, `Err`, variant constructors, `match` (expression and statement) | `unwrap` needs the right variant (obligation `unwrap`) | nested patterns, `?` where the operand is not always evaluated (see "Effects inside an expression"), `==` on these types |
 | `Map<K, V>` | presence array, value array, size; `has`, `get`, `set`, `delete`, `keys`, `values`, `size`, `new Map` | | `entries`; map equality |
 | `string` | datatype (length, id); `length`, `+`, `==`, literals, `charCodeAt`, `charAt`, `substring`, `trim`, `startsWith`, `endsWith`, `includes`, `toString`, template literals; `split`, `indexOf` partially (see "Method axioms") | index / range in bounds; `split` needs a non-empty separator | contents (see "Strings") |
 | calls | modular: callee `@Requires` obligation, `@Ensures` assumed; pure function = uninterpreted function; recursion assumes the callee contract | A-CALL, A-PURE | calls of generic functions from outside their class, function values, interface calls |
 | methods and constructors | receiver as a datatype value; a mutating method returns the new receiver; `new C(..)`; static methods | class invariants (B8), frames (B9) | `new C<T>(..)` of a generic class |
 | generic functions and classes | checked once, abstractly: a type parameter `T` is an opaque value (nothing can be done with it but pass it around and store it), the class applied to its own parameters is the class | | `==` on a `T`; a call of a generic function from code that is not in the same class |
-| `if`, `match`, blocks, `return`, `let`, assignment, `+=` etc. | symbolic execution with merged states | | `break` / `continue` effects (the loop is havoc'd), `?` |
+| `if`, `match`, blocks, `return`, `let`, assignment, `+=` etc. | symbolic execution with merged states | | `break` / `continue` effects (the loop is havoc'd); an effect (`?`, a mutating call) in a `while` condition or in the right operand of `&&` / `||` / `==>`, in a branch of `?:` or in an arm of a `match` that is not a `return match` |
 | `while`, `for .. of` | loop `@Invariant`, inferred counter bound, or havoc; also unrolled 3 iterations exactly | A-LOOP | nested loop invariants inside a loop with `break` |
 | `console.log` / `console.error`, `exit` | no effect on the values; `exit` ends the path | | any other I/O |
+
+### Effects inside an expression (`?`, mutating calls)
+
+The translation of an expression is pure, so an expression that contains an effect is first split into statements.
+The effects are `e?` on a `Result` (the checker accepts `?` on nothing else; an `Option` is encoded the same way, with `None` as the early return) and a call of a mutating method (`this.next()`, `xs.pop()`, `m.set(k, v)`).
+They are executed in the order the expression evaluates them (left to right, EXP-20) and replaced by a temporary holding
+their value; each operand evaluated before an effect is bound to a temporary first, so an effect never changes what an
+earlier operand reads and an earlier trap still comes first. This is done for a statement, a `let` initialiser, an assigned
+value (to a variable or a field of `this`), a `return` value and an `if` condition. In `return match (s) { P => e, .. }` the
+effects of the arms are executed in the arm that matches (each arm is a `return` of its own).
+
+`e?` where `e` is Err / None is a return: the function returns `Err(payload)` / `None` of its own result type from that state
+(the state after the effects so far), so every `@Ensures` and class invariant is checked on that path too, and the path
+continues with the payload where `e` is Ok / Some. The error type of `e` must equal the error type of the function result;
+`?` in a function that returns neither Result nor Option is UNKNOWN.
+
+Where the order of evaluation cannot be kept the function is UNKNOWN with a reason: an effect in the right operand of
+`&&` / `||` / `==>`, in a branch of `?:`, in an arm of a `match` that is not a `return match`, in a `while` condition, in the receiver of a mutating call,
+in the arguments of a mutating call on a receiver that is not a plain variable or field path, in the right-hand side of
+`x += ..` or of an assignment to an element (`xs[i] = ..`), or after a function value that is evaluated before it.
 
 ### Method axioms (`compiler/vc/methods.or`)
 
@@ -261,7 +281,6 @@ runtime (`runtime/core/orin_runtime.c`) or the prelude (`library/collections/arr
 
 | Method | Facts |
 |---|---|
-| `xs.pop().unwrap()` | the `pop` runs as a statement (the array loses its last element: length down by 1, prefix unchanged), then the `unwrap` is reported as an `unwrap` obligation (the array was not empty); the value is the old last element |
 | `xs.sort(cmp)` | same length; every element of the result is an element of `xs` and vice versa. The order is not stated |
 | `xs.findIndex(p)` / `xs.find(p)` | exact: `Some(i)` with `i` in bounds, `p(xs[i])` and `p` false before `i` (`find`: the value is `xs[i]`); `None` when `p` is false everywhere. Facts about calls inside `p` are hypotheses, so a call whose contract does not hold weakens the result, never strengthens it |
 | `xs.reduce(f, init)` | an empty `xs` gives `init`; nothing else |

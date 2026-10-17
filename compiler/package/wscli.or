@@ -1,5 +1,6 @@
 // Workspace inspection. Paths are explicit; direct invocation discovers ancestors without a cwd primitive.
-import { FsGrant, readFile, writeFile, exists, listDir } from "std:fs";
+import { FsGrant, readFile, writeFile, listDir, fsErrorMessage } from "std:fs";
+import { existsOr } from "../util";
 import {
   SourceFile, SourceMap, Diagnostic, render, renderTerminal, TerminalOptions, terminalOptions,
   terminalSafe,
@@ -16,12 +17,16 @@ function skipped(name: string): bool {
 // Keep every returned path relative to the workspace; file ids and tree lookup use that same order.
 type Directory = { path: string; entries: string[]; };
 
-function walk(fs: FsGrant, root: string): Directory[] {
+function walk(fs: FsGrant, root: string): Result<Directory[], string> {
   let out: Directory[] = [];
   let todo: string[] = [""];
   while (todo.length > 0) {
     const d = todo.pop().unwrap();
-    const entries = listDir(fs, join([root, d]));
+    const listed = listDir(fs, join(root, d));
+    if (listed.isErr()) {
+      return Err(fsErrorMessage(listed.unwrapErr()));
+    }
+    const entries = listed.unwrap();
     out.push(Directory { path: d, entries: entries });
     for (const e of entries) {
       if (e.endsWith("/") && !skipped(e)) {
@@ -31,7 +36,7 @@ function walk(fs: FsGrant, root: string): Directory[] {
       }
     }
   }
-  return out;
+  return Ok(out);
 }
 
 function report(files: SourceFile[], d: Diagnostic, ui: TerminalOptions): usize {
@@ -109,21 +114,21 @@ export function runWorkspaceWithOptions(fs: FsGrant, argv: string[], ui: Termina
   if (!explicit) {
     // Relative paths have no lexical filesystem-root sentinel. Bound the walk, and offer --root to bypass it.
     let depth: usize = 0;
-    while (!exists(fs, join([root, "orin-workspace.toml"])) && depth < 256) {
-      root = join([root, ".."]);
+    while (!existsOr(fs, join(root, "orin-workspace.toml")) && depth < 256) {
+      root = join(root, "..");
       depth += 1;
     }
-    if (!exists(fs, join([root, "orin-workspace.toml"]))) {
+    if (!existsOr(fs, join(root, "orin-workspace.toml"))) {
       console.error(
         "error: no orin-workspace.toml found within 256 ancestors; use --root <directory>",
       );
       return 1;
     }
   }
-  const wsPath = join([root, "orin-workspace.toml"]);
+  const wsPath = join(root, "orin-workspace.toml");
   const wsRead = readFile(fs, wsPath);
   if (wsRead.isErr()) {
-    console.error(terminalSafe("error: cannot read " + wsPath + ": " + wsRead.unwrapErr()));
+    console.error(terminalSafe("error: cannot read " + wsPath + ": " + fsErrorMessage(wsRead.unwrapErr())));
     return 1;
   }
   const wsText = wsRead.unwrap();
@@ -132,7 +137,12 @@ export function runWorkspaceWithOptions(fs: FsGrant, argv: string[], ui: Termina
   if (wr.isErr()) {
     return report(files, wr.unwrapErr(), ui);
   }
-  const listings = walk(fs, root);
+  const walked = walk(fs, root);
+  if (walked.isErr()) {
+    console.error(terminalSafe("error: " + walked.unwrapErr()));
+    return 1;
+  }
+  const listings = walked.unwrap();
   let dirs: string[] = [];
   let workspaces: string[] = [];
   let npmDirs: string[] = [];
@@ -143,19 +153,19 @@ export function runWorkspaceWithOptions(fs: FsGrant, argv: string[], ui: Termina
       continue;
     }
     dirs.push(d);
-    const path = join([root, d]);
+    const path = join(root, d);
     if (listing.entries.includes("orin-workspace.toml")) {
       workspaces.push(d);
     }
     if (listing.entries.includes("package.json")) {
       npmDirs.push(d);
     }
-    const manifestPath = join([path, "orin.toml"]);
+    const manifestPath = join(path, "orin.toml");
     let text: Option<string> = None;
     if (listing.entries.includes("orin.toml") || listing.entries.includes("orin.toml/")) {
       const read = readFile(fs, manifestPath);
       if (read.isErr()) {
-        console.error(terminalSafe("error: cannot read " + manifestPath + ": " + read.unwrapErr()));
+        console.error(terminalSafe("error: cannot read " + manifestPath + ": " + fsErrorMessage(read.unwrapErr())));
         return 1;
       }
       text = Some(read.unwrap());
@@ -193,12 +203,12 @@ export function runWorkspaceWithOptions(fs: FsGrant, argv: string[], ui: Termina
     }
     return 0;
   }
-  const lockPath = join([root, "orin.lock"]);
+  const lockPath = join(root, "orin.lock");
   if (sub == "lock") {
-    if (exists(fs, lockPath)) {
+    if (existsOr(fs, lockPath)) {
       const previous = readFile(fs, lockPath);
       if (previous.isErr()) {
-        console.error(terminalSafe("error: cannot read " + lockPath + ": " + previous.unwrapErr()));
+        console.error(terminalSafe("error: cannot read " + lockPath + ": " + fsErrorMessage(previous.unwrapErr())));
         return 1;
       }
       if (!workspaceLock(previous.unwrap())) {
@@ -208,7 +218,7 @@ export function runWorkspaceWithOptions(fs: FsGrant, argv: string[], ui: Termina
     }
     const w = writeFile(fs, lockPath, lockText(r));
     if (w.isErr()) {
-      console.error(terminalSafe("error: cannot write " + lockPath + ": " + w.unwrapErr()));
+      console.error(terminalSafe("error: cannot write " + lockPath + ": " + fsErrorMessage(w.unwrapErr())));
       return 1;
     }
     return 0;

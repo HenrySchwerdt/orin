@@ -1,0 +1,56 @@
+// std:io (ADR-0048 rule 3.1): shell / shellTimeout return Result<int, ProcessError>; no -1 / -2 sentinels, a Duration
+// instead of a number of seconds. Run by tools/test_std.sh with and without contract checking.
+import { assert, assertEq, assertEqString } from "std:test";
+import { Host, useProcess } from "std:host";
+import { shell, shellTimeout, ProcessError, ProcessErrorKind, Timeout, InvalidDuration, Failed, processErrorMessage } from "std:io";
+import { seconds, milliseconds } from "std:time";
+
+function kindName(k: ProcessErrorKind): string {
+  return match (k) {
+    Timeout => "Timeout",
+    InvalidDuration => "InvalidDuration",
+    Failed => "Failed"
+  };
+}
+
+@Test
+function exitStatusIsOk(host: Host): void {
+  useProcess(host, proc => {
+    assertEq(shell(proc, "exit 0").unwrap(), 0, "success");
+    assertEq(shell(proc, "exit 7").unwrap(), 7, "a failing command is still an Ok status");
+    assertEq(shell(proc, "exit 255").unwrap(), 255, "largest status");
+    assertEq(shellTimeout(proc, "exit 3", seconds(5)).unwrap(), 3, "bounded command");
+    assertEq(shellTimeout(proc, "exit 124", seconds(5)).unwrap(), 124, "124 is an exit status, not a timeout");
+  });
+}
+
+@Test
+function timeoutIsAKind(host: Host): void {
+  useProcess(host, proc => {
+    const r = shellTimeout(proc, "sleep 30", seconds(1));
+    assert(r.isErr(), "the command did not finish in time");
+    assertEqString(kindName(r.unwrapErr().kind), "Timeout", "kind");
+    assertEqString(r.unwrapErr().command, "sleep 30", "command");
+    assertEqString(processErrorMessage(r.unwrapErr()), "command timed out: sleep 30", "message");
+    const sub = shellTimeout(proc, "sleep 30", milliseconds(1500));
+    assertEqString(kindName(sub.unwrapErr().kind), "Timeout", "a fraction of a second rounds up");
+  });
+}
+
+@Test
+function invalidDuration(host: Host): void {
+  useProcess(host, proc => {
+    const zero = shellTimeout(proc, "echo MUST_NOT_RUN", seconds(0));
+    assertEqString(kindName(zero.unwrapErr().kind), "InvalidDuration", "zero");
+    const negative = shellTimeout(proc, "echo MUST_NOT_RUN", milliseconds(-5));
+    assertEqString(kindName(negative.unwrapErr().kind), "InvalidDuration", "negative");
+    assertEqString(processErrorMessage(negative.unwrapErr()), "timeout must be positive: echo MUST_NOT_RUN", "message");
+  });
+}
+
+@Test
+function messagesAreNeverEmpty(): void {
+  assert(processErrorMessage(ProcessError { kind: Failed, command: "x" }).length > 0, "Failed");
+  assert(processErrorMessage(ProcessError { kind: Timeout, command: "x" }).length > 0, "Timeout");
+  assert(processErrorMessage(ProcessError { kind: InvalidDuration, command: "x" }).length > 0, "InvalidDuration");
+}

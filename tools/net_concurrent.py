@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Concurrency checks of examples/http_server_concurrent.or for tools/test_net.sh (ADR-0017 Addendum C).
+"""Concurrency checks of examples/http_server.or for tools/test_net.sh (ADR-0017 Addendum C).
 
   net_concurrent.py PORT REQUEST_MS WORKERS
 The server was started with WORKERS worker tasks and a request deadline of REQUEST_MS.

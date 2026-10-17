@@ -11,9 +11,10 @@ human-readable output works. Without z3 the test is skipped unless --require-z3 
 
 The files cover one construct each, with VERIFIED, REFUTED (with counterexample) and UNKNOWN (with reason) cases:
 verify_basic (int / bool, modular calls), verify_int_widths (exact ranges), verify_arrays (sequences, bounds),
-verify_data (records, Option, Result, unions, Map, strings), verify_methods (axioms for `pop().unwrap()`, `sort`, `find`, `findIndex`, `reduce`, `split`, `indexOf`: compiler/vc/methods.or), verify_classes (invariants per method, constructors,
+verify_data (records, Option, Result, unions, Map, strings), verify_methods (axioms for `sort`, `find`, `findIndex`, `reduce`, `split`, `indexOf`: compiler/vc/methods.or), verify_classes (invariants per method, constructors,
 frames, modular method calls), verify_loops (inferred bounds, user invariants, havoc, unrolling), verify_quantifiers
-(every / some / range, sorted, no duplicates, conservation, totals), verify_generics, verify_soundness (places where a
+(every / some / range, sorted, no duplicates, conservation, totals), verify_generics, verify_try (`?` as an early return and
+mutating calls inside expressions, hoisted in evaluation order), verify_soundness (places where a
 careless encoding gives a wrong status), quality_vc (W046x), names/ (two units declaring the same function and type names:
 each call and type is resolved in the scope of its own unit). Run with the contract-checked compiler in CI
 (tools/test_compiler_contracts.sh), so the verifier's own contracts are exercised too.
@@ -141,6 +142,13 @@ def check_extras(orinc):
     rep = json.loads(run(orinc, "--format=json", "tests/contracts/quality_vc.or", case="_extras").stdout.decode())
     part = [x for x in rep["results"] if x["function"] == "partial"][0]
     check(part["candidates"] == ["@Requires(!(x == 1))"], "candidate precondition: %r" % part["candidates"])
+    # `?` is an early return: a claim that is wrong on that path is never VERIFIED, whatever the expect lines say.
+    rep = json.loads(run(orinc, "--format=json", "tests/contracts/verify_try.or", case="_extras").stdout.decode())
+    wrong = {"pass_on_wrong", "pass_err_wrong", "chain_wrong", "in_return_wrong", "in_condition_wrong", "shortcut", "branch_arm",
+             "Cursor.run2Ok", "Cursor.run2Moves", "Cursor.minusWrongOrder", "Cursor.readBeforeWrong", "Cursor.armEffectWrong", "drain_two_wrong", "Gauge.bad"}
+    seen = [x for x in rep["results"] if x["function"] in wrong and (x["kind"] == "ensures" or x["function"] == "Gauge.bad")]
+    check({x["function"] for x in seen} == wrong, "verify_try: wrong claims not all reported: %r" % sorted(wrong - {x["function"] for x in seen}))
+    check(all(x["status"] != "VERIFIED" for x in seen), "verify_try: a wrong claim is VERIFIED: %r" % [x["function"] for x in seen if x["status"] == "VERIFIED"])
     # Unavailable solver: UNKNOWN with a reason, not a crash.
     r = run(orinc, "--format=json", "--z3", "/nonexistent/z3", "tests/contracts/verify_basic.or", case="_extras")
     rep = json.loads(r.stdout.decode())

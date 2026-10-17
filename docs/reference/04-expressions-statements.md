@@ -190,7 +190,7 @@ last-use moves) is an optimisation and not observable (chapter 5).
 - EXP-6: `for ... of` over a string or a map as a negative test (E0400) does not exist.
 - EXP-8: an expression statement that is not a call (`1 + 2;`) is accepted; no test pins this.
 - EXP-15: the "arm after a catch-all is accepted" behaviour has no test.
-- EXP-16: the E0402 arity error for a variant pattern and the E0405 for a non-variant name pattern have no test of their own; the E0402 for nested patterns is only a message ("sub-patterns must be a binding name or `_`").
+- EXP-16: the E0402 arity error for a variant pattern and the E0405 for a non-variant name pattern have no test of their own; the E0402 for nested patterns is only a message ("nested patterns are not supported; a variant pattern binds only names or `_`").
 - EXP-20: no conformance test fixes operand, argument and element evaluation order of plain expressions; only the OX attribute tests print the order.
 - EXP-21: assignment target before right-hand side has no test.
 - EXP-22: traps for `slice(a, b)` with `a > b` exist (`array_slice_trap_order`); there is no test for every trap listed (e.g. a failed `process.exit` flush).
