@@ -12,10 +12,29 @@ top-level declaration is private to its file unless marked `export`. Declaration
 
 **MOD-2.** `import { a, B } from "path";` brings the named **exported** declarations of the target into the file's scope. The path is a
 string literal and is one of: a relative path `./x`, `../x` (resolved against the importing file's directory to `x.or`, else `x/module.or`);
-a standard module `std:name`; or a dependency name (MOD-14). There is no renaming (`as`), no namespace import, no wildcard and no default
+a standard module `std:name`; or a dependency name (MOD-14). There is no wildcard that brings all names into scope and no default
 import. Importing a name that the target does not export (or that is private) is E0300.
-- Tests: `tests/run/modules_basic`, `tests/errors/e0300_not_exported`, `tests/parse_edge/err0200_import_as.or`, `tests/parse_edge/err0200_import_star.or`,
+- Tests: `tests/run/modules_basic`, `tests/errors/e0300_not_exported`, `tests/parse_edge/ok_import_alias.or`, `tests/parse_edge/ok_import_namespace.or`,
   `tests/next/errors/e0300_import_generic_not_exported`, `tests/next/errors/e0300_source_private_not_exported`.
+
+**MOD-2a.** **Aliases** (ADR-0048 addendum). `import { exists as fileExists, empty as emptyBytes } from "path";` binds the export under the new name, for
+types and values alike (the variants of an imported union keep their own names). `export { a as b } from "path";` re-exports under another name. The
+alias is the only name the file gets; two bindings of one name stay E0304 (MOD-6), and an export the target lacks is E0300.
+- Tests: `tests/next/run/import_alias.or`, `tests/next/run/import_alias_reexport`, `tests/next/errors/e0304_duplicate_import_alias.or`, `tests/next/errors/e0304_import_alias_collides_with_declaration.or`,
+  `tests/next/errors/e0300_import_alias_unknown_name.or`.
+
+**MOD-2b.** **Namespace imports** (ADR-0048 addendum). `import * as m from "path";` binds the name `m`, a compile-time namespace of the target's exports:
+`m.f(..)` calls a function (`m.f<T>(..)` a generic one), `m.CONST` reads a constant, `m.T` names a type (`m.Box<int>`, `m.T[]`), and `m.Ctor(..)`, `m.Rec { .. }`,
+`new m.C(..)` and the patterns `m.Variant(x)` use constructors; the same entity `import { x }` would bind, so the generated code is identical. `m` is not a
+value: passing, storing, comparing, printing or calling it is E0400. A member the target does not export is E0300. Because `m.x` would otherwise mean
+something else, a local, parameter, closure parameter, function, type or import named `m` in a file with `import * as m` is E0304 (rename one of them).
+`import * from ".."` without `as` is E0200. Re-exports have no namespace form.
+- Tests: `tests/next/run/namespace_import_std.or`, `tests/next/run/namespace_import_local`, `tests/next/errors/e0300_namespace_unknown_member.or`,
+  `tests/next/errors/e0300_namespace_unknown_type.or`, `tests/next/errors/e0304_namespace_shadowed_by_local.or`, `tests/next/errors/e0304_namespace_shadowed_by_param.or`,
+  `tests/next/errors/e0304_namespace_shadowed_by_closure_param.or`, `tests/next/errors/e0304_namespace_shadowed_by_function.or`,
+  `tests/next/errors/e0304_namespace_shadowed_by_import.or`, `tests/next/errors/e0400_namespace_as_value.or`, `tests/next/errors/e0400_namespace_passed.or`,
+  `tests/next/errors/e0400_namespace_printed.or`, `tests/next/errors/e0400_namespace_compared.or`, `tests/next/errors/e0400_namespace_called.or`,
+  `tests/next/errors/e0200_import_star_without_as.or`.
 
 **MOD-3.** A path that resolves to no file is E0301 (`cannot find module`). A path starting with `$` is reserved for the embedded preludes and is not an
 importable path from source (it is reported as an unreadable file, E0301).
@@ -132,7 +151,7 @@ workspace CLI, library/runtime moves) are in the tree.
 
 ## Gaps: rules without a test
 
-- MOD-2: no test shows an import of a name that is exported by `export { x } from` of a third module (only the union case, `modules_reexport_union`); `as` and `*` are rejected by parse-only tests.
+- MOD-2: no test shows an import of a name that is exported by `export { x } from` of a third module (only the union case, `modules_reexport_union`). MOD-2a/2b: a union type exported through a namespace is covered only for a local module.
 - MOD-3: the `$`-path rejection has no test.
 - MOD-6: no test for an import colliding with a local declaration or with another import (E0304 probed with `orin2`).
 - MOD-7: that an exported declaration may mention a private type, and that an importer can then read its fields, has no test (see the README discrepancies).
