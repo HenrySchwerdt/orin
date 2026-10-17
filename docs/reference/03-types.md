@@ -248,16 +248,25 @@ An instantiation chain that does not terminate (polymorphic recursion) is E0413.
   `tests/next/errors/e0400_generic_body_type_mismatch.or`, `tests/next/errors/e0413_polymorphic_recursion.or`,
   `tests/next/errors/e0413_infinite_type_instantiation.or`.
 
-**TYP-28.** A type parameter of a generic function or class may have **one bound**, `T extends I`, where `I` is an interface (TYP-29) or
-`Eq`/`Ord`/`Hash` (TYP-35). The opaque `T` then has the methods of `I`. Every instantiation is checked against the bound: the argument must
-be a class that implements `I` (nominally), `I` itself, or a parameter bounded by `I` (E0417). A bound that names no interface is E0400
-(or E0300 if unknown); `A & B` is E0408; a bound on a `type` or a method is E0408.
+**TYP-28.** A type parameter of a generic function, class or method may have **one or several bounds**, `T extends I` or `T extends A & B`,
+where each bound is an interface (TYP-29) or `Eq`/`Ord`/`Hash` (TYP-35). The opaque `T` then has the methods of every bound, and converts
+to each bound interface. Every instantiation is checked against all bounds, in order; the first one the argument does not satisfy is the
+error: the argument must be a class that implements the interface (nominally), the interface itself, or a parameter bounded by it (E0417),
+and for `Eq`/`Ord`/`Hash` it must have the instance (E0475 / E0476). The order of the bounds is not significant, `Ord` and `Hash` imply `Eq`,
+and `T extends Ord & Hash` works with derived and explicit instances alike. A member lookup on `T` searches all bounds; two bounds that
+declare a method of the same name with different parameter or result types are E0477 at the declaration (the same signature in both is fine),
+and the same bound twice is E0304. A method that no bound declares is E0405. A bound that names no interface is E0400 (or E0300 if unknown);
+a bound on a `type` is E0408.
 - Tests: `tests/next/run/genclass_bounds.or`, `tests/next/run/iface_bound_calls_bound.or`, `tests/next/run/iface_static_bound_sum.or`,
   `tests/next/run/iface_generic_bound_modules`, `tests/next/errors/e0417_bound_violation_builtin.or`,
   `tests/next/errors/e0417_genclass_bound_inferred.or`, `tests/next/errors/e0417_bound_not_declared.or`,
   `tests/next/errors/e0400_bound_not_interface.or`, `tests/next/errors/e0300_bound_unknown_interface.or`,
-  `tests/next/errors/e0408_multiple_bounds.or`, `tests/next/errors/e0408_bound_on_generic_type.or`,
-  `tests/next/errors/e0405_method_not_in_bound.or`.
+  `tests/next/errors/e0408_bound_on_generic_type.or`, `tests/next/errors/e0405_method_not_in_bound.or`,
+  `tests/next/run/multi_bounds_ord_hash.or`, `tests/next/run/multi_bounds_class_and_interface.or`, `tests/next/run/multi_bounds_methods.or`,
+  `tests/next/errors/e0417_second_bound_unsatisfied.or`, `tests/next/errors/e0417_second_bound_unsatisfied_class.or`,
+  `tests/next/errors/e0475_second_bound_hash_unsatisfied.or`, `tests/next/errors/e0477_conflicting_bound_members.or`,
+  `tests/next/errors/e0477_conflicting_bound_params.or`, `tests/next/errors/e0304_duplicate_bound.or`,
+  `tests/next/errors/e0405_multi_bound_no_such_member.or`.
 
 ## 3.8 Interfaces
 
@@ -322,12 +331,12 @@ methods is part of the module's public API.
   `tests/next/errors/e0408_class_mut_call_in_condition.or`, `tests/next/errors/ts_dev_e0401_const_mutating_call.or`.
 
 **TYP-33.** A class has no inheritance (`extends` is E0408), no `protected`, getters/setters, overloads, abstract members, static fields
-(E0408) or generic methods (E0460; ADR-0040 changes the last one and is pending). A **generic class** `class Box<T extends I> { .. }` is
+(E0408); a class method may be generic (ADR-0040), an interface method may not (E0460). A **generic class** `class Box<T extends I> { .. }` is
 instantiated per type-argument list (`Box<int>` and `Box<string>` are distinct types, E0400 on mixing); its type parameters are not in
-scope in static methods (E0461), may carry one bound, and every instantiation is checked (E0417); a class needs its type arguments
+scope in static methods (E0461), may carry bounds (`T extends A & B`), and every instantiation is checked (E0417); a class needs its type arguments
 (`Box` alone is E0400) and exactly as many as it has parameters.
-- Tests: `tests/next/errors/e0408_class_extends.or`, `tests/next/errors/ts_dev_e0408_extends.or`, `tests/next/errors/e0460_class_generic_method.or`,
-  `tests/next/errors/ts_dev_e0460_generic_method.or`, `tests/next/errors/e0461_genclass_static_uses_param.or`,
+- Tests: `tests/next/errors/e0408_class_extends.or`, `tests/next/errors/ts_dev_e0408_extends.or`, `tests/next/errors/e0460_interface_generic_method.or`,
+  `tests/next/errors/e0461_genclass_static_uses_param.or`,
   `tests/next/errors/e0408_genclass_extends.or`, `tests/next/run/genclass_basic.or`, `tests/next/run/genclass_multi_params.or`,
   `tests/next/run/genclass_implements.or`, `tests/next/run/genclass_storage.or`, `tests/next/run/genclass_module`,
   `tests/next/errors/e0400_genclass_instances_are_distinct_types.or`, `tests/next/errors/e0400_genclass_without_type_arguments.or`,
