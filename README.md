@@ -172,15 +172,19 @@ Orin releases are experimental pre-releases for Linux (x86-64, arm64) and macOS 
 `~/.orin`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/HenrySchwerdt/orin/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/orin-lang/orin-lang/main/install.sh | sh
 orin doctor        # checks the install and the C compiler, prints fixes
 ```
 
-**Homebrew**: planned, not available yet.
+**Homebrew** (macOS on Apple silicon):
+
+```bash
+brew install orin-lang/orin/orin
+```
 
 **Windows**: WSL2 works today ([docs/windows.md](docs/windows.md)); a native build is planned.
 
-**Manual tarball**: download a package from [Releases](https://github.com/HenrySchwerdt/orin/releases) and run it in place:
+**Manual tarball**: download a package from [Releases](https://github.com/orin-lang/orin-lang/releases) and run it in place:
 
 ```bash
 tar xzf orin-<version>-<platform>.tar.gz && cd orin-<version>-<platform>

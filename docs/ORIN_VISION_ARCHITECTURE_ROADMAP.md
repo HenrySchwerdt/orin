@@ -2,7 +2,7 @@
 
 > **Produktvision, technische Zielarchitektur und Implementierungsfahrplan**  
 > Stand: 13. Oktober 2026 · Status: Designvorschlag, nicht vollständig implementiert  
-> Repository: https://github.com/HenrySchwerdt/orin
+> Repository: https://github.com/orin-lang/orin-lang
 
 ## Executive Summary
 
@@ -94,7 +94,7 @@ Die folgende **integrierte** Funktionalität ist Produktvision beziehungsweise n
 - Verifizierbare und signierte `.orcert`-Release-Artefakte.
 - Realer PostgreSQL/HTTP/JSX-Referenzdienst und belastbare End-to-End-Benchmarks.
 
-**Statusquellen:** [README](https://github.com/HenrySchwerdt/orin/blob/main/README.md), [Fortschritt](https://github.com/HenrySchwerdt/orin/blob/main/docs/progress.md), [PR #9](https://github.com/HenrySchwerdt/orin/pull/9), [PR #10](https://github.com/HenrySchwerdt/orin/pull/10).
+**Statusquellen:** [README](https://github.com/orin-lang/orin-lang/blob/main/README.md), [Fortschritt](https://github.com/orin-lang/orin-lang/blob/main/docs/progress.md), [PR #9](https://github.com/orin-lang/orin-lang/pull/9), [PR #10](https://github.com/orin-lang/orin-lang/pull/10).
 
 ---
 

@@ -117,3 +117,47 @@ jobs:
         if: env.DRY_RUN == 'true'
         run: |
           echo "Dry run, nothing published. Packages and SHA256SUMS are in the workflow artifacts." | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # Opens a formula update PR on the orin-lang/homebrew-orin tap for the release just published (ADR-0047
+  # section 6). Needs the repository secret HOMEBREW_TAP_TOKEN (a fine-grained token with contents and pull-request
+  # write access to the tap only); without it the job only renders the formula and says so. The tap's own CI installs
+  # and tests the formula on macOS before the PR is merged.
+  homebrew:
+    needs: release
+    if: github.event_name == 'push' || inputs.dry_run == false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: SHA256SUMS
+          path: dist
+      - name: Render Formula/orin.rb
+        run: ./tools/homebrew_formula.sh "${TAG#v}" --sums dist/SHA256SUMS > orin.rb && cat orin.rb
+      - name: Open the formula update PR on the tap
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "HOMEBREW_TAP_TOKEN is not set: formula rendered, no tap PR opened." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          ver="${TAG#v}"
+          branch="orin-$ver"
+          git clone -q "https://x-access-token:$GH_TOKEN@github.com/orin-lang/homebrew-orin.git" tap
+          cd tap
+          mkdir -p Formula
+          cp ../orin.rb Formula/orin.rb
+          if git diff --quiet -- Formula/orin.rb && git ls-files --error-unmatch Formula/orin.rb >/dev/null 2>&1; then
+            echo "Formula already at $ver." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          git checkout -q -b "$branch"
+          git add Formula/orin.rb
+          git commit -q -m "orin $ver"
+          git push -q -f origin "$branch"
+          gh pr create --repo orin-lang/homebrew-orin --head "$branch" --base main \
+            --title "orin $ver" --body "Formula update for [Orin $TAG]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$TAG), rendered by tools/homebrew_formula.sh from the release's SHA256SUMS." \
+            || echo "PR for $branch already exists."

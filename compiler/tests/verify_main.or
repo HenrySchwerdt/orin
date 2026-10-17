@@ -944,6 +944,57 @@ function netCases(): usize {
   return bad;
 }
 
+// ---------------------------------------------------------------- network handles moved into a task (ADR-0017 Addendum C)
+// A Stream (BNetAccept / BNetConnect) or a cloned NetGrant is moved out with grantMove (BTask 18; a closer, the token is a scalar);
+// the task adopts a Stream with grantAdoptStream (BTask 30) or a NetGrant with grantAdoptNet (BTask 29) and must close / revoke it
+// exactly once. The verifier rules are the generic handle rules; these cases pin them for the network kinds.
+
+function gadoptStream(d: usize, tok: usize): Instr { return IBuiltin(Some(d), BTask(30), [OLocal(tok)]); }
+function gadoptNet(d: usize, tok: usize): Instr { return IBuiltin(Some(d), BTask(29), [OLocal(tok)]); }
+
+function netMoveCases(): usize {
+  let bad: usize = 0;
+  const p1 = pos("an accepted stream is moved into a task; the listener stays usable", straight(1,
+    [lh("host"), lh("net"), lh("ln"), lh("s"), lu("tok"), lh("s2")], [
+      gnet(1), nlisten(2, 1), naccept(3, 2), gmove(3, 4), naccept(5, 2), nclose(5), nclose(2), grev(1)]));
+  const p2 = pos("the task adopts the stream, uses it and closes it", prog([
+    fn("f", 1, [lu("tok"), lh("s"), lr("r")], MVoid, [bk([gadoptStream(1, 0), nrecv(1, 2), IRelease(2), nclose(1)], ret())])]));
+  const p3 = pos("a cloned NetGrant is moved; the original is revoked by its owner", straight(1,
+    [lh("host"), lh("net"), lh("c"), lu("tok")], [gnet(1), gclone(2, 1), gmove(2, 3), grev(1)]));
+  const p4 = pos("the task adopts a NetGrant, connects through it, revokes it", prog([
+    fn("f", 1, [lu("tok"), lh("g"), lh("s")], MVoid, [bk([gadoptNet(1, 0), nconnect(2, 1), nclose(2), grev(1)], ret())])]));
+  const n1 = neg("stream moved twice", straight(1, [lh("host"), lh("net"), lh("ln"), lh("s"), lu("t1"), lu("t2")], [
+    gnet(1), nlisten(2, 1), naccept(3, 2), gmove(3, 4), gmove(3, 5), nclose(2), grev(1)]), "not open");
+  const n2 = neg("stream used after it was moved", straight(1, [lh("host"), lh("net"), lh("ln"), lh("s"), lu("tok"), lr("r")], [
+    gnet(1), nlisten(2, 1), naccept(3, 2), gmove(3, 4), nrecv(3, 5), IRelease(5), nclose(2), grev(1)]), "dead");
+  const n3 = neg("stream closed after it was moved", straight(1, [lh("host"), lh("net"), lh("ln"), lh("s"), lu("tok")], [
+    gnet(1), nlisten(2, 1), naccept(3, 2), gmove(3, 4), nclose(3), nclose(2), grev(1)]), "not open");
+  const n4 = neg("stream moved on one branch, left open on the other", prog([
+    fn("f", 1, [lh("host"), lb("c"), lh("net"), lh("ln"), lh("s"), lu("tok")], MVoid, [
+      bk([gnet(2), nlisten(3, 2), naccept(4, 3)], TBranch(OLocal(1), 1, 2)),
+      bk([gmove(4, 5)], TGoto(3)),
+      bk([], TGoto(3)),
+      bk([nclose(3), grev(2)], ret())])]), "closed");
+  const n5 = neg("a Stream parameter is not moved (its owner closes it)", prog([
+    fn("f", 1, [lh("s"), lu("tok")], MVoid, [bk([gmove(0, 1)], ret())])]), "parameter");
+  const n6 = neg("adopted stream never closed", prog([
+    fn("f", 1, [lu("tok"), lh("s")], MVoid, [bk([gadoptStream(1, 0)], ret())])]), "not closed");
+  const n7 = neg("adopted stream closed twice", prog([
+    fn("f", 1, [lu("tok"), lh("s")], MVoid, [bk([gadoptStream(1, 0), nclose(1), nclose(1)], ret())])]), "not open");
+  const n8 = neg("adopt a stream from a handle (it takes a token)", prog([
+    fn("f", 1, [lh("other"), lh("s")], MVoid, [bk([IBuiltin(Some(1), BTask(30), [OLocal(0)]), nclose(1)], ret())])]), "token");
+  const n9 = neg("the moved token is not a handle: it cannot be received on", straight(1,
+    [lh("host"), lh("net"), lh("ln"), lh("s"), lu("tok"), lr("r")], [
+      gnet(1), nlisten(2, 1), naccept(3, 2), gmove(3, 4), IBuiltin(Some(5), BNetRecv, [OLocal(4), OInt(16), OInt(100)]), IRelease(5), nclose(2), grev(1)]), "first argument");
+  const n10 = neg("adopted NetGrant never revoked", prog([
+    fn("f", 1, [lu("tok"), lh("g")], MVoid, [bk([gadoptNet(1, 0)], ret())])]), "not closed");
+  if (!p1) { bad += 1; } if (!p2) { bad += 1; } if (!p3) { bad += 1; } if (!p4) { bad += 1; }
+  if (!n1) { bad += 1; } if (!n2) { bad += 1; } if (!n3) { bad += 1; } if (!n4) { bad += 1; }
+  if (!n5) { bad += 1; } if (!n6) { bad += 1; } if (!n7) { bad += 1; } if (!n8) { bad += 1; }
+  if (!n9) { bad += 1; } if (!n10) { bad += 1; }
+  return bad;
+}
+
 // ---------------------------------------------------------------- in/out receiver (v1.10)
 
 // An inout function: parameter 0 (owned) is handed back at return. `fnIO(name, locals, ret, blocks)`.
@@ -1591,7 +1642,7 @@ function rangeCases(): usize {
 }
 
 function main(): void {
-  const bad = robustnessCases() + spanCases() + negatives1() + negatives2() + positives() + ownedCases() + closureCases() + ifaceCases() + handleCases() + grantCases() + netCases() + taskGrantCases() + inoutCases() + forwardCases() + uncheckedCases() + rangeCases();
+  const bad = robustnessCases() + spanCases() + negatives1() + negatives2() + positives() + ownedCases() + closureCases() + ifaceCases() + handleCases() + grantCases() + netCases() + netMoveCases() + taskGrantCases() + inoutCases() + forwardCases() + uncheckedCases() + rangeCases();
   if (bad > 0) {
     console.log(bad.toString() + " case(s) FAILED");
     exit(1);

@@ -294,3 +294,83 @@ Non-goals:
 - The Lean work (M6, M8, M12) is the long pole and the only way to move C1-C5 above `MODEL_ONLY`; the CBMC and z3 work (M3, M7, M9, M11) can
   run in parallel with it.
 - ADR-0052's R3 gains a reason to keep the core dialect small and verifiable: M9 needs the verifier to model `load`/`store` and layout.
+
+## Addendum A (2026-10-17): the compiler proves itself, with no `UNKNOWN`
+
+### Question
+
+The owner's requirement (2026-10-17): the compiler itself must be proven; `UNKNOWN` results are not acceptable. What does that mean
+exactly, where do we stand, and how do we get to zero?
+
+### Target
+
+"The compiler is proven" means: `orin verify --contracts compiler/main.or` reports every obligation of every compiler function as
+`VERIFIED`, with **0 `REFUTED` and 0 `UNKNOWN`**. Every `VERIFIED` result is relative to the assumptions it names (A-INT, A-CALL,
+A-LOOP, A-STR, ... in `docs/assurance.md`) and to z3 and the VC generator as trusted components (`docs/tcb.md`). Reaching zero does not
+by itself raise any ledger level; it removes the open obligations so that the remaining gap is exactly the named assumptions.
+
+An obligation may leave the count only by being proved. Deleting a contract or weakening it to `true` to remove an `UNKNOWN` is not
+allowed; a contract that is wrong is fixed and the fix is justified in the PR.
+
+### Baseline (origin/main d0a17a9)
+
+Full run over `compiler/` (25 modules, z3 4.8.12, per-module instrumented runs; data and method in the project report
+`reports/compiler-verify-triage.md`):
+
+| | count |
+|---|---|
+| obligations | 2469 |
+| `VERIFIED` | 782 |
+| `REFUTED` | 23 (none is a compiler bug: all are incomplete or non-inductive contracts) |
+| `UNKNOWN` | 1664 |
+| serial run time | 133 min (module `opt` alone 93 min) |
+
+`UNKNOWN` by cause:
+
+| Group | Count | Fix (verifier feature or contract work) | Owner code |
+|---|---|---|---|
+| U1 Callee result known only via its contract, or string contents | 360 | unfold small pure callees as definitions; add the missing `@Ensures` (`rtNames`, `isEofTok`, `isValidCode`, the `diag(code, ...)` precondition ×45) | `vc/expr.or`, `vc/gen.or`, compiler sources |
+| U2 Name collisions (callee not unique 148, duplicate type name 116) | 264 | qualify function keys and type names by unit, resolved like the type checker | `vc/vc.or` (`buildProg`), `vc/expr.or`, `vc/vt.or` |
+| U3 Recursive records and unions (`FnCtx` alone 150) | 259 | z3 recursive datatypes or an opaque sort with field accessors; `match` on them | `vc/expr.or`, `vc/stmt.or`, `vc/vt.or` |
+| U4 Missing loop invariants (53 in `syntax/lexer.or`) | 235 | `@Invariant` on the loops; infer the "accumulator length = i" shape | compiler sources, `vc/stmt.or` |
+| U5 z3 timeout (131 in `opt`) | 211 | per-goal fact slicing, incremental solving; split large functions | `vc/vc.or` |
+| U6 `?` operator | 104 | encode early return on `Err` / `None` | `vc/stmt.or`, `vc/expr.or` |
+| U7 Mutating method call inside an expression | 82 | hoist to a statement in the VC encoding (or in the source) | `vc/expr.or` |
+| U8 Array and string methods (`pop`, `split`, `sort`, ...) | 41 | axioms for each method | `vc/expr.or` |
+| U9 Unknown record or class (`Workspace`, `Scope`, ...) | 33 | mostly closed by U2 | |
+| U10 Map size, string axioms, other constructs, rest | 75 | case by case | |
+
+Run time: 91 % of the 133 min is z3 calls that hit the 4 s timeout; 45 % of z3 time is the bounded-search retry after a timeout
+(`rawProve`), which produced 26 counterexamples and 8 proofs in 900 runs. Parsing and VC generation are 1 %.
+
+### Decision
+
+1. **Ratchet in CI.** A new step in the `assurance` job runs the verifier over the compiler and compares the counts per module with
+   a checked-in baseline file. `VERIFIED` may only go up and `UNKNOWN` / `REFUTED` only down; a PR that lowers a number updates the
+   baseline. Once a module reaches zero it is marked strict and any `UNKNOWN` there fails the build. The step lands after Z1 makes the
+   run short enough for CI.
+2. **Speed before breadth.** The run must be fast enough to iterate on and to gate in CI, so the first PRs cut time, not unknowns.
+3. **Order of work** (each line is one or a few small PRs, merged alone):
+
+| # | Content | Expected effect |
+|---|---|---|
+| Z0 | Fix the 23 `REFUTED` contracts (constructor `@Requires`, inductive invariants, forwarded preconditions) | `REFUTED` 23 → 0 |
+| Z1 | Cap the post-timeout retry, configurable timeout (`--timeout-ms`), deterministic `rlimit`; per-module filter and timing output in `orin verify` | z3 time about −45 %; reproducible results |
+| Z2 | U2: qualify names by unit | up to −264 `UNKNOWN` |
+| Z3 | U6 `?` operator and U7 mutating calls in expressions | up to −186 |
+| Z4 | U1: unfold small pure callees; missing `@Ensures` in compiler sources | up to −360 |
+| Z5 | U3: recursive records and unions as datatypes | up to −259 |
+| Z6 | U4: loop invariants in compiler sources plus the accumulator-shape inference | up to −235 |
+| Z7 | U5: fact slicing and incremental solving; parallel functions; per-function result cache keyed by a content hash (sound only with the deterministic limit from Z1) | timeouts toward 0; repeat runs only re-prove changed functions |
+| Z8 | U8-U10 tail; ratchet switched to strict for the whole compiler | `UNKNOWN` 0 |
+
+Z0, Z1 and Z2 start at once and touch disjoint code (compiler sources, the solver call, name resolution in `compiler/vc`). Each verifier
+feature in Z2-Z7 comes with positive, negative and soundness tests in `tests/contracts/` before it may turn an `UNKNOWN` into
+`VERIFIED`; a feature that cannot be modelled soundly keeps `UNKNOWN` and is reported here instead.
+
+### Consequences
+
+- The compiler becomes the main test case for the verifier; every gap it shows is a gap for user programs too.
+- New compiler code must arrive with contracts that verify, enforced by the ratchet.
+- The verifier grows (U1, U3, U6-U8), so its own TCB entry grows; the differential test against the Lean checker and the mutation
+  classes have to keep up.

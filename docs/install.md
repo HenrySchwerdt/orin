@@ -10,7 +10,7 @@ targets four platforms; available downloads depend on the version:
 | macOS Apple silicon | `orin-<version>-macos-arm64.tar.gz` | available |
 | macOS Intel | `orin-<version>-macos-x86_64.tar.gz` | absent |
 
-As checked on 2026-10-15, [v0.1.0-alpha.2](https://github.com/HenrySchwerdt/orin/releases/tag/v0.1.0-alpha.2)
+As checked on 2026-10-15, [v0.1.0-alpha.2](https://github.com/orin-lang/orin-lang/releases/tag/v0.1.0-alpha.2)
 is the latest published release. It contains those two tarballs and a combined `SHA256SUMS`, without
 individual `.sha256` assets. The current workflow additionally generates `<file>.sha256` for each tarball
 and a combined `SHA256SUMS`; that configuration is not a claim that older releases contain all four targets.
@@ -24,7 +24,7 @@ system libraries; Git is needed for Git dependencies. On Alpine/musl see "Troubl
 ## One-line install (Linux, macOS)
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/HenrySchwerdt/orin/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/orin-lang/orin-lang/main/install.sh | sh
 ```
 
 (Read the script first if you like: it is [`install.sh`](../install.sh), about 250 lines of POSIX sh.)
@@ -71,6 +71,23 @@ The installer only deletes a directory that it created itself (it writes a `.ori
 
 The latest release is found with the GitHub API (`/releases?per_page=1`), which is rate limited to 60
 requests per hour per IP for anonymous callers; pin `ORIN_VERSION` in CI.
+
+## Homebrew (macOS, Apple silicon)
+
+```sh
+brew install orin-lang/orin/orin
+orin doctor
+```
+
+The tap is [orin-lang/homebrew-orin](https://github.com/orin-lang/homebrew-orin). Its formula installs the
+`macos-arm64` release package (pinned URL and sha256) and runs `orin --version`, `orin doctor`, `orin run` and
+`orin build` as its test. `brew upgrade orin` updates, `brew uninstall orin` removes it. Intel macOS and Linux use
+the one-line install until their Homebrew smoke tests exist.
+
+How the tap is kept current: `tools/homebrew_formula.sh <version> --sums SHA256SUMS` renders `Formula/orin.rb`;
+the `homebrew` job of the release workflow runs it after each published release and opens a PR on the tap (repository
+secret `HOMEBREW_TAP_TOKEN`, write access to the tap only; without it the job only renders the formula). The tap's CI
+installs and tests the formula on macOS. The tap's README and workflow live in `dist/homebrew/tap/`.
 
 ## Manual tarball
 

@@ -2,7 +2,7 @@
 
 Written by `.github/workflows/bench.yml` (nightly and manual runs on `main`); one JSON file per run in [`history/`](history/), charts rendered by `tooling/benchmarks` (`bench-report render`, no external services). The same data as a stand-alone page: [`report.html`](report.html). Metrics and methodology: `docs/benchmarks.md` on `main`. Do not edit this branch by hand.
 
-2 runs, 2026-10-14 to 2026-10-16. Latest: [`9f83f16af4`](https://github.com/HenrySchwerdt/orin/commit/9f83f16af40241f235b3652208e703af6b084374).
+2 runs, 2026-10-14 to 2026-10-16. Latest: [`9f83f16af4`](https://github.com/orin-lang/orin-lang/commit/9f83f16af40241f235b3652208e703af6b084374).
 
 Instruction counts are the regression metric: they are deterministic for single-threaded programs, while wall time on a shared runner moves by 10-25 % between identical binaries.
 

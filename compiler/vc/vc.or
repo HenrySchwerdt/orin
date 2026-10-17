@@ -387,12 +387,25 @@ function queryText(g: Gen, base: string[], pc: string[], goal: string, probes: P
 // asker passes these up in `miss`, the driver solves them in parallel, enters the answers here, and runs the functions
 // that asked again. An answer depends on the text of its query only, so the results do not depend on the number of
 // threads.
-type Oracle = { z3: string; deferred: bool; answers: Map<string, Result<Solved, string>>; };
+type Oracle = { z3: string; lim: SolverLimits; deferred: bool; answers: Map<string, Result<Solved, string>>; };
+
+// The solver budget of one run (`orin verify --contracts --timeout-ms N --retry-ms N --rlimit N`). `timeoutMs` is the wall
+// time of the first query of an obligation; `retryMs` the wall time of the bounded-search retry after an `unknown`
+// (rawProve), 0 = no retry; `rlimit` is z3's deterministic resource limit (0 = none), applied to both queries on top of
+// the wall time, so that a query that runs out of it gives `unknown` on every machine.
+export type SolverLimits = { timeoutMs: int; retryMs: int; rlimit: int; };
+
+export function defaultSolverLimits(): SolverLimits {
+  return SolverLimits { timeoutMs: 4000, retryMs: 1000, rlimit: 0 };
+}
 
 const PENDING: string = "pending";
 
-function solverCommand(z3: string, base: string): string {
-  return z3 + " -in -t:4000 -T:15 < " + base + ".smt2 > " + base + ".out 2>&1";
+function solverCommand(z3: string, lim: SolverLimits, base: string): string {
+  const ms = base.endsWith("b") ? lim.retryMs : lim.timeoutMs;
+  const hard = (ms + 999) / 1000 + 2;
+  const rl = lim.rlimit > 0 ? " rlimit=" + lim.rlimit.toString() : "";
+  return z3 + " -in -t:" + ms.toString() + " -T:" + hard.toString() + rl + " < " + base + ".smt2 > " + base + ".out 2>&1";
 }
 
 // The answer in `base.out` after the solver ran with exit status `rc`.
@@ -431,7 +444,7 @@ function solve(fs: FsGrant, proc: ProcessGrant, or: Oracle, fi: usize, qn: usize
   if (or.deferred) {
     return Ok(Solved { status: PENDING, values: [base, key] });
   }
-  return readAnswer(fs, or.z3, base, shellRun(proc, solverCommand(or.z3, base)));
+  return readAnswer(fs, or.z3, base, shellRun(proc, solverCommand(or.z3, or.lim, base)));
 }
 
 // Solves the missed queries (pairs of file base and key) on all threads and enters the answers.
@@ -441,7 +454,7 @@ function solveMissing(fs: FsGrant, proc: ProcessGrant, or0: Oracle, miss: string
   let cmds: string[] = [];
   let j: usize = 0;
   while (j < n) {
-    cmds.push(solverCommand(or0.z3, miss[2 * j]));
+    cmds.push(solverCommand(or0.z3, or0.lim, miss[2 * j]));
     j += 1;
   }
   const rcs = mapOrderedProcess(proc, n, (k, pg) => shellRun(pg, cmds[k]));
@@ -743,7 +756,7 @@ function rawProve(fs: FsGrant, proc: ProcessGrant, or: Oracle, fi: usize, qn: us
   if (r.status == PENDING) {
     return Raw { status: "error", reason: PENDING, values: [], miss: r.values };
   }
-  if (r.status == "unknown" && probes.length > 0) {
+  if (r.status == "unknown" && probes.length > 0 && or.lim.retryMs > 0) {
     let bounds: string[] = [];
     for (const pr of probes) {
       if (pr.label.endsWith(".length") && pr.kind == 0) {
@@ -1320,10 +1333,10 @@ function verifyOne(fs: FsGrant, proc: ProcessGrant, p: Prog, or: Oracle, fi: usi
   return FnRes { out: rt.out, warns: rt.warns, miss: rt.miss };
 }
 
-export function verifyContracts(fs: FsGrant, proc: ProcessGrant, prog: LoadedProgram, sm: SourceMap, hir: Program, z3: string): Report {
+export function verifyContracts(fs: FsGrant, proc: ProcessGrant, prog: LoadedProgram, sm: SourceMap, hir: Program, z3: string, lim: SolverLimits): Report {
   const p = buildProg(prog, sm, hir);
   shellRun(proc, "mkdir -p build/contracts-vc");
-  let or = Oracle { z3: z3, deferred: parallelism() > 1, answers: new Map<string, Result<Solved, string>>() };
+  let or = Oracle { z3: z3, lim: lim, deferred: parallelism() > 1, answers: new Map<string, Result<Solved, string>>() };
   // Functions without clauses are still analysed (their calls of contracted functions are proof obligations);
   // if they are outside the fragment nothing is reported for them.
   let todo: usize[] = [];

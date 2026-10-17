@@ -4,7 +4,7 @@ _Status refresh: 2026-10-16, baseline `732af00`; dated measurements below retain
 
 ## Current stage: self-hosting alpha, first public pre-release
 - Release **v0.1.0-alpha.1** (Linux x86-64, macOS arm64):
-  https://github.com/HenrySchwerdt/orin/releases/tag/v0.1.0-alpha.1
+  https://github.com/orin-lang/orin-lang/releases/tag/v0.1.0-alpha.1
 - Self-hosted compiler (`compiler/`, full Orin source) bootstraps reproducibly (`stage2.c == stage3.c`);
   a compiler built through the LLVM backend reproduces the same `stage3.c`.
 - Pipeline: parse → load (modules, preludes) → check → HIR → MIR → optimise (owned params, moves)
@@ -119,8 +119,9 @@ Census re-run 2026-10-16 (after lever 1 and T1/T3/T4) with the current lever ran
    Not bundled in the packages; aarch64 / macOS downloads unexercised. Gate 2 is met (2026-10-16: `tools/llvm_fixpoint.sh`, in CI;
    the LLVM-built compiler emits the same C and the same `.ll` as orin2, also with a third stage). Gate 1 is met (LLVM at or
    below the C backend on 13 of 15 instruction rows; appends +0.8%, qsort_func +0.5%).
-5. **Parallel sockets:** `spawnNet` / `scopeNet`, a move rule for `Stream`, a per-task net buffer in place of the
-   global `g_netbuf`, and a concurrent HTTP server with limits and TSan / load tests.
+5. **Parallel sockets (done, ADR-0017 Addendum C):** `spawnNet` / `scopeNet`, `acceptDetached` / `spawnAccepted` / `serveAccepted`
+   (a `Stream` is moved into a task via the grant-token machinery), E0487, a per-task net buffer in place of the global
+   `g_netbuf`, `examples/http_server_concurrent.or` with limits, load and TSan tests in `tools/test_net.sh`.
 6. **Rewrite:** `compiler/vc/` and the remaining checker files. Then the rule-7 stream-style sweep, and later
    `.parallel()` per compiler phase (ADR-0039 §6).
 7. **Follow-ups:**

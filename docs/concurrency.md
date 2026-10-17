@@ -68,7 +68,7 @@ monitors, copyable by design). Not sendable, and not even representable as a cap
 variable, a field, a result or a capture, and E0483 gives the task-specific message at `spawn`.
 
 **Resources.** A resource handle (`File`, grant, `Host`) is not a value: it cannot be captured by a task body (E0483), stored,
-returned or sent (E0450-E0452). Grants are delegated, see below.
+returned or sent (E0450-E0452). Grants are delegated (`spawnFs` ... `spawnNet`), see below; an accepted `Stream` is moved into a task (`acceptDetached` / `spawnAccepted` of `std:net`, ADR-0017 Addendum C), a `Listener` stays in the task that bound it.
 
 **Panics.** A trap on a task thread ends that task only (the runtime records the message, closes the task's grants and
 files, releases monitors it held, folds its counters, and exits the thread). `join` turns it into a trap of the joiner with
@@ -129,9 +129,10 @@ addresses, load / store, `size_of` and header access, and calls L0 only through 
 | trap hook in `orin_trap` (`task_active`, `task_trap`) | a trap on a task thread records the message, ends the task, never returns | `core.trap.endTask` (called by the Orin `core.trap`) |
 | `orin_rt_heap_exit()` | end of a task heap: revoke its grants, close its files, free its free lists and work stack, fold its counters | `core.heap.retire()` |
 | thread-local `g_live`, `orin_stats`, free lists, work stack, grant table, file table | the per-task heap state | fields of the Orin `core.heap.TaskHeap` record (R3 allocator), grant and file tables of `std:host` / `core.cap` |
+| thread-local net buffer `netbuf()` (replaces `g_netbuf`; freed in `orin_rt_heap_exit`) | the bulk buffer between `u8[]` and L0 for `recv` / `send` / `resolve`, one per task | a field of `core.heap.TaskHeap` |
 | `orin_rt_trap_str(msg)` | trap with an Orin string | `core.trap.fromString` |
 | `orin_mon_*` (11 forwarders) | trap when an L0 monitor call fails | `core.sync.*`, one line each; the L0 functions they call are unchanged |
-| `orin_cap_clone` / `orin_cap_move` / `orin_cap_adopt_*` | delegation of a grant (clone the record, detach it into a token, adopt it) | part of the `core.cap` module that replaces the C grant table |
+| `orin_cap_clone` / `orin_cap_move` / `orin_cap_adopt_*` (incl. `adopt_net`, `adopt_stream`, ADR-0017 Addendum C) | delegation of a grant, and the move of an accepted Stream (clone the record, detach it into a token, adopt it) | part of the `core.cap` module that replaces the C grant table |
 
 L0 functions (stay C, handle-checked, contracts in `runtime/platform/orin_platform.h`): `orin_platform_thread_create / join / exit /
 id`, `monitor_new / free / lock / unlock / wait / wait_until / notify / get / set / grow`, `runtime_lock / unlock`, and the pure `millis_split`. They do not move in R3.
@@ -144,7 +145,7 @@ one-character strings) are shared and published with a compare-and-swap (they ar
 
 | Where | Rule |
 |---|---|
-| checker (`compiler/check/tasks.or`) | **E0481** a task body (a closure literal passed to `spawn*`) captures a `Scope`. **E0482** `channel(0)`. **E0483** a task body captures a resource handle (the message points at `spawnFs` and friends) |
+| checker (`compiler/check/tasks.or`) | **E0481** a task body (a closure literal passed to `spawn*`) captures a `Scope`. **E0482** `channel(0)`. **E0483** a task body captures a resource handle (the message points at `spawnFs` and friends; a Listener or Stream too). **E0487** (library code) a Listener moved or a Stream cloned |
 | checker, existing rules that apply unchanged | E0450 (a resource as a type argument: `channel<FsGrant>`), E0451 / E0452 (a handle stored, returned, captured), E0301 (the task primitives live in the internal module `std:fsraw`; user code cannot import it), E0460 (generic methods) |
 | checker, internal | the primitives are one builtin `BTask(k)` (`compiler/hir/taskops.or`: names, C functions, result kinds). `transitPut` and `lendPut` take any value but a handle (E0480), `transitTake` needs an expected type (E0407), `grantClone` / `grantMove` take any family grant (E0471 otherwise) |
 | MIR verifier (v2.1, `compiler/verify`) | `grantClone` is an opener (authority: the parent handle), `grantMove` a closer that returns a token (a handle is moved exactly once on every path: never twice, never used or revoked afterwards, never left open at a return, never a parameter), `grantAdopt*` an opener whose argument is a token (it must not be a handle) and whose destination must be a bound handle that the function revokes exactly once. 14 cases in `compiler/tests/verify_main.or` |

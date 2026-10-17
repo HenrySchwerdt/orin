@@ -5,6 +5,11 @@ source with signature, errors/absence, behaviour and complexity (the spec 08 val
 page is the map. `orin mcp` `inspect` answers `std:path.join`, `std:json/legacy.parse`, `std:json.parseDocument`, ... from its built-in
 API table (`compiler/mcp/apitable.or`).
 
+Importing (ADR-0048 addendum): `import { fromString } from "std:bytes";` brings single names, `import { empty as emptyBytes } from "std:bytes";` renames one,
+and `import * as bytes from "std:bytes";` binds a compile-time namespace, so `bytes.fromString(..)`, `bytes.Bytes` and `bytes.empty()` need no prefix in the name and
+cannot clash with `html.empty()`. The namespace is no value, and a local or parameter named like it is E0304 (name grants `grant` / `proc` when `fs` is a namespace).
+The examples below use the namespace form for bytes, encoding, html, path, json, fs, time and url.
+
 | Module | Implemented in | Status |
 |---|---|---|
 | `std:host` | Orin, `library/std/host.or` over the grant primitives of `std:fsraw` | the root of authority: `Host`, scope functions that derive grants (ADR-0027); **unstable** until the I/O freeze |
@@ -897,6 +902,7 @@ Inputs below 8,192 elements, and every input with `ORIN_THREADS=1`, run on the c
 | E0484 | every function given to a parallel operation is an arrow function or a named function and **pure** (no I/O, no impure call, no call of a function value); the message names the effect and where it happens |
 | E0485 | the reducer of a parallel `reduce` is a built-in associative operator: `+` (integers, floats, strings), `*`, `&&`, `||`, min / max (`a < b ? a : b` and the other orders and comparisons, `Math.min` / `Math.max`), parameters in either order. A user-defined reducer needs a proved associativity law (ADR-0039 §3.2), a later step |
 | E0486 | the input element type is a scalar (integers, floats, `bool`) or a record whose fields are all scalars. The workers read the input without copying it, which needs elements without counted references until borrow inference exists (ADR-0039 §4). Stages may produce any type (`map(x => x.toString())` is fine) |
+| E0487 | (library code: the primitives of `std:fsraw`) a `Listener` is moved into a task, or a `Stream` is cloned. A `NetGrant` is delegated (`spawnNet`), an accepted `Stream` is moved (`acceptDetached`, `spawnAccepted`, ADR-0017 Addendum C), a `Listener` stays in the task that bound it |
 | W0480 | a parallel float `reduce` (`+`, `*`, min, max): float arithmetic is not associative, so the result may differ from the sequential `reduce` in the last bits (it is the same everywhere else) |
 | W0481 | a parallel integer `reduce` with signed `+`, or with `*`: a chunk's partial result can overflow (and trap) where the sequential fold does not, or the reverse. Unsigned `+` cannot differ (every partial sum is at most the total), so it gives no warning |
 
