@@ -7,12 +7,24 @@
 // Deterministic: the same inputs give byte-identical files. Exit 1 on unreadable or invalid input, 2 on a usage error.
 
 import { Host, useHost } from "std:host";
-import { FsGrant, readFile, writeFile, exists, listDir } from "std:fs";
+import { FsGrant, readFile, writeFile, exists, listDir, fsErrorMessage } from "std:fs";
 import { ProcessGrant, args, exit } from "std:process";
 import { shell } from "std:io";
 import { decodeSnap, decodeDiff, Diff } from "./model";
 import { buildSiteWith } from "./site";
 import { decodeRuns, sortRuns, Run } from "./runs";
+
+// True when `path` exists; a path the grant refuses to look at counts as absent.
+function existsOr(fs: FsGrant, path: string): bool {
+  const r = exists(fs, path);
+  return r.isOk() && r.unwrap();
+}
+
+// Exit status 0..255 of the command, -1 when it could not be run (the tool keeps statuses as data).
+function shellStatus(p: ProcessGrant, cmd: string): int {
+  const r = shell(p, cmd);
+  return r.isOk() ? r.unwrap() : 0 - 1;
+}
 
 function usage(): void {
   console.error("usage: explore SNAPSHOT.json [--diff DIFF.json] [--runs FILE-OR-DIR] [--title NAME] --out DIR");
@@ -39,14 +51,14 @@ function joinPath(dir: string, name: string): string {
 // The records of a file, or of every *.json file of a directory (a file that holds none is reported and skipped; a path that
 // yields no record at all is an error).
 function loadRuns(fs: FsGrant, proc: ProcessGrant, path: string): Result<Run[], string> {
-  if (!exists(fs, path)) {
+  if (!existsOr(fs, path)) {
     return Err("cannot read " + path + ": no such file or directory");
   }
   let runs: Run[] = [];
-  if (shell(proc, "test -d " + shellQuote(path)) != 0) {
+  if (shellStatus(proc, "test -d " + shellQuote(path)) != 0) {
     const text = readFile(fs, path);
     if (text.isErr()) {
-      return Err("cannot read " + path + ": " + text.unwrapErr());
+      return Err("cannot read " + path + ": " + fsErrorMessage(text.unwrapErr()));
     }
     const r = decodeRuns(text.unwrap());
     if (r.isErr()) {
@@ -54,14 +66,14 @@ function loadRuns(fs: FsGrant, proc: ProcessGrant, path: string): Result<Run[], 
     }
     runs = r.unwrap();
   } else {
-    for (const e of listDir(fs, path)) {
+    for (const e of listDir(fs, path).unwrap()) {
       if (!e.endsWith(".json") || e.startsWith(".")) {
         continue;
       }
       const p = joinPath(path, e);
       const t = readFile(fs, p);
       if (t.isErr()) {
-        console.error("explore: skipping " + p + ": " + t.unwrapErr());
+        console.error("explore: skipping " + p + ": " + fsErrorMessage(t.unwrapErr()));
         continue;
       }
       const r = decodeRuns(t.unwrap());
@@ -119,7 +131,7 @@ function run(fs: FsGrant, proc: ProcessGrant): void {
   }
   const text = readFile(fs, snapPath);
   if (text.isErr()) {
-    fail("cannot read " + snapPath + ": " + text.unwrapErr());
+    fail("cannot read " + snapPath + ": " + fsErrorMessage(text.unwrapErr()));
     return;
   }
   const snap = decodeSnap(text.unwrap());
@@ -131,7 +143,7 @@ function run(fs: FsGrant, proc: ProcessGrant): void {
   if (diffPath.length > 0) {
     const dt = readFile(fs, diffPath);
     if (dt.isErr()) {
-      fail("cannot read " + diffPath + ": " + dt.unwrapErr());
+      fail("cannot read " + diffPath + ": " + fsErrorMessage(dt.unwrapErr()));
       return;
     }
     const d = decodeDiff(dt.unwrap());
@@ -155,14 +167,14 @@ function run(fs: FsGrant, proc: ProcessGrant): void {
     runs = loaded.unwrap();
   }
   const files = buildSiteWith(sn, diff, runs);
-  if (shell(proc, "mkdir -p " + shellQuote(joinPath(out, "m")) + " " + shellQuote(joinPath(out, "s")) + " " + shellQuote(joinPath(out, "u")) + " " + shellQuote(joinPath(out, "assets"))) != 0) {
+  if (shellStatus(proc, "mkdir -p " + shellQuote(joinPath(out, "m")) + " " + shellQuote(joinPath(out, "s")) + " " + shellQuote(joinPath(out, "u")) + " " + shellQuote(joinPath(out, "assets"))) != 0) {
     fail("cannot create the directory " + out);
     return;
   }
   for (const f of files) {
     const r = writeFile(fs, joinPath(out, f.path), f.text);
     if (r.isErr()) {
-      fail("cannot write " + joinPath(out, f.path) + ": " + r.unwrapErr());
+      fail("cannot write " + joinPath(out, f.path) + ": " + fsErrorMessage(r.unwrapErr()));
       return;
     }
   }

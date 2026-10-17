@@ -69,9 +69,9 @@ build() {
     CC=$CC JOBS=$jobs tools/cc_split.sh $D/orin.c $D/orin.tmp -O1 -w -- -lm
     rm -f $D/orin.h $D/orin.data.c $D/orin.[0-9]*.c
   else
-    $host compile compiler/main.or -o $D/orin.c
-    # C from the seed compiler (orin0) links the frozen legacy runtime, as in tools/bootstrap.sh
-    world=core; [ "$host" = $B/orin0 ] && world=legacy
+    # C from the seed compiler (orin0) is built with --c-builtins and links the frozen legacy runtime, as in tools/bootstrap.sh
+    world=core; flag=; [ "$host" = $B/orin0 ] && world=legacy && flag=--c-builtins
+    $host compile $flag compiler/main.or -o $D/orin.c
     $CC -O1 -w $(rt_inc $world) $D/orin.c $(rt_src $world) -lm -o $D/orin.tmp
   fi
   mv $D/orin.tmp $D/orin
