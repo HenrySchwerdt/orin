@@ -286,6 +286,7 @@ runtime (`runtime/core/orin_runtime.c`) or the prelude (`library/collections/arr
 | `xs.reduce(f, init)` | an empty `xs` gives `init`; nothing else |
 | `s.split(sep)` | obligation `bounds`: `sep` is not empty (the runtime traps). At least one piece, at most `s.length + 1`; every piece is a well-formed string no longer than `s` (than `s.length - sep.length` when there are two or more); one piece is `s` (always the case when `s` is shorter than `sep`); with two or three pieces the lengths and the separators add up to `s.length` |
 | `s.startsWith(t)`, `s.endsWith(t)`, `s.includes(t)` | one uninterpreted function each of the two strings, so the same call has the same answer in the body and in a contract (also inside a quantifier body). For well-formed strings: true implies `s.length >= t.length`; an empty `t` or `t == s` gives true; true with equal lengths implies `s == t`; `startsWith` / `endsWith` imply `includes` |
+| string literals | the bytes of a literal of at most 16 bytes are facts about `charCodeAt` (a literal's id stands for its contents, and distinct literals have distinct ids), so `"E0412".charCodeAt(0) == 69` and a precondition such as `c.length == 5 && c.charCodeAt(0) == 69` are provable on a literal argument |
 | `s.indexOf(x)` | an empty `x` is found at 0; an `x` longer than `s` is not found; a position `p` has `p + x.length <= s.length` |
 
 ### Semantics (honest limits)
