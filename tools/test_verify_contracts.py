@@ -13,7 +13,7 @@ The files cover one construct each, with VERIFIED, REFUTED (with counterexample)
 verify_basic (int / bool, modular calls), verify_int_widths (exact ranges), verify_arrays (sequences, bounds),
 verify_data (records, Option, Result, unions, Map, strings), verify_classes (invariants per method, constructors,
 frames, modular method calls), verify_loops (inferred bounds, user invariants, havoc, unrolling), verify_quantifiers
-(every / some / range, sorted, no duplicates, conservation, totals), verify_generics, verify_try (`?` as an early return and
+(every / some / range, sorted, no duplicates, conservation, totals), verify_generics, verify_forof (`for .. of` invariants with `loopIndex`), verify_try (`?` as an early return and
 mutating calls inside expressions, hoisted in evaluation order), verify_soundness (places where a
 careless encoding gives a wrong status), quality_vc (W046x), names/ (two units declaring the same function and type names:
 each call and type is resolved in the scope of its own unit). Run with the contract-checked compiler in CI
@@ -145,6 +145,15 @@ def check_extras(orinc):
     seen = [x for x in rep["results"] if x["function"] in wrong and (x["kind"] == "ensures" or x["function"] == "Gauge.bad")]
     check({x["function"] for x in seen} == wrong, "verify_try: wrong claims not all reported: %r" % sorted(wrong - {x["function"] for x in seen}))
     check(all(x["status"] != "VERIFIED" for x in seen), "verify_try: a wrong claim is VERIFIED: %r" % [x["function"] for x in seen if x["status"] == "VERIFIED"])
+    # `for .. of` invariants (`loopIndex`): a wrong claim is never VERIFIED, and a wrong invariant is not VERIFIED on both obligations.
+    rep = json.loads(run(orinc, "--format=json", "tests/contracts/verify_forof.or", case="_extras").stdout.decode())
+    wrong = {"is_sorted_wrong", "wrong_entry", "wrong_step", "wrong_claim", "wrong_exit", "wrong_elem", "with_break"}
+    seen = [x for x in rep["results"] if x["function"] in wrong and x["kind"] == "ensures"]
+    check({x["function"] for x in seen} == wrong, "verify_forof: wrong claims not all reported: %r" % sorted(wrong - {x["function"] for x in seen}))
+    check(all(x["status"] != "VERIFIED" for x in seen), "verify_forof: a wrong claim is VERIFIED: %r" % [x["function"] for x in seen if x["status"] == "VERIFIED"])
+    for f in ("wrong_entry", "wrong_step", "wrong_exit", "wrong_elem"):
+        inv = [x for x in rep["results"] if x["function"] == f and x["kind"] == "loop-invariant"]
+        check(any(x["status"] != "VERIFIED" for x in inv), "verify_forof: the wrong invariant of %s is VERIFIED" % f)
     # Unavailable solver: UNKNOWN with a reason, not a crash.
     r = run(orinc, "--format=json", "--z3", "/nonexistent/z3", "tests/contracts/verify_basic.or", case="_extras")
     rep = json.loads(r.stdout.decode())

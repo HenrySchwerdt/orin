@@ -36,7 +36,7 @@ functions) and `old(e)` (only in `@Ensures`, not nested); `a ==> b` (right assoc
 | Code | Meaning |
 |---|---|
 | E0414 | clause is not `bool` (`@Decreases`: not integer) |
-| E0415 | `old` outside `@Ensures` / nested, `==>` outside a contract, `?` in a contract, parameter called `result` hiding it |
+| E0415 | `old` outside `@Ensures` / nested, `==>` outside a contract, `?` in a contract, parameter called `result` (or a variable called `loopIndex` in a `for .. of` invariant) hiding it |
 | E0416 | impure contract expression (below) |
 | E0300 | `result` outside `@Ensures` (or in a `void` function), or any unknown name |
 
@@ -350,8 +350,15 @@ analysis cannot read (a call it cannot resolve) has the whole object as its fram
   gets `i0 <= i <= max(i0, N)` for free; it is proved like a user invariant but not reported by itself.
 - Otherwise what the loop assigns (variables, `this.f`, receivers of `push` / `pop` / `set` / `delete` / mutating methods)
   is havoc'd. When the clause depends on it the result is UNKNOWN: "loop without invariant: ... is unconstrained after the loop",
-  `action: STRENGTHEN_SPEC`. In `for (const x of xs)` the element is some element of `xs`. A body with `break` or `continue`
+  `action: STRENGTHEN_SPEC`. In `for (const x of xs)` the element is `xs[i]` for the position `i` of the iteration. A body with `break` or `continue`
   gets no invariant and no exit condition.
+- `for (const x of xs)` has no counter, so an `@Invariant` in front of it may use the pseudo-variable **`loopIndex`** (a `usize`,
+  read-only, in scope only in the clauses of a `for .. of`; a variable of that name hides it: E0415). It is the position in `xs`
+  of the iteration the invariant is about: `0` on entry, `i + 1` after the iteration at position `i`, `xs.length` after the loop.
+  The invariant holds at the start of the iteration at position `loopIndex`, so it speaks about the elements before it
+  (`range(0, loopIndex).every(j => xs[j] >= 0)`, `loopIndex > 0 ==> last == xs[loopIndex - 1]`). Inside the body the verifier
+  assumes `0 <= i < xs.length` and `x == xs[i]` for the position `i` of that iteration (`xs` is the value evaluated before the
+  loop). Like every loop invariant it is not a run-time check (rtcheck.or), and it is ignored with `break` / `continue`.
 
 ### Quantifiers and sums (C11, C12)
 
