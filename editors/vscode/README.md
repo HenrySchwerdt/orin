@@ -56,7 +56,7 @@ workspace has errors, because the semantic index is then partial. See
 
 ## Using the language server
 
-1. Install Orin (`curl -fsSL https://raw.githubusercontent.com/HenrySchwerdt/orin/main/install.sh | sh`,
+1. Install Orin (`curl -fsSL https://raw.githubusercontent.com/orin-lang/orin-lang/main/install.sh | sh`,
    see `docs/install.md`), or inside the orin repository build the compiler with
    `./tools/bootstrap.sh` (`build/bootstrap/orin2`; the `lsp` command needs a build from stage 2 on).
 2. Open a `.or` file. The extension finds the compiler itself (see "Compiler discovery"). Any other

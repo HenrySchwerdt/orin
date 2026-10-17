@@ -7,9 +7,9 @@ import { Ident, Item, TypeDeclBody, DAlias, DRecord, DUnion, FieldDecl, VariantD
 import { Type, Builtin, FieldDef, RecordDef, UnionDef, VariantDef, Local, Function, VTable, taskOpFromName, coreOpFromName } from "../hir";
 import { LoadedProgram, ImportTarget, ImportUnit, ImportStd, StdModule, StdFs, StdProcess, StdClock, StdCore } from "../loader";
 import {
-  TypeEnt, ValEnt, EntRecord, EntUnion, EntAlias, EntGen, EntIface, EntBuiltin, IfaceInfo, IfaceSig, VFunc, VConst, VVariant, VStd, VGFunc, VGVariant,
+  TypeEnt, ValEnt, EntRecord, EntUnion, EntAlias, EntGen, EntIface, EntBuiltin, IfaceInfo, IfaceSig, VFunc, VConst, VVariant, VStd, VGFunc, VGVariant, VNamespace,
   Names, UnitInfo, AliasInfo, FuncInfo, ConstInfo, ConstLit, LitInt, Env, RecordSrc,
-  UnionSrc, GenType, GenFunc, Insts, ClassInfo, typeEntEq, valEntEq, findType, findVal, emptyNames, isBuiltinTypeName, FmOrdinary,
+  UnionSrc, GenType, GenFunc, Insts, ClassInfo, typeEntEq, valEntEq, nsShadowErr, findType, findVal, emptyNames, isBuiltinTypeName, FmOrdinary,
   builtinCmpIfaces
 } from "./env";
 
@@ -400,44 +400,88 @@ export function collect(prog: LoadedProgram): Collected {
     // Imports and re-exports.
     let imp: usize = 0;
     let oxUnit = -1;
+    let nsBound: string[] = [];
     for (const item of unit.ast.items) {
       let isImport = false;
       let isReexport = false;
       let names: Ident[] = [];
+      let aliasOf: Option<Ident>[] = [];
+      let nsName: Option<Ident> = None;
+      let nsUses: Ident[] = [];
       let path = "";
       match (item) {
         IImport(d) => {
           isImport = true;
           names = d.names;
+          aliasOf = d.aliases;
+          nsName = d.namespace;
+          nsUses = d.uses;
           path = d.path;
           if (d.provider && imp < unit.imports.length) {
             match (unit.imports[imp]) { ImportUnit(t) => { oxUnit = t.toInt(); }, _ => {} }
           }
         },
-        IReExport(d) => { isImport = true; isReexport = true; names = d.names; path = d.path; },
+        IReExport(d) => { isImport = true; isReexport = true; names = d.names; aliasOf = d.aliases; path = d.path; },
         _ => {}
       }
       if (isImport) {
         const hasTarget = imp < unit.imports.length;
         if (!hasTarget) {
-          const sp = names.length > 0 ? names[0].span : Span { file: unit.file, start: 0, end: 0 };
+          const sp = names.length > 0 ? names[0].span : (nsName.isSome() ? nsName.unwrap().span : Span { file: unit.file, start: 0, end: 0 });
           diags.push(diag("E0300", sp, "module `" + path + "` was not resolved by the loader"));
         } else {
           const target = unit.imports[imp];
-          for (const n of names) {
-            const lk = exportLookup(exportsAll, target, n.name);
+          // The entries to bind: the export `member` of the target under the name `local` (variants of a union under
+          // `vprefix` + their name). A named import binds each name (or its alias); a namespace import (ADR-0048
+          // addendum) binds `m.x` for every `m.x` the file wrote, and `m` itself as the namespace.
+          let members: string[] = [];
+          let locals: string[] = [];
+          let vprefixes: string[] = [];
+          let spans: Span[] = [];
+          let k: usize = 0;
+          while (k < names.length) {
+            members.push(names[k].name);
+            locals.push(k < aliasOf.length && aliasOf[k].isSome() ? aliasOf[k].unwrap().name : names[k].name);
+            vprefixes.push("");
+            spans.push(names[k].span);
+            k += 1;
+          }
+          if (nsName.isSome()) {
+            const ns = nsName.unwrap();
+            nsBound.push(ns.name);
+            const clash = findVal(scope, ns.name).isSome() || findType(scope, ns.name).isSome();
+            const r = addVal(scope, ns.name, VNamespace(imp), ns.span);
+            scope = r.names;
+            if (clash) {
+              diags.push(diag("E0304", ns.span, "the namespace import `" + ns.name + "` clashes with another definition of `" + ns.name + "` in this file; rename one of them"));
+            }
+            for (const u of nsUses) {
+              members.push(u.name.substring(ns.name.length + 1, u.name.length));
+              locals.push(u.name);
+              vprefixes.push(ns.name + ".");
+              spans.push(u.span);
+            }
+          }
+          k = 0;
+          while (k < members.length) {
+            const member = members[k];
+            const local = locals[k];
+            const vprefix = vprefixes[k];
+            const nspan = spans[k];
+            const lk = exportLookup(exportsAll, target, member);
             if (lk.t.isNone() && lk.v.isNone()) {
-              diags.push(diag("E0300", n.span, "`" + n.name + "` is not exported by `" + path + "`"));
+              diags.push(diag("E0300", nspan, "`" + member + "` is not exported by `" + path + "`"
+                + (vprefix == "" ? "" : " (`" + local + "` names a member of the namespace import `" + vprefix.substring(0, vprefix.length - 1) + "`; a local or parameter of that name would shadow the namespace)")));
             } else {
               if (lk.t.isSome()) {
                 const te = lk.t.unwrap();
-                const r = addType(isReexport ? exports : scope, n.name, te, n.span);
+                const r = addType(isReexport ? exports : scope, local, te, nspan);
                 if (isReexport) { exports = r.names; } else { scope = r.names; }
                 match (r.err) { Some(d) => { diags.push(d); }, None => {} }
               }
               if (lk.v.isSome()) {
                 const ve = lk.v.unwrap();
-                const r = addVal(isReexport ? exports : scope, n.name, ve, n.span);
+                const r = addVal(isReexport ? exports : scope, local, ve, nspan);
                 if (isReexport) { exports = r.names; } else { scope = r.names; }
                 match (r.err) { Some(d) => { diags.push(d); }, None => {} }
               }
@@ -446,7 +490,7 @@ export function collect(prog: LoadedProgram): Collected {
                   EntUnion(u) => {
                     let tag: usize = 0;
                     for (const v of unions[u].variants) {
-                      const r = addVal(isReexport ? exports : scope, v.name, VVariant(u, tag), n.span);
+                      const r = addVal(isReexport ? exports : scope, vprefix + v.name, VVariant(u, tag), nspan);
                       if (isReexport) { exports = r.names; } else { scope = r.names; }
                       match (r.err) { Some(d) => { diags.push(d); }, None => {} }
                       tag += 1;
@@ -457,7 +501,7 @@ export function collect(prog: LoadedProgram): Collected {
                       DUnion(vs) => {
                         let tag: usize = 0;
                         for (const v of vs) {
-                          const r = addVal(isReexport ? exports : scope, v.name.name, VGVariant(g, tag), n.span);
+                          const r = addVal(isReexport ? exports : scope, vprefix + v.name.name, VGVariant(g, tag), nspan);
                           if (isReexport) { exports = r.names; } else { scope = r.names; }
                           match (r.err) { Some(d) => { diags.push(d); }, None => {} }
                           tag += 1;
@@ -470,9 +514,27 @@ export function collect(prog: LoadedProgram): Collected {
                 }
               }
             }
+            k += 1;
           }
         }
         imp += 1;
+      }
+    }
+    // A parameter must not reuse the name of a namespace import (the other locals are checked by FnCtx.declare).
+    if (nsBound.length > 0) {
+      for (const item of unit.ast.items) {
+        match (item) {
+          IFunction(f) => {
+            for (const p of f.params) {
+              for (const nb of nsBound) {
+                if (p.name.name == nb) {
+                  diags.push(nsShadowErr(p.name));
+                }
+              }
+            }
+          },
+          _ => {}
+        }
       }
     }
     units.push(UnitInfo { name: unit.name, file: unit.file, scope: scope, ox: oxUnit });
@@ -498,7 +560,7 @@ export function collect(prog: LoadedProgram): Collected {
     insts: new Insts(),
     classes: noClasses,
     ifaces: ifaces,
-    bounds: new Map<usize, usize>(),
+    bounds: new Map<usize, usize[]>(),
     vtables: noVts,
     lifted: noLifted,
     wrappers: new Map<string, usize>(),

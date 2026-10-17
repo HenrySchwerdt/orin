@@ -138,7 +138,7 @@ These are the async-concurrency.md steps. Without them no option delivers usable
 | C2 | Trap-safe structured cleanup: live-scope registry, parent trap cancels and joins descendants, primary/secondary failure reporting | M-L | runtime task code (temporary C) | Prefer implementing in Orin as part of R3e rather than growing the 342-line C interface that R3e deletes (see M2/M3 ordering) |
 | C3 | Interruptible network waits and operation-wide deadlines (accept/read/write/connect), wake source in readiness wait, generation-tagged handles; DNS limitation stated or resolver pool | M-L | `library/std/net.or`, L0 net wait | Same L0 budget issue |
 | C4 | Network ownership for concurrent servers: either delegate a net grant and move an accepted `Stream` into a task, or an acceptor task that owns sockets and exchanges bounded value messages with workers | M | ADR amendment (resources, E0450-E0452, E0483), checker, verifier rules like `grantMove` | Needs a language-level resource rule; this is the one floor item that touches the checker and the MIR verifier |
-| C5 | Server acceptance campaign (1, 64, 1,024 clients; slowloris, non-reading peers, cancellation storms; C/LLVM parity; TSan) and a concurrent `examples/http_server.or` | M | `tests/concurrency`, `tests/net`, `examples/` | Defined in async-concurrency.md "Server acceptance campaign" |
+| C5 | Server acceptance campaign (1, 64, 1,024 clients; slowloris, non-reading peers, cancellation storms; C/LLVM parity; TSan) and a concurrent `examples/http_server.or` | M | `tests/concurrency`, `tests/net`, `examples/` | **Done (2026-10-17):** `tools/test_server_campaign.sh` (1 / 64 / 1,024 clients, slowloris, non-reading peers, cancellation storms, graceful shutdown, C/LLVM parity, TSan, ASan+UBSan; CI `concurrency` job) against `examples/http_server.or`, now the concurrent server. Results: async-concurrency.md "Server acceptance campaign" |
 | C6 | Windows thread/monitor backend, if Windows is supported (D4) | M-L | `runtime/platform`, L0 budget again | Only if Windows is in the 1.0 platform list |
 
 Everything in C0-C5 keeps the existing model: isolated tasks, non-atomic RC, move-or-copy transfer, no
@@ -242,9 +242,9 @@ that R3b makes redundant _(inference)_).
 | Item | Today | Needed |
 |---|---|---|
 | Org move to `orin-lang/orin-lang` | PR #150 prepared | M0. All URLs in `install.sh`, docs, `dist/`, workflow, VS Code manifest follow |
-| Homebrew tap `orin-lang/homebrew-orin` | PR #149 | M0. Note ADR-0047 section 6 names `HenrySchwerdt/homebrew-orin`; the ADR text needs the new owner |
+| Homebrew tap `orin-lang/homebrew-orin` | PR #149 | M0 |
 | Platforms | linux-x86_64, macos-arm64 published; linux-aarch64 and macos-x86_64 built by the workflow but absent from alpha.2; Windows only via WSL2 | D4 |
-| Release workflow | always `--prerelease`, title "(experimental)" (`release.yml` line ~113) | Make pre-release status depend on the tag (`-alpha`, `-beta`, `-rc` suffix); 1.0.0 publishes a normal release. S |
+| Release workflow | **Done:** pre-release status follows the tag suffix (`-alpha`, `-beta`, `-rc`); 1.0.0 publishes a normal release (`release.yml`). Note: `0.1.0-beta.1` is a pre-freeze beta; 1.0.0-beta waits for M4 | Keep as is. S |
 | Notarisation and signing | not notarised | Not required for 1.0; document the quarantine workaround (already in install.md). Owner may want it for the Homebrew cask path |
 | Toolchain requirements | needs a C compiler; LLVM optional and not bundled; Z3 for verification | Document precisely; `orin doctor` already reports them. Bundling LLVM is post-1.0 |
 | musl / static Linux | glibc only | Post-1.0 |
@@ -269,12 +269,15 @@ R4 refinement proofs, `@NoTrap` modes beyond Stage A, lineage.
 | Item | Today | Needed |
 |---|---|---|
 | Language reference | `spec/` is a design RFC ("pre-implementation specification (v0.1)", `spec/spec.md`); no normative, traceable reference exists (roadmap.md step 4 lists one) **Draft written (2026-10-17):** [docs/reference](../reference/README.md), 10 chapters, each rule cites its tests, gaps listed per chapter, `tools/check_reference.py` checks the citations; review and gap-closing remain. | Write a reference from the implemented language: grammar, types, semantics, errors, each rule traced to a test. Size L. Prerequisite for the freeze claim |
-| Tutorial / website | none found (`docs/ts-developers.md` says it is "not a tutorial") | Tutorial (getting started, a CLI tool, a service, tests, contracts) and a static site. Hosting under the new org is an owner decision |
+| Tutorial / website | **In progress:** tutorial in [docs/tutorial](../tutorial/README.md), plus [getting started](../getting-started.md); no website yet (`docs/ts-developers.md` says it is "not a tutorial") | Tutorial (getting started, a CLI tool, a service, tests, contracts) and a static site. Hosting under the new org is an owner decision |
 | Std reference | hand-written `docs/std*.md` and `apitable.or` | Generated from source (ADR-0048 section 8) |
 | Honest limits | [known-limitations.md](../known-limitations.md), [tcb.md](../tcb.md) have known staleness | Gate R4: reconcile README, std.md, limits, TCB, install |
-| Stability policy page | none | Section 3.9 content as a page |
+| Stability policy page | **Done:** [docs/stability.md](../stability.md) | Keep in step with 3.9 and the std freeze |
 
 ### 3.9 Stability policy
+
+Published as [docs/stability.md](../stability.md). Note: `0.1.0-beta.1` is a pre-freeze beta; the syntax/std freeze (M4) is
+not complete, so `1.0.0-beta.1` (D10) is still reserved for M4.
 
 Proposed (D6, D10):
 - Semantic versioning from 1.0.0: patch = fixes, minor = additive, major = breaking.
@@ -342,7 +345,7 @@ what is in, with (a) and (b) in and (d) relaxed per D5.
 **D3. TLS / HTTPS client / HTTP in 1.0?**
 Options: (i) none, `std:net` TCP and the pure `std:http` layer only; (ii) HTTP/1.1 client and server over
 `std:net` without TLS; (iii) TLS client with certificate validation. Recommendation: (ii) with the
-concurrency floor as the demonstration (`examples/http_server.or` becomes concurrent), and document TLS as
+concurrency floor as the demonstration (`examples/http_server.or` is concurrent since C5), and document TLS as
 post-1.0 behind a reverse proxy. TLS needs either a verified or well-audited implementation and is a large
 TCB addition; the readiness audit does not require it.
 

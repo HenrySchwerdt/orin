@@ -1,0 +1,177 @@
+// Cancellation storm for tools/test_server_campaign.sh (ADR-0017 Addendum D, work package C5): ROUNDS rounds; in each, N tasks of one
+// scope block in network waits (a third each in accept, recv, and send to a peer that never reads), the scope's token is cancelled at
+// once, and every task must wake with Err(Cancelled) within a bound. The campaign script reads the descriptor count of this process
+// before the first round and after the last ("fds-start" / "fds-end" lines mark the moments) and requires them to be equal.
+// Usage: storm [N] [ROUNDS]       defaults 192 and 3
+// Output: one "round r: ..." line per round, "storm: ok" or "storm: FAIL ...".
+import { Host, withProcess, useNet } from "std:host";
+import { Deadline, MonotonicInstant, milliseconds } from "std:time";
+import { Bytes, fromString } from "std:bytes";
+import { args } from "std:process";
+import { Scope, TaskHandle, CancelToken, Sender, channel, scopeNet, spawnNet, sleepUntil } from "std:task";
+import {
+  NetGrant, Listener, Stream, Peer, NetErrorKind, RecvResult, RecvData, RecvEof, RecvTimeout, RecvReset, RecvError,
+  Denied, Closed, Timeout, Cancelled, Reset, InvalidArgument, InvalidPeer, Os,
+  withListenerNet, withConnectionBeside, withAccepted, acceptDetached, dropAccepted, portOf, recv, sendAll, monotonicMillis, netErrorMessage
+} from "std:net";
+
+const LONG: int = 30000;
+const BOUND: int = 5000;   // every task must have woken within this many ms of the cancel
+
+type Probe = { what: string; t0: int; t1: int; };
+
+function kindName(k: NetErrorKind): string {
+  return match (k) {
+    Denied => "Denied", Closed => "Closed", Timeout => "Timeout", Cancelled => "Cancelled", Reset => "Reset",
+    InvalidArgument => "InvalidArgument", InvalidPeer => "InvalidPeer", Os => "Os"
+  };
+}
+
+function recvName(r: RecvResult): string {
+  return match (r) {
+    RecvData(b) => "data", RecvEof => "eof", RecvTimeout => "Timeout", RecvReset => "Reset", RecvError(e) => kindName(e.kind)
+  };
+}
+
+function at(ms: int): Deadline {
+  return Deadline { at: MonotonicInstant { millis: ms } };
+}
+
+function nowMs(net: NetGrant): int {
+  const r = withListenerNet(net, "127.0.0.1", 0, 1, (ln: Listener, n: NetGrant) => {
+    const c = withConnectionBeside(n, "127.0.0.1", portOf(ln), milliseconds(2000), ln, (s: Stream, l2: Listener) => monotonicMillis(s));
+    return c.isOk() ? c.unwrap() : -1;
+  });
+  return r.isOk() ? r.unwrap() : -1;
+}
+
+function megabyte(): Bytes {
+  let b = fromString("0123456789abcdef");
+  while (b.length() < 1048576) {
+    b = b.concat(b);
+  }
+  return b;
+}
+
+// kind 0: blocked in accept (its own listener, nobody connects after the first). kind 1: the server side of an idle connection, in
+// recv. kind 2: the server side writing to a client that never reads, in send.
+function blocked(net: NetGrant, kind: int, starts: Sender<int>): Probe {
+  const r = withListenerNet(net, "127.0.0.1", 0, 4, (ln: Listener, n: NetGrant) => {
+    if (kind == 0) {
+      const q = withConnectionBeside(n, "127.0.0.1", portOf(ln), milliseconds(5000), ln, (c: Stream, l2: Listener) => {
+        withAccepted(l2, milliseconds(5000), (a: Stream, p: Peer) => 0);
+        const t0 = monotonicMillis(c);
+        starts.send(t0);
+        const a = acceptDetached(l2, milliseconds(LONG));
+        const t1 = monotonicMillis(c);
+        if (a.isOk()) {
+          dropAccepted(a.unwrap());
+          return Probe { what: "accepted", t0: t0, t1: t1 };
+        }
+        return Probe { what: kindName(a.unwrapErr().kind), t0: t0, t1: t1 };
+      });
+      return q.isOk() ? q.unwrap() : Probe { what: "connect: " + netErrorMessage(q.unwrapErr()), t0: 0, t1: 0 };
+    }
+    const q = withConnectionBeside(n, "127.0.0.1", portOf(ln), milliseconds(5000), ln, (c: Stream, l2: Listener) => {
+      const a = withAccepted(l2, milliseconds(5000), (s: Stream, p: Peer) => {
+        const t0 = monotonicMillis(s);
+        starts.send(t0);
+        let what = "returned";
+        if (kind == 1) {
+          what = recvName(recv(s, 100, milliseconds(LONG)));
+        } else {
+          const block = megabyte();
+          what = "sent";
+          let i: int = 0;
+          while (i < 200 && what == "sent") {
+            const sent = sendAll(s, block, milliseconds(LONG));
+            if (sent.isErr()) {
+              what = kindName(sent.unwrapErr().kind);
+            }
+            i += 1;
+          }
+        }
+        return Probe { what: what, t0: t0, t1: monotonicMillis(s) };
+      });
+      return a.isOk() ? a.unwrap() : Probe { what: "accept: " + netErrorMessage(a.unwrapErr()), t0: 0, t1: 0 };
+    });
+    return q.isOk() ? q.unwrap() : Probe { what: "connect: " + netErrorMessage(q.unwrapErr()), t0: 0, t1: 0 };
+  });
+  return r.isOk() ? r.unwrap() : Probe { what: "listen: " + netErrorMessage(r.unwrapErr()), t0: 0, t1: 0 };
+}
+
+type Round = { woken: int; bad: int; maxMs: int; first: string; };
+
+function round(net: NetGrant, n: int): Round {
+  const ch = channel<int>(n.toUsize() + 1);
+  return scopeNet(net, (sc: Scope, g: NetGrant) => {
+    const tok = sc.token();
+    const rx = ch.rx;
+    const tx = ch.tx;
+    let hs: TaskHandle<Probe>[] = [];
+    let i: int = 0;
+    while (i < n) {
+      const k = i % 3;
+      hs.push(spawnNet(sc, g, (t: NetGrant) => blocked(t, k, tx)));
+      i += 1;
+    }
+    const stopper = spawnNet(sc, g, (t: NetGrant) => {
+      // every probe is blocked when its start time arrives; a probe that failed to start sends nothing, so count with a bound
+      let latest: int = 0;
+      let seen: int = 0;
+      while (seen < n) {
+        const v = rx.recv();
+        if (v.isNone()) {
+          seen = n;
+        } else {
+          seen += 1;
+          if (v.unwrap() > latest) {
+            latest = v.unwrap();
+          }
+        }
+      }
+      sleepUntil(at(latest + 200));
+      const when = nowMs(t);
+      tok.cancel();
+      return when;
+    });
+    const cancelAt = stopper.join();
+    let bad: int = 0;
+    let maxMs: int = 0;
+    let first = "";
+    for (const h of hs) {
+      const p = h.join();
+      const dt = p.t1 - cancelAt;
+      if (p.what != "Cancelled") {
+        bad += 1;
+        if (first == "") { first = p.what; }
+      } else if (dt > BOUND) {
+        bad += 1;
+        if (first == "") { first = "woke " + dt.toString() + " ms after the cancel"; }
+      }
+      if (dt > maxMs) { maxMs = dt; }
+    }
+    return Round { woken: n - bad, bad: bad, maxMs: maxMs, first: first };
+  });
+}
+
+function main(host: Host): void {
+  const argv = withProcess(host, p => args(p));
+  const n = argv.length > 0 ? parseInt(argv[0]).unwrapOr(192) : 192;
+  const rounds = argv.length > 1 ? parseInt(argv[1]).unwrapOr(3) : 3;
+  useNet(host, net => {
+    console.error("fds-start");
+    sleepUntil(at(nowMs(net) + 800));   // a moment for the script to count descriptors
+    let bad: int = 0;
+    let r: int = 0;
+    while (r < rounds) {
+      const o = round(net, n);
+      console.log("round " + (r + 1).toString() + ": " + n.toString() + " tasks, " + o.woken.toString() + " woke Cancelled, slowest " + o.maxMs.toString() + " ms after the cancel" + (o.bad > 0 ? ", FAILED " + o.bad.toString() + " (" + o.first + ")" : ""));
+      bad += o.bad;
+      r += 1;
+    }
+    console.error("fds-end");
+    sleepUntil(at(nowMs(net) + 800));
+    console.log(bad == 0 ? "storm: ok" : "storm: FAIL");
+  });
+}

@@ -5,8 +5,8 @@
 
 import { FsGrant } from "std:fs";
 import {
-  Item, FunctionDecl, TypeDecl, ConstDecl, ImportDecl, TypeExpr, Param, FieldDecl, VariantDecl,
-  Ident, InterfaceDecl, parse,
+  Item, FunctionDecl, TypeDecl, ConstDecl, ImportDecl, importedName, TypeExpr, Param, FieldDecl, VariantDecl,
+  Ident, InterfaceDecl, parse, lex,
 } from "../syntax";
 import { Span } from "../diag";
 import { dirname, joinPath, normalizePath, isNormalized } from "../loader";
@@ -451,15 +451,25 @@ function addImported(
       target = symbolsOrEmpty(tt.unwrap());
     }
   }
-  for (const n of imp.names) {
-    if (hasLabel(out, n.name)) {
+  if (imp.namespace.isSome()) {
+    const ns = imp.namespace.unwrap();
+    if (!hasLabel(out, ns.name)) {
+      out.push(CompletionItem { label: ns.name, kind: DkImported, detail: "namespace of \"" + imp.path + "\"" });
+    }
+  }
+  let k: usize = 0;
+  while (k < imp.names.length) {
+    const n = imp.names[k];
+    const local = importedName(imp, k);
+    k += 1;
+    if (hasLabel(out, local.name)) {
       continue;
     }
     let found = false;
     for (const s of target) {
       if (s.name == n.name && s.exported) {
         found = true;
-        out.push(asItem(s));
+        out.push(CompletionItem { label: local.name, kind: s.kind, detail: s.detail });
         if (isUnion(s.kind)) {
           for (const v of s.children) {
             if (!hasLabel(out, v.name)) {
@@ -471,11 +481,79 @@ function addImported(
     }
     if (!found) {
       out.push(CompletionItem {
-        label: n.name,
+        label: local.name,
         kind: DkImported,
         detail: "imported from \"" + imp.path + "\"",
       });
     }
   }
   return out;
+}
+
+function isNameChar(c: int): bool {
+  return (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95;
+}
+
+// The namespace name when the cursor (byte offset `off` of `text`) sits after `ns.` or `ns.prefix`: the identifier before
+// the `.` that precedes the identifier prefix at the cursor.
+function namespaceBeforeCursor(text: string, off: usize): Option<string> {
+  let i = off < text.length ? off : text.length;
+  while (i > 0 && isNameChar(text.charCodeAt(i - 1))) {
+    i -= 1;
+  }
+  if (i < 2 || text.charCodeAt(i - 1) != 46) {
+    return None;
+  }
+  const end = i - 1;
+  let st = end;
+  while (st > 0 && isNameChar(text.charCodeAt(st - 1))) {
+    st -= 1;
+  }
+  if (st == end) {
+    return None;
+  }
+  return Some(text.substring(st, end));
+}
+
+// Member completion after `ns.` (ADR-0048 addendum): when the cursor follows a namespace import of the file
+// (`import * as ns from "./m"`), the exported declarations of the target module (and the variants of its unions). None
+// when the cursor does not follow `name.` or `name` is no namespace import. The target of a std module cannot be read
+// here (`resolveModulePath`), so the list for a std namespace is empty. The file need not parse (it is being typed): the
+// import is found in the token stream.
+export function namespaceCompletions(fs: FsGrant, ws: Workspace, path: string, text: string, off: usize): Option<CompletionItem[]> {
+  const nsq = namespaceBeforeCursor(text, off);
+  if (nsq.isNone()) {
+    return None;
+  }
+  const toks = lex(0, text);
+  if (toks.isErr()) {
+    return None;
+  }
+  const ts = toks.unwrap();
+  let k: usize = 0;
+  while (k + 5 < ts.length) {
+    if (ts[k].text == "import" && ts[k + 1].text == "*" && ts[k + 2].text == "as" && ts[k + 3].text == nsq.unwrap()
+        && ts[k + 4].text == "from") {
+      let out: CompletionItem[] = [];
+      const mp = resolveModulePath(fs, ws, path, ts[k + 5].text);
+      if (mp.isSome()) {
+        const tt = readText(fs, ws, mp.unwrap());
+        if (tt.isSome()) {
+          for (const s of symbolsOrEmpty(tt.unwrap())) {
+            if (s.exported) {
+              out.push(asItem(s));
+              if (isUnion(s.kind)) {
+                for (const v of s.children) {
+                  out.push(asItem(v));
+                }
+              }
+            }
+          }
+        }
+      }
+      return Some(out);
+    }
+    k += 1;
+  }
+  return None;
 }

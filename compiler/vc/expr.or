@@ -15,10 +15,11 @@ import {
   isIntKind, intLo, intHi, joinKinds, vtName, vtKey, isBad, badReason, vtEq, isIntTy, intKindOf, concrete, resolveTy, resolveTyP, fieldTyOf, fieldIndex, isMapKey
 } from "./vt";
 import { Gen, SortR, sortOf, opaqueSort } from "./gen";
+import { bareOf } from "./scope";
 import {
   Var, Chk, TR, Fn, Cls, Prog, Cx, I64_MIN, I64_MAX, lineOf, clauseText, srcText, lit, inRange, inKind, guarded, guardChks, concat, concatChk,
-  andAll, noChks, noExp, lookupVar, mk, sortS, tyOf, symName, fresh, freshFree, wfOf, arrLen, arrData, arrMk, arrSel, inBounds,
-  isSomeT, isOkT, recField, mapHas, mapSize, mapFact, tfOf, tfChk, clausesOfList, exprOf, isThisExpr, Fresh
+  andAll, noChks, noExp, lookupVar, mk, sortS, tyOf, tyIn, symName, fresh, freshFree, wfOf, arrLen, arrData, arrMk, arrSel, inBounds,
+  isSomeT, isOkT, recField, mapHas, mapSize, mapFact, tfOf, tfChk, clausesOfList, exprOf, isThisExpr, Fresh, valKey, typeKey
 } from "./ctx";
 
 // The conjunction of the obligations among the checks (what a contract needs to be well defined).
@@ -166,11 +167,12 @@ function trIdent(g0: Gen, vars: Var[], cx: Cx, name: string, exp: VT): Result<TR
   if (own.isSome()) {
     return trVariant(g, vars, cx, own.unwrap(), name, []);
   }
+  const ck = valKey(cx, name);
   for (const c of cx.p.consts) {
-    if (c.name == name) {
-      const cc = Cx { p: cx.p, f: cx.f, res: None, ens: false, body: false, olds: [], ret: VUnit, inQ: cx.inQ, text: c.text };
+    if (ck.isSome() && c.key == ck.unwrap()) {
+      const cc = Cx { p: cx.p, unit: c.unit, f: cx.f, res: None, ens: false, body: false, olds: [], ret: VUnit, inQ: cx.inQ, text: c.text };
       const dty = match (c.decl.ty) {
-        Some(t) => tyOf(cx, t),
+        Some(t) => tyIn(cx, c.unit, t),
         None => noExp()
       };
       const none: Var[] = [];
@@ -186,11 +188,11 @@ function trVariant(g0: Gen, vars: Var[], cx: Cx, uni: string, vname: string, arg
   let g = g0;
   const u = cx.p.tab.findUni(uni);
   if (u.isNone()) {
-    return Err("unknown union `" + uni + "`");
+    return Err("unknown union `" + bareOf(uni) + "`");
   }
   const t = VUni(uni);
   if (cx.p.tab.isCyclic("u:" + uni)) {
-    return Err("the variants of the recursive union `" + uni + "` are not modelled");
+    return Err("the variants of the recursive union `" + bareOf(uni) + "` are not modelled");
   }
   const so = sortS(g, cx, t)?;
   g = so.g;
@@ -203,7 +205,7 @@ function trVariant(g0: Gen, vars: Var[], cx: Cx, uni: string, vname: string, arg
       let chks: Chk[] = [];
       let i: usize = 0;
       while (i < args.length) {
-        const pt = tyOf(cx, v.payload[i]);
+        const pt = tyIn(cx, u.unwrap().unit, v.payload[i]);
         if (isBad(pt)) {
           const fr = freshFreeOpaque(g);
           g = fr.g;
@@ -445,19 +447,19 @@ function trMember(g: Gen, vars: Var[], cx: Cx, base: Expr, name: string, e: Expr
     VRec(rn) => {
       const rd = cx.p.tab.findRec(rn);
       if (rd.isNone()) {
-        return Err("unknown record `" + rn + "`");
+        return Err("unknown record `" + bareOf(rn) + "`");
       }
       const fi = fieldIndex(rd.unwrap(), name);
       if (fi.isNone()) {
-        return Err("no field `" + name + "` on `" + rn + "`");
+        return Err("no field `" + name + "` on `" + bareOf(rn) + "`");
       }
       const ft = fieldTyOf(cx.p.tab, rd.unwrap(), fi.unwrap());
       if (isBad(ft)) {
-        return Err("field `" + rn + "." + name + "` has an unsupported type (" + badReason(ft) + ")");
+        return Err("field `" + bareOf(rn) + "." + name + "` has an unsupported type (" + badReason(ft) + ")");
       }
       const so = sortS(b.g, cx, b.vt)?;
       if (cx.p.tab.isCyclic("r:" + rn)) {
-        return Err("the fields of the recursive type `" + rn + "` are not modelled");
+        return Err("the fields of the recursive type `" + bareOf(rn) + "` are not modelled");
       }
       const fterm = recField(so.s, name, b.t);
       const tf = tfOf(so.g, cx, ft, fterm)?;
@@ -528,11 +530,16 @@ function trArrayLit(g0: Gen, vars: Var[], cx: Cx, xs: Expr[], exp: VT): Result<T
   return mk(g, arrMk(so.s, data, xs.length.toString()), at, chks);
 }
 
-function trRecordLit(g0: Gen, vars: Var[], cx: Cx, name: string, spread: Option<Expr>, inits: FieldInit[]): Result<TR, string> {
+function trRecordLit(g0: Gen, vars: Var[], cx: Cx, srcName: string, spread: Option<Expr>, inits: FieldInit[]): Result<TR, string> {
   let g = g0;
+  const nk = typeKey(cx, srcName);
+  if (nk.isNone()) {
+    return Err("unknown record `" + srcName + "` (not a type of the program in scope, or a name that two declarations claim)");
+  }
+  const name = nk.unwrap();
   const rd = cx.p.tab.findRec(name);
   if (rd.isNone()) {
-    return Err("unknown record `" + name + "`");
+    return Err("unknown record `" + srcName + "`");
   }
   const d = rd.unwrap();
   if (d.generic) {
@@ -543,12 +550,12 @@ function trRecordLit(g0: Gen, vars: Var[], cx: Cx, name: string, spread: Option<
       }
     }
     if (!inScope) {
-      return Err("generic record `" + name + "`");
+      return Err("generic record `" + srcName + "`");
     }
   }
   const t = VRec(name);
   if (cx.p.tab.isCyclic("r:" + name)) {
-    return Err("record literal of the recursive type `" + name + "`");
+    return Err("record literal of the recursive type `" + srcName + "`");
   }
   const so = sortS(g, cx, t)?;
   g = so.g;
@@ -611,21 +618,23 @@ function indexIn(xs: string[], x: string): usize {
 }
 
 function isUserFn(cx: Cx, name: string): bool {
-  return cx.p.fnCount.get(name).unwrapOr(0) > 0;
+  const k = valKey(cx, name);
+  return k.isSome() && cx.p.fnCount.get(k.unwrap()).unwrapOr(0) > 0;
 }
 
 // Is the unique function called `name` the one of `std:seq` (library/std/seq.or)? Its calls are axiomatised, not
 // executed: `sum`, `sumBy` as recursive sums, `range(a, b).every` as a bounded quantifier.
 function isSeqFn(cx: Cx, name: string): bool {
-  if (cx.p.fnCount.get(name).unwrapOr(0) != 1) {
+  const k = valKey(cx, name);
+  if (k.isNone() || cx.p.fnCount.get(k.unwrap()).unwrapOr(0) != 1) {
     return false;
   }
-  const i = cx.p.fnIx.get(name);
+  const i = cx.p.fnIx.get(k.unwrap());
   return i.isSome() && cx.p.fns[i.unwrap()].unit == "$stdlib/seq";
 }
 
 function calleeCx(cx: Cx, f: Fn): Cx {
-  return Cx { p: cx.p, f: f, res: None, ens: false, body: false, olds: [], ret: VUnit, inQ: cx.inQ, text: f.text };
+  return Cx { p: cx.p, unit: f.unit, f: f, res: None, ens: false, body: false, olds: [], ret: VUnit, inQ: cx.inQ, text: f.text };
 }
 
 function trCall(g: Gen, vars: Var[], cx: Cx, callee: Expr, args: Expr[], e: Expr, exp: VT): Result<TR, string> {
@@ -633,6 +642,7 @@ function trCall(g: Gen, vars: Var[], cx: Cx, callee: Expr, args: Expr[], e: Expr
     EIdent(id) => trNamedCall(g, vars, cx, id.name, args, e, exp),
     EMember(recv, m) => trMethodCall(g, vars, cx, recv, m.name, args, e, exp),
     ETyApp(_, _) => Err("call of a generic function"),
+    EMethodT(_, _, _) => Err("call of a generic method"),
     _ => Err("unsupported call (only calls of named functions and methods)")
   };
 }
@@ -640,7 +650,7 @@ function trCall(g: Gen, vars: Var[], cx: Cx, callee: Expr, args: Expr[], e: Expr
 function trNamedCall(g0: Gen, vars: Var[], cx: Cx, name: string, args: Expr[], e: Expr, exp: VT): Result<TR, string> {
   let g = g0;
   if (name == "old" && cx.ens && args.length == 1) {
-    const oc = Cx { p: cx.p, f: cx.f, res: cx.res, ens: false, body: cx.body, olds: cx.olds, ret: cx.ret, inQ: cx.inQ, text: cx.text };
+    const oc = Cx { p: cx.p, unit: cx.unit, f: cx.f, res: cx.res, ens: false, body: cx.body, olds: cx.olds, ret: cx.ret, inQ: cx.inQ, text: cx.text };
     return tr(g, cx.olds, oc, args[0], exp);
   }
   if (name == "Some" && args.length == 1) {
@@ -687,10 +697,14 @@ function trNamedCall(g0: Gen, vars: Var[], cx: Cx, name: string, args: Expr[], e
   if (own.isSome() && !isUserFn(cx, name)) {
     return trVariant(g, vars, cx, own.unwrap(), name, args);
   }
-  if (cx.p.fnCount.get(name).unwrapOr(0) != 1) {
-    return Err("call of `" + name + "`: not a unique function of the program, or a built-in");
+  const fk = valKey(cx, name);
+  if (fk.isNone()) {
+    return Err("call of `" + name + "`: not a function of the program in scope (a built-in, or a name that two declarations of this module's scope claim)");
   }
-  const fi = cx.p.fnIx.get(name);
+  if (cx.p.fnCount.get(fk.unwrap()).unwrapOr(0) != 1) {
+    return Err("call of `" + name + "`: not a unique function of the program");
+  }
+  const fi = cx.p.fnIx.get(fk.unwrap());
   if (fi.isNone()) {
     return Err("call of `" + name + "`: unknown function");
   }
@@ -744,8 +758,9 @@ function trMethodCall(g0: Gen, vars: Var[], cx: Cx, recvE: Expr, name: string, a
   // `Class.method(..)`: a static method (the receiver is a class name, not a value).
   match (recvE.kind) {
     EIdent(id) => {
-      if (lookupVar(vars, id.name).isNone() && cx.p.clsIx.get(id.name).isSome()) {
-        const mi = cx.p.fnIx.get(id.name + "." + name);
+      const ck = typeKey(cx, id.name);
+      if (lookupVar(vars, id.name).isNone() && ck.isSome() && cx.p.clsIx.get(ck.unwrap()).isSome()) {
+        const mi = cx.p.fnIx.get(ck.unwrap() + "." + name);
         if (mi.isSome() && cx.p.fns[mi.unwrap()].kind == 2) {
           return callFn(g, vars, cx, cx.p.fns[mi.unwrap()], None, args, e, exp);
         }
@@ -772,14 +787,14 @@ function trMethodCall(g0: Gen, vars: Var[], cx: Cx, recvE: Expr, name: string, a
     VRec(cn) => {
       const mi = cx.p.fnIx.get(cn + "." + name);
       if (mi.isNone()) {
-        return Err("no method `" + name + "` on `" + cn + "` (or it is generic)");
+        return Err("no method `" + name + "` on `" + bareOf(cn) + "` (or it is generic)");
       }
       const f = cx.p.fns[mi.unwrap()];
       if (f.kind != 1) {
-        return Err("`" + cn + "." + name + "` is not an instance method");
+        return Err("`" + bareOf(cn) + "." + name + "` is not an instance method");
       }
       if (f.mutating) {
-        return Err("call of the mutating method `" + cn + "." + name + "` inside an expression (only as a statement)");
+        return Err("call of the mutating method `" + bareOf(cn) + "." + name + "` inside an expression (only as a statement)");
       }
       return callFn(g, vars, cx, f, Some(r), args, e, exp);
     },
@@ -1137,7 +1152,7 @@ function trArgs(g0: Gen, vars: Var[], cx: Cx, f: Fn, ptys: VT[], args: Expr[]): 
   while (i < args.length) {
     const a = tr(g, vars, cx, args[i], ptys[i])?;
     if (!vtEq(a.vt, ptys[i])) {
-      return Err("call of `" + f.key + "`: argument " + (i + 1).toString() + " has type `" + vtName(a.vt) + "`, expected `" + vtName(ptys[i]) + "`");
+      return Err("call of `" + f.disp + "`: argument " + (i + 1).toString() + " has type `" + vtName(a.vt) + "`, expected `" + vtName(ptys[i]) + "`");
     }
     g = a.g;
     chks = concatChk(chks, a.chks);
@@ -1154,9 +1169,9 @@ export function sigOf(cx: Cx, f: Fn): Result<Sig, string> {
   let ptys: VT[] = [];
   let i: usize = 0;
   while (i < f.ptys.length) {
-    const t = tyOf(cx, f.ptys[i]);
+    const t = tyIn(cx, f.unit, f.ptys[i]);
     if (isBad(t)) {
-      return Err("parameter `" + f.pnames[i] + "` of `" + f.key + "` is outside the fragment (" + badReason(t) + ")");
+      return Err("parameter `" + f.pnames[i] + "` of `" + f.disp + "` is outside the fragment (" + badReason(t) + ")");
     }
     ptys.push(t);
     i += 1;
@@ -1164,9 +1179,9 @@ export function sigOf(cx: Cx, f: Fn): Result<Sig, string> {
   let rty = VUnit;
   match (f.ret) {
     Some(t) => {
-      rty = tyOf(cx, t);
+      rty = tyIn(cx, f.unit, t);
       if (isBad(rty)) {
-        return Err("result of `" + f.key + "` is outside the fragment (" + badReason(rty) + ")");
+        return Err("result of `" + f.disp + "` is outside the fragment (" + badReason(rty) + ")");
       }
     },
     None => {}
@@ -1189,7 +1204,7 @@ function paramVarsOf(f: Fn, terms: string[], ptys: VT[]): Var[] {
 export type Invs = { g: Gen; terms: string[]; };
 
 export function invTerms(g0: Gen, cx: Cx, cls: Cls, thisTerm: string): Invs {
-  return invTermsFor(g0, cx, cls.text, cls.invs, VRec(cls.name), thisTerm);
+  return invTermsFor(g0, cx, cls.unit, cls.text, cls.invs, VRec(cls.name), thisTerm);
 }
 
 // The invariants of a value of a class (ADR-0031 B8) or of a record type (A3: a record that violates its invariant
@@ -1204,7 +1219,7 @@ export function valueInvariants(g0: Gen, cx: Cx, vt: VT, term: string): Invs {
       }
       const rd = cx.p.tab.findRec(cn);
       if (rd.isSome()) {
-        return invTermsFor(g0, cx, rd.unwrap().text, clausesOfList(rd.unwrap().contracts, 4), vt, term);
+        return invTermsFor(g0, cx, rd.unwrap().unit, rd.unwrap().text, clausesOfList(rd.unwrap().contracts, 4), vt, term);
       }
       return Invs { g: g0, terms: none };
     },
@@ -1212,10 +1227,10 @@ export function valueInvariants(g0: Gen, cx: Cx, vt: VT, term: string): Invs {
   };
 }
 
-function invTermsFor(g0: Gen, cx: Cx, text: string, clauses: ContractClause[], vt: VT, thisTerm: string): Invs {
+function invTermsFor(g0: Gen, cx: Cx, unit: string, text: string, clauses: ContractClause[], vt: VT, thisTerm: string): Invs {
   let g = g0;
   let out: string[] = [];
-  const cc = Cx { p: cx.p, f: cx.f, res: None, ens: false, body: false, olds: [], ret: VUnit, inQ: cx.inQ, text: text };
+  const cc = Cx { p: cx.p, unit: unit, f: cx.f, res: None, ens: false, body: false, olds: [], ret: VUnit, inQ: cx.inQ, text: text };
   const vars: Var[] = [Var { name: "this", term: thisTerm, vt: vt }];
   for (const c of clauses) {
     const ex = exprOf(c);
@@ -1252,10 +1267,10 @@ export function callFn(g0: Gen, vars: Var[], cx: Cx, f: Fn, recv: Option<TR>, ar
 export function callFnX(g0: Gen, vars: Var[], cx: Cx, f: Fn, recv: Option<TR>, args: Expr[], e: Expr, exp: VT): Result<CallR, string> {
   let g = g0;
   if (f.generic && !(f.cls != "" && f.cls == cx.f.cls)) {
-    return Err("call of the generic function `" + f.key + "`");
+    return Err("call of the generic function `" + f.disp + "`");
   }
   if (f.pnames.length != args.length) {
-    return Err("call of `" + f.key + "`: wrong number of arguments");
+    return Err("call of `" + f.disp + "`: wrong number of arguments");
   }
   const sig = sigOf(cx, f)?;
   const a = trArgs(g, vars, cx, f, sig.ptys, args)?;
@@ -1284,10 +1299,10 @@ export function callFnX(g0: Gen, vars: Var[], cx: Cx, f: Fn, recv: Option<TR>, a
         Ok(x) => {
           g = x.g;
           const goal = clGoal(x);
-          chks = concatChk(chks, [oblChk("call-precondition", f.key, line, clauseText(f.text, c) + " (call of " + f.key + ")", goal)]);
+          chks = concatChk(chks, [oblChk("call-precondition", f.disp, line, clauseText(f.text, c) + " (call of " + f.disp + ")", goal)]);
         },
         Err(m) => {
-          return Err("the @Requires of `" + f.key + "` is outside the fragment: " + m);
+          return Err("the @Requires of `" + f.disp + "` is outside the fragment: " + m);
         }
       }
     }
@@ -1312,7 +1327,7 @@ export function callFnX(g0: Gen, vars: Var[], cx: Cx, f: Fn, recv: Option<TR>, a
     g = so.g;
     const co = cx.p.clsIx.get(f.cls);
     if (co.isNone()) {
-      return Err("unknown class `" + f.cls + "`");
+      return Err("unknown class `" + bareOf(f.cls) + "`");
     }
     if (!f.frameAll) {
       for (const fld of cx.p.classes[co.unwrap()].fields) {
@@ -1344,7 +1359,7 @@ export function callFnX(g0: Gen, vars: Var[], cx: Cx, f: Fn, recv: Option<TR>, a
       }
       const rs2 = sortS(g, cx, rty)?;
       g = rs2.g;
-      const fname = (f.kind == 0 ? "uf_" : "um_") + f.key;
+      const fname = (f.kind == 0 ? "uf_" : "um_") + f.sym;
       if (!g.hasFun(fname)) {
         g.registerFun(fname);
         if (sorts.length == 0) {
@@ -1361,7 +1376,7 @@ export function callFnX(g0: Gen, vars: Var[], cx: Cx, f: Fn, recv: Option<TR>, a
       }
     } else {
       if (cx.inQ) {
-        return Err("call of the impure function `" + f.key + "` inside a quantifier body");
+        return Err("call of the impure function `" + f.disp + "` inside a quantifier body");
       }
       const fr = freshFree(g, cx, rty)?;
       g = fr.g;
@@ -1374,7 +1389,7 @@ export function callFnX(g0: Gen, vars: Var[], cx: Cx, f: Fn, recv: Option<TR>, a
   // would unfold forever, and at the function's own @Ensures it would assume what is being proved. Sound for
   // VERIFIED; the proof then cannot rely on a counterexample.
   if (g.isActive(f.key) || (cx.ens && cx.f.key == f.key)) {
-    g.noteApprox("the contract of `" + f.key + "` calls `" + f.key + "`, which is treated as unknown inside that contract");
+    g.noteApprox("the contract of `" + f.disp + "` calls `" + f.disp + "`, which is treated as unknown inside that contract");
     return Ok(CallR { g: g, t: resTerm, vt: rty, chks: chks, newThis: newThis });
   }
   g.enter(f.key);
@@ -1420,7 +1435,7 @@ export function callFnX(g0: Gen, vars: Var[], cx: Cx, f: Fn, recv: Option<TR>, a
       g.useAssumption("A-INV");
     }
   }
-  const ecx = Cx { p: cx.p, f: f, res: res, ens: true, body: false, olds: calleeVars, ret: rty, inQ: cx.inQ, text: f.text };
+  const ecx = Cx { p: cx.p, unit: f.unit, f: f, res: res, ens: true, body: false, olds: calleeVars, ret: rty, inQ: cx.inQ, text: f.text };
   let ens: string[] = [];
   if (newThis != "" && !f.priv) {
     // a public method maintains the class invariants: they hold for the receiver afterwards
@@ -1463,18 +1478,23 @@ export function isUnit(t: VT): bool {
 // `new C(args)`: the constructor's @Requires are obligations; the new object satisfies the class invariants
 // (constructors establish them, proved separately) and the fields the constructor takes from its parameter
 // properties and field initialisers.
-function trNew(g0: Gen, vars: Var[], cx: Cx, name: string, targs: TypeExpr[], args: Expr[], e: Expr): Result<TR, string> {
+function trNew(g0: Gen, vars: Var[], cx: Cx, srcName: string, targs: TypeExpr[], args: Expr[], e: Expr): Result<TR, string> {
   let g = g0;
-  if (name == "Map") {
+  if (srcName == "Map") {
     return trNewMap(g, cx, targs);
   }
-  const co = cx.p.clsIx.get(name);
-  if (co.isNone()) {
-    return Err("`new " + name + "`: not a class of the program");
+  const nk = typeKey(cx, srcName);
+  if (nk.isNone()) {
+    return Err("`new " + srcName + "`: not a class of the program in scope");
   }
+  const co = cx.p.clsIx.get(nk.unwrap());
+  if (co.isNone()) {
+    return Err("`new " + srcName + "`: not a class of the program in scope");
+  }
+  const name = nk.unwrap();
   const cls = cx.p.classes[co.unwrap()];
   if (cls.generic || targs.length > 0) {
-    return Err("`new " + name + "`: generic class");
+    return Err("`new " + srcName + "`: generic class");
   }
   if (cx.inQ) {
     return Err("`new` inside a quantifier body");
@@ -1490,7 +1510,7 @@ function trNew(g0: Gen, vars: Var[], cx: Cx, name: string, targs: TypeExpr[], ar
   if (ctor.isSome()) {
     const f = ctor.unwrap();
     if (f.pnames.length != args.length) {
-      return Err("`new " + name + "`: wrong number of arguments");
+      return Err("`new " + srcName + "`: wrong number of arguments");
     }
     const sig = sigOf(cx, f)?;
     const a = trArgs(g, vars, cx, f, sig.ptys, args)?;
@@ -1499,7 +1519,7 @@ function trNew(g0: Gen, vars: Var[], cx: Cx, name: string, targs: TypeExpr[], ar
     argTerms = a.terms;
     calleeVars = paramVarsOf(f, a.terms, sig.ptys);
   } else if (args.length != 0) {
-    return Err("`new " + name + "`: the class has no constructor");
+    return Err("`new " + srcName + "`: the class has no constructor");
   }
   const so = sortS(g, cx, t)?;
   g = so.g;
@@ -1520,10 +1540,10 @@ function trNew(g0: Gen, vars: Var[], cx: Cx, name: string, targs: TypeExpr[], ar
             g = x.g;
             reqTerms.push(clHyp(x));
             const goal = clGoal(x);
-            chks = concatChk(chks, [oblChk("call-precondition", name + ".constructor", line, clauseText(f.text, c) + " (call of new " + name + ")", goal)]);
+            chks = concatChk(chks, [oblChk("call-precondition", srcName + ".constructor", line, clauseText(f.text, c) + " (call of new " + srcName + ")", goal)]);
           },
           Err(m) => {
-            return Err("the @Requires of the constructor of `" + name + "` is outside the fragment: " + m);
+            return Err("the @Requires of the constructor of `" + srcName + "` is outside the fragment: " + m);
           }
         }
       }
@@ -1540,7 +1560,7 @@ function trNew(g0: Gen, vars: Var[], cx: Cx, name: string, targs: TypeExpr[], ar
     }
   }
   // Fields with an initialiser that the constructor does not write and does not take from a parameter.
-  const icx = Cx { p: cx.p, f: cx.f, res: None, ens: false, body: false, olds: [], ret: VUnit, inQ: false, text: cls.text };
+  const icx = Cx { p: cx.p, unit: cls.unit, f: cx.f, res: None, ens: false, body: false, olds: [], ret: VUnit, inQ: false, text: cls.text };
   let fi: usize = 0;
   while (fi < cls.fields.length) {
     const fname = cls.fields[fi];
@@ -1552,7 +1572,7 @@ function trNew(g0: Gen, vars: Var[], cx: Cx, name: string, targs: TypeExpr[], ar
           skip = true;
         }
       }
-      const ft = resolveTyP(cx.p.tab, cls.ftys[fi], cls.tparams);
+      const ft = resolveTyP(cx.p.tab, cls.unit, cls.ftys[fi], cls.tparams);
       if (!skip && !isBad(ft)) {
         const none: Var[] = [];
         const r = tr(g, none, icx, cls.finit[fi].unwrap(), ft);
@@ -1705,7 +1725,7 @@ export function matchPattern(g0: Gen, cx: Cx, s: TR, sn: string, p: Pattern): Re
   match (s.vt) {
     VUni(un) => {
       if (cx.p.tab.isCyclic("u:" + un)) {
-        return Err("`match` on the recursive union `" + un + "` is not modelled");
+        return Err("`match` on the recursive union `" + bareOf(un) + "` is not modelled");
       }
     },
     _ => {}
@@ -1781,7 +1801,7 @@ function variantPayloadTy(cx: Cx, s: TR, name: string, i: usize): VT {
       }
       for (const v of u.unwrap().variants) {
         if (v.name == name && i < v.payload.length) {
-          return tyOf(cx, v.payload[i]);
+          return tyIn(cx, u.unwrap().unit, v.payload[i]);
         }
       }
       return VBad("unknown variant");
@@ -1832,7 +1852,7 @@ function trBody(g: Gen, vars: Var[], cx: Cx, lam: Lam, tys: VT[], terms: string[
     vars2.push(Var { name: lam.params[i], term: terms[i], vt: tys[i] });
     i += 1;
   }
-  const qcx = Cx { p: cx.p, f: cx.f, res: cx.res, ens: cx.ens, body: cx.body, olds: cx.olds, ret: cx.ret, inQ: true, text: cx.text };
+  const qcx = Cx { p: cx.p, unit: cx.unit, f: cx.f, res: cx.res, ens: cx.ens, body: cx.body, olds: cx.olds, ret: cx.ret, inQ: true, text: cx.text };
   return tr(g, vars2, qcx, lam.body, exp);
 }
 

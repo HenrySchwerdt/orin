@@ -18,7 +18,7 @@
 
 import { Span, Diagnostic, spanTo, diag } from "../diag";
 import {
-  Ident, Module, Item, ImportDecl, FunctionDecl, Param, TypeDecl, TypeDeclBody, FieldDecl,
+  Ident, Module, Item, ImportDecl, plainImport, FunctionDecl, Param, TypeDecl, TypeDeclBody, FieldDecl,
   VariantDecl, ConstDecl, TypeExpr, TypeExprKind, Block, Stmt, AssignOp, StmtKind, Expr, UnaryOp,
   BinaryOp, ExprKind, FieldInit, MatchArm, ArmBody, Pattern, PatternKind, InterfaceDecl,
   IfaceMethod, ClassDecl, ClassMember, ClassField, CtorDecl, CtorParam, MethodDecl, FnTyParam,
@@ -38,7 +38,7 @@ import {
 } from "./wellformed";
 
 // Type parameters with their optional bounds (parallel); `any`: some parameter has a bound.
-type Bounds = { ids: Ident[]; bounds: Option<Ident>[]; any: bool; };
+type Bounds = { ids: Ident[]; bounds: Ident[][]; any: bool; };
 
 // Contract clauses and annotations before a declaration; `first` is the span of the first one.
 type Decos = { clauses: ContractClause[]; annos: Annotation[]; first: Span; };
@@ -76,6 +76,27 @@ function errAt(t: Token, msg: string): Diagnostic {
 function isPunctTok(t: Token, s: string): bool {
   return match (t.kind) {
     KPunct => t.text == s,
+    _ => false,
+  };
+}
+
+function isKeywordTok(t: Token, s: string): bool {
+  return match (t.kind) {
+    KKeyword => t.text == s,
+    _ => false,
+  };
+}
+
+function isIdentTok(t: Token, s: string): bool {
+  return match (t.kind) {
+    KIdent => t.text == s,
+    _ => false,
+  };
+}
+
+function isAnyIdentTok(t: Token): bool {
+  return match (t.kind) {
+    KIdent => true,
     _ => false,
   };
 }
@@ -210,8 +231,20 @@ export function isSyntaxCode(code: string): bool {
       || code == "E0440"
       || code == "E0441"
       || code == "E0442"
-      || code == "E0447";
+      || code == "E0447"
+      || code == "E0460";
 }
+
+function hasIdentNamed(ids: Ident[], name: string): bool {
+  for (const i of ids) {
+    if (i.name == name) {
+      return true;
+    }
+  }
+  return false;
+}
+
+type ImportNames = { names: Ident[]; aliases: Option<Ident>[]; };
 
 // The parser over a token stream that ends with KEof (`lex` output). The cursor stays on a token: it never moves past
 // the final KEof. Error recovery (only after `enableRecovery`): `errs` holds the errors reported so far (at most
@@ -232,9 +265,18 @@ export class Parser {
   private floor: usize = 0;
   private unwinding: bool = false;
   private sawProvider: bool = false; // an `import ox from` was parsed (ADR-0044: at most one per file)
+  private nsNames: string[] = []; // the namespace imports of the file (`import * as m`), found by a scan of the tokens
+  private nsUses: Ident[] = []; // every `m.x` merged into one identifier so far (ADR-0048 addendum)
 
   constructor(toks: Token[]) {
     this.toks = toks;
+    let i: usize = 0;
+    while (i + 3 < toks.length) {
+      if (isKeywordTok(toks[i], "import") && isPunctTok(toks[i + 1], "*") && isIdentTok(toks[i + 2], "as") && isAnyIdentTok(toks[i + 3])) {
+        this.nsNames.push(toks[i + 3].text);
+      }
+      i += 1;
+    }
   }
 
   // Report several errors (see `parseRecovering`) instead of stopping at the first.
@@ -554,8 +596,9 @@ export class Parser {
     };
   }
 
-  // Span of the last consumed token (the cursor has moved at least once).
-  @Requires(this.pos >= 1)
+  // Span of the last consumed token (the cursor has moved at least once; `pos < toks.length` is the class invariant,
+  // restated for the verifier, which does not assume it in a private method).
+  @Requires(this.pos >= 1 && this.pos < this.toks.length)
   private lastSpan(): Span {
     return this.toks[this.pos - 1].span;
   }
@@ -670,6 +713,21 @@ export class Parser {
     return Ok(ty);
   }
 
+  // An identifier; when it names a namespace import of the file (`import * as m`) and `.name` follows, both are merged into
+  // the one identifier `m.name` (ADR-0048 addendum). No other identifier can contain a `.`, so the checker finds
+  // such a name in the file's scope only through the import. The merged identifier is recorded in `nsUses`.
+  private parseNameRef(): Result<Ident, Diagnostic> {
+    const nm = this.parseIdent()?;
+    if (this.isP(".") && this.isAnyIdentAt(1) && this.nsNames.indexOf(nm.name).isSome()) {
+      this.pos += 1;
+      const mem = this.parseIdent()?;
+      const merged = Ident { name: nm.name + "." + mem.name, span: spanTo(nm.span, mem.span) };
+      this.nsUses.push(merged);
+      return Ok(merged);
+    }
+    return Ok(nm);
+  }
+
   // `Name`, `Name<A, B>`, followed by any number of `[]`; or a function type (see above).
   @Ensures(result.isOk()
       ==> this.spansFrom(result.unwrap().span, old(this.pos)) && typeShallowOk(result.unwrap()))
@@ -677,7 +735,7 @@ export class Parser {
     if (this.isP("(")) {
       return this.parseParenType();
     }
-    const nm = this.parseIdent()?;
+    const nm = this.parseNameRef()?;
     let args: TypeExpr[] = [];
     if (this.isP("<")) {
       this.pos += 1;
@@ -701,13 +759,14 @@ export class Parser {
   }
 
   // Optional `<T, U>` list of generic parameter names, each with an optional bound `T extends Shape`
-  // (interfaces, ADR-0019). More than one bound (`A & B`) is E0408. Consumes nothing when there is no `<`.
+  // (interfaces, ADR-0019), or a list of bounds `T extends Ord & Hash` (ADR-0034 limit lifted). `bounds` is parallel to `ids`; an empty
+  // list means no bound. Consumes nothing when there is no `<`.
   @Ensures(result.isOk() ==> result.unwrap().ids.length == result.unwrap().bounds.length)
   @Ensures(result.isOk() ==> result.unwrap().ids.length == 0 == (this.pos == old(this.pos)))
-  @Ensures(result.isOk() ==> result.unwrap().any == result.unwrap().bounds.some(b => b.isSome()))
+  @Ensures(result.isOk() ==> result.unwrap().any == result.unwrap().bounds.some(b => b.length > 0))
   private parseTypeParamsB(): Result<Bounds, Diagnostic> {
     let ids: Ident[] = [];
-    let bounds: Option<Ident>[] = [];
+    let bounds: Ident[][] = [];
     let any = false;
     if (!this.isP("<")) {
       return Ok(Bounds { ids: ids, bounds: bounds, any: any });
@@ -716,20 +775,14 @@ export class Parser {
     while (true) {
       const id = this.parseIdent()?;
       ids.push(id);
-      let b: Option<Ident> = None;
+      let b: Ident[] = [];
       if (this.isIdentText(0, "extends")) {
         this.pos += 1;
-        const bi = this.parseIdent()?;
-        b = Some(bi);
+        b.push(this.parseIdent()?);
         any = true;
-        if (this.isP("&")) {
-          return Err(
-            diag(
-              "E0408",
-              this.toks[this.pos].span,
-              "a type parameter can have only one bound in Orin 1.0 (`T extends A & B` is not supported, ADR-0019)",
-            ),
-          );
+        while (this.isP("&")) {
+          this.pos += 1;
+          b.push(this.parseIdent()?);
         }
       }
       bounds.push(b);
@@ -1010,14 +1063,22 @@ export class Parser {
   // Items
   // ---------------------------------------------------------------------------
 
-  // `{ a, b, }` list of names (trailing comma allowed).
+  // `{ a, b as c, }` list of imported names with optional aliases (trailing comma allowed).
   @Ensures(result.isOk() ==> this.pos >= old(this.pos) + 2)
-  private parseNameList(): Result<Ident[], Diagnostic> {
+  private parseImportNames(): Result<ImportNames, Diagnostic> {
     this.expectP("{")?;
     let ids: Ident[] = [];
+    let als: Option<Ident>[] = [];
     while (!this.isP("}")) {
       const id = this.parseIdent()?;
       ids.push(id);
+      if (this.isIdentText(0, "as") && this.isAnyIdentAt(1)) {
+        this.pos += 1;
+        const al = this.parseIdent()?;
+        als.push(Some(al));
+      } else {
+        als.push(None);
+      }
       if (this.isP(",")) {
         this.pos += 1;
       } else if (!this.isP("}")) {
@@ -1025,13 +1086,19 @@ export class Parser {
       }
     }
     this.pos += 1;
-    return Ok(ids);
+    return Ok(ImportNames { names: ids, aliases: als });
   }
 
-  // `import { .. } from "path";` or `export { .. } from "path";` (the cursor is at the first keyword).
+  private isAnyIdentAt(k: usize): bool {
+    return isAnyIdentTok(this.at(k));
+  }
+
+  // `import { .. } from "path";`, `import * as m from "path";` or `export { .. } from "path";` (the cursor is at the first
+  // keyword).
   @Ensures(result.isOk() ==> this.spansFrom(result.unwrap().span, old(this.pos)))
   private parseImportDecl(): Result<ImportDecl, Diagnostic> {
     const start = this.toks[this.pos].span;
+    const isImport = this.isKw("import");
     this.pos += 1;
     if (this.isIdentText(0, "ox") && this.isKwAt(1, "from")) {
       if (this.sawProvider) {
@@ -1039,14 +1106,32 @@ export class Parser {
       }
       this.sawProvider = true;
       this.pos += 1;
-      return this.parseImportRest(start, [], true);
+      return this.parseImportRest(start, plainImport([], "", start, start, true));
     }
-    const names = this.parseNameList()?;
-    return this.parseImportRest(start, names, false);
+    if (isImport && this.isP("*")) {
+      const star = this.toks[this.pos].span;
+      this.pos += 1;
+      if (!(this.isIdentText(0, "as") && this.isAnyIdentAt(1))) {
+        return Err(diag("E0200", star, "`import *` needs a name: write `import * as name from \"path\";`"));
+      }
+      this.pos += 1;
+      const ns = this.parseIdent()?;
+      const d = plainImport([], "", start, start, false);
+      return this.parseImportRest(start, ImportDecl {
+        names: d.names, aliases: d.aliases, namespace: Some(ns), uses: d.uses,
+        path: "", pathSpan: start, span: start, provider: false,
+      });
+    }
+    const nl = this.parseImportNames()?;
+    const noUses: Ident[] = [];
+    return this.parseImportRest(start, ImportDecl {
+      names: nl.names, aliases: nl.aliases, namespace: None, uses: noUses,
+      path: "", pathSpan: start, span: start, provider: false,
+    });
   }
 
-  // `from "path";` of an import (the names or `ox` are parsed).
-  private parseImportRest(start: Span, names: Ident[], provider: bool): Result<ImportDecl, Diagnostic> {
+  // `from "path";` of an import (the names, the namespace or `ox` are parsed and given in `head`).
+  private parseImportRest(start: Span, head: ImportDecl): Result<ImportDecl, Diagnostic> {
     this.expectKw("from")?;
     const pt = this.toks[this.pos];
     if (!isStrTok(pt)) {
@@ -1055,11 +1140,14 @@ export class Parser {
     this.pos += 1;
     this.expectP(";")?;
     return Ok(ImportDecl {
-      names: names,
+      names: head.names,
+      aliases: head.aliases,
+      namespace: head.namespace,
+      uses: head.uses,
       path: pt.text,
       pathSpan: pt.span,
       span: spanTo(start, this.lastSpan()),
-      provider: provider,
+      provider: head.provider,
     });
   }
 
@@ -1326,9 +1414,9 @@ export class Parser {
     if (this.isP("<")) {
       return Err(
         diag(
-          "E0408",
+          "E0460",
           this.toks[this.pos].span,
-          "generic interface methods are not supported (ADR-0019)",
+          "an interface method cannot be generic (a virtual call cannot pick a monomorphised instance, ADR-0040)",
         ),
       );
     }
@@ -1412,14 +1500,15 @@ export class Parser {
     if (this.isP("(") || this.isP("<")) {
       checkPlacement(cls, T_METHOD)?;
       checkAnnoPlacement(annos, T_METHOD)?;
-      const tps = this.parseTypeParams()?;
+      const tps = this.parseTypeParamsB()?;
       const sg = this.parseSigBody()?;
       return Ok(
         MMethod(MethodDecl {
           priv: priv,
           isStatic: isStatic,
           name: name,
-          typeParams: tps,
+          typeParams: tps.ids,
+          bounds: tps.bounds,
           params: sg.params,
           ret: sg.ret,
           body: sg.body,
@@ -2105,7 +2194,23 @@ export class Parser {
       } else if (this.isP(".")) {
         this.pos += 1;
         const m = this.parseIdent()?;
-        e = mkExpr(EMember(e, m), spanTo(e.span, m.span));
+        // `recv.m<T, U>(args)`: explicit type arguments of a generic method (ADR-0040), decided by backtracking like
+        // `f<T>(x)`: the `>` must be followed by `(`.
+        let targs: Option<TypeExpr[]> = None;
+        if (this.isP("<")) {
+          const afterName = this.pos;
+          const ta = this.tryTypeArgs();
+          if (ta.isSome() && this.isP("(")) {
+            targs = ta;
+          } else {
+            this.pos = afterName;
+          }
+        }
+        if (targs.isSome()) {
+          e = mkExpr(EMethodT(e, m, targs.unwrap()), spanTo(e.span, this.lastSpan()));
+        } else {
+          e = mkExpr(EMember(e, m), spanTo(e.span, m.span));
+        }
       } else if (this.isP("[")) {
         this.pos += 1;
         const ix = this.parseExpr()?;
@@ -2490,7 +2595,7 @@ export class Parser {
     }
     const start = this.toks[this.pos].span;
     this.pos += 1;
-    const nm = this.parseIdent()?;
+    const nm = this.parseNameRef()?;
     let targs: TypeExpr[] = [];
     if (this.isP("<")) {
       const ta = this.tryTypeArgs();
@@ -2544,7 +2649,7 @@ export class Parser {
   // form `name<types>(` / `Name<types> {` -- decided by backtracking (ADR-0007).
   @Ensures(result.isOk() ==> this.spansFrom(result.unwrap().span, old(this.pos)))
   private parseIdentExpr(): Result<Expr, Diagnostic> {
-    const nm = this.parseIdent()?;
+    const nm = this.parseNameRef()?;
     if (this.isP("{")) {
       return this.parseRecordLit(nm, []);
     }
@@ -2712,7 +2817,7 @@ export class Parser {
   // restriction to bindings and `_` is enforced later, by the checker.
   @Ensures(result.isOk() ==> this.spansFrom(result.unwrap().span, old(this.pos)))
   private parseIdentPattern(): Result<Pattern, Diagnostic> {
-    const nm = this.parseIdent()?;
+    const nm = this.parseNameRef()?;
     if (nm.name == "_") {
       return Ok(Pattern { kind: PWildcard, span: nm.span });
     }
@@ -2753,7 +2858,38 @@ export class Parser {
         return Err(it.unwrapErr());
       }
     }
-    return Ok(Module { file: file, items: items });
+    return Ok(Module { file: file, items: this.withNsUses(items) });
+  }
+
+  // The namespace imports get the uses of their namespace (`m.x` of `import * as m`) collected while parsing.
+  private withNsUses(items: Item[]): Item[] {
+    if (this.nsUses.length == 0) {
+      return items;
+    }
+    let out: Item[] = [];
+    for (const it of items) {
+      match (it) {
+        IImport(d) => {
+          match (d.namespace) {
+            Some(ns) => {
+              let mine: Ident[] = [];
+              for (const u of this.nsUses) {
+                if (u.name.startsWith(ns.name + ".") && !hasIdentNamed(mine, u.name)) {
+                  mine.push(u);
+                }
+              }
+              out.push(IImport(ImportDecl {
+                names: d.names, aliases: d.aliases, namespace: d.namespace, uses: mine,
+                path: d.path, pathSpan: d.pathSpan, span: d.span, provider: d.provider,
+              }));
+            },
+            None => { out.push(it); },
+          }
+        },
+        _ => { out.push(it); },
+      }
+    }
+    return out;
   }
 }
 

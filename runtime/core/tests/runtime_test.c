@@ -135,8 +135,8 @@ static void test_deep_chain(void) {
 }
 
 static void test_misc(void) {
-    CHECK(orin_add_i(1, 2) == 3 && orin_div_i(-7, 2) == -3 && orin_rem_i(-7, 2) == -1);
-    CHECK(orin_int_to_usize(5) == 5 && orin_usize_to_int(5) == 5);
+    /* The checked arithmetic of generated code is defined by the compiler's preamble (compiler/backends/c/preamble.or, ADR-0052 R3d.6);
+     * its results and traps are covered by tests/run and the conformance suite, not here. */
     OrinObj *none = orin_none();
     CHECK(none->rc < 0 && orin_nullary(1) == none);
     orin_release(none); /* no-op on immortal */
@@ -401,6 +401,16 @@ static void t_net_stale(void) {
     orin_net_close(c);
     orin_release(orin_net_recv(c, 4, 10)); /* the closed slot: stale */
 }
+/* the slot of a closed stream is reused by the next one with a NEW generation: the old handle stays dead (generation-tagged handles) */
+static void t_net_stale_after_reuse(void) {
+    OrinObj *host = orin_str_new("127.0.0.1", 9); /* borrowed by connect; released before the trap (LeakSanitizer) */
+    int64_t c1 = orin_net_connect(n_net, host, orin_net_port(n_lis), 1000, 0);
+    orin_net_close(c1);
+    int64_t c2 = orin_net_connect(n_net, host, orin_net_port(n_lis), 1000, 0);
+    orin_release(host);
+    if (c2 == c1 || (c2 & 0xff) != (c1 & 0xff)) _exit(3); /* the test needs the same slot under another generation */
+    orin_release(orin_net_recv(c1, 4, 10));
+}
 static void t_net_double_close(void) {
     int64_t c = orin_net_connect(n_net, orin_str_new("127.0.0.1", 9), orin_net_port(n_lis), 1000, 0);
     orin_net_close(c);
@@ -438,6 +448,13 @@ static void test_net_handles(void) {
     CHECK(trap_code(t_net_listener_as_stream) == 101 && trap_code(t_net_stream_as_listener) == 101 && trap_code(t_net_grant_as_stream) == 101);
     CHECK(trap_code(t_net_stale) == 101 && trap_code(t_net_double_close) == 101 && trap_code(t_net_close_grant) == 101);
     CHECK(trap_code(t_net_use_after_grant_revoked) == 101);
+    CHECK(trap_code(t_net_stale_after_reuse) == 101);
+    /* a set wake source (ADR-0017 Addendum D) ends a wait with the code 1004 and leaves the connection queued */
+    int64_t wk = orin_platform_wake_open();
+    CHECK(wk > 0 && orin_platform_wake_signal(wk) == 1);
+    int64_t cancelled = orin_net_accept(n_lis, 1000, 0);
+    CHECK(cancelled < 0 && orin_net_status(cancelled) == ORIN_PLATFORM_NET_CANCELLED);
+    CHECK(orin_platform_wake_close(wk) == 0 && orin_platform_wake_bound() == 0);
     CHECK(trap_code(t_net_send_range) == 101 && trap_code(t_net_send_range_overflow) == 101);
     /* a recv never returns more than the capacity it was given, and the bytes are right */
     OrinObj *a = K(orin_array_new(10, 0));

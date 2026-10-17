@@ -1,7 +1,7 @@
 # ADR-0017: Concurrency design — isolated tasks, transfer by move or copy, no shared mutable memory
 
 Status: accepted as design (2026-10-13); implementation after the 1.0 core freeze (ADR-0016). **Stage 0 implemented
-(2026-10-14): see "Addendum A: stage 0 as built" at the end and docs/concurrency.md.**
+(2026-10-14): see "Addendum A: stage 0 as built" at the end and docs/concurrency.md. Gate 1 floor C0-C5 implemented; the server acceptance campaign (C5, 2026-10-17) passes: results in docs/roadmaps/async-concurrency.md "Server acceptance campaign".**
 Resolves spec-12 OPEN #5 at the design level. Spec references: 06 (concurrency), 07 (race freedom).
 
 ## Model
@@ -128,7 +128,7 @@ against the new runtime unchanged, so no seed bridge was needed (the compiler so
 Status: accepted per [roadmap](../roadmaps/orin-1.0.md) default D1 = option B (owner default 2026-10-16; Henry can still
 overturn it). This addendum fixes the semantics; C0 implements only the pure state machines (`std:taskcore`: `CancelState`,
 `CancelScope`, `TaskCell` and the functions around them); blocking behaviour lands in C1-C3 (**C1 implemented**: timed monitor wait in L0, `recvUntil`/`recvTimeout`, `sendUntil`/`sendTimeout`,
-`joinUntil`/`joinTimeout`, `select`/`selectUntil`/`selectTimeout`, `sleep`/`sleepUntil`; see docs/concurrency.md "Gate 1, C1"). Related: ADR-0054 (the L0 budget that
+`joinUntil`/`joinTimeout`, `select`/`selectUntil`/`selectTimeout`, `sleep`/`sleepUntil`; see docs/concurrency.md "Gate 1, C1"; **C3 implemented**: scope tokens, interruptible network waits, Addendum D). Related: ADR-0054 (the L0 budget that
 C1/C3 need), ADR-0048 (naming), [async-concurrency roadmap](../roadmaps/async-concurrency.md).
 
 **No new syntax.** No `async`/`await`, no new keywords or operators, no new checker rules. Cancellation, deadlines, `select` and
@@ -193,3 +193,121 @@ A `select` of several arms is one monitor wait on a shared wake word, not a poll
 
 **7. What is not changed.** Isolation, move-or-copy transfer, non-atomic RC, bounded channels and 1:1 threads in stage 0 stay.
 A trap inside a task still never unwinds the process; it becomes the `Error` outcome of that task.
+
+## Addendum C: network ownership for concurrent servers (C4) (2026-10-17)
+
+Status: accepted per [roadmap](../roadmaps/orin-1.0.md) default D1 (owner default 2026-10-16). Implements work package C4 and the
+concurrent server example of C5. Related: ADR-0033 (net primitives), ADR-0048 (naming), ADR-0025.
+
+**Problem.** `Listener` and `Stream` are resource handles in the owning thread's grant table. They cannot be captured, returned, stored
+or sent (E0450-E0452, E0483), task delegation covered fs / process / stdio / clock but not net, and the bulk buffer between byte arrays
+and L0 (`g_netbuf`) was one global. A server could serve one connection at a time.
+
+**Decision: delegate and move, no new value kind.** A socket stays a handle. It crosses a task boundary through the machinery that
+already moves grants (`grantClone` / `grantMove` / `grantAdopt*`, a one-shot token), now with two more kinds:
+
+1. **NetGrant delegation.** `spawnNet(scope, net, body)` clones the grant (same listen address, connect pattern and ports, same
+   `ORIN_DENY` policy), moves the clone into the task and hands it to `body(g)`; the task revokes it when it ends, also on a trap.
+   `scopeNet` / `scopeNetDo` carry the grant into a scope. Authority is never widened: the clone is a copy of the parent's record.
+2. **Stream move.** `grantMove(stream)` ends the handle in the parent (its slot leaves the parent's grant table; the MIR verifier treats
+   it as a closer, so no use, close or second move afterwards, and it must happen on every path or the stream is "not closed") and
+   returns a token; `grantAdoptStream(token)` in the child defines a fresh `Stream` handle in the child's table, which the child must
+   close exactly once. The socket descriptor travels with the token. A token can be adopted once; a second adoption traps ("invalid
+   grant token"), a forged one too.
+3. **std:net on top (ADR-0048 naming).** `acceptDetached(ln, timeoutMs): Result<Accepted, NetError>` accepts and moves; `Accepted` is
+   a plain value `{ token, peer }` that can travel in a `channel<Accepted>`; `serveAccepted(a, body)` / `serveAcceptedDo` adopt, run and
+   close; `dropAccepted(a)` closes unserved; `spawnAccepted(scope, ln, timeoutMs, body)` / `spawnAcceptedDo` accept and start a task.
+   A bounded pool of N workers receiving `Accepted` from a bounded channel gives a server with at most N connections in service.
+4. **Per-task net buffer.** `g_netbuf` is replaced by a thread-local buffer allocated on first use and freed in `orin_rt_heap_exit`;
+   concurrent tasks never share it.
+
+**What stays forbidden.** A task body cannot capture a `Listener`, a `Stream` or any grant (E0483, text extended). A `Listener`
+never leaves the task that bound it (the accepting task accepts and moves the `Stream`). A `Stream` is moved, never duplicated.
+
+**Checker and verifier rules.**
+
+| Code | Rule |
+|---|---|
+| E0487 | (library code, the primitives of `std:fsraw`) `grantMove` of a `Listener`, or `grantClone` of a `Stream`, is rejected; `grantClone` / `grantMove` also accept a `NetGrant`, `grantMove` also a `Stream` |
+| E0471 | now lists net among the families a grant primitive accepts (the Host is still rejected) |
+| E0483 | text extended to Listener and Stream captures |
+| MIR verifier | no new code: `grantMove` of a Stream is a closer (double move, use after move, move on one branch only, moving a Stream parameter are the existing "not open" / "dead" / "closed" / "parameter" errors), `grantAdoptStream` / `grantAdoptNet` are openers of a token (a handle argument is rejected). `compiler/tests/verify_main.or` pins the cases |
+
+E0475 and E0476 belong to the parallel ADR-0034 work and are not used; E0487 is the next free code after E0486.
+
+**Runtime.** `orin_cap_clone` accepts `GK_NET` (copying the scope record), `orin_cap_move` accepts a stream and traps for the Host or
+a Listener, `orin_cap_adopt_net` / `orin_cap_adopt_stream` are new, the net buffer is thread-local. All are listed in the porting
+table of [concurrency.md](../concurrency.md); `runtime/platform` is unchanged.
+
+**Example and tests.** `examples/http_server.or` (the concurrent server; bounded workers, request-size limits, per-connection deadlines),
+`tools/test_net.sh` section 6 (Python clients: held connections, 408 at the deadline, queueing behind a full pool, many clients; an
+Orin client with 64 and 256 `spawnNet` tasks; the same server under ThreadSanitizer when available), `tests/next/run/net_task_move.or`,
+error tests for E0483 and E0450, library-level E0487 tests in `tests/net/libcheck`.
+
+## Addendum D: interruptible network waits, operation-wide deadlines and wake sources (C3) (2026-10-17)
+
+Status: accepted per [roadmap](../roadmaps/orin-1.0.md) default D1 (owner default 2026-10-16). Implements work package C3 on top of C4
+(Addendum C, sockets live in tasks) and C1 (absolute deadlines). Related: ADR-0054 (the L0 budget it spends), ADR-0048 (naming),
+Addendum B sections 4 and 5 (cooperative checkpoints, absolute deadlines).
+
+**Problem.** A task blocked in `accept`, `connect`, `recv` or `send` could only be ended by the timeout of that one call (at most one hour).
+Nothing could stop it from outside, so a server could neither shut down promptly nor cancel the tasks of a scope whose sibling failed.
+A deadline applied to one wait, not to an exchange of many small reads and writes, and `connect` gave every address of a name the full
+timeout. Names were resolved by a blocking `getaddrinfo`.
+
+**Decision.**
+
+1. **A wake source in the readiness wait of L0** (`runtime/platform`). A *wake source* is a cancellation token: a record with a flag and a
+   descriptor (an `eventfd` on Linux, a pipe elsewhere) that is made the first time a wait polls it. A thread *binds* one source
+   (`orin_platform_wake_bind`); the four waits (`accept`, `connect`, `recv`, `send`) poll the socket **and** the descriptors of the bound
+   source and its ancestors in one `poll(2)`. Setting the flag (`orin_platform_wake_signal`) writes the descriptor, so a blocked wait returns at
+   once with the new code `ORIN_PLATFORM_NET_CANCELLED` (1004); the flag and the descriptor are updated under one lock, so a signal cannot fall
+   between the check and the poll. A set source is permanent; it is checked **before** the socket is touched, so a cancelled task never starts
+   new network work and a pending connection or the bytes in the kernel buffer stay where they are. Cancellation wins over a socket that is ready
+   at the same instant (nothing is lost: the data is still in the kernel). The platform signatures did not change: the binding is thread-local,
+   so the runtime and the frozen snapshot (`bootstrap/seed/runtime`) are untouched.
+2. **Tokens form a tree.** A source opened while another is bound is its child (`orin_platform_wake_open` also binds it);
+   `orin_platform_wake_close` unbinds it and rebinds the parent. A wait observes the whole chain, so cancelling an outer scope reaches a task of
+   an inner scope, and cancelling an inner scope reaches only its own tasks (Addendum B section 1: cancellation flows downward). The depth is
+   limited to 33 levels (`ORIN_PLATFORM_WAKE_DEPTH` = 32); a scope opened deeper has no token of its own and its tasks inherit the nearest
+   ancestor's (`Scope.token()` / `Scope.cancel()` of such a scope trap with a message).
+3. **Generation-tagged handles.** A token is named by `generation << 32 | (index + 1)`. Closing a source bumps the generation of its slot, so
+   a handle kept after its scope ended is *stale*: `signal` returns 0 and changes nothing, `check` returns 2, `close` returns `EINVAL`, and a
+   later scope that reuses the slot cannot be cancelled or observed through it (over 200 rounds in `tests/concurrency/cancel_tokens.or`,
+   exhaustively over short operation sequences in `harness_wake_state_machine`). The other handles of the network path already were
+   generation-tagged (grant table: `GRANT_TAG | task | generation | slot`; a stale, forged or wrong-kind socket handle traps), and
+   `runtime_test.c` now also pins the case where the slot of a closed stream is reused by the next one.
+4. **`std:task` owns the tokens.** `scope` (`begin` / `finish`) opens a token and stores it in header word 4 of the task table; `finish` closes it
+   after every task has ended. `spawn` binds the scope's token in the new task (a thread starts unbound). `Scope.token(): CancelToken`
+   is a copyable value a task may capture (a task cannot capture the `Scope`, E0481); `CancelToken.cancel(): bool` is true when this call set it;
+   `Scope.cancel()`, `Scope.isCancelled()`, `CancelToken.isCancelled()` and the free `isCancelled()` (the calling task's own chain) complete the
+   API. These are ordinary functions: no syntax, no checker rule, no MIR instruction.
+5. **`std:net` surface (ADR-0048).** `NetErrorKind` gains `Cancelled` (bare word describing the cause, rule 3.1.4; L0 code 1004; `Timeout` stays
+   the kind of a deadline). `recv` reports it as `RecvError(e)`, the readers as `FillError(e)`. Every operation has an absolute form on a `Deadline`
+   of std:time, the naming of C1: `recvUntil`, `sendUntil`, `sendAllUntil`, `StreamReader.readExactUntil`, `StreamReader.readDelimitedUntil`,
+   `withAcceptedUntil`, `acceptDetachedUntil`, `withConnectionUntil`, `useConnectionUntil`; the relative forms are unchanged and implemented on them.
+   The loops of the reading and writing forms check the clock before every system call, so one deadline spans any number of small reads and
+   writes (a peer that sends a byte every `timeout - 1` ms cannot stretch it) and is not cut at the one-hour limit of a single wait. In L0, the
+   timeout of `connect` now bounds *all addresses of the name together*. `withListenerNet` and `withConnectionBeside` are the value-returning
+   twins of `useListenerNet` / `useConnectionBeside` (a closure cannot modify what it captured, so a body that both listens and connects needs them).
+6. **What is not interrupted, stated.** (a) *Name resolution.* `getaddrinfo` is blocking and the C library offers no way to abandon it, so the lookup
+   of `resolve` and the lookup `connect` makes for a name is bounded by no timeout and no deadline and is not interrupted by a cancellation; a task
+   already cancelled does not start one, and a task cancelled during it fails at its next network call. A resolver pool (a helper thread per
+   lookup, abandoned when the waiter is cancelled) was **not** built: it needs a second thread table in L0 and leaves an unbounded number of
+   lookups running after their waiter gave up, which is a resource leak with a cost larger than the 100 lines the rest of C3 needs. The documented
+   workaround is to connect to address literals, or to resolve in a task of its own that the caller waits for with `joinUntil`. (b) *Waits on
+   channels* (`recv`, `send`, `join`, `select`, `sleep`) do not observe the token yet; they end by their channel or deadline. Making them
+   checkpoints (and a trapped task cancelling its scope) is C2. (c) *Pure computation* is not interrupted; `isCancelled()` is the cooperative check.
+7. **L0 budget (ADR-0054).** 1,036 to 1,163 code lines (+127 of the 364 left), each function with an ACSL contract in `orin_platform.h`, a CBMC state
+   machine (`harness_wake_state_machine`, `harness_wake_generation` in `cbmc_l0_harness.c`) for the table logic, executable contract tests with real
+   sockets and threads in `platform_test.c` (plain, ASan + UBSan, ThreadSanitizer). The descriptor and `poll` parts are tested, not model checked.
+8. **No new runtime or snapshot symbol.** The wake functions are platform functions that generated code calls directly (task operations 31-36 of
+   `compiler/hir/taskops.or`; the C backend declares them in its preamble, the LLVM backend in `declare`s). `runtime/core` only gained a test; the
+   frozen snapshot needs nothing, and `tools/check_seed_runtime.sh` is unaffected.
+
+**Tests.** `runtime/platform/tests/platform_test.c` (handles, stale handles, depth, thread binding, cancel-first on every wait, wake from another
+thread within a bound, no descriptor leak), `runtime/core/tests/runtime_test.c` (stale handle after slot reuse, code 1004 through `orin_net_accept`),
+`tests/std/net_test.or` (absolute deadlines, a cancelled scope), `tests/concurrency/cancel_tokens.or` and `cancel_storm.or` (stale tokens, nesting,
+depth beyond 32; 288 + 24 + 16 blocked tasks cancelled by concurrent cancellers, plain, ThreadSanitizer, ASan + UBSan), `tests/net/interrupt.or`
+through `tools/test_net.sh` (accept, recv, send and a hanging connect woken within a bound; a cancelled scope fails at once; nested scopes; one
+deadline over many small reads, a non-reading peer and a hanging connect; plain and ThreadSanitizer).

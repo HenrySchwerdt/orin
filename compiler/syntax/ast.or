@@ -22,13 +22,50 @@ export type Item =
 
 // `import { a, b } from "path";` and `export { a, b } from "path";`. `provider`: `import ox from "path";` (ADR-0044),
 // which selects the OX provider of the file and binds no name (`names` is empty).
-export type ImportDecl = { names: Ident[]; path: string; pathSpan: Span; span: Span; provider: bool; };
+// Aliases (ADR-0048 addendum): `import { a as b }` binds the export `a` under the name `b`; `aliases` is parallel to `names`
+// (None: no `as`). A namespace import `import * as m from "path"` has `namespace = Some(m)`, no names, and `uses`: every
+// `m.x` the file wrote (the parser merges it into the one identifier `m.x`, at its own span), which the checker resolves to
+// the export `x` of the module.
+export type ImportDecl = {
+  names: Ident[];
+  aliases: Option<Ident>[];
+  namespace: Option<Ident>;
+  uses: Ident[];
+  path: string;
+  pathSpan: Span;
+  span: Span;
+  provider: bool;
+};
+
+// An import without aliases or namespace: `names` from `path`.
+export function plainImport(names: Ident[], path: string, pathSpan: Span, span: Span, provider: bool): ImportDecl {
+  const none: Option<Ident>[] = names.map(n => None);
+  const noUses: Ident[] = [];
+  return ImportDecl { names: names, aliases: none, namespace: None, uses: noUses, path: path, pathSpan: pathSpan, span: span, provider: provider };
+}
+
+// The index of the import entry that binds `local` (its alias, else its exported name), if any.
+export function importIndexOf(d: ImportDecl, local: string): Option<usize> {
+  let k: usize = 0;
+  while (k < d.names.length) {
+    if (importedName(d, k).name == local) {
+      return Some(k);
+    }
+    k += 1;
+  }
+  return None;
+}
+
+// The name that import entry `k` binds in the file: its alias, else the exported name.
+export function importedName(d: ImportDecl, k: usize): Ident {
+  return k < d.aliases.length && d.aliases[k].isSome() ? d.aliases[k].unwrap() : d.names[k];
+}
 
 export type FunctionDecl = {
   exported: bool;
   name: Ident;
   typeParams: Ident[];
-  bounds: Option<Ident>[];     // one per type parameter: `T extends Shape` (ADR-0019)
+  bounds: Ident[][];     // one per type parameter: `T extends Shape` (ADR-0019)
   params: Param[];
   ret: Option<TypeExpr>;
   body: Block;
@@ -83,7 +120,7 @@ export type ClassDecl = {
   exported: bool;
   name: Ident;
   typeParams: Ident[];
-  bounds: Option<Ident>[];
+  bounds: Ident[][];
   ext: Option<Ident>;
   impls: Ident[];              // `implements A, B` (ADR-0019)
   members: ClassMember[];
@@ -122,6 +159,7 @@ export type MethodDecl = {
   isStatic: bool;
   name: Ident;
   typeParams: Ident[];
+  bounds: Ident[][];                            // parallel to typeParams (ADR-0040: generic methods, `m<T extends Ord>`)
   params: Param[];
   ret: Option<TypeExpr>;
   body: Block;
@@ -187,6 +225,7 @@ export type ExprKind =
   | ERecord(Ident, Option<Expr>, FieldInit[])         // type name, spread, fields
   // --- beyond Orin-B (generics, ADR-0007); Stage 0 never produces these ---
   | ETyApp(Ident, TypeExpr[])                         // `name<T, U>`; only valid as a call callee
+  | EMethodT(Expr, Ident, TypeExpr[])                 // `recv.name<T, U>` (ADR-0040): explicit type arguments of a generic method; only valid as a call callee
   | ERecordT(Ident, TypeExpr[], Option<Expr>, FieldInit[])  // `Name<T, U> { ... }`
   | EMatch(Expr, MatchArm[])
   // --- beyond Orin-B (classes, ADR-0009) ---

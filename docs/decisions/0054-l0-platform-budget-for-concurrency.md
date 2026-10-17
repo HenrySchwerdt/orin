@@ -45,3 +45,8 @@ Estimates sum above 400 on purpose; C6 and the scheduler are conditional. If bot
 - TCB grows by at most 400 code lines, every one under contract and a harness.
 - The check in `tools/verify_platform.sh` changes from 1,000 to 1,400; nothing else in the pipeline reads the figure.
 - ADR-0052's "~1,000 code lines" row describes the state when written.
+
+## Status of the consumers
+
+- C1 timed monitor wait: built, +37 code lines (1,036).
+- C3 interruptible network wait: built (ADR-0017 Addendum D), +127 code lines (1,163 of 1,400; estimate was 100-150). 237 lines of headroom are left for C6 and the scheduler readiness backend.

@@ -16,7 +16,7 @@ Inside WSL2 Orin is the normal Linux release (linux-x86_64, or linux-aarch64 on 
    ```
 3. Install Orin and check it:
    ```sh
-   curl -fsSL https://raw.githubusercontent.com/HenrySchwerdt/orin/main/install.sh | sh
+   curl -fsSL https://raw.githubusercontent.com/orin-lang/orin-lang/main/install.sh | sh
    export PATH="$HOME/.orin/bin:$PATH"     # the installer prints the right line if it is not on PATH yet
    orin doctor
    orin run ~/.orin/current/examples/hello.or
@@ -98,9 +98,9 @@ stable.
 
 1. **Zip**: `orin-<version>-windows-x86_64.zip` with the same layout plus `bin\orin.ps1`/`orin.cmd`, a
    `.sha256` file and a line in `SHA256SUMS` (release.yml matrix gets a `windows-x86_64` entry).
-2. **Scoop** (first, easy): a manifest `orin.json` in a bucket repo (`HenrySchwerdt/scoop-orin`) with
+2. **Scoop** (first, easy): a manifest `orin.json` in a bucket repo (`orin-lang/scoop-orin`) with
    `url`, `hash`, `bin`, `depends` (`llvm` or `mingw`), `checkver`/`autoupdate` from GitHub releases.
-3. **winget**: a manifest PR to `microsoft/winget-pkgs` (`HenrySchwerdt.Orin`, installer type `zip` with a
+3. **winget**: a manifest PR to `microsoft/winget-pkgs` (`OrinLang.Orin`, installer type `zip` with a
    nested portable installer, or `portable`), generated with `wingetcreate` from the release. winget
    moderation takes days and requires a stable, signed-looking release; do it after Scoop works.
 4. **install.ps1** (`irm .../install.ps1 | iex`) mirroring `install.sh`: detect arch, download, verify

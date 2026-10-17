@@ -611,6 +611,8 @@ int64_t orin_cap_adopt_fs(uint64_t token);
 int64_t orin_cap_adopt_process(uint64_t token);
 int64_t orin_cap_adopt_stdio(uint64_t token);
 int64_t orin_cap_adopt_clock(uint64_t token);
+int64_t orin_cap_adopt_net(uint64_t token);
+int64_t orin_cap_adopt_stream(uint64_t token);
 void orin_cap_require(int64_t grant, int64_t kind, const char *what); /* traps unless valid, of `kind` and not denied */
 void orin_cap_require_spawn(int64_t proc);                     /* traps unless the process grant may spawn */
 void orin_process_exit(int64_t code) __attribute__((noreturn)); /* flushes stdout */

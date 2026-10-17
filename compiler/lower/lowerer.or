@@ -37,6 +37,22 @@ import {
 import { Fin, walkPlace } from "./place";
 import { operandMatches, localsMatchHir, fnWellLowered } from "./wellformed";
 
+// The operands of `ops` (one per expression of `es`) whose expression is not of type `void`: a `void` value (ADR-0040) has
+// no operand and no slot, it was only evaluated, in order, for its effects.
+@Requires(es.length == ops.length)
+@Ensures(result.length <= ops.length)
+function keepNonVoid(es: HExpr[], ops: Operand[]): Operand[] {
+  let out: Operand[] = [];
+  let i: usize = 0;
+  while (i < ops.length) {
+    if (!isVoidTy(es[i].ty)) {
+      out.push(ops[i]);
+    }
+    i += 1;
+  }
+  return out;
+}
+
 // The operands of a left-nested string concatenation `((a + b) + c) + d`, left to right; any other expression is its own
 // single operand.
 function addChain(e: HExpr): HExpr[] {
@@ -143,6 +159,8 @@ export class Lowerer {
     this.b.terminate(t, sp);
   }
 
+  // `l` comes from `labels` and is placed once (`BlockBuilder.canPlace`).
+  @Requires(this.b.canPlace(l))
   private at(l: usize): void {
     const sp = this.sp;
     this.b.place(l, sp);
@@ -338,6 +356,9 @@ export class Lowerer {
         return this.floatLit(e, t);
       },
       XBool(b) => {
+        if (isVoidTy(e.ty)) {
+          return vVoid();
+        }
         return vConst(OBool(b));
       },
       XStr(s) => {
@@ -532,13 +553,13 @@ export class Lowerer {
 
   private call(e: HExpr, f: usize, args: HExpr[]): V {
     const a = this.args(args);
-    return this.callResult(e, a, CFn(f), a.ops);
+    return this.callResult(e, a, CFn(f), keepNonVoid(args, a.ops));
   }
 
   // A closure: the captured values are consumed like the slots of a variant (IClosure, docs/mir.md v1.3).
   private closure(f: usize, caps: HExpr[]): V {
     const a = this.args(caps);
-    const ops = this.ownAll(a, typesOf(caps));
+    const ops = keepNonVoid(caps, this.ownAll(a, typesOf(caps)));
     const t = this.temp(MRef);
     this.emit(IClosure(t, f, ops));
     return vOwned(t);
@@ -549,7 +570,7 @@ export class Lowerer {
     const es: HExpr[] = [callee].concat(args);
     const a = this.args(es);
     const f = a.ops[0];
-    const rest = tailOps(a.ops);
+    const rest = keepNonVoid(args, tailOps(a.ops));
     return this.callResult(e, a, CIndirect(f), rest);
   }
 
@@ -569,7 +590,7 @@ export class Lowerer {
     const es: HExpr[] = [recv].concat(args);
     const a = this.args(es);
     const r = a.ops[0];
-    const rest = tailOps(a.ops);
+    const rest = keepNonVoid(args, tailOps(a.ops));
     return this.callResult(e, a, CVirtual(r, slot), rest);
   }
 
@@ -658,13 +679,23 @@ export class Lowerer {
       },
       _ => {},
     }
+    match (b) {
+      BOptUnwrapOr => {
+        if (isVoidTy(e.ty)) {
+          // `unwrapOr` of an `Option<void>`: nothing to choose between
+          this.releaseOps(a);
+          return vVoid();
+        }
+      },
+      _ => {},
+    }
     if (isVoidTy(e.ty)) {
-      this.emit(IBuiltin(None, b, a.ops));
+      this.emit(IBuiltin(None, b, keepNonVoid(args, a.ops)));
       this.releaseOps(a);
       return vVoid();
     }
     const t = this.temp(mty(e.ty));
-    this.emit(IBuiltin(Some(t), b, a.ops));
+    this.emit(IBuiltin(Some(t), b, keepNonVoid(args, a.ops)));
     this.releaseOps(a);
     if (isRefTy(e.ty)) {
       return vOwned(t);
@@ -701,6 +732,11 @@ export class Lowerer {
 
   private field(e: HExpr, base: HExpr, idx: usize): V {
     const v = this.expr(base);
+    if (isVoidTy(e.ty)) {
+      // a field of type void has no slot (voiderase.or): only the base is evaluated
+      this.discard(v);
+      return vVoid();
+    }
     const d = this.temp(mty(e.ty));
     this.emit(IGetField(d, v.op, idx));
     return this.projected(d, e.ty, v.op, kindIsO(v.k), v.root, v.stable);
@@ -709,6 +745,13 @@ export class Lowerer {
   private index(e: HExpr, base: HExpr, ix: HExpr): V {
     const es: HExpr[] = [base, ix];
     const a = this.args(es);
+    if (isVoidTy(e.ty)) {
+      // an element of a `void[]` is the placeholder 0: the read only checks the bounds
+      const pd = this.temp(MInt);
+      this.emit(IArrayGet(pd, a.ops[0], a.ops[1]));
+      this.releaseOps(a);
+      return vVoid();
+    }
     const d = this.temp(mty(e.ty));
     this.emit(IArrayGet(d, a.ops[0], a.ops[1]));
     return this.projected(d, e.ty, a.ops[0], a.own[0], a.roots[0], a.stab[0]);
@@ -740,7 +783,9 @@ export class Lowerer {
     i = 0;
     for (const f of fields) {
       const o = this.ownOp(f.value.ty, a.ops[base + i], a.own[base + i]);
-      slots[f.index] = o;
+      if (f.index < nf) {
+        slots[f.index] = o;
+      }
       i += 1;
     }
     if (hasSpread) {
@@ -775,8 +820,13 @@ export class Lowerer {
       return vOwned(t);
     }
     const a = this.args(payload);
-    const ops = this.ownAll(a, typesOf(payload));
+    const ops = keepNonVoid(payload, this.ownAll(a, typesOf(payload)));
     const t = this.temp(MRef);
+    if (ops.length == 0) {
+      // every payload is void (`Some(())`): a variant without slots
+      this.emit(INullary(t, tag));
+      return vOwned(t);
+    }
     this.emit(IStructNew(t, tag, ops));
     return vOwned(t);
   }
