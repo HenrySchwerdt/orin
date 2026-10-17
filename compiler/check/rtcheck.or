@@ -24,7 +24,7 @@
 import { Span, SourceMap } from "../diag";
 import {
   Ident, Module, Item, ImportDecl, FunctionDecl, Param, TypeDeclBody, DRecord, TypeExpr, TNamed, Block, Stmt, StmtKind, Expr, ExprKind,
-  EInt, ETemplate, EStr, EIdent, ECall, EMember, EUnary, EBinary, EThis, ETyApp, EIndex, ETry, ECond, EArray,
+  EInt, ETemplate, EStr, EIdent, ECall, EMember, EUnary, EBinary, EThis, ETyApp, EMethodT, EIndex, ETry, ECond, EArray,
   ERecord, ERecordT, EMatch, ENew, EBool, EArrow, ArrowParam, ArrowBody, AExpr, ABlock, FieldInit, MatchArm, ArmBody, BExpr, BBlock,
   SLet, SIf, SExpr, SReturn, SAssign, OpAssign, UNot, BAdd, BOr, BImplies,
   IImport, IFunction, IClass, IType, TypeDecl, parse, ClassDecl, ClassMember, MField, MCtor, MMethod, MethodDecl, CtorDecl,
@@ -122,6 +122,7 @@ function rw(e: Expr, th: string): Expr {
     },
     ECall(callee, args) => rwCall(e, callee, args, th),
     EMember(b, n) => mkE(EMember(rw(b, th), n), sp),
+    EMethodT(b, n, tys) => mkE(EMethodT(rw(b, th), n, tys), sp),
     EIndex(b, i) => mkE(EIndex(rw(b, th), rw(i, th)), sp),
     ETry(x) => mkE(ETry(rw(x, th)), sp),
     ECond(c, a, b) => mkE(ECond(rw(c, th), rw(a, th), rw(b, th)), sp),
@@ -212,6 +213,7 @@ function rn(e: Expr): Expr {
     EBinary(op, l, r) => mkE(EBinary(op, rn(l), rn(r)), sp),
     ECall(c, args) => mkE(ECall(rn(c), rnAll(args)), sp),
     EMember(b, n) => mkE(EMember(rn(b), n), sp),
+    EMethodT(b, n, tys) => mkE(EMethodT(rn(b), n, tys), sp),
     EIndex(b, i) => mkE(EIndex(rn(b), rn(i)), sp),
     ETry(x) => mkE(ETry(rn(x)), sp),
     ECond(c, a, b) => mkE(ECond(rn(c), rn(a), rn(b)), sp),
@@ -288,6 +290,7 @@ function os(e: Expr): string {
     EBinary(_, l, r) => os(l) + os(r),
     ECall(callee, args) => osCall(callee, args),
     EMember(b, _) => os(b),
+    EMethodT(b, _, _) => os(b),
     EIndex(b, i) => os(b) + os(i),
     ETry(x) => os(x),
     ECond(c, a, b) => os(c) + os(a) + os(b),
@@ -525,30 +528,34 @@ function wrapMethod(sm: SourceMap, cname: Ident, md: MethodDecl, invs: ContractC
   }
   const bodyName = idOf(BODY + md.name.name, md.name.span);
   const bodyM = MethodDecl {
-    priv: true, isStatic: md.isStatic, name: bodyName, typeParams: md.typeParams, params: md.params,
+    priv: true, isStatic: md.isStatic, name: bodyName, typeParams: md.typeParams, bounds: md.bounds, params: md.params,
     ret: md.ret, body: md.body, contracts: [], annotations: [], span: md.span
   };
   // Instance methods call the body through `this`, static methods through the class name.
   const recv = md.isStatic ? mkE(EIdent(cname), md.span) : mkE(EThis, md.span);
-  const callee = mkE(EMember(recv, bodyName), md.span);
+  const callee = md.typeParams.length == 0
+      ? mkE(EMember(recv, bodyName), md.span)
+      : mkE(EMethodT(recv, bodyName, tyArgs(md.typeParams)), md.span);
   if (reqs.length == 0) {
     const wrapper = MethodDecl {
-      priv: md.priv, isStatic: md.isStatic, name: md.name, typeParams: md.typeParams, params: md.params,
+      priv: md.priv, isStatic: md.isStatic, name: md.name, typeParams: md.typeParams, bounds: md.bounds, params: md.params,
       ret: md.ret, body: wrapperBody(sm, md.span, callee, md.params, md.ret, reqs, enss, minv, !md.isStatic, mkE(EStr(""), md.span)),
       contracts: [], annotations: md.annotations, span: md.span
     };
     return WrappedMembers { members: [MMethod(wrapper), MMethod(bodyM)], used: true };
   }
   const siteName = idOf(SITE + md.name.name, md.name.span);
-  const siteCallee = mkE(EMember(recv, siteName), md.span);
+  const siteCallee = md.typeParams.length == 0
+      ? mkE(EMember(recv, siteName), md.span)
+      : mkE(EMethodT(recv, siteName, tyArgs(md.typeParams)), md.span);
   const checking = MethodDecl {
-    priv: true, isStatic: md.isStatic, name: siteName, typeParams: md.typeParams, params: withSiteParam(md.params, md.span),
+    priv: true, isStatic: md.isStatic, name: siteName, typeParams: md.typeParams, bounds: md.bounds, params: withSiteParam(md.params, md.span),
     ret: md.ret,
     body: wrapperBody(sm, md.span, callee, md.params, md.ret, reqs, enss, minv, !md.isStatic, mkE(EIdent(idOf(SITE_PARAM, md.span)), md.span)),
     contracts: [], annotations: [], span: md.span
   };
   const forwarder = MethodDecl {
-    priv: md.priv, isStatic: md.isStatic, name: md.name, typeParams: md.typeParams, params: md.params,
+    priv: md.priv, isStatic: md.isStatic, name: md.name, typeParams: md.typeParams, bounds: md.bounds, params: md.params,
     ret: md.ret, body: forwarderBody(md.span, siteCallee, md.params, md.ret),
     contracts: [], annotations: md.annotations, span: md.span
   };
