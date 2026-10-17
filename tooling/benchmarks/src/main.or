@@ -11,7 +11,7 @@
 // History files are the JSON of bench.py, one per run, named <date>-<sha>.json; they are ordered by their "date" field.
 
 import { Host, useHost } from "std:host";
-import { FsGrant, readFile, writeFile, exists, listDir } from "std:fs";
+import { FsGrant, readFile, writeFile, exists, listDir, fsErrorMessage } from "std:fs";
 import { ProcessGrant, args, exit } from "std:process";
 import { shell } from "std:io";
 import { BenchRun, decodeRun, strCmp } from "./bench";
@@ -20,6 +20,18 @@ import { summary, compare } from "./markdown";
 import { charts, readme } from "./render";
 import { renderHtml } from "./htmlreport";
 import { svgText } from "orin-reports";
+
+// True when `path` exists; a path the grant refuses to look at counts as absent.
+function existsOr(fs: FsGrant, path: string): bool {
+  const r = exists(fs, path);
+  return r.isOk() && r.unwrap();
+}
+
+// Exit status 0..255 of the command, -1 when it could not be run (the tool keeps statuses as data).
+function shellStatus(p: ProcessGrant, cmd: string): int {
+  const r = shell(p, cmd);
+  return r.isOk() ? r.unwrap() : 0 - 1;
+}
 
 function usage(): void {
   console.error("usage: bench-report summary RUN.json");
@@ -39,7 +51,11 @@ function baseName(path: string): string {
 }
 
 function loadRun(fs: FsGrant, path: string, name: string): Result<BenchRun, string> {
-  const text = readFile(fs, path)?;
+  const read = readFile(fs, path);
+  if (read.isErr()) {
+    return Err(fsErrorMessage(read.unwrapErr()));
+  }
+  const text = read.unwrap();
   const doc = parse(text)?;
   return decodeRun(doc, name);
 }
@@ -51,10 +67,10 @@ function joinPath(dir: string, name: string): string {
 // every *.json of the directory (not dot files), ordered by (date, file name); a file that does not load is skipped
 function loadHistory(fs: FsGrant, dir: string): BenchRun[] {
   let runs: BenchRun[] = [];
-  if (!exists(fs, dir)) {
+  if (!existsOr(fs, dir)) {
     return runs;
   }
-  for (const entry of listDir(fs, dir)) {
+  for (const entry of listDir(fs, dir).unwrap()) {
     if (!entry.endsWith(".json") || entry.startsWith(".")) {
       continue;
     }
@@ -81,7 +97,7 @@ function shellQuote(s: string): string {
 }
 
 function mkdirs(proc: ProcessGrant, dir: string): void {
-  if (shell(proc, "mkdir -p " + shellQuote(dir)) != 0) {
+  if (shellStatus(proc, "mkdir -p " + shellQuote(dir)) != 0) {
     fail("cannot create the directory " + dir);
   }
 }
@@ -89,7 +105,7 @@ function mkdirs(proc: ProcessGrant, dir: string): void {
 function put(fs: FsGrant, path: string, text: string): void {
   const r = writeFile(fs, path, text);
   if (r.isErr()) {
-    fail("cannot write " + path + ": " + r.unwrapErr());
+    fail("cannot write " + path + ": " + fsErrorMessage(r.unwrapErr()));
   }
 }
 

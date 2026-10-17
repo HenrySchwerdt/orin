@@ -13,6 +13,8 @@ status 0..255, -2 for deadline expiration, and -1 for invalid duration, spawn,
 signal termination or an OS error. Exit 124 is an ordinary exit, not a timeout.
 The existing `shell` API and its unlimited semantics do not change.
 
+*Superseded by ADR-0048 (rule 3.1): `shell` and `shellTimeout(proc, cmd, timeout: Duration)` return `Result<int, ProcessError>`; the -1 and -2 sentinels became the `Failed`, `InvalidDuration` and `Timeout` kinds. The runtime primitive and its semantics are unchanged.*
+
 L0 uses POSIX `posix_spawn` with a new process group, `CLOCK_MONOTONIC`, `waitid`
 with WNOWAIT, a 10 ms polling sleep, SIGKILL for group cleanup, and `waitpid` to
 reap the direct child. Keeping the leader unreaped until cleanup prevents its PID

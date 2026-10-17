@@ -8,9 +8,12 @@ Rust Stage 0 is retired (see "Retired Stage 0" below).
 | Stage | Built by | Source | Output |
 |---|---|---|---|
 | seed | `cc` | `bootstrap/seed/orin-seed.c.gz` (sha256-verified) | `orin0` |
-| 1 | `orin0` | `compiler/` | `orin1` |
+| 1 | `orin0 compile --c-builtins` | `compiler/` | `orin1` (C runtime path, linked with the frozen `bootstrap/seed/runtime/`) |
 | 2 | `orin1` | `compiler/` | `orin2` (+ `stage2.c`) |
 | 3 | `orin2` | `compiler/` | `stage3.c` — must be byte-identical to `stage2.c` |
+
+The seed is itself the `--c-builtins` build of the compiler (`tools/update_seed.sh` writes `orin2 compile --c-builtins compiler/main.or`), so
+it and stage 1 link the frozen runtime snapshot even though the compiler's logic is current.
 
 ```bash
 ./tools/bootstrap.sh                 # seed -> orin0 -> orin1 -> orin2 -> stage3, compare, conformance
