@@ -292,6 +292,150 @@ static void test_grants(void) {
     orin_cap_revoke(host);
 }
 
+
+/* ---------------------------------------------------------------- network handles moving into a task (ADR-0017 Addendum C) */
+
+enum { NETN = 8 };
+static uint64_t g_net_tok[NETN], g_stream_tok[NETN];
+static int g_net_port, g_net_ok[NETN], g_srv_ok[NETN];
+static OrinObj *u8_of(const char *t) { /* a u8[] */
+    OrinObj *a = orin_array_new(strlen(t), 0);
+    for (size_t i = 0; t[i]; i++) orin_array_push(a, (uint64_t)(unsigned char)t[i]);
+    return a;
+}
+
+static void body_net_client(OrinObj *env) { /* adopts a cloned NetGrant, connects, ping / pong, closes */
+    int64_t i = (int64_t)orin_struct_get(env, 0);
+    int64_t g = orin_cap_adopt_net(g_net_tok[i]);
+    orin_cap_require(g, 5, "net");
+    OrinObj *host = S("127.0.0.1");
+    int64_t s = orin_net_connect(g, host, g_net_port, 2000, 1);
+    orin_release(host);
+    if (s > 0) {
+        OrinObj *ping = u8_of("ping");
+        OrinObj *w = orin_net_send(s, ping, 0, 4, 2000);
+        orin_release(w);
+        orin_release(ping);
+        OrinObj *r = orin_net_recv(s, 16, 2000); /* Result<u8[], int>: tag 0 = Ok */
+        g_net_ok[i] = orin_tag(r) == 0;
+        orin_release(r);
+        orin_net_close(s);
+    }
+    orin_cap_revoke(g);
+}
+
+static void body_net_server(OrinObj *env) { /* adopts the accepted Stream the main task moved out, pong */
+    int64_t i = (int64_t)orin_struct_get(env, 0);
+    int64_t s = orin_cap_adopt_stream(g_stream_tok[i]);
+    orin_cap_require(s, 7, "stream");
+    OrinObj *r = orin_net_recv(s, 16, 2000);
+    int ok = orin_tag(r) == 0;
+    orin_release(r);
+    OrinObj *pong = u8_of("pong");
+    OrinObj *w = orin_net_send(s, pong, 0, 4, 2000);
+    orin_release(w);
+    orin_release(pong);
+    g_srv_ok[i] = ok;
+    orin_net_close(s);
+}
+
+static int64_t g_dead_stream;
+static void body_use_moved(OrinObj *env) { /* the moved Stream's handle is dead in the task that moved it */
+    (void)env;
+    (void)orin_net_status(g_dead_stream); /* traps: stale handle */
+}
+static uint64_t g_twice_tok;
+static void body_adopt_twice(OrinObj *env) {
+    (void)env;
+    int64_t s = orin_cap_adopt_stream(g_twice_tok); /* traps: the token was adopted already */
+    orin_net_close(s);
+}
+static void body_adopt_wrong_kind(OrinObj *env) { /* a Stream token adopted as a NetGrant */
+    (void)env;
+    (void)orin_cap_adopt_net(g_twice_tok);
+}
+static void body_move_listener(OrinObj *env) { /* a task binds its own listener and tries to move it: refused */
+    int64_t i = (int64_t)orin_struct_get(env, 0);
+    int64_t g = orin_cap_adopt_net(g_net_tok[i]);
+    OrinObj *a = S("127.0.0.1");
+    int64_t lg = orin_cap_listen(g, a, 0);
+    int64_t l = orin_net_listen(lg, a, 0, 4, 1);
+    (void)orin_cap_move(l); /* traps */
+    orin_release(a);
+}
+
+static OrinObj *env_i(int64_t i) {
+    OrinObj *e = orin_struct_new(0, 1, 0);
+    orin_struct_init(e, 0, (uint64_t)i);
+    return e;
+}
+
+static void test_net_move(void) {
+    int64_t host = orin_cap_host_root();
+    int64_t net = orin_cap_net(host);
+    OrinObj *a = S("127.0.0.1");
+    int64_t lg = orin_cap_listen(net, a, 0);
+    int64_t ln = orin_net_listen(lg, a, 0, 16, 1);
+    CHECK(ln > 0);
+    g_net_port = (int)orin_net_port(ln);
+    uint64_t cth[NETN], sth[NETN];
+    for (int i = 0; i < NETN; i++) { /* NETN client tasks, each with its own clone of the NetGrant */
+        int64_t c = orin_cap_clone(net);
+        CHECK(c != net);
+        g_net_tok[i] = orin_cap_move(c);
+        cth[i] = start(body_net_client, env_i(i));
+    }
+    int64_t first = 0;
+    for (int i = 0; i < NETN; i++) { /* accept each connection and MOVE it into a task of its own */
+        int64_t st = orin_net_accept(ln, 2000, 1);
+        CHECK(st > 0);
+        if (i == 0) first = st;
+        g_stream_tok[i] = orin_cap_move(st);
+        sth[i] = start(body_net_server, env_i(i));
+    }
+    for (int i = 0; i < NETN; i++) {
+        CHECK(orin_rt_task_join(cth[i]) == 0);
+        CHECK(orin_rt_task_join(sth[i]) == 0);
+        CHECK(g_net_ok[i] && g_srv_ok[i]);
+    }
+    /* the moved handle is dead for the mover */
+    g_dead_stream = first;
+    uint64_t th = start(body_use_moved, orin_nullary(0));
+    CHECK(orin_rt_task_join(th) == 1);
+    orin_release(orin_rt_task_message());
+    /* a token is valid for one adopt; the wrong family is refused */
+    OrinObj *h = S("127.0.0.1");
+    int64_t cs = orin_net_connect(net, h, g_net_port, 2000, 1);
+    orin_release(h);
+    CHECK(cs > 0);
+    int64_t st = orin_net_accept(ln, 2000, 1);
+    CHECK(st > 0);
+    g_twice_tok = orin_cap_move(st);
+    th = start(body_adopt_wrong_kind, orin_nullary(0));
+    CHECK(orin_rt_task_join(th) == 1);
+    OrinObj *msg = orin_rt_task_message();
+    CHECK(strstr(orin_str_data(msg), "wrong family") != NULL);
+    orin_release(msg);
+    th = start(body_adopt_twice, orin_nullary(0)); /* the failed adopt consumed the token */
+    CHECK(orin_rt_task_join(th) == 1);
+    msg = orin_rt_task_message();
+    CHECK(strstr(orin_str_data(msg), "invalid grant token") != NULL);
+    orin_release(msg);
+    orin_net_close(cs);
+    /* a Listener never moves */
+    g_net_tok[0] = orin_cap_move(orin_cap_clone(net));
+    th = start(body_move_listener, env_i(0));
+    CHECK(orin_rt_task_join(th) == 1);
+    msg = orin_rt_task_message();
+    CHECK(strstr(orin_str_data(msg), "only a family grant or a Stream") != NULL);
+    orin_release(msg);
+    orin_release(a);
+    orin_net_close(ln);
+    orin_cap_revoke(lg);
+    orin_cap_revoke(net);
+    orin_cap_revoke(host);
+}
+
 static void body_foreign(OrinObj *env) { /* uses a handle that belongs to another task: must trap */
     orin_cap_require((int64_t)orin_struct_get(env, 0), 4, "now");
 }
@@ -453,6 +597,7 @@ int main(void) {
     test_cross_heap_free();
     test_grants();
     test_grant_is_per_task();
+    test_net_move();
     test_invalid_handles();
     if (failures) {
         fprintf(stderr, "task_test: %d of %d checks FAILED\n", failures, checks);

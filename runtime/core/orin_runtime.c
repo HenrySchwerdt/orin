@@ -1911,7 +1911,16 @@ void orin_file_flush(int64_t h) {
  * in the L0 record (`orin_platform_net`) and are checked by L0 before any system call; a refusal is the code EPERM
  * (reported as Err by std:net). An opener returns the handle or the NEGATED error code (as orin_file_open). */
 enum { NET_BUF = 65536 };
-static char g_netbuf[NET_BUF]; /* the bulk buffer between the u8[] arrays and L0 (single-threaded) */
+/* The bulk buffer between the u8[] arrays and L0: one per task (thread), allocated on first use and freed when the task
+ * ends (orin_rt_heap_exit), so concurrent tasks never share it (ADR-0017 Addendum C). */
+static __thread char *t_netbuf;
+static char *netbuf(void) {
+    if (!t_netbuf) {
+        t_netbuf = (char *)orin_platform_alloc(NET_BUF);
+        if (!t_netbuf) orin_trap("out of memory");
+    }
+    return t_netbuf;
+}
 
 int64_t orin_cap_net(int64_t host) {
     (void)grant_ref(host, GK_HOST);
@@ -2004,12 +2013,13 @@ int64_t orin_net_now(int64_t h) {
  * L0 buffer into a fresh array (a u8 element is an 8-byte slot, ADR-0022). */
 OrinObj *orin_net_recv(int64_t sh, uint64_t cap, int64_t timeout_ms) {
     Grant *s = grant_ref(sh, GK_STREAM);
+    char *nb = netbuf();
     size_t n = 0, want = cap < NET_BUF ? (size_t)cap : NET_BUF;
     int rc = timeout_ms < 0 || timeout_ms > ORIN_PLATFORM_NET_MAXMS ? ORIN_PLATFORM_EINVAL
-                                                                      : orin_platform_stream_recv(&s->net, g_netbuf, want, (int)timeout_ms, &n);
+                                                                      : orin_platform_stream_recv(&s->net, nb, want, (int)timeout_ms, &n);
     if (rc != 0 || n == 0 || n > want) return orin_variant1(1, 0, (uint64_t)(rc ? rc : ORIN_PLATFORM_EINVAL));
     OrinObj *a = orin_array_new(n, 0);
-    for (size_t i = 0; i < n; i++) orin_array_push(a, (uint64_t)(unsigned char)g_netbuf[i]);
+    for (size_t i = 0; i < n; i++) orin_array_push(a, (uint64_t)(unsigned char)nb[i]);
     return orin_variant1(0, 1, ORIN_SLOT(a));
 }
 
@@ -2019,9 +2029,10 @@ OrinObj *orin_net_send(int64_t sh, OrinObj *data, uint64_t off, uint64_t len, in
     OrinArray *a = (OrinArray *)data;
     if (data->kind != ORIN_K_ARRAY || off > a->len || len > a->len - off) orin_trap("net send: byte range out of bounds");
     size_t n = len < NET_BUF ? (size_t)len : NET_BUF, sent = 0;
-    for (size_t i = 0; i < n; i++) g_netbuf[i] = (char)a->items[off + i];
+    char *nb = netbuf();
+    for (size_t i = 0; i < n; i++) nb[i] = (char)a->items[off + i];
     int rc = timeout_ms < 0 || timeout_ms > ORIN_PLATFORM_NET_MAXMS ? ORIN_PLATFORM_EINVAL
-                                                                      : orin_platform_stream_send(&s->net, g_netbuf, n, (int)timeout_ms, &sent);
+                                                                      : orin_platform_stream_send(&s->net, nb, n, (int)timeout_ms, &sent);
     return rc ? orin_variant1(1, 0, (uint64_t)rc) : orin_variant1(0, 0, (uint64_t)sent);
 }
 
@@ -2047,10 +2058,11 @@ OrinObj *orin_net_peer(int64_t sh) {
 /* Result<string, int>: the numeric addresses of a name, one per line */
 OrinObj *orin_net_resolve(int64_t gh, OrinObj *name) {
     Grant *g = grant_ref(gh, GK_NET);
+    char *nb = netbuf();
     size_t n = 0;
-    int rc = orin_platform_dns_resolve(&g->net, orin_str_data(name), (size_t)orin_str_len(name), g_netbuf, 4096, &n);
+    int rc = orin_platform_dns_resolve(&g->net, orin_str_data(name), (size_t)orin_str_len(name), nb, 4096, &n);
     if (rc) return orin_variant1(1, 0, (uint64_t)rc);
-    return orin_variant1(0, 1, ORIN_SLOT(orin_str_new(g_netbuf, n)));
+    return orin_variant1(0, 1, ORIN_SLOT(orin_str_new(nb, n)));
 }
 
 OrinObj *orin_net_error_text(int64_t code) {
@@ -2434,6 +2446,8 @@ void orin_rt_heap_exit(void) {
     for (int i = 0; i < GR_SLOTS; i++)
         if (g_grants[i].live) orin_cap_revoke(grant_handle(&g_grants[i]));
     files_at_exit();
+    orin_platform_free(t_netbuf);
+    t_netbuf = NULL;
     orin_platform_free(t_dstack);
     t_dstack = NULL;
     t_dcap = 0;
@@ -2566,14 +2580,17 @@ static uint32_t g_gf_n, g_gf_cap, g_gf_free;
 
 int64_t orin_cap_clone(int64_t h) {
     Grant *p = grant_ref(h, -1);
-    if (p->kind < GK_FS || p->kind > GK_CLOCK) orin_trap("only a grant of a family (fs, process, stdio, clock) can be delegated to a task");
+    if (p->kind < GK_FS || p->kind > GK_NET) orin_trap("only a grant of a family (fs, process, stdio, clock, net) can be delegated to a task");
     Grant *g = grant_new(p->kind);
     grant_copy_into(g, p);
+    if (p->kind == GK_NET) g->net = p->net; /* the scope and the policy bit; a NetGrant owns no socket */
     return grant_handle(g);
 }
 
 uint64_t orin_cap_move(int64_t h) {
     Grant *g = grant_ref(h, -1);
+    /* a family grant, or an accepted / connected Stream (the socket travels with the token); never the Host or a Listener */
+    if (g->kind == GK_HOST || g->kind == GK_LISTENER) orin_trap("only a family grant or a Stream can be moved into a task");
     orin_platform_runtime_lock();
     if (!g_gf_free && g_gf_n == g_gf_cap) {
         uint32_t cap = g_gf_cap ? g_gf_cap * 2 : 16;
@@ -2630,3 +2647,5 @@ int64_t orin_cap_adopt_fs(uint64_t t) { return cap_adopt(t, GK_FS); }
 int64_t orin_cap_adopt_process(uint64_t t) { return cap_adopt(t, GK_PROCESS); }
 int64_t orin_cap_adopt_stdio(uint64_t t) { return cap_adopt(t, GK_STDIO); }
 int64_t orin_cap_adopt_clock(uint64_t t) { return cap_adopt(t, GK_CLOCK); }
+int64_t orin_cap_adopt_net(uint64_t t) { return cap_adopt(t, GK_NET); }
+int64_t orin_cap_adopt_stream(uint64_t t) { return cap_adopt(t, GK_STREAM); }
