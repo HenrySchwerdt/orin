@@ -161,7 +161,7 @@ def stepH (hs : List (Nat × Nat)) : MI → Option (List (Nat × Nat))
   | .borrow d s => if hasHole hs d || hasHole hs s then none else some hs
   | .dup d s => if hasHole hs d || hasHole hs s then none else some hs
   | .release x => if hasHole hs x then none else some hs
-  | .alloc d _ => if hasHole hs d then none else some hs
+  | .alloc d n => if hasHole hs d then none else some (hs ++ (List.range n).map (fun i => (d, i)))
   | .getField d o i _ => if hasHole hs d || decide ((o, i) ∈ hs) then none else some hs
   | .setField x i v => if hasHole hs v || decide ((x, i) ∈ hs) then none else some hs
   | .takeField d x i => if hasHole hs d || decide ((x, i) ∈ hs) then none else some ((x, i) :: hs)
