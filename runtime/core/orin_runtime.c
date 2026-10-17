@@ -658,6 +658,9 @@ OrinObj *orin_str_with_capacity(uint64_t cap) {
     return &str_alloc(0, cap)->h;
 }
 
+/* The string append family (concat, append, append_sub / _int / _usize, prepend) is the Orin functions of runtime/core/str.or (R3d.4);
+   the unit tests reach concat and append through the wrappers orin_str_concat / orin_str_append. A census build keeps the C versions. */
+#ifdef ORIN_SITE_STATS
 OrinObj *orin_str_concat(OrinObj *a, OrinObj *b) {
     OrinString *x = (OrinString *)a, *y = (OrinString *)b;
     if (y->len == 0) return orin_dup(a);
@@ -794,6 +797,8 @@ OrinObj *orin_str_prepend(OrinObj *a, OrinObj *b) {
     orin_release(a);
     return &r->h;
 }
+
+#endif
 
 int64_t orin_str_eq(OrinObj *a, OrinObj *b) {
     if (a == b) return 1;
@@ -1185,6 +1190,9 @@ OrinObj *orin_array_get(OrinObj *o, uint64_t i) {
     return orin_variant1(0, a->is_ref, v);
 }
 
+/* slice, concat, extend and the byte conversions are the Orin functions of runtime/core/array.or (R3d.4), reached by the unit tests through the
+   wrappers of the same names; a census build keeps the C versions. */
+#ifdef ORIN_SITE_STATS
 OrinObj *orin_array_slice(OrinObj *o, uint64_t from, uint64_t to) {
     OrinArray *a = (OrinArray *)o;
     if (from > to || to > a->len) orin_trap("slice out of range");
@@ -1296,6 +1304,8 @@ OrinObj *orin_string_to_bytes(OrinObj *o) {
     a->len = s->len;
     return r;
 }
+
+#endif
 
 OrinObj *orin_array_join(OrinObj *o, OrinObj *sep) {
     OrinArray *a = (OrinArray *)o;

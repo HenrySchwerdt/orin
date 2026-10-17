@@ -8,7 +8,8 @@ import { BinOp, UnOp, Builtin, taskOpC } from "../../hir";
 import {
   MType, MLocal, Operand, Instr, SwitchCase, Terminator, MBlock, MFunction, MProgram, aggWords,
   isAggTy, slotWords, RT_OPT_UNWRAP, RT_RES_UNWRAP, RT_RES_UNWRAP_ERR, RT_V_UNWRAP, RT_ASSERT_FACT, RT_ASSERT_ARRAY,
-  RT_STRUCT_NEW, RT_ARRAY_NEW,
+  RT_STRUCT_NEW, RT_ARRAY_NEW, RT_STR_APPEND, RT_STR_APPEND_SUB, RT_STR_APPEND_USIZE, RT_STR_APPEND_INT, RT_STR_PREPEND,
+  RT_ARRAY_SLICE, RT_ARRAY_CONCAT, RT_ARRAY_EXTEND, RT_BYTES_TO_STRING, RT_STRING_TO_BYTES, rtSig, l1Builtin,
 } from "../../mir";
 
 import {
@@ -161,11 +162,7 @@ function runtimeCall(op: Builtin): Option<RtCall> {
     BStrWithCapacity => c("orin_str_with_capacity", 1),
     BArrLength => c("orin_array_len", 1),
     BArrGet => c("orin_array_get", 2),
-    BArrSlice => c("orin_array_slice", 3),
-    BArrConcat => c("orin_array_concat", 2),
     BArrJoin => c("orin_array_join", 2),
-    BBytesToString => c("orin_bytes_to_string", 3),
-    BStringToBytes => c("orin_string_to_bytes", 1),
     BIntToString => c("orin_int_to_string", 1),
     BIntToUsize => c("orin_int_to_usize", 1),
     BUsizeToString => c("orin_usize_to_string", 1),
@@ -257,10 +254,33 @@ function l1Obj(sym: string, a: string): string {
   return sym + "((uint64_t)(uintptr_t)(" + a + "))";
 }
 
+// The call of the string / array function that the L1 entry `k` replaces, with the C arguments `a`: the Orin function of `$rt`
+// (objects as address words, the result cast back) when the program has it, else the C runtime function of the same signature.
+function rtCallC(syms: CSymbols, k: usize, a: string[]): string {
+  const sym = syms.l1(k);
+  const w = rtSig(k).unwrap();
+  if (sym == "") {
+    return callN(w.name, a, a.length);
+  }
+  let args = "";
+  let i: usize = 0;
+  while (i < w.params.length) {
+    args += (i > 0 ? ", " : "") + (w.params[i] == "o" ? "(uint64_t)(uintptr_t)(" + a[i] + ")" : a[i]);
+    i += 1;
+  }
+  return "((OrinObj *)(uintptr_t)" + sym + "(" + args + "))";
+}
+
 // C expression for a builtin whose result is a fresh Owned ref or a scalar. `rt` is the type of the destination (MVoid
 // when there is none). `syms` holds the L1 entries (the unwrap builtins call the Orin functions of `$rt`; without them the
 // C runtime's).
 export function builtinC(op: Builtin, a: string[], rt: MType, syms: CSymbols): string {
+  match (l1Builtin(op)) {
+    Some(k) => {
+      return rtCallC(syms, k, a);
+    },
+    None => {},
+  }
   match (runtimeCall(op)) {
     Some(rc) => {
       return callN(rc.name, a, rc.n);
@@ -534,13 +554,13 @@ export class CFunctionEmitter {
       ICall(d, g, args) => this.call(d, g, args),
       IBuiltin(d, b, args) => this.builtin(d, b, args),
 
-      IStrAppend(x, y) => lname(x) + " = orin_str_append(" + lname(x) + ", " + opC(y) + ");",
-      IStrAppendSub(x, y, a, b) => lname(x) + " = orin_str_append_sub(" + lname(x) + ", " + opC(y) + ", " + opC(a) + ", "
-          + opC(b) + ");",
-      IStrAppendNum(x, y, uns) => lname(x) + " = " + (uns ? "orin_str_append_usize(" : "orin_str_append_int(")
-          + lname(x) + ", " + opC(y) + ");",
-      IStrPrepend(x, y) => lname(x) + " = orin_str_prepend(" + lname(x) + ", " + opC(y) + ");",
-      IArrayExtend(x, y) => lname(x) + " = orin_array_extend(" + lname(x) + ", " + opC(y) + ");",
+      IStrAppend(x, y) => lname(x) + " = " + rtCallC(this.syms, RT_STR_APPEND, [lname(x), opC(y)]) + ";",
+      IStrAppendSub(x, y, a, b) => lname(x) + " = " + rtCallC(this.syms, RT_STR_APPEND_SUB, [lname(x), opC(y), opC(a), opC(b)])
+          + ";",
+      IStrAppendNum(x, y, uns) => lname(x) + " = "
+          + rtCallC(this.syms, uns ? RT_STR_APPEND_USIZE : RT_STR_APPEND_INT, [lname(x), opC(y)]) + ";",
+      IStrPrepend(x, y) => lname(x) + " = " + rtCallC(this.syms, RT_STR_PREPEND, [lname(x), opC(y)]) + ";",
+      IArrayExtend(x, y) => lname(x) + " = " + rtCallC(this.syms, RT_ARRAY_EXTEND, [lname(x), opC(y)]) + ";",
       IStructNew(d, tag, slots) => this.structNew(d, tag, slots),
       INullary(d, t) => isAggTy(this.ty(d))
           ? this.aggNew(d, t, [])
