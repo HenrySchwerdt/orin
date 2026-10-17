@@ -1,0 +1,167 @@
+// Rule U6, unchecked struct slots (docs/mir.md v2.8, ADR-0038 lever 2, T7). `IGetFieldU(d, o, k)` and `ISetFieldU(o, k, v)` are
+// `IGetField` / `ISetField` of a heap struct WITHOUT the check that the object is a struct (kind 3) with more than k slots, so
+// the emitters read or write `slots[k]` directly. That is memory safety, so the verifier accepts one only with a fact:
+//   dominated-by-check: an earlier access of the SAME struct local already passed the check for this slot or a higher one.
+//     The scan is a backward walk over the same block, at most WINDOW instructions (scan.or):
+//   the source: an instruction on the way back that touches struct local `o` with a checked or unchecked
+//               IGetField / ISetField / ITakeField / IPutField of slot k' >= k, an `IShapeCheck(o, k')` with k' >= k, or the
+//               `IStructNew` that builds `o` with more than k slots (every field access of them traps unless the object is
+//               a struct with more than k' slots). An access of a lower slot is no source but does not end the scan. It must
+//               not define `o` itself: `o = getfield o.k` leaves `o` naming another object, so it justifies nothing after it.
+//   no change:  on the way back there is no definition of `o` (a move, a call result, the receiver of an in/out call ...)
+//               and no in-place string / array operation on it. Unlike the array rule U1 nothing else ends the scan: the kind
+//               and the slot count of a struct are fixed when `IStructNew` builds it and never change during its lifetime
+//               (there is no instruction that pushes onto, pops from or shrinks a struct), and the copy `IMakeUnique` makes of
+//               a shared struct has the same header. Another slot, a read, a borrow, a take or a put of any slot, a call
+//               that receives `o`: none of them can change what the earlier check established.
+// The local must be a reference local (the check of an unboxed aggregate is not a heap check; `wf.or` requires it of the
+// unchecked forms as well). Fail closed: an in-place operation on `o` that this scan does not know about ends it; no source
+// found is "not justified".
+
+import { MProgram, MFunction, MRef, Instr, Operand } from "../mir";
+import { WINDOW, isLocal, defines } from "./scan";
+
+// The number of slots that `ins` has shown local `o` to have (the object is a struct with at least that many), when `ins` is a
+// heap field access of `o` that does not redefine it (slot k' shows k' + 1), an `IShapeCheck(o, k')` (k' + 1), or the `IStructNew`
+// that builds `o` (the number of its slots); else `None`.
+function knownSlots(ins: Instr, o: usize): Option<usize> {
+  match (ins) {
+    IGetField(d, x, k) => {
+      if (isLocal(x, o) && d != o) {
+        return Some(k + 1);
+      }
+    },
+    IGetFieldU(d, x, k) => {
+      if (isLocal(x, o) && d != o) {
+        return Some(k + 1);
+      }
+    },
+    ISetField(x, k, _) => {
+      if (x == o) {
+        return Some(k + 1);
+      }
+    },
+    ISetFieldU(x, k, _) => {
+      if (x == o) {
+        return Some(k + 1);
+      }
+    },
+    ITakeField(d, x, k) => {
+      if (x == o && d != o) {
+        return Some(k + 1);
+      }
+    },
+    IPutField(x, k, _) => {
+      if (x == o) {
+        return Some(k + 1);
+      }
+    },
+    IShapeCheck(x, k) => {
+      if (x == o) {
+        return Some(k + 1);
+      }
+    },
+    IStructNew(d, _, slots) => {
+      if (d == o) {
+        return Some(slots.length);
+      }
+    },
+    _ => {},
+  }
+  return None;
+}
+
+// An in-place string / array operation on `o`: the runtime may replace the object, so `o` need not be the one checked before.
+function replacesInPlace(ins: Instr, o: usize): bool {
+  return match (ins) {
+    IStrAppend(x, _) => x == o,
+    IStrPrepend(x, _) => x == o,
+    IStrAppendNum(x, _, _) => x == o,
+    IStrAppendSub(x, _, _, _) => x == o,
+    IArrayExtend(x, _) => x == o,
+    IArrayPush(x, _) => x == o,
+    IArrayPop(_, x) => x == o,
+    _ => false,
+  };
+}
+
+// The instruction ends the scan for local `o`: it defines it, or may replace the object in place.
+export function scanEnds(p: MProgram, ins: Instr, o: usize): bool {
+  return defines(p, ins, o) || replacesInPlace(ins, o);
+}
+
+// Rule U6: is the unchecked access of slot `k` of struct operand `x` at position `at` of block `blk` of `f` justified?
+@Requires(blk < f.blocks.length && at <= f.blocks[blk].instrs.length)
+export function fieldJustified(p: MProgram, f: MFunction, blk: usize, at: usize, x: Operand, k: usize): bool {
+  match (x) {
+    OLocal(o) => {
+      if (o >= f.locals.length) {
+        return false;
+      }
+      match (f.locals[o].ty) {
+        MRef => {},
+        _ => {
+          return false;
+        },
+      }
+      const instrs = f.blocks[blk].instrs;
+      let i = at;
+      let n: usize = 0;
+      @Invariant(i <= at && at <= instrs.length && n <= WINDOW)
+      @Decreases(i)
+      while (i > 0 && n < WINDOW) {
+        i -= 1;
+        n += 1;
+        const ins = instrs[i];
+        match (knownSlots(ins, o)) {
+          Some(s) => {
+            if (s > k) {
+              return true;
+            }
+          },
+          None => {},
+        }
+        if (scanEnds(p, ins, o)) {
+          return false;
+        }
+      }
+      return false;
+    },
+    _ => {
+      return false;
+    },
+  }
+}
+
+// One unchecked field access of a function: its position and whether rule U6 justifies it.
+export type FieldFact = { block: usize; instr: usize; ok: bool; };
+
+// Rule U6 over a whole function: for every unchecked field access in the blocks `reached`, its position and the verdict.
+export function fieldFacts(p: MProgram, f: MFunction, reached: bool[]): FieldFact[] {
+  let out: FieldFact[] = [];
+  let b: usize = 0;
+  @Invariant(b <= f.blocks.length)
+  @Decreases(f.blocks.length - b)
+  while (b < f.blocks.length) {
+    if (b < reached.length && reached[b]) {
+      const instrs = f.blocks[b].instrs;
+      let q: usize = 0;
+      @Invariant(q <= instrs.length && b < f.blocks.length)
+      @Decreases(instrs.length - q)
+      while (q < instrs.length) {
+        match (instrs[q]) {
+          IGetFieldU(_, o, k) => {
+            out.push(FieldFact { block: b, instr: q, ok: fieldJustified(p, f, b, q, o, k) });
+          },
+          ISetFieldU(x, k, _) => {
+            out.push(FieldFact { block: b, instr: q, ok: fieldJustified(p, f, b, q, OLocal(x), k) });
+          },
+          _ => {},
+        }
+        q += 1;
+      }
+    }
+    b += 1;
+  }
+  return out;
+}
