@@ -10,7 +10,8 @@ import { BinOp, UnOp, Builtin, taskOpC, taskOpRet } from "../../hir";
 import {
   MType, MLocal, Operand, Instr, SwitchCase, Terminator, MBlock, MFunction, MProgram, isInlineFn,
   slotWords, RT_OPT_UNWRAP, RT_RES_UNWRAP, RT_RES_UNWRAP_ERR, RT_V_UNWRAP, RT_ASSERT_FACT, RT_ASSERT_ARRAY,
-  RT_STRUCT_NEW, RT_ARRAY_NEW,
+  RT_STRUCT_NEW, RT_ARRAY_NEW, RT_STR_APPEND, RT_STR_APPEND_SUB, RT_STR_APPEND_USIZE, RT_STR_APPEND_INT, RT_STR_PREPEND,
+  RT_ARRAY_EXTEND, rtSig, rtCold, l1Builtin,
 } from "../../mir";
 import { refMask, inoutArgOk, targetsBelow, linesOfBlocks } from "../c";
 import { u, isRefT, isUsizeT, isFloatT, isAggT, zeroOf, lty, attrTy, paramTy } from "./text";
@@ -179,11 +180,7 @@ function bname(op: Builtin): string {
     BStrTrim => "orin_str_trim",
     BStrWithCapacity => "orin_str_with_capacity",
     BArrGet => "orin_array_get",
-    BArrSlice => "orin_array_slice",
-    BArrConcat => "orin_array_concat",
     BArrJoin => "orin_array_join",
-    BBytesToString => "orin_bytes_to_string",
-    BStringToBytes => "orin_string_to_bytes",
     BIntToString => "orin_int_to_string",
     BUsizeToString => "orin_usize_to_string",
     BBoolToString => "orin_bool_to_string",
@@ -783,9 +780,49 @@ export class LlvmFunctionEmitter {
     };
   }
 
+  // The call of the string / array function that the L1 entry `k` replaces, on the loaded values `vals`: the Orin function of `$rt`
+  // (objects converted to address words and the result back) when the module has it, else the C runtime function. The result is a ptr.
+  private rtCallL(p: string, k: usize, vals: string[]): R {
+    const sym = this.syms.l1(k);
+    const w = rtSig(k).unwrap();
+    let pre = "";
+    let args: string[] = [];
+    let i: usize = 0;
+    while (i < w.params.length) {
+      const isObj = w.params[i] == "o";
+      if (sym != "" && isObj) {
+        pre += "  " + p + "pw" + u(i) + " = ptrtoint ptr " + vals[i] + " to i64\n";
+        args.push("i64 " + p + "pw" + u(i));
+      } else {
+        args.push((isObj ? "ptr " : "i64 ") + vals[i]);
+      }
+      i += 1;
+    }
+    if (sym == "") {
+      return R { text: pre + "  " + p + "r = call ptr @" + w.name + "(" + args.join(", ") + ")\n", val: p + "r" };
+    }
+    return R {
+      text: pre + "  " + p + "rw = call i64 @" + sym + "(" + args.join(", ") + ")\n  " + p + "r = inttoptr i64 " + p
+          + "rw to ptr\n",
+      val: p + "r",
+    };
+  }
+
   private builtinR(p: string, b: Builtin, args: Operand[], rt: MType): R {
     const a0 = args.length > 0 ? ov(p, 0, args[0]) : "";
     const r = p + "r";
+    match (l1Builtin(b)) {
+      Some(k) => {
+        let vals: string[] = [];
+        let n: usize = 0;
+        while (n < args.length) {
+          vals.push(ov(p, n, args[n]));
+          n += 1;
+        }
+        return this.rtCallL(p, k, vals);
+      },
+      None => {},
+    }
     const name = bname(b);
     if (name != "") {
       const ret = bret(b);
@@ -1247,6 +1284,20 @@ export class LlvmFunctionEmitter {
     return "  store " + lty(this.opTy(v)) + " " + ov(p, n, v) + ", ptr " + slot + "\n";
   }
 
+  // `x = f(x, os..)` for the string / array function of the L1 entry `k` (the first argument is the local `x`, which the call consumes).
+  private rtStmt(p: string, x: usize, k: usize, os: Operand[]): string {
+    let s = "  " + p + "x = load ptr, ptr %l" + u(x) + "\n";
+    let vals: string[] = [p + "x"];
+    let n: usize = 0;
+    while (n < os.length) {
+      n += 1;
+      s += this.ld(p, n, os[n - 1]);
+      vals.push(ov(p, n, os[n - 1]));
+    }
+    const r = this.rtCallL(p, k, vals);
+    return s + r.text + this.st(x, r.val);
+  }
+
   private instrI(p: string, i: Instr): string {
     return match (i) {
       ICopy(d, o) => this.ld(p, 0, o) + this.st(d, ov(p, 0, o)),
@@ -1260,21 +1311,11 @@ export class LlvmFunctionEmitter {
       IBinary(d, op, a, b) => this.binaryI(p, d, op, a, b),
       ICall(d, f, args) => this.callI(p, d, f, args),
       IBuiltin(d, b, args) => this.builtinInstr(p, d, b, args),
-      IStrAppend(x, y) => "  " + p + "x = load ptr, ptr %l" + u(x) + "\n" + this.ld(p, 1, y) + "  "
-          + p + "r = call ptr @orin_str_append(ptr " + p + "x, ptr " + ov(p, 1, y) + ")\n"
-          + this.st(x, p + "r"),
-      IStrAppendSub(x, y, a, b) => "  " + p + "x = load ptr, ptr %l" + u(x) + "\n" + this.ld(p, 1, y) + this.ld(p, 2, a)
-          + this.ld(p, 3, b) + "  " + p + "r = call ptr @orin_str_append_sub(ptr " + p + "x, ptr " + ov(p, 1, y) + ", i64 "
-          + ov(p, 2, a) + ", i64 " + ov(p, 3, b) + ")\n" + this.st(x, p + "r"),
-      IStrAppendNum(x, y, uns) => "  " + p + "x = load ptr, ptr %l" + u(x) + "\n" + this.ld(p, 1, y) + "  "
-          + p + "r = call ptr @" + (uns ? "orin_str_append_usize" : "orin_str_append_int") + "(ptr " + p + "x, i64 "
-          + ov(p, 1, y) + ")\n" + this.st(x, p + "r"),
-      IStrPrepend(x, y) => "  " + p + "x = load ptr, ptr %l" + u(x) + "\n" + this.ld(p, 1, y) + "  "
-          + p + "r = call ptr @orin_str_prepend(ptr " + p + "x, ptr " + ov(p, 1, y) + ")\n"
-          + this.st(x, p + "r"),
-      IArrayExtend(x, y) => "  " + p + "x = load ptr, ptr %l" + u(x) + "\n" + this.ld(p, 1, y)
-          + "  " + p + "r = call ptr @orin_array_extend(ptr " + p + "x, ptr " + ov(p, 1, y) + ")\n"
-          + this.st(x, p + "r"),
+      IStrAppend(x, y) => this.rtStmt(p, x, RT_STR_APPEND, [y]),
+      IStrAppendSub(x, y, a, b) => this.rtStmt(p, x, RT_STR_APPEND_SUB, [y, a, b]),
+      IStrAppendNum(x, y, uns) => this.rtStmt(p, x, uns ? RT_STR_APPEND_USIZE : RT_STR_APPEND_INT, [y]),
+      IStrPrepend(x, y) => this.rtStmt(p, x, RT_STR_PREPEND, [y]),
+      IArrayExtend(x, y) => this.rtStmt(p, x, RT_ARRAY_EXTEND, [y]),
       IStructNew(d, tag, slots) => this.structNewI(p, d, tag, slots),
       INullary(d, t) => isAggT(this.f.locals[d].ty)
           ? this.aggNewI(p, d, t, [])
@@ -1488,7 +1529,7 @@ export class LlvmFunctionEmitter {
     // fold its body (and its register pressure) into the fast path of the callers.
     sig += isInlineFn(this.prog, f.name)
         ? ") alwaysinline nounwind {\nentry:\n"
-        : (f.name == "$rt/object.arrayPushGrow" ? ") noinline nounwind {\nentry:\n" : ") nounwind {\nentry:\n");
+        : (f.name == "$rt/object.arrayPushGrow" || rtCold(f.name) ? ") noinline nounwind {\nentry:\n" : ") nounwind {\nentry:\n");
     out.push(sig);
     i = 0;
     while (i < f.locals.length) {
