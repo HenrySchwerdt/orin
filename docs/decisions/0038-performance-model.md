@@ -950,3 +950,20 @@ An SSE2 version (16 per iteration) reached bytesstr -58.9 %, but `<emmintrin.h>`
 compiles them worse than the plain loop (bytesstr 444 M, http_parse +5 %). The plain loop is kept; an intrinsics path would need
 its own place in the platform layer. The rest of bytesstr is the 8-byte slot traffic (2 x 8 MB per round trip); only packed
 storage removes it. http_parse gains little because its strings are short.
+
+## Addendum (2026-10-17): U6 unchecked struct slots
+Every `getfield` / `setfield` of a heap struct executes the check `kind == 3 && nslots > k` in both backends (`slotInline` in the LLVM backend,
+`orinc_chk_slot` in C). Removing every one of them by hand from the LLVM IR of `bench/mutres` halved its executed instructions (2.03G to 1.02G) and
+cut `pqueue` by 13%. This change removes the ones a verifier can justify: MIR v2.8 adds `IGetFieldU` / `ISetFieldU` (docs/mir.md), accepted by rule
+**U6** (`compiler/verify/fieldcheck.or`) when an earlier access (`getfield`, `setfield`, `takefield`, `putfield`, checked or unchecked) of the same struct
+local in the same block, within 64 instructions, checked slot `k' >= k` and nothing in between defines the local. Unlike the array rule U1, `makeunique`
+and every other use of the local leave the fact intact, because a struct's kind and slot count never change and the copy `makeunique` makes has the
+same header. The optimiser pass `compiler/opt/fieldcheck.or` asks the same predicate. `--assert-facts` does not re-check these (it needs a new runtime
+symbol; runtime/ and the seed are frozen here).
+
+Measured (executed instructions, cachegrind, LLVM backend / C backend, main vs this change): mutres 2,030M / 2,542M to 1,877M / 2,507M; pqueue,
+nbody, bintrees, qsort_inplace, html, mapfreq unchanged within 0.3%. In the self-compile 1,936 of 26,162 field accesses (7.4%) become unchecked.
+The gain is a fraction of the hand-removal because the first access to a struct in each block (typically a parameter, `l1 = move l0; getfield l1.k`)
+keeps its check: nothing in the function proves a parameter is a struct. Removing those needs a fact across calls (a typed-parameter shape
+invariant) or a dominator-based rule across blocks; both are follow-ups. Mutation classes `field-*` in `tools/mutate_mir.py` (736 unchecked accesses
+of the corpus, 5,369 checked ones) are all rejected, and the positive control is accepted.

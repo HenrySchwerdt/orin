@@ -1,0 +1,91 @@
+// Struct slot checks that cannot fire (ADR-0038 lever 2, T7; docs/mir.md v2.8). A `getfield` / `setfield` of a heap struct
+// becomes `IGetFieldU` / `ISetFieldU`, which the emitters compile without the check that the object is a struct with more
+// than k slots, when an earlier access of the same block and the same struct local already passed that check for this slot
+// or a higher one (a struct's kind and slot count never change):
+//
+//     x = getfield o.3                         x = getfield o.3
+//     ...                          ==>         ...
+//     y = getfield o.1                         y = getfieldu o.1
+//     setfield o.2 = z                         setfieldu o.2 = z
+//
+// The pass asks the verifier's own rule U6 (`fieldJustified`, compiler/verify/fieldcheck.or) and never emits an instruction that
+// rule rejects; the verifier checks the result again like that of every other pass. No check moves: the first access keeps
+// its check, in its place, with its message. It runs after the array pass, so it sees the final instruction stream.
+
+import { MProgram, MFunction, Instr, OLocal } from "../mir";
+import { fieldJustified } from "../verify";
+import { fnWellFormed, passKept } from "./wellformed";
+
+// The unchecked form of the access at position `at` of block `bi`, if it is a checked one and rule U6 accepts it.
+@Requires(bi < f.blocks.length && at < f.blocks[bi].instrs.length)
+function unchecked(p: MProgram, f: MFunction, bi: usize, at: usize): Option<Instr> {
+  match (f.blocks[bi].instrs[at]) {
+    IGetField(d, o, k) => {
+      if (fieldJustified(p, f, bi, at, o, k)) {
+        return Some(IGetFieldU(d, o, k));
+      }
+    },
+    ISetField(x, k, v) => {
+      if (fieldJustified(p, f, bi, at, OLocal(x), k)) {
+        return Some(ISetFieldU(x, k, v));
+      }
+    },
+    _ => {},
+  }
+  return None;
+}
+
+// `f` with every justified field access made unchecked. The accesses are visited in block and instruction order on the
+// function as rewritten so far, so an unchecked access is itself a source for the ones after it (it was justified in turn).
+@Requires(fnWellFormed(p, f))
+@Ensures(fnWellFormed(p, result) && passKept(f, result))
+export function uncheckFields(p: MProgram, f: MFunction): MFunction {
+  let g = f;
+  let bi: usize = 0;
+  while (bi < g.blocks.length) {
+    let i: usize = 0;
+    @Invariant(bi < g.blocks.length)
+    while (i < g.blocks[bi].instrs.length) {
+      match (unchecked(p, g, bi, i)) {
+        Some(r) => {
+          g.blocks[bi].instrs[i] = r;
+        },
+        None => {},
+      }
+      i += 1;
+    }
+    bi += 1;
+  }
+  return g;
+}
+
+// `p` with `uncheckFields` applied to every function (each reads only `p` and itself, so the order does not matter).
+@Requires(p.functions.every(f => fnWellFormed(p, f)))
+export function uncheckFieldsProgram(p: MProgram): MProgram {
+  return MProgram {
+    functions: p.functions.map(f => uncheckFields(p, f)),
+    strings: p.strings,
+    main: p.main,
+    vtables: p.vtables,
+    inlineFns: p.inlineFns,
+  };
+}
+
+// The number of unchecked field accesses of `f`.
+export function uncheckedFieldCount(f: MFunction): usize {
+  let n: usize = 0;
+  for (const b of f.blocks) {
+    for (const i of b.instrs) {
+      match (i) {
+        IGetFieldU(_, _, _) => {
+          n += 1;
+        },
+        ISetFieldU(_, _, _) => {
+          n += 1;
+        },
+        _ => {},
+      }
+    }
+  }
+  return n;
+}

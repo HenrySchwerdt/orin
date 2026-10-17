@@ -1,4 +1,4 @@
-# MIR and the OIM ownership verifier (v2.6; in/out receivers and `IArrayExtend` are v1.10, unboxed aggregates v2.2, load forwarding `IForward` v2.4, string append primitives v2.5, unchecked array access `IArrayGetU` / `IArraySetU` v2.6)
+# MIR and the OIM ownership verifier (v2.8; in/out receivers and `IArrayExtend` are v1.10, unboxed aggregates v2.2, load forwarding `IForward` v2.4, string append primitives v2.5, unchecked array access `IArrayGetU` / `IArraySetU` v2.6, unchecked struct slots `IGetFieldU` / `ISetFieldU` v2.8)
 
 Normative companion to `compiler/mir/mir.or`. Status: contract defined; implementation in
 progress. Relation to spec 07: MIR is the *memory IR* layer; the verifier is the independent
@@ -79,6 +79,17 @@ scalars held **by value** in n + 1 64-bit words (word 0 the tag, words 1..n the 
 object, no header and no reference count. Produced only by the optimiser (`compiler/opt/unbox.or`); no new instruction: the existing ones
 take an aggregate where noted in "Unboxed aggregates" below. The verifier treats an aggregate as a scalar (`Init`).
 
+v2.8 (ADR-0038 lever 2, T7) **unchecked struct slots**: two new instructions, `IGetFieldU(d, o, k)` (`d = getfieldu o.k`) and
+`ISetFieldU(x, k, v)` (`setfieldu x.k = v`). Each means exactly `IGetField` / `ISetField` of a **heap struct** **without the check that the object
+is a struct (kind 3) with more than `k` slots** (the C backend's `orinc_chk_slot`, the LLVM backend's `slotInline` guard): the backends read and write
+`slots[k]` directly (`orinc_struct_get_u`, `orinc_struct_set_u` / `orinc_mir_struct_replace_u`; one `getelementptr inbounds`). The operand must be a
+reference local (never an unboxed aggregate: that path has no header to check and is unchanged). Like U1 this is a **memory-safety** fact, so the
+verifier rejects an unchecked access it cannot justify (rule **U6**, `compiler/verify/fieldcheck.or`, section "Unchecked struct slots" below, error
+text `unchecked struct slot access without a dominating check`). The optimiser (`compiler/opt/fieldcheck.or`, its last pass) emits them where U6
+accepts them; the lowering never does. Textual forms `l2 = getfieldu l0.1` and `setfieldu l0.0 = l3`. `ITakeField` / `IPutField` keep their check.
+`--assert-facts` does not re-run the omitted check for these (it would need a new runtime symbol; runtime/ and the seed are frozen for this change).
+(v2.7 is taken by another branch, so this is v2.8.)
+
 v2.6 (ADR-0038 lever 2, T2) **unchecked array access**: two new instructions, `IArrayGetU(d, a, i)` (`d = arraygetu a[i]`) and
 `IArraySetU(x, i, v)` (`arraysetu x[i] = v`). Each means exactly `IArrayGet` / `IArraySet` **without the kind check and without the
 bounds check**: the C backend reads and writes `items[i]` directly (`orinc_array_at_u`, `orinc_mir_array_put_u` / `orinc_mir_array_replace_u`),
@@ -149,6 +160,8 @@ hole slot when reading that slot.
   s and o live, slot `key` of o not a hole; d `Init`. Rule F1 must justify the claim (below), else **error** `unjustified forward`.
 - `IArrayGetU(d, a, i)` (v2.6): the rules of `IArrayGet`, and rule U1 must justify the omitted checks (below, by a dominating access or by
   interval facts), else **error** `unchecked array access without a dominating check or a range fact`.
+- `IGetFieldU(d, o, i)` / `ISetFieldU(x, i, v)` (v2.8): the rules of `IGetField` / `ISetField` for a reference local, and rule U6 must justify the
+  omitted check (below), else **error** `unchecked struct slot access without a dominating check`.
 - `ISetField(x, i, v)` / `IArraySet(x, i, v)` / `IArraySetU(x, i, v)` (v2.6, plus rule U1): x **Unique**; v consumed as for StructNew.
   Effect: invalidates every `Borrowed(x)` local (→ Dead) because the old slot value is released.
 - `ITakeField(d, x, i)` / `IArrayTake(d, x, i)`: x Unique; i not already a hole → d Owned, i added
@@ -293,6 +306,22 @@ access without an earlier one): `bce-no-fact`, `bce-across-push`, `bce-after-red
 and the positive controls `bce-makeunique-ok` and `bce-other-index-ok` (accepted; a rejection is a finding). Lean: array length is outside the
 model (`formal/Orin/Machine.lean` has no arrays with a length), so U1 has no lemma; it is listed with the other rules not yet in the model
 (docs/tcb.md, docs/formal.md), not claimed as proved.
+
+## Unchecked struct slots (v2.8, ADR-0038 lever 2 T7, rule U6)
+`d = getfieldu o.k` and `setfieldu o.k = v` skip the check of the runtime (`orin_struct_get` / `orin_struct_set`: the object is a struct and `k < nslots`).
+The verifier accepts one only when a backward scan of **the same block**, over at most 64 instructions (`WINDOW`, `scan.or`), finds an earlier
+`getfield`, `getfieldu`, `setfield`, `setfieldu`, `takefield` or `putfield` of the **same struct local** `o` with slot `k' >= k` (each of them traps unless
+the object is a struct with more than `k'` slots, hence more than `k`), with no instruction in between that **defines `o`** (a destination, a move, the
+receiver of an in/out call) and no in-place string / array operation on `o` (fail closed). An access of a lower slot is no source but does not end the
+scan. A source that defines `o` itself (`o = getfield o.k`) justifies nothing after it. *Unlike U1 nothing else ends the scan*: the kind and the slot
+count of a struct are fixed by `IStructNew` and no instruction changes them, and the copy `IMakeUnique` makes of a shared struct has the same header,
+so `makeunique`, takes and puts, stores, calls that receive `o` and any other use leave the fact intact. The operand must be a reference local
+(`wf.or`); an unboxed aggregate is a different local type, so the source is a heap access of the same local. The ordinary rules apply to the
+instruction itself (`getfieldu` is a `getfield`: a hole or a borrow is as for the checked form; `setfieldu` needs a `Unique` object).
+*Trap semantics.* The removed check duplicates one that passed on the same object, so it cannot fire; the first access keeps its check, in its place.
+*Tests.* `compiler/tests/verify_main.or` `fieldCases`, `compiler/tests/opt_test.or` and `emit_test.or` (T7 sections); mutation classes of
+`tools/mutate_mir.py`: `field-no-fact`, `field-after-redef`, `field-across-block`, `field-higher-slot` and the positive control `field-makeunique-ok`.
+`verify_text --facts` reports `field-checked` / `field-none` per unchecked field access.
 
 ### Range facts (v2.6, ADR-0038 lever 2 T6, rules R1-R5)
 The second fact source of U1, `compiler/verify/range.or`: a forward interval analysis of the whole function, independent of the ownership
