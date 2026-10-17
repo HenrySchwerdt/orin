@@ -13,7 +13,7 @@ that every reachable step is neither `bad` (ownership) nor `ill` (shape, type, n
 namespace Orin
 open Heap
 
-variable {ext : List Val} {np : Nat} {sg : List Sig} {sh : Shapes} {Γ : List Ty} {hty : HTy}
+variable {ext : List Val} {np : Nat} {sg : List Sig} {sh : Shapes} {tsg : List TSig} {Γ : List Ty} {hty : HTy}
   {a a1 : AState} {s : St}
 
 /-- the ownership half of every instruction (the dispatch of `sound_step`) -/
@@ -38,7 +38,7 @@ theorem op_safe_all (i : MI) (hI : Inv ext a.ls s) {a1 : List AS}
 
 theorem top_op (i : MI) (hI : Inv ext a.ls s) (hT : TInv sh Γ hty a s) (hu : HU a)
     (ht : tcheckI sh Γ i = true) (h : stepA np a i = some a1) :
-    TOp sh Γ hty a1 (mop s i) := by
+    TOp sh Γ hty a1 s (mop s i) := by
   cases i with
   | const d n => exact top_const hI hT ht h
   | move d x => exact top_move hI hT ht h
@@ -58,7 +58,7 @@ theorem top_op (i : MI) (hI : Inv ext a.ls s) (hT : TInv sh Γ hty a s) (hu : HU
 
 /-- the release worklist keeps the type invariant and never produces `ill` -/
 theorem top_drain (hT : TInv sh Γ hty a s) (hp : s.pending ≠ []) :
-    drain s ≠ .ill ∧ ∀ s', drain s = .ok s' → TInv sh Γ hty a s' := by
+    drain s ≠ .ill ∧ ∀ s', drain s = .ok s' → TInv sh Γ hty a s' ∧ s.heap.next ≤ s'.heap.next := by
   obtain ⟨hd, rest, hpe⟩ : ∃ hd rest, s.pending = hd :: rest := by
     cases h : s.pending with
     | nil => exact absurd h hp
@@ -69,7 +69,7 @@ theorem top_drain (hT : TInv sh Γ hty a s) (hp : s.pending ≠ []) :
     refine ⟨(by rw [hdr]; intro e; cases e), fun s' hs => ?_⟩
     rw [hdr] at hs
     cases hs
-    exact hT.same rfl rfl
+    exact ⟨hT.same rfl rfl, Nat.le_refl _⟩
   | ref l =>
     cases hob : s.heap.objs l with
     | none =>
@@ -87,7 +87,7 @@ theorem top_drain (hT : TInv sh Γ hty a s) (hp : s.pending ≠ []) :
           refine ⟨(by rw [hdr]; intro e; cases e), fun s' hs => ?_⟩
           rw [hdr] at hs
           cases hs
-          refine hT.heap rfl ⟨rfl, fun k o' ho' => ⟨o', ?_, rfl⟩⟩
+          refine ⟨hT.heap rfl ⟨rfl, fun k o' ho' => ⟨o', ?_, rfl⟩⟩, Nat.le_refl _⟩
           by_cases hk : k = l
           · simp [Heap.del, hk] at ho'
           · simpa [Heap.del, hk] using ho'
@@ -96,7 +96,8 @@ theorem top_drain (hT : TInv sh Γ hty a s) (hp : s.pending ≠ []) :
           refine ⟨(by rw [hdr]; intro e; cases e), fun s' hs => ?_⟩
           rw [hdr] at hs
           cases hs
-          refine hT.heap rfl ⟨decRc_next s.heap l, fun k o' ho' => ?_⟩
+          refine ⟨hT.heap rfl ⟨decRc_next s.heap l, fun k o' ho' => ?_⟩, by
+            have := decRc_next s.heap l; show s.heap.next ≤ (s.heap.decRc l).next; omega⟩
           by_cases hk : k = l
           · subst hk
             rw [decRc_objs _ _ _ hob, if_pos rfl] at ho'
@@ -131,10 +132,10 @@ theorem HU.weaken {a b : AState} (hu : HU a) (hF : FleS a b) : HU b := by
 theorem sound_stepT_nopending {E : AState → Prop} {a : AState} {code : Code}
     (hC : Cont sg np E a code) :
     ∀ (s : St) (hty : HTy), Inv ext a.ls s → TInv sh Γ hty a s → HU a →
-      tcode sh Γ code = true → s.pending = [] →
+      tcode sh tsg Γ code = true → s.pending = [] →
       (mstep (code, s) = none ∨ (mstep (code, s) ≠ some .ill ∧
-        ∀ c', mstep (code, s) = some (.ok c') → ∃ a' hty', Cont sg np E a' c'.1 ∧
-          Inv ext a'.ls c'.2 ∧ TInv sh Γ hty' a' c'.2 ∧ HU a' ∧ tcode sh Γ c'.1 = true)) := by
+        ∀ c', mstep (code, s) = some (.ok c') → ∃ a' hty', HyExt hty hty' s.heap c'.2.heap ∧
+          Cont sg np E a' c'.1 ∧ Inv ext a'.ls c'.2 ∧ TInv sh Γ hty' a' c'.2 ∧ HU a' ∧ tcode sh tsg Γ c'.1 = true)) := by
   induction hC with
   | nil _ =>
     intro s hty hI hT hu ht hp
@@ -164,8 +165,8 @@ theorem sound_stepT_nopending {E : AState → Prop} {a : AState} {code : Code}
         rw [hr] at hc''
         simp only [Res.liftC, Res.ok.injEq] at hc''
         subst hc''
-        obtain ⟨hty', hT'⟩ := htop.2 s' hr
-        exact ⟨a1, hty', hk, hsafe.2 s' hr, hT', HU_stepA hu hstep, ht.2⟩
+        obtain ⟨hty', hex, hT'⟩ := htop.2 s' hr
+        exact ⟨a1, hty', hex, hk, hsafe.2 s' hr, hT', HU_stepA hu hstep, ht.2⟩
       | trap => rw [hr] at hc''; simp [Res.liftC] at hc''
       | bad _ => rw [hr] at hc''; simp [Res.liftC] at hc''
       | ill => rw [hr] at hc''; simp [Res.liftC] at hc''
@@ -175,21 +176,21 @@ theorem sound_stepT_nopending {E : AState → Prop} {a : AState} {code : Code}
     simp only [tcode, Bool.and_eq_true] at ht
     have hcl : c < s.locals.length := hI.len ▸ hc
     obtain ⟨n, hn⟩ := (hI.cl c).ini hinit
-    have htt : tcode sh Γ (t.app k) = true := tcode_app t k ht.1.1.2 ht.2
-    have hte : tcode sh Γ (e.app k) = true := tcode_app e k ht.1.2 ht.2
+    have htt : tcode sh tsg Γ (t.app k) = true := tcode_app t k ht.1.1.2 ht.2
+    have hte : tcode sh tsg Γ (e.app k) = true := tcode_app e k ht.1.2 ht.2
     by_cases h0 : n = 0
     · subst h0
       have hm : mstep (.ite c t e k, s) = some (.ok (t.app k, s)) := by simp [mstep, hp, hcl, hn]
       rw [hm]
       refine ⟨(fun hh => by cases hh), fun c' hc' => ?_⟩
       cases hc'
-      exact ⟨a, hty, hT_, hI, hT, hu, htt⟩
+      exact ⟨a, hty, HyExt.refl _ _, hT_, hI, hT, hu, htt⟩
     · have hm : mstep (.ite c t e k, s) = some (.ok (e.app k, s)) := by
         simp [mstep, hp, hcl, hn, h0]
       rw [hm]
       refine ⟨(fun hh => by cases hh), fun c' hc' => ?_⟩
       cases hc'
-      exact ⟨a, hty, hE, hI, hT, hu, hte⟩
+      exact ⟨a, hty, HyExt.refl _ _, hE, hI, hT, hu, hte⟩
   | @loop E a b c t k hF hcb hinit hBody hK ihBody ihK =>
     intro s hty hI hT hu ht hp
     right
@@ -208,14 +209,14 @@ theorem sound_stepT_nopending {E : AState → Prop} {a : AState} {code : Code}
       rw [hm]
       refine ⟨(fun hh => by cases hh), fun c' hc' => ?_⟩
       cases hc'
-      refine ⟨b, hty, Cont.seq hBody _ (fun x hx => Cont.weak hx hself), hIb, hTb, hub, ?_⟩
+      refine ⟨b, hty, HyExt.refl _ _, Cont.seq hBody _ (fun x hx => Cont.weak hx hself), hIb, hTb, hub, ?_⟩
       exact tcode_app t _ ht.1.2 (by simp [tcode, ht.1.1, ht.1.2, ht.2])
     · have hm : mstep (.loop c t k, s) = some (.ok (k, s)) := by
         simp [mstep, hp, hcl, hn, h0]
       rw [hm]
       refine ⟨(fun hh => by cases hh), fun c' hc' => ?_⟩
       cases hc'
-      exact ⟨b, hty, hK, hIb, hTb, hub, ht.2⟩
+      exact ⟨b, hty, HyExt.refl _ _, hK, hIb, hTb, hub, ht.2⟩
   | call _ _ _ =>
     intro s hty hI hT hu ht hp
     left
@@ -227,10 +228,10 @@ theorem sound_stepT_nopending {E : AState → Prop} {a : AState} {code : Code}
 
 theorem sound_stepT {E : AState → Prop} {a : AState} {code : Code}
     (hC : Cont sg np E a code) (s : St) (hty : HTy) (hI : Inv ext a.ls s)
-    (hT : TInv sh Γ hty a s) (hu : HU a) (ht : tcode sh Γ code = true) :
+    (hT : TInv sh Γ hty a s) (hu : HU a) (ht : tcode sh tsg Γ code = true) :
     (mstep (code, s) = none ∨ (mstep (code, s) ≠ some .ill ∧
-      ∀ c', mstep (code, s) = some (.ok c') → ∃ a' hty', Cont sg np E a' c'.1 ∧
-        Inv ext a'.ls c'.2 ∧ TInv sh Γ hty' a' c'.2 ∧ HU a' ∧ tcode sh Γ c'.1 = true)) := by
+      ∀ c', mstep (code, s) = some (.ok c') → ∃ a' hty', HyExt hty hty' s.heap c'.2.heap ∧
+        Cont sg np E a' c'.1 ∧ Inv ext a'.ls c'.2 ∧ TInv sh Γ hty' a' c'.2 ∧ HU a' ∧ tcode sh tsg Γ c'.1 = true)) := by
   by_cases hp : s.pending = []
   · exact sound_stepT_nopending hC s hty hI hT hu ht hp
   · right
@@ -255,18 +256,18 @@ theorem sound_stepT {E : AState → Prop} {a : AState} {code : Code}
         rw [hd'] at hh
         simp only [Res.liftC, Res.ok.injEq] at hh
         subst hh
-        exact ⟨a, hty, hC, hdr.2 s' hd', hdt.2 s' hd', hu, ht⟩
+        exact ⟨a, hty, HyExt.keep (hdt.2 s' hd').2, hC, hdr.2 s' hd', (hdt.2 s' hd').1, hu, ht⟩
       | bad _ => rw [hd'] at hh; simp [Res.liftC] at hh
       | trap => rw [hd'] at hh; simp [Res.liftC] at hh
       | ill => rw [hd'] at hh; simp [Res.liftC] at hh
 
 theorem reach_T {E : AState → Prop} {a : AState} {code : Code} {s : St} {hty : HTy}
     (hC : Cont sg np E a code) (hI : Inv ext a.ls s) (hT : TInv sh Γ hty a s) (hu : HU a)
-    (ht : tcode sh Γ code = true) {c : Code × St} (hr : MReach (code, s) c) :
+    (ht : tcode sh tsg Γ code = true) {c : Code × St} (hr : MReach (code, s) c) :
     mstep c ≠ some .ill ∧ ∀ k, mstep c ≠ some (.bad k) := by
   have key : ∀ (c0 c : Code × St), MReach c0 c → ∀ (a : AState) (hty : HTy),
       Cont sg np E a c0.1 → Inv ext a.ls c0.2 → TInv sh Γ hty a c0.2 → HU a →
-      tcode sh Γ c0.1 = true → mstep c ≠ some .ill ∧ ∀ k, mstep c ≠ some (.bad k) := by
+      tcode sh tsg Γ c0.1 = true → mstep c ≠ some .ill ∧ ∀ k, mstep c ≠ some (.bad k) := by
     intro c0 c hr
     induction hr with
     | refl =>
@@ -281,7 +282,7 @@ theorem reach_T {E : AState → Prop} {a : AState} {code : Code} {s : St} {hty :
       rcases sound_stepT hC _ hty hI hT hu ht with hn | ⟨_, hok⟩
       · rw [hn] at h12; cases h12
       · have h12' : mstep c1 = some (.ok c2) := h12
-        obtain ⟨a', hty', hC', hI', hT', hu', ht'⟩ := hok c2 h12'
+        obtain ⟨a', hty', _, hC', hI', hT', hu', ht'⟩ := hok c2 h12'
         exact ih a' hty' hC' hI' hT' hu' ht'
   exact key _ _ hr a hty hC hI hT hu ht
 
