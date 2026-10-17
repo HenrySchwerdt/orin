@@ -7,7 +7,7 @@
 import { BinOp, UnOp, Builtin, taskOpC } from "../../hir";
 import {
   MType, MLocal, Operand, Instr, SwitchCase, Terminator, MBlock, MFunction, MProgram, aggWords,
-  isAggTy, slotWords,
+  isAggTy, slotWords, RT_OPT_UNWRAP, RT_RES_UNWRAP, RT_RES_UNWRAP_ERR, RT_V_UNWRAP, RT_ASSERT_FACT, RT_ASSERT_ARRAY,
 } from "../../mir";
 
 import {
@@ -248,9 +248,15 @@ function coreC(k: usize, a: string[]): string {
   };
 }
 
+// The call of the L1 function `sym` (mir/rt.or) with the object `a` as an address word.
+function l1Obj(sym: string, a: string): string {
+  return sym + "((uint64_t)(uintptr_t)(" + a + "))";
+}
+
 // C expression for a builtin whose result is a fresh Owned ref or a scalar. `rt` is the type of the destination (MVoid
-// when there is none).
-export function builtinC(op: Builtin, a: string[], rt: MType): string {
+// when there is none). `syms` holds the L1 entries (the unwrap builtins call the Orin functions of `$rt`; without them the
+// C runtime's).
+export function builtinC(op: Builtin, a: string[], rt: MType, syms: CSymbols): string {
   match (runtimeCall(op)) {
     Some(rc) => {
       return callN(rc.name, a, rc.n);
@@ -262,14 +268,26 @@ export function builtinC(op: Builtin, a: string[], rt: MType): string {
     BOptIsNone => "(orin_tag(" + a[0] + ") == 1)",
     BResIsOk => "(orin_tag(" + a[0] + ") == 0)",
     BResIsErr => "(orin_tag(" + a[0] + ") == 1)",
-    BOptUnwrap => dupIf(rt, fromSlot(rt, callN("orin_opt_unwrap", a, 1))),
+    BOptUnwrap => dupIf(
+      rt,
+      fromSlot(rt, syms.l1(RT_OPT_UNWRAP) != "" ? l1Obj(syms.l1(RT_OPT_UNWRAP), a[0]) : callN("orin_opt_unwrap", a, 1)),
+    ),
     BOptUnwrapOr => dupIf(
       rt,
       "(orin_tag(" + a[0] + ") == 0 ? " + fromSlot(rt, "orin_struct_get(" + a[0] + ", 0)") + " : "
           + a[1] + ")",
     ),
-    BResUnwrap => dupIf(rt, fromSlot(rt, callN("orin_res_unwrap", a, 1))),
-    BResUnwrapErr => dupIf(rt, fromSlot(rt, callN("orin_res_unwrap_err", a, 1))),
+    BResUnwrap => dupIf(
+      rt,
+      fromSlot(rt, syms.l1(RT_RES_UNWRAP) != "" ? l1Obj(syms.l1(RT_RES_UNWRAP), a[0]) : callN("orin_res_unwrap", a, 1)),
+    ),
+    BResUnwrapErr => dupIf(
+      rt,
+      fromSlot(
+        rt,
+        syms.l1(RT_RES_UNWRAP_ERR) != "" ? l1Obj(syms.l1(RT_RES_UNWRAP_ERR), a[0]) : callN("orin_res_unwrap_err", a, 1),
+      ),
+    ),
     BIntToFloat => "((double)(" + a[0] + "))",
     BUsizeToFloat => "((double)(" + a[0] + "))",
     BF32Round => "((double)(float)(" + a[0] + "))",
@@ -340,7 +358,7 @@ function unwrapWhat(b: Builtin): string {
 
 // C expression of an Option / Result builtin whose argument 0 is the aggregate local `l` (`a1` the C text of argument 1,
 // the default of `unwrapOr`); `rt` is the type of the destination (a plain scalar, or MVoid).
-export function aggBuiltinC(b: Builtin, l: usize, a1: string, rt: MType): string {
+export function aggBuiltinC(b: Builtin, l: usize, a1: string, rt: MType, syms: CSymbols): string {
   const tag = aggWordC(l, 0);
   return match (b) {
     BOptIsSome => "(" + tag + " == 0)",
@@ -348,7 +366,11 @@ export function aggBuiltinC(b: Builtin, l: usize, a1: string, rt: MType): string
     BOptIsNone => "(" + tag + " == 1)",
     BResIsErr => "(" + tag + " == 1)",
     BOptUnwrapOr => "(" + tag + " == 0 ? " + fromSlot(rt, aggWordC(l, 1)) + " : " + a1 + ")",
-    _ => fromSlot(rt, "orin_v_unwrap(" + tag + ", " + aggWordC(l, 1) + ", " + unwrapWhat(b) + ")"),
+    _ => fromSlot(
+      rt,
+      (syms.l1(RT_V_UNWRAP) != "" ? syms.l1(RT_V_UNWRAP) : "orin_v_unwrap") + "(" + tag + ", " + aggWordC(l, 1) + ", "
+          + unwrapWhat(b) + ")",
+    ),
   };
 }
 
@@ -405,7 +427,10 @@ export class CFunctionEmitter {
 
   // `--assert-facts`: the check an unchecked array access skips, run before it (exit 70 if it would have trapped).
   private assertArray(a: Operand, k: Operand): string {
-    return this.facts ? "orin_assert_array(" + opC(a) + ", " + opC(k) + "); " : "";
+    const sym = this.syms.l1(RT_ASSERT_ARRAY);
+    return this.facts
+        ? (sym != "" ? sym + "((uint64_t)(uintptr_t)(" + opC(a) + "), " : "orin_assert_array(" + opC(a) + ", ") + opC(k) + "); "
+        : "";
   }
 
   private slotOf(o: Operand): string {
@@ -469,8 +494,8 @@ export class CFunctionEmitter {
     };
     const agg: Option<usize> = args.length > 0 ? this.aggLocal(args[0]) : None;
     const code = match (agg) {
-      Some(l) => aggBuiltinC(b, l, args.length > 1 ? opC(args[1]) : "0", rt),
-      None => builtinC(b, args.map(opC), rt),
+      Some(l) => aggBuiltinC(b, l, args.length > 1 ? opC(args[1]) : "0", rt, this.syms),
+      None => builtinC(b, args.map(opC), rt, this.syms),
     };
     return assignOpt(d, code);
   }
@@ -515,7 +540,7 @@ export class CFunctionEmitter {
       IStructNew(d, tag, slots) => this.structNew(d, tag, slots),
       INullary(d, t) => isAggTy(this.ty(d))
           ? this.aggNew(d, t, [])
-          : lname(d) + " = orin_nullary(" + u(t) + ");",
+          : lname(d) + " = " + this.nullaryC(t) + ";",
       ITag(d, o) => match (this.aggLocal(o)) {
         Some(l) => lname(d) + " = (int64_t)" + aggWordC(l, 0) + ";",
         None => lname(d) + " = (int64_t)orin_tag(" + opC(o) + ");",
@@ -557,7 +582,9 @@ export class CFunctionEmitter {
 
       // Check the pre-instruction slot: d may also be the index local k.
       IForward(d, s, o, k) => (this.facts
-          ? "orin_assert_fact(" + opC(o) + ", " + opC(k) + ", " + this.slotOf(OLocal(s)) + "); "
+          ? (this.syms.l1(RT_ASSERT_FACT) != ""
+              ? this.syms.l1(RT_ASSERT_FACT) + "((uint64_t)(uintptr_t)(" + opC(o) + "), "
+              : "orin_assert_fact(" + opC(o) + ", ") + opC(k) + ", " + this.slotOf(OLocal(s)) + "); "
           : "")
           + lname(d) + " = " + lname(s) + ";",
       IClosure(d, g, caps) => this.closure(d, g, caps),
@@ -612,6 +639,12 @@ export class CFunctionEmitter {
     return s;
   }
 
+  // The immortal payload-less variant with tag `t`: a static object of the unit when the program has the L1 entries
+  // (`nullaryDecls` in cemit.or: no table, no atomic load), else the C runtime's shared singleton.
+  private nullaryC(t: usize): string {
+    return this.syms.l1Loaded() ? "(OrinObj *)&orin_nz" + u(t) : "orin_nullary(" + u(t) + ")";
+  }
+
   // A closure is a struct `{ code pointer (scalar slot 0), environment (reference slot 1) }`; the environment is a struct
   // holding the captured values in order (the immortal nullary object when nothing is captured). docs/mir.md v1.3,
   // ADR-0011.
@@ -619,7 +652,7 @@ export class CFunctionEmitter {
   private closure(d: usize, g: usize, caps: Operand[]): string {
     const n = lname(d);
     let s = "";
-    let env = "orin_nullary(0)";
+    let env = this.nullaryC(0);
     if (caps.length > 0) {
       s += "{ OrinObj *env_ = orin_struct_new(0, " + u(caps.length) + ", " + u(this.maskOf(caps))
           + "ULL);";

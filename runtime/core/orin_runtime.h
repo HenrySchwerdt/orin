@@ -445,21 +445,23 @@ OrinObj *orin_parse_int_k(OrinObj *s, int64_t kind);                      /* Opt
 
 /* New struct with all slots zero (null refs). Fill with orin_struct_init (init only). */
 OrinObj *orin_struct_new(uint32_t tag, uint32_t nslots, uint64_t refmask);
-/* Shared immortal singleton for a payload-less variant. */
-OrinObj *orin_nullary(uint32_t tag);
+/* Immortal singleton for a payload-less variant, for the C shells: tag 0 (Ok of void) or 1 (None, Err), one static object per
+ * translation unit. Generated code has its own static objects per tag (`orin_nz<tag>`, ADR-0052 R3d.2). */
+static inline OrinObj *orin_nullary(uint32_t tag) {
+    static struct { OrinObj h; uint32_t nslots; uint32_t pad; uint64_t refmask; } n[2] = {
+        {{-1, ORIN_K_STRUCT, 0}, 0, 0, 0}, {{-1, ORIN_K_STRUCT, 1}, 0, 0, 0}};
+    if (ORIN_UNLIKELY(tag > 1)) orin_trap("variant tag too large");
+    return &n[tag].h;
+}
 /* Variant with one slot; consumes the slot's reference if the slot is a ref (refmask 0/1). */
 OrinObj *orin_variant1(uint32_t tag, uint64_t refmask, uint64_t slot);
-/* dst.slots[i] = src.slots[j], retaining it if it is a reference. dst slot must be empty. */
-void orin_struct_copy_slot(OrinObj *dst, uint32_t i, OrinObj *src, uint32_t j);
 /* Defence in depth (docs/assurance.md, finding "shape confusion"): every field access on an object of unknown
  * provenance checks that it is a struct and that the slot index is below its slot count, so a lowering bug that
  * confuses value shapes becomes a clean trap instead of an out-of-bounds read or write. The ownership verifier
  * does not check value shapes. The LLVM backend does the same check in its inline helper @orinl_slot. */
 void orin_trap_shape(void) __attribute__((noreturn, cold));
-/* `--assert-facts` builds only (docs/mir.md v2.4): checks the value an IForward claims for slot `key` of `o`; exit 70 if it differs. */
-void orin_assert_fact(const OrinObj *o, uint64_t key, uint64_t got);
-/* `--assert-facts` builds only (docs/mir.md v2.6): the kind and bounds checks an IArrayGetU / IArraySetU omits; exit 70 if they would fail. */
-void orin_assert_array(const OrinObj *o, uint64_t i);
+/* `--assert-facts` checks (orin_assert_fact, orin_assert_array), the unwrap helpers (orin_opt_unwrap, orin_res_unwrap(_err), orin_v_unwrap)
+ * and the shape trap of generated LLVM code are Orin functions of runtime/core/leaf.or ($rt, ADR-0052 R3d.2); this C trap serves the inlines below. */
 static inline void orin_chk_slot(const OrinObj *o, uint32_t i) {
     if (ORIN_UNLIKELY(o->kind != ORIN_K_STRUCT || i >= ((const OrinStruct *)o)->nslots)) orin_trap_shape();
 }
@@ -488,17 +490,11 @@ static inline uint32_t orin_tag(const OrinObj *o) { return o->tag; }
 /* Option / Result helpers (return borrowed slots; trap on the wrong variant). */
 static inline OrinObj *orin_none(void) { return orin_nullary(1); }
 static inline OrinObj *orin_ok_void(void) { return orin_nullary(0); }
-uint64_t orin_opt_unwrap(OrinObj *o);
-/* Unboxed Option / Result (ADR-0038 step 1, docs/mir.md v2.2): `word` when `tag` is the expected one, else the trap of
-   the boxed builtin. what: 0 = Option.unwrap (tag 0), 1 = Result.unwrap (tag 0), 2 = Result.unwrapErr (tag 1). */
-uint64_t orin_v_unwrap(uint64_t tag, uint64_t word, int64_t what);
 /* `pop` into an unboxed Option<T>: out[0] = 0 and out[1] = the element, or out[0] = 1 (None) and out[1] = 0 when the
    array is empty. The Option holds a scalar only: an element of a reference array is released (the Option is never
    read as a reference; the optimiser unboxes only Options whose payload is read as a scalar or not at all). */
 void orin_array_pop_v(OrinObj *a, uint64_t *out);
 
-uint64_t orin_res_unwrap(OrinObj *o);
-uint64_t orin_res_unwrap_err(OrinObj *o);
 
 /* ---------------------------------------------------------------- strings (all byte strings) */
 
