@@ -8,7 +8,7 @@ import { args } from "std:process";
 import { Bytes, bytesFromString } from "std:bytes";
 import { ResponseParser, NeedMore, Done, Failed, ToOther, defaultLimits } from "std:http";
 import { Scope, TaskHandle, scopeNetDo, spawnNet } from "std:task";
-import { NetGrant, Stream, useConnect, withConnection, sendAll, recv, RecvData, netErrorMessage } from "std:net";
+import { NetGrant, Stream, Reset, useConnect, withConnection, sendAll, recv, RecvData, netErrorMessage } from "std:net";
 
 function body(i: int, n: int): string {
   let s = "client " + i.toString() + ":";
@@ -55,12 +55,24 @@ function exchange(s: Stream, i: int, n: int): string {
   return out;
 }
 
+// A connect refused by a full accept backlog is retried: macOS answers a SYN beyond kern.ipc.somaxconn (128) with a reset
+// where Linux drops it and the client's own SYN retry covers it. Only the connect is retried; an exchange that has started
+// is never repeated.
+const CONNECT_TRIES: int = 2000;
+
 function one(net: NetGrant, port: int, i: int, n: int): string {
-  const r = withConnection(net, "127.0.0.1", port, milliseconds(5000), (s: Stream) => exchange(s, i, n));
-  if (r.isErr()) {
-    return "connect: " + netErrorMessage(r.unwrapErr());
+  let tries: int = 0;
+  while (true) {
+    const r = withConnection(net, "127.0.0.1", port, milliseconds(5000), (s: Stream) => exchange(s, i, n));
+    if (r.isOk()) {
+      return r.unwrap();
+    }
+    const e = r.unwrapErr();
+    tries += 1;
+    if (e.kind != Reset || tries >= CONNECT_TRIES) {
+      return "connect: " + netErrorMessage(e);
+    }
   }
-  return r.unwrap();
 }
 
 function main(host: Host): void {
