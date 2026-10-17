@@ -53,7 +53,6 @@ function isStdlibModule(p: string): bool {
     "std:meta" => true,
     "std:metacore" => true,
     "std:metajson" => true,
-    "std:coreprobe" => true,
     _ => false,
   };
 }
@@ -61,13 +60,14 @@ function isStdlibModule(p: string): bool {
 // Std modules backed by the C runtime. `std:fsraw` is internal: the file primitives behind `std:fs`
 // (library/std/fs.or); only library code may import it. `std:clock` is internal too (`std:time` wraps it).
 // The two tables are disjoint: a module that is in both would resolve to the C runtime silently.
-@Ensures(result.isSome() ==> p.startsWith("std:") && !isStdlibModule(p) && p != "std:math")
+@Ensures(result.isSome() ==> p.startsWith("std:") && !isStdlibModule(p) && p != "std:math" && p != "std:coreprobe")
 function runtimeModule(p: string): Option<StdModule> {
   return match (p) {
     "std:fsraw" => Some(StdFs),
     "std:process" => Some(StdProcess),
     "std:io" => Some(StdIo),
     "std:clock" => Some(StdClock),
+    "std:core" => Some(StdCore),
     _ => None,
   };
 }
@@ -114,6 +114,7 @@ export class ImportResolver {
   @Ensures(result.isOk() ==> result.unwrap().std.isNone() ==> isNormalized(result.unwrap().path))
   @Ensures(result.isOk() && result.unwrap().std.isSome() ==> p.startsWith("std:"))
   @Ensures(p == "std:fsraw" && !importer.startsWith("$") ==> result.isErr())
+  @Ensures(p == "std:core" && !importer.startsWith("$rt/") ==> result.isErr())
   @Ensures(p.startsWith("$") ==> result.isOk() && result.unwrap().path == normalizePath(p))
   @Ensures(result.isErr()
       ==> result.unwrapErr().code == "E0301" || result.unwrapErr().code == "E0302")
@@ -124,6 +125,10 @@ export class ImportResolver {
       // The implicit import of a prelude root's entry file (added to the program's entry file by the loader).
       return Ok(Resolved { std: None, path: normalizePath(p) });
     }
+    if (p == "std:coreprobe") {
+      // std:coreprobe is the self-test of the core operations (runtime/core/coreprobe.or, part of the embedded `$rt` root), loaded on demand.
+      return Ok(Resolved { std: None, path: "$rt/coreprobe.or" });
+    }
     if (p == "std:math") {
       // std:math is Orin code (library/collections/math.or, part of the embedded `$array` prelude root), loaded on demand.
       return Ok(Resolved { std: None, path: "$array/math.or" });
@@ -133,7 +138,7 @@ export class ImportResolver {
         return Ok(Resolved { std: None, path: `$stdlib/${p.substring(4, p.length)}.or` });
       }
       const m = runtimeModule(p);
-      if (m.isNone() || p == "std:fsraw" && !importer.startsWith("$")) {
+      if (m.isNone() || p == "std:fsraw" && !importer.startsWith("$") || p == "std:core" && !importer.startsWith("$rt/")) {
         return Err(unknownStd(p, sp));
       }
       return Ok(Resolved { std: m, path: "" });

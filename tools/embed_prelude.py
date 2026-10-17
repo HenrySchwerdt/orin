@@ -23,6 +23,7 @@ PRELUDES = [
     ("library/core", "$std", "compiler/loader/embedded_std.or", "embeddedStdFiles"),
     ("library/collections", "$array", "compiler/loader/embedded_array.or", "embeddedArrayFiles"),
     ("library/std", "$stdlib", "compiler/loader/embedded_stdlib.or", "embeddedStdlibFiles"),
+    ("runtime/core", "$rt", "compiler/loader/embedded_rt.or", "embeddedRtFiles"),
 ]
 
 
