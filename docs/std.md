@@ -2,7 +2,7 @@
 
 Status of the std modules of ADR-0016 (spec 08). Every public function has a doc comment in its
 source with signature, errors/absence, behaviour and complexity (the spec 08 validation rule); this
-page is the map. `orin mcp` `inspect` answers `std:path.join`, `std:json.parse`, ... from its built-in
+page is the map. `orin mcp` `inspect` answers `std:path.join`, `std:json/legacy.parse`, `std:json.parseDocument`, ... from its built-in
 API table (`compiler/mcp/apitable.or`).
 
 | Module | Implemented in | Status |
@@ -11,7 +11,7 @@ API table (`compiler/mcp/apitable.or`).
 | `std:fs` | Orin, `library/std/fs.or` (scope API) over C runtime primitives (`std:fsraw`, internal) | done; takes an `FsGrant` first (ADR-0027), **unstable** until the owner confirms the I/O freeze (ADR-0016); resources and streaming: ADR-0025 |
 | `std:process`, `std:io` | C runtime built-ins (`runtime/core/orin_runtime*.c/.h`) | done; `args`, `shell`, `readLine`, ... take a `ProcessGrant` / `StdioGrant` first (ADR-0027), **unstable** |
 | `std:path` | Orin, `library/std/path.or` | done (POSIX, lexical) |
-| `std:json` | Orin, `library/std/json.or` | done, **integers only** |
+| `std:json` | Orin, `library/std/json.or` (+ `json/number.or`, `json/decode.or`, `json/legacy.or`) | done (ADR-0048 section 7.1): exact bounded `JsonValue`, `std:json/number`, `std:json/decode`; the integer-only `Json` is `std:json/legacy` (deprecated) |
 | `std:time` | Orin, `library/std/time.or` + clock-read built-ins | wall/monotonic clocks, checked elapsed/deadline helpers, durations and UTC calendar; no `sleep`; **unstable** (ADR-0027); [monotonic API](std-time-monotonic.md) |
 | `std:graph` | Orin, `library/std/graph.or` | `class Graph<T>` with generational, tagged `GraphId<T>` (ADR-0026) |
 | `std:bytes` | Orin, `library/std/bytes.or` | `Bytes`, `ByteBuilder`, `ByteReader`; provable-std layer 1 (ADR-0030), contract standard |
@@ -38,7 +38,7 @@ API table (`compiler/mcp/apitable.or`).
 `compiler/loader/embedded_stdlib.or`; run it after editing `library/std/`, `tools/bootstrap.sh` checks it).
 It is a *library root* (`PreludeRoot` with an empty `entry`): its files are served from memory under
 `$stdlib/<name>.or` but, unlike `library/core/` and `library/collections/`, **not** imported implicitly. The loader maps
-`import ... from "std:path"` (also `std:json`, `std:time`, `std:graph`, `std:test`, `std:bytes`, `std:utf8`, `std:url`, `std:collections`, `std:http`, `std:seq`, `std:net`, `std:text`, `std:html`, `std:meta`) to the unit `$stdlib/path`.
+`import ... from "std:path"` (also `std:json` and its submodules `std:json/number`, `std:json/decode`, `std:json/legacy`, which live in `library/std/json/`; `std:time`, `std:graph`, `std:test`, `std:bytes`, `std:utf8`, `std:url`, `std:collections`, `std:http`, `std:seq`, `std:net`, `std:text`, `std:html`, `std:meta`) to the unit `$stdlib/path`.
 Programs that do not import a module pay nothing for it, and the leading `$` makes unused functions of
 imported modules disappear in `compiler/opt/prune.or`. The sources use the full language (generics,
 records, closures); only the compiler itself has to stay Orin-B. Type names in diagnostics show the
@@ -129,7 +129,9 @@ leading `..` of relative paths kept, trailing `/` kept), `dirname(p)`, `basename
 (`".txt"`; `""` for `.bashrc`, `..`, no dot), `stem(p)`, `withExtension(p, ext)`, `isAbsolute(p)`,
 `resolveAgainst(base, p)`.
 
-## std:json (integers only)
+## std:json/legacy (integers only, deprecated)
+
+The integer-only model, moved from `std:json` by ADR-0048 section 7.1. New code uses `std:json` (below); `toValue(j): JsonValue` and `fromValue(v): Result<Json, NumberError>` cross between the two.
 
 ```
 type Json = JNull | JBool(bool) | JNum(int) | JStr(string) | JArr(Json[]) | JObj(JField[])
@@ -138,9 +140,9 @@ type JsonError = { message: string; offset: usize; line: usize; column: usize } 
 ```
 
 `parse(text): Result<Json, JsonError>`, `stringify(j): string` (compact), `pretty(j, indent: usize): string`,
-`quote(s)`, `formatError(e)` ("line L, column C: message"); builders `field(key, value)`; accessors (all
-total, `None` on a wrong kind/missing key): `get`, `at`, `path`, `keys`, `asString`, `asInt`, `asBool`,
-`asArray`, `asObject`, `isNull`, `getString`, `getInt`, `getBool`, `getArray`.
+`quote(s)`, `jsonErrorMessage(e)` ("line L, column C: message"; `formatError` is a deprecated alias); builders `field(key, value)`; accessors (all
+total, `None` on a wrong kind/missing key): `get`, `getIndex`, `getPath`, `keys`, `asString`, `asInt`, `asBool`,
+`asArray`, `asObject`, `isNull`, `getString`, `getInt`, `getBool`, `getArray` (`at` and `path` are deprecated aliases of `getIndex` and `getPath`).
 
 Rules: integers in -(2^63-1)..2^63-1 only; `1.5` / `1e3` are errors ("floats are not supported yet") until
 floats exist; nesting > 200 is an error; `\uXXXX` and surrogate pairs decode to UTF-8 (lone surrogate ->
@@ -926,21 +928,19 @@ function main(host: Host): void {
 Strict byte-based Hex, Base64 and Base64URL codecs with explicit padding policy
 and structured errors containing byte offsets. See [API, errors and complexity](std-encoding.md).
 
-## std:jsonnumber
+## std:json
 
-Exact validated JSON numeric tokens and checked decimal/exponent-to-int conversion,
-with full i64 preservation and structured errors. Separate from legacy std:json;
-see [API, bounds and validation](std-jsonnumber.md).
+Bounded JSON documents (`JsonValue`, `parseDocument`, `writeDocument`, `defaultLimits`, `defaultReadOptions`,
+`jsonParseErrorMessage`, `jsonWriteErrorMessage`) with exact numbers, ordered members, an explicit duplicate
+policy, strict Unicode and per-call budgets. See [API, limits and errors](std-json.md).
 
-## std:jsonvalue
+## std:json/number
 
-Opt-in bounded JSON document parser and compact writer, with exact std:jsonnumber
-tokens, ordered members, explicit duplicate policy, strict Unicode and per-call
-budgets. Legacy std:json is unchanged. See [API, limits and errors](std-jsonvalue.md).
+Exact validated JSON numeric tokens and checked decimal/exponent-to-int conversion, with full i64
+preservation and structured errors. See [API, bounds and validation](std-json-number.md).
 
-## std:jsondecode
+## std:json/decode
 
-Pure field-path validation over bounded JsonValue trees: sealed cursors, exact
-integer ranges, absent/null distinction, explicit unknown-field policy, and
-structural JSON Pointer errors. See [API, ordering and complexity](std-jsondecode.md)
-and the [config example](../examples/json_config.or).
+Pure field-path validation over bounded `JsonValue` trees: sealed cursors, exact integer ranges, absent/null
+distinction, explicit unknown-field policy, structural JSON Pointer errors and `decodeErrorMessage`. See
+[API, ordering and complexity](std-json-decode.md) and the [config example](../examples/json_config.or).
