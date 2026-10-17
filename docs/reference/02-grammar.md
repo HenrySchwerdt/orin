@@ -49,7 +49,7 @@ function    = 'function' IDENT [ typeParams ] '(' [ params ] ')' [ ':' type ] bl
 params      = param { ',' param } [ ',' ] ;
 param       = IDENT ':' type ;
 typeParams  = '<' typeParam { ',' typeParam } '>' ;
-typeParam   = IDENT [ 'extends' IDENT ] ;             (* bound: functions and classes only; one bound *)
+typeParam   = IDENT [ 'extends' IDENT { '&' IDENT } ] ;  (* bounds: functions, classes and their methods; not on a type *)
 
 typeDecl    = 'type' IDENT [ plainParams ] '=' typeBody ';' ;
 plainParams = '<' IDENT { ',' IDENT } '>' ;
@@ -92,11 +92,12 @@ elements, record fields, variant payloads, name lists, match arms); a leading or
   `tests/parse_edge/err0200_fn_expr.or`, `tests/parse_edge/err0200_fn_param_trailing_comma_ok_then_bad.or`, `tests/parse_edge/err0200_fn_no_body.or`,
   `tests/parse_edge/err0200_fn_param_leading_comma.or`, `tests/parse_edge/ok_return_forms.or`.
 
-**GRM-5.** A type parameter takes at most one bound (`T extends I`); `T extends A & B` is E0408. A bound is allowed on a
-generic function and on a generic class only; on a `type` or a method it is E0408. A method may have type parameters
-(syntax only: generic methods are a pending feature, see the README).
-- Tests: `tests/next/errors/e0408_multiple_bounds.or`, `tests/next/errors/e0408_bound_on_generic_type.or`,
-  `tests/next/run/genclass_bounds.or`, `tests/next/run/iface_static_bound_sum.or`.
+**GRM-5.** A type parameter takes a list of bounds joined with `&` (`T extends I`, `T extends Ord & Hash`); the list is written once, after
+`extends`, and each bound is an identifier. A bound list is allowed on a generic function, on a generic class and on a generic method; on a
+`type` it is E0408. The same bound twice in one list is E0304.
+- Tests: `tests/next/run/multi_bounds_ord_hash.or`, `tests/next/run/multi_bounds_methods.or`, `tests/fmt/bounds.in.or`,
+  `tests/next/errors/e0408_bound_on_generic_type.or`, `tests/next/errors/e0408_bound_on_type_alias_multi.or`,
+  `tests/next/errors/e0304_duplicate_bound.or`, `tests/next/run/genclass_bounds.or`, `tests/next/run/iface_static_bound_sum.or`.
 
 **GRM-6.** In a class body `public`, `private` and `static` are modifiers only when an identifier follows them (a field
 or method may still be named `static`). A field has a type and an optional initialiser; a static field is E0408.

@@ -25,7 +25,7 @@ import {
   ClassInfo, MethodInfo, ValEnt, Inst, mapOrigin, parOrigin, mapGenType, isMapKeyType, EntRecord, EntUnion,
   EntAlias, EntGen, EntIface, EntBuiltin, typeEq, isBool, isString, isVoid, isIntish, isFloatTy,
   isArrayTy, isIface, isSignedInt, isFn, showType, mismatch, globalVal, findType, findVal, originOf,
-  boundOf, ifaceMethodIndex, IfaceSig, typeInRange, isWellFormedEnv, CmOld, CmEnsures, sameContractMode, inContract,
+  boundsOf, ifaceMethodIndex, IfaceSig, typeInRange, isWellFormedEnv, CmOld, CmEnsures, sameContractMode, inContract,
   isEnsuresMode, isOldMode, isMutRetMode, isUnit, isRecordKind, isNamespaceName, nsShadowErr, nsValueErr,
 } from "./env";
 import { checkBounds, internVtable } from "./ifaces";
@@ -1186,14 +1186,20 @@ export class ExprChecker {
           }
         }
         if (!isMethod) {
-          const bd = boundOf(env, r);
-          if (bd.isSome()) {
-            const info = env.ifaces[bd.unwrap()];
-            const so = ifaceMethodIndex(info, tag.name);
-            if (so.isNone()) {
+          const bds = boundsOf(env, r);
+          if (bds.length > 0) {
+            // the first bound that declares the member (a conflict between bounds is reported at the declaration, E0477)
+            let found: Option<IfaceSig> = None;
+            for (const bi of bds) {
+              const so = ifaceMethodIndex(env.ifaces[bi], tag.name);
+              if (so.isSome() && found.isNone()) {
+                found = Some(env.ifaces[bi].methods[so.unwrap()]);
+              }
+            }
+            if (found.isNone()) {
               return Err(noMethod);
             }
-            sig = Some(this.oxSigOfIface(info.methods[so.unwrap()]));
+            sig = Some(this.oxSigOfIface(found.unwrap()));
           } else if (recordHasFnField(env.records[r].fields, tag.name)) {
             return Err(notMethod);
           } else {
@@ -3394,9 +3400,19 @@ export class ExprChecker {
               return this.classMethodCall(span, base, b0, co.unwrap(), name, explicit, args, exp);
             }
           }
-          const bd = boundOf(this.fx.env, r);
-          if (bd.isSome()) {
-            return this.ifaceCall(b0, span, bd.unwrap(), name, args);
+          const bds = boundsOf(this.fx.env, r);
+          if (bds.length > 0) {
+            // `T extends A & B`: the call goes to the first bound that declares the method (E0477 rules out bounds that
+            // disagree on its signature); a method no bound declares is reported against the first bound
+            let target = bds[0];
+            let hit = false;
+            for (const bi of bds) {
+              if (!hit && ifaceMethodIndex(this.fx.env.ifaces[bi], n).isSome()) {
+                target = bi;
+                hit = true;
+              }
+            }
+            return this.ifaceCall(b0, span, target, name, args);
           }
           if (recordHasFnField(this.fx.env.records[r].fields, n)) {
             return this.callFieldValue(b0, span, r, name, args);
