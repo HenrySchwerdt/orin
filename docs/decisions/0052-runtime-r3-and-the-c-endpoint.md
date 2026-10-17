@@ -240,3 +240,250 @@ Each assumption is a separate commit (R3d.0) and can be reverted alone if the ow
    R3a behaviour only for a failed allocation.
 6. **Order against R3c.** R3d does not need R3c; both touch the C shells and the snapshot rule. Recommend R3c first if nearly done, else R3d.0-R3d.2
    in parallel and R3d.3 after it.
+
+## Addendum B: R3e design (task interface)
+
+Status: proposed (2026-10-17). Design only; no code. Structure and depth follow Addendum A. *(inference)* marks a conclusion from the code, not
+something the code states. Basis: `origin/main` d0a17a96 (R3d.5 done) plus the open concurrency work, read from its branches (PR number to head
+branch by `gh api repos/henryschwerdt/orin/pulls/N`): #175 `claude/project-thread-5wtl8u-c4` (C4), #187 `...-c3` (C3, base c4), #189 `...-c5`
+(C5, base c3), #184 `...-gm` (ADR-0040), #191 `claude/adr0048-fs`. What each means for R3e is in section 7. Open questions: section 8.
+
+### 1. What moves to Orin, what stays C
+
+The interface is the "tasks and transfer" section of `runtime/core/orin_runtime.c` (about 580 lines to the end of the file on main; ADR-0017 counts
+342 code lines) plus the grant flight table. Destination modules are new files of the `$rt` root (`runtime/core/*.or`), one per step of section 5.
+
+| C today (`orin_runtime.c`) | Orin (`$rt`) | Needs from outside Orin |
+|---|---|---|
+| `orin_mon_*` (11 forwarders: new, free, lock, unlock, wait, wait_until, notify_all, notify_one, get, set, grow) and `mon_check` | `sync.or`: one `@Inline` function per op, a `plat` call plus the failure test | L0 `orin_platform_monitor_*` |
+| `orin_rt_transfer_put/take/drop/count`, `tr_publish/claim_kind/is_lend` (slot table, generation tokens), `graph_unique`, `copy_node`, `deep_copy` | `transfer.or` | `runtime_lock/unlock`; the shared block (2.3) |
+| `orin_rt_lend`, `lend_put/lend_end`, `pin_*`, `orin_rt_par_threads` | `lend.or` | `thread_id`, `cpu_count`, `getenv`, runtime lock |
+| `orin_rt_task_spawn/join/message/watch`, `RtTask`, `task_main`, `task_signal_done`, `task_trap`, `orin_rt_heap_exit`, `orin_rt_trap_str`, **`orin_trap`** | `task.or` | `thread_create/join/exit`, monitors (done signal), `write_line`, `exit` |
+| `orin_cap_clone/move/adopt_*` and the flight table `g_gf` (plus `orin_cap_adopt_net/stream` of C4) | `cap.or`, **only after R3c** (step R3e.5) | the `Grant` table, which is still C |
+
+**Stays in `runtime/core/` C until R3c or R3f, reached from Orin through `hook`:** the grant table and policy (`grant_new/ref/copy_into`,
+`orin_cap_revoke`), the file table (`files_at_exit`), the per-task net buffer of C4 (`t_netbuf`), the allocation-site census tables, `orin_init`,
+`orin_flush`. They are R3c shells; R3e must not port half of them. `orin_rt_heap_exit` reaches them through new hooks (2.2).
+
+**Stays in L0 (`runtime/platform`, C, no change in R3e):**
+
+- thread create/join/exit/id with the handle registry (`g_reg`, generation-checked), `pthread_exit` and the release of monitors held by an exiting
+  thread (this is the trap unwinding, 6.3), the thread-local `t_tid` and the atomic `g_next_tid`;
+- monitors: mutex, two condition variables, integer words, the atomic `owner`, `wait_until` on `CLOCK_MONOTONIC`; the runtime lock `g_rt` and the stdout
+  lock `g_io`;
+- everything that needs libc or the kernel: `getenv`, `cpu_count`, `write_line`, `exit`, `alloc/free/realloc/mem_*`, and (after #187) the wake sources
+  (`eventfd`/pipe, `poll`, the thread-local binding).
+
+**The exact L0 primitive set R3e calls** (20 functions, all existing; each is one case of the `plat` operation, 2.1; signatures as in `orin_platform.h`):
+
+| group | functions |
+|---|---|
+| threads (4) | `thread_create(entry, arg)`, `thread_join(h, &arg)`, `thread_exit()`, `thread_id()` |
+| monitors (10) | `monitor_new/free/lock/unlock/wait/wait_until/notify/get/set/grow` |
+| process (6) | `runtime_lock`, `runtime_unlock`, `cpu_count`, `getenv`, `write_line(fd, buf, n)`, `exit(code)` |
+
+No atomic, no TLS and no signal primitive is added: Orin code takes shared state only under the runtime lock or a monitor, and the thread-local state
+is the heap block (2.4). **Budget (ADR-0054): R3e adds 0 code lines to L0.** L0 is 1,036 of 1,400 on main (measured with the `tools/verify_platform.sh`
+method) and 1,163 after #187 (its Addendum D: +127), so 237 stay reserved for the scheduler and the Windows backend. The variant of Q3 (setjmp/longjmp
+instead of `pthread_exit`) would cost about +10 lines. What leaves the trusted C is about 580 lines of `orin_runtime.c` (the forwarders and the whole
+transfer and task code), none of it L0, so the TCB figure in tcb.md falls by that much at R3e.6. Every L0 function R3e calls already has its contract
+and its executable test; no L0 test is added.
+
+### 2. Core operations and hooks
+
+#### 2.1 Three new operations (`BCore(k)`, `compiler/hir/coreops.or`, 28..30; E0301 outside `$rt/`, negative tests as in R3d.0)
+
+| new op | C / LLVM | semantics and safety rule |
+|---|---|---|
+| `plat(k, a, b, c)` -> usize (28) | a direct call of `orin_platform_<name>(a, b, c)` / `call @orin_platform_<name>` | `k` indexes a **closed table** of the 20 functions above and must be a literal (a non-literal `k` is a compile error, so there is no computed call). Arguments are words, pointers are addresses (`thread_join`'s `void **` is the address of a word of the heap block). Void functions give 0, the others their `int` / `int64_t` result as usize. **Not pure**, may write any memory, may not return (`thread_exit`, `exit`). The table is the "calls to L0 functions by declaration" of the core dialect list above; it replaces the L0-shaped hooks of R3d.5 (`HK_LOCK`, `HK_UNLOCK`, `HK_GETENV`, `HK_WRITE_LINE`) |
+| `fnAddr(k)` -> usize (29) | `(uint64_t)(uintptr_t)&orin_rt_task_main` / `ptrtoint ptr @orin_rt_task_main` | the address of the C-ABI wrapper (the `RtWrap` machinery of `mir/rt.or`) of the entry `k`, a literal; only entries of type `void(void *)` qualify (one today: the task entry). Needed because `thread_create` takes a C function pointer and a core module has no function-pointer type. Pure |
+| `sharedBase()` -> usize (30) | `extern uint64_t orin_shared[128]` / `@orin_shared = global [128 x i64]` | the address of the process-wide zero-initialised block of 128 words (1,024 bytes), the shared counterpart of `heapBase()`. Layout in 2.3. Executables only, like `heapBase`. Pure (an address) |
+
+**Considered and not needed:** an atomic or compare-and-swap operation (all cross-thread state is under the runtime lock or a monitor; the one CAS
+table of the runtime, `char_string` in C, belongs to R3f); an indirect-call operation (the task entry calls its closure as an Orin value,
+`const b: TaskBox = take(tok); b.f();`, the way `std:task` builds the box with `putBox`); a function-address operation for arbitrary functions.
+
+#### 2.2 Hooks (`orin_core_hook`, the `HK_*` constants of `runtime/core/heap.or`: C services that are not L0)
+
+Added: `HK_REVOKE_GRANTS` (12, revoke every live grant of this task: the loop of `orin_rt_heap_exit`), `HK_CLOSE_FILES` (13, `files_at_exit`),
+`HK_FREE_NETBUF` (14, C4's `t_netbuf`), `HK_SITE_FOLD` (15, `site_fold`, census builds only). `HK_FOLD_STATS` and `HK_FOLD_LIVE` stay (the totals live in
+C until R3f). The four L0-shaped hooks are removed once `plat` replaces them (R3e.1). Each remaining hook disappears with the shell it serves (R3c, R3f).
+
+#### 2.3 The shared block `orin_shared` (word offsets pinned by `_Static_assert`s and named constants in `task.or`)
+
+| words | content (read and written only between `plat(RUNTIME_LOCK)` and `plat(RUNTIME_UNLOCK)`) |
+|---:|---|
+| 0..3 | transfer slot table: pointer, `n`, `cap`, free head (`g_tr*`) |
+| 4..7 | grant flight table: pointer, `n`, `cap`, free head (`g_gf*`, step R3e.5) |
+| 8..63 | reserved |
+| 64..127 | line buffer of the process trap (512 bytes; used only by the main thread, which is about to exit, so it needs no lock; the trap path allocates nothing) |
+
+`orin_shared` is defined in `orin_runtime.c` like `orin_heap` and listed in `bootstrap/seed/runtime/core-only-symbols.txt`; R3f makes the backends emit it.
+
+#### 2.4 Per-task state in the heap block (the reserved bytes 336..503 of Addendum A section 5; the block size does not change)
+
+| offset | field | was |
+|---:|---|---|
+| 336 | `task`: address of the `RtTask` record, 0 on a thread that is not a task | `t_task` |
+| 344 | `joined`: record of the task joined last by this thread (`taskMessage` reads its message; freed at the next join and at heap exit) | `t_joined_msg[481]` |
+| 352 / 360 | `grants`, `files`: pointers reserved for R3c | `g_grants`, `g_files` |
+| 368 | `netbuf` | `t_netbuf` (C4) |
+| 376 | scratch word (the out-parameter of `thread_join`) | |
+
+`RtTask` is 512 bytes of raw memory from `memAlloc` (never the small-block cache: the joiner frees it on another thread): `tok`@0, `trapped`@8,
+`done_mon`@16, message@24 (480 bytes and a NUL).
+
+### 3. How `BTask(k)` lowers
+
+`BTask(k)` stays one builtin through HIR and MIR: names, result kinds, opener/closer rules (`taskOpRet/OpensFrom/Adopts/Moves`), the MIR verifier
+and OSIG do not change. Only the two backends change, exactly as `l1Builtin` did for `BArrSlice` in R3d.4: `compiler/mir/rt.or` gets the entries
+30.. and `l1Task(k): Option<usize>`; a backend emits a call of the Orin function when the program has the entry (`rtIds`), else the old call
+`taskOpC(k)`. Reference operands and results are words (`transitPut` takes the box address, `transitTake` returns the owned object address; no
+count changes at the call). `opt/prune.or` keeps the entry that a live `BTask(k)` implies (`rtImplied`). The C name column is the fallback of the
+legacy world and the seed (section 4). `taskops.or` gains a third table (`entry`) beside `names()` and `cnames()`.
+
+| k | op | C name (fallback, test wrapper) | `$rt` entry | step |
+|---|---|---|---|---|
+| 0..8, 23, 27 | monNew .. monGrow, monNotifyOne, monWaitUntil | `orin_mon_*` | `sync.monNew` .. `sync.monWaitUntil` (`@Inline`) | R3e.1 |
+| 24 | arrayWithCapacity | `orin_array_new` | the existing `RT_ARRAY_NEW` (a call of its wrapper today) | R3e.1 |
+| 9, 10, 11, 16 | transitPut, transitTake, transitDrop, transferCount | `orin_rt_transfer_*` | `transfer.put/take/drop/count` | R3e.2 |
+| 25, 26 | lendPut, parThreads | `orin_rt_lend`, `orin_rt_par_threads` | `lend.put`, `task.parThreads` | R3e.3 |
+| 12, 13, 14, 28, 15 | taskSpawn, taskJoin, taskMessage, taskWatch, taskTrap | `orin_rt_task_*`, `orin_rt_trap_str` | `task.spawn/join/message/watch`, `task.trapStr` | R3e.4 |
+| 17..22, 29, 30 | grantClone, grantMove, grantAdopt* (Fs, Process, Stdio, Clock, Net, Stream) | `orin_cap_*` | `cap.clone/move/adopt` | R3e.5 (needs R3c) |
+| 31..36 | wakeOpen .. wakeCheck (#187) | `orin_platform_wake_*` | none: they stay direct L0 calls | - |
+
+New entries (numbers from 30 in `rtNames`): the 11 `sync` ops, `transfer.put/take/drop/count`, `lend.put`, `task.spawn/join/message/watch/trapStr/
+parThreads`, `task.main` (the thread entry, kept alive by a live `taskSpawn`), `task.trap` (the C name `orin_trap`: wrapper always emitted, called by
+the C shells and by every emitted trap) and `task.heapRetire` (the C name `orin_rt_heap_exit`, called by `task.main` and `task.trap`).
+**Wrappers for C callers.** After R3e the only C that calls these names are the unit tests (`runtime/core/tests/task_test.c`, `runtime_test.c`, which
+link the stub of `tools/rt_stub.sh`) and, until R3c, the C shells that trap. `rtAlways` must not pull the whole task code into every program:
+only `orin_trap` and `task.main` (when spawn is live) are always wrapped; the test wrappers (`orin_rt_*`, `orin_mon_*`) are emitted only when the stub
+is compiled with a new driver flag `--rt-wrappers`, set by `tools/rt_stub.sh` (Q4).
+
+### 4. Seed and legacy world
+
+- **The frozen snapshot keeps the C versions.** `bootstrap/seed/runtime/orin_runtime.c` holds the whole C tasks section as of 4d5eeee (plus the
+  additive exceptions of its README). Stage 0 and stage 1 and the `--c-builtins` programs call the C names, so R3e touches the snapshot only for
+  the additive exceptions below. Each R3e step deletes its C from the **live** runtime at once (as R3d did); the snapshot is the oracle.
+- **What #191 changed.** `tools/update_seed.sh` now builds the seed with `--c-builtins` ("stage 0 and stage 1 link the frozen runtime snapshot").
+  Then the R3d.7 refresh does not make the seed independent of the C task code: a seed built that way calls `orin_rt_*`, `orin_mon_*` and `orin_cap_*` by
+  their C names. The snapshot (with the task section) must survive until a seed is produced **without** `--c-builtins` by a compiler that has R3e
+  (step R3e.7), and, for the legacy world of the differential, until R3f. This corrects Addendum A section 4 ("(2) R3e removes `orin_rt_*`"):
+  R3e removes them from the *live* runtime only.
+- **The platform file is shared between the worlds** (`tools/runtime-sources.txt`: both list `runtime/platform/orin_platform.c`). R3e does not change
+  L0, so this holds; a later L0 change must keep every function the snapshot calls.
+- **Additive edits the snapshot needs from the stack** (the stack's duty, listed so it is not forgotten). #175 adds `orin_cap_adopt_net/stream`, the
+  `GK_NET` branch of `orin_cap_clone` and the thread-local net buffer to the live runtime but touches no snapshot file on its branch; it was cut
+  before `tools/check_seed_runtime.sh` existed, which fails until they are copied verbatim. #184 changes the live `orin_rt_transfer_put` to accept a
+  box of 0 slots (void task results); `tests/next/run/task_void_*` under `--c-builtins` needs the same edit in the snapshot. R3e.2 ports the post-#184
+  behaviour (`nslots <= 1`).
+- **`tools/check_seed_runtime.sh`** compares the external symbols of the C files of each world. R3e deletes live symbols (allowed) and adds exactly
+  one, `orin_shared`, which goes into `core-only-symbols.txt` (`orin_heap`, `orin_oom`, `orin_core_hook` are there). Wrappers are emitted code, not
+  runtime symbols, so they never appear. Any other new live C symbol is a design violation.
+- **Oracle.** `tools/differential.sh --mode builtins` (new world against legacy world) on every task test: stdout, exit status and `ORIN_STATS`
+  (`tasks_spawned`, `transfer_moves`, `transfer_copies`, `live_objs_at_exit`) must be identical.
+
+### 5. Steps, gates and benchmarks
+
+Gate for every step (Addendum A section 5, plus the task suites): `stage2.c == stage3.c` for both backends and `tools/llvm_fixpoint.sh`; conformance and
+`differential.sh` (all modes, `--sanitize`, `--c-builtins`); `tools/test_concurrency.sh` in full (task_test.c plain, **TSan**, ASan + UBSan; every
+`tests/concurrency/*.or` plain, TSan, ASan + UBSan, no live object at exit); `tools/test_parallel.sh`; `tools/test_net.sh` (after #175);
+`tools/verify_platform.sh` (size unchanged, platform tests under TSan); `tools/check_seed_runtime.sh`; the `ORIN_STATS=1` counters of every `bench/`
+program identical.
+
+**Budget rule.** Per step at most +1 % executed instructions on the LLVM backend and below +2 % on the C backend, on every benchmark that
+`tools/bench.py` counts (valgrind). R3e touches code that a program without tasks never runs, so the expected change there is 0.00 % (unused entries
+are pruned). `bench/tasks`, `bench/parallel_collatz` and `bench/streams_parallel` cannot be counted (valgrind serialises threads; `bench/tasks/
+instructions.skip` says so). They get **user-mode instructions from `perf stat -e instructions:u` where the host has the counter** (same thresholds),
+else the median of 9 interleaved runs of wall time: at most +5 % for the channel parts (ping-pong 3.7 us per message and throughput 1.5 us per
+message are futex-bound) and +10 % for spawn/join (83 us, thread creation dominates). Reference numbers: docs/concurrency.md "Measurements".
+
+| step | content (one PR each) | extra tests and benchmarks | risk |
+|---|---|---|---|
+| R3e.0 | `plat`, `fnAddr`, `sharedBase` in `coreops.or` and both backends; `orin_shared` (C definition, core-only list); heap block offsets 336..376 with `_Static_assert`s; `rt.or` entries 30.., `l1Task`, prune roots, `--rt-wrappers`; E0301 negative tests (user file, `$std` file importing the ops, non-literal `k`, unknown `k`); a probe function per op in `coreprobe.or`. No emitted-code change for normal programs | self-compile output byte-identical; `tests/run/core_ops.or` extended; the lint of 6.2 over the L0 declarations; the `clang -fsanitize=thread x.ll` experiment of 6.1 | low |
+| R3e.1 | `sync.or` (11 monitor ops); k=24 to `RT_ARRAY_NEW`; the four L0-shaped hooks replaced by `plat` | `bench/tasks` (all three parts), `timed_waits.or`, `select`, `stress_*`; the monitor checks of task_test.c through test wrappers; expect slightly fewer instructions (the forwarder call is gone) | low |
+| R3e.2 | `transfer.or`: slot table, tokens, `graph_unique`, deep copy, move-or-copy, counters, box-once path, void box (#184) | `move_counts.or`, `stress_messages.or`, `par_pipelines`, task_test.c (200,000-deep chain, immortals, pinned objects), copying 1,000,000 ints and 100,000 strings as in the Measurements section, `task_void_*`; `ORIN_STATS` move/copy counts identical | medium: iterative walks over raw memory, `rc` sign tests |
+| R3e.3 | `lend.or`, `parThreads` | `tools/test_parallel.sh` (ORIN_THREADS 1..8, TSan at 2, 4, 8), `bench/parallel_collatz`, `bench/streams_parallel` | medium: pin bits, owner thread id in 30 bits |
+| R3e.4 | `task.or`: `RtTask`, spawn/main/join/message/watch, heap retire, `orin_trap` and `trapStr`, thread exit | `panic_chain`, `panic_many`, `timed_join_panic`, the 23,254-task stress, a new `trap_deep.or` (trap at depth in generated frames and in `$rt` frames, 10,000 tasks), `bench/tasks` spawn/join, a trap on the main thread (exit 101, stderr text identical), `tools/test_server_campaign.sh` (#189) | **highest**: trap unwinding, retire order, TSan |
+| R3e.5 | `cap.or`: clone/move/adopt, the flight table, `adopt_net/stream`, net buffer release. **Only when R3c has moved the grant table**; otherwise skipped, these stay C until R3c | `net_task_move.or`, `tools/test_net.sh` under TSan, the grant task tests | medium |
+| R3e.6 | delete the dead C from the live runtime (the tasks section, `t_task`, `g_tr*`, `g_gf*`, the four hooks); docs: concurrency.md porting table marked done, spec 19, progress, tcb.md | `verify_platform.sh`, `check_platform_boundary.sh`, every user of `tools/rt_stub.sh` | low |
+| R3e.7 | seed refresh without `--c-builtins` by an R3e compiler (`tools/update_seed.sh`): stage 0 and 1 no longer call C task names; the snapshot stays for the legacy world until R3f | bootstrap from the new seed; selfcompile | low |
+
+R3e.0 and R3e.1 can ship together if the result stays inside the budget; R3e.2 and R3e.3 are independent of each other. Every step reverts alone:
+`l1Task` falls back to the C name for an absent entry, and the step's C stays in the live runtime until R3e.6.
+
+### 6. Risks
+
+1. **TSan sees Orin code through the C backend only.** `tools/test_concurrency.sh` compiles the program with the C backend and `-fsanitize=thread`, so
+   the emitted `$rt` functions are ordinary instrumented C: the transfer code is checked as code, as the C runtime is today. The LLVM backend's `.ll` is
+   probably not instrumented *(inference: the instrumentation pass is driven by a per-function attribute that clang's front end adds and the LLVM
+   backend does not emit)*; that is already true of all emitted code, so R3e does not lower the evidence, but R3e.0 must run one
+   `clang -fsanitize=thread x.ll` experiment and record the result. Happens-before edges come only from L0 calls (mutex, condvar, `pthread_create/join`
+   are intercepted); `plat` must never become something TSan cannot see (no inline atomics, no `futex` calls from `$rt`). No TSan suppressions.
+2. **Memory ordering.** Shared Orin data is (a) the transfer and flight tables, touched only between `runtime_lock` and `runtime_unlock`; (b) `RtTask`,
+   written by the spawner before `thread_create` and by the task before it ends, read by the joiner after `thread_join`; (c) lent objects, pinned by
+   the owner before the workers start and restored after they are joined; (d) monitor words, under the monitor. All four get their ordering from
+   pthread operations in L0, which are opaque external calls. Requirements on the toolchain: a core `load`/`store` is never moved across a `plat`
+   call (the conservative effects of `coreops.or`: loads read mutable memory, stores and `plat` write it), and the L0 declarations in the LLVM
+   preamble and the C header never gain `readnone`/`readonly`/`argmemonly`/`const`/`pure` or `static inline` (a lint in R3e.0 over
+   `backends/llvm/runtime.or` and `orin_platform.h`; with LTO this would otherwise be silently wrong). No `__atomic` is used in R3e, so there is no
+   weaker-than-sequentially-consistent case to reason about. The "box once" shortcut of `transfer_put` relies on the sender's release being ordered
+   before the receiver's take by a monitor or a thread start; both are L0 calls, so the argument is unchanged and is restated in the Orin source.
+3. **Trap unwinding across Orin frames.** A task trap ends the task with `pthread_exit` (forced unwinding in glibc), which must walk every frame
+   between the trap and the thread entry, including generated code and now `$rt` frames. Today the same walk crosses generated C or LLVM frames, so the
+   unwind tables of both backends already work for `panic_chain` and `panic_many`; R3e adds frames of the same kind. New hazards: (a) an optimisation
+   or attribute that lets a caller of `task.trap` drop its unwind info (`nounwind`/`noreturn` on the LLVM declaration of the trap entry); (b)
+   `heapRetire` runs on the unwinding thread before `thread_exit` and must not itself trap (it allocates nothing; a failure inside it is
+   `plat(EXIT, 101)`); (c) the runtime lock is never held across a possible trap (the C code unlocks before `orin_trap` everywhere; the Orin code keeps
+   the rule and `trap_deep.or` pins it); (d) macOS arm64 uses compact unwind and is not run in CI (docs/windows.md, the release dry run): the probe must
+   run there once before R3e.4 merges. Fallback if a platform fails: Q3.
+4. **The trap path must not allocate or depend on the object model.** It runs when memory is exhausted (`orin_oom` -> `orin_trap`), from `$rt` code in
+   the middle of an allocation, and on the main thread for every checked failure of every program. Preallocated buffers only (2.3, 2.4), no strings, no
+   `rtCold` call.
+5. **Cost from inlining** (`@Inline` of 11 monitor operations into `std:task`: code size) and from `inttoptr` aliasing around transfer: the transfer
+   functions stay out of line; `bench/tasks` and `streams_parallel` decide (Addendum A section 3, "Costs to watch").
+6. **Conflicts with the concurrency stack.** `taskops.or` is edited by #175 (29, 30), #187 (31..36, count 37) and by every R3e step; `orin_runtime.c`
+   by #175, #184 and #191. R3e is written against main after they merge (section 9), never stacked on them.
+
+### 7. What the open PRs change for R3e
+
+| PR (head branch) | Touches the task interface | Consequence |
+|---|---|---|
+| #175 (`claude/project-thread-5wtl8u-c4`) | `taskops.or` 29, 30; `orin_cap_clone` accepts `GK_NET`, `orin_cap_move` rejects Host and Listener, `orin_cap_adopt_net/stream`; thread-local `t_netbuf` freed by `orin_rt_heap_exit`; `task_test.c` +145 lines; LLVM `declares` | the `cap` step grows by two adopters; `heapRetire` frees the net buffer through `HK_FREE_NETBUF`; the snapshot needs the same additive edits (section 4) |
+| #187 (`...-c3`, base c4) | L0 wake sources (+127 lines, 1,163 in all), `taskops.or` 31..36 as direct platform calls, `std:task` binds the scope token in `spawn`; no runtime C change | R3e leaves 31..36 alone; the L0 binding is thread-local and dies with the thread, so `task.main` needs no code for it; `taskOpCount` is 37 |
+| #189 (`...-c5`, base c3) | tests, campaign scripts, CI; no runtime change | `tools/test_server_campaign.sh` joins the gate of R3e.4 and R3e.5 (a server under TSan is the best task-trap and cancel stress there is) |
+| #184 (`...-gm`) | `orin_rt_transfer_put` accepts a box of 0 slots (void task results); no other runtime edit | R3e.2 ports `nslots <= 1`; `tests/next/run/task_void_*` join the transfer gate |
+| #191 (`claude/adr0048-fs`) | seed refresh built with `--c-builtins`; snapshot edited for `orin_fs_exists` / `listDir`; `update_seed.sh` | changes the seed story of section 4: R3d.7 and R3e.7 are both needed before the snapshot is unnecessary for bootstrap |
+
+### 8. Open questions for the project owner
+
+Working assumption until the owner answers: the recommendations below; each is a separate commit of the step it affects.
+
+1. **Reaching L0 from `$rt`.** Recommend the `plat(k, ...)` operation with a closed table (20 functions) over more `hook` numbers: a monitor operation is
+   on the channel hot path (`bench/tasks` 1.5 us per message) and a hook adds a call and a `switch` in C that R3f has to delete again, while `plat` is
+   the direct call that the core dialect list of this ADR promised. Hooks stay for the C-only services (grants, files, census) and die with them.
+2. **Shared process state.** Recommend the `sharedBase()` operation (no cost, like `heapBase`) over a hook that returns the address of a C static
+   (as `HK_FOLD_STATS` does). Both work; the operation needs no C file in R3f.
+3. **How a task thread ends on a trap.** Recommend keeping `pthread_exit` (no L0 change, behaviour identical) and gating R3e.4 on the `trap_deep.or`
+   probe, including one macOS arm64 run. If a platform fails it, add to L0 `task_run(entry, arg)` and `task_abort()` (setjmp in the thread frame,
+   longjmp to it, then the same monitor release; about +10 code lines with a contract and an executable test) and re-budget under ADR-0054.
+4. **Test wrappers.** Recommend `--rt-wrappers` (test-only C names, stub only) and moving the C unit tests to Orin `@Test`s in R3f, over wrapping every
+   task entry in every program (`rtAlways` would keep about 15 functions alive in every binary).
+5. **R3c versus R3e.5.** Recommend R3e.0..R3e.4 and R3e.6 without waiting for R3c, and R3e.5 (grants) only after R3c has put the grant and file tables
+   in Orin, so that `cap.or` reads them instead of hooking. If R3c slips, R3e.5 leaves the definition of "R3e done" and is tracked with R3c; the
+   1.0 roadmap (D8 gates on R3d/R3e merged) then reads "R3e.0-R3e.4".
+6. **C2 (trap-safe structured cleanup).** The roadmap asks for it "in Orin inside R3e". Recommend after R3e.6, as its own change on `task.or`: R3e is a
+   1:1 port whose oracle is identical counters and output against the legacy world, which a behaviour change (cancel and join the descendants of a
+   trapping parent) would destroy.
+7. **Measuring the task benchmarks.** Recommend `perf stat -e instructions:u` for the three task benchmarks with the thresholds of section 5, wall-time
+   medians as the fallback and no new valgrind mode. Confirm that the budget rule (+1 % LLVM, below +2 % C per step) applies to them.
+8. **LLVM and ThreadSanitizer.** Recommend only recording the R3e.0 experiment and not building an instrumented LLVM mode in R3e (it needs
+   `sanitize_thread` attributes in the backend); decide that separately.
+
+### 9. Ordering
+
+R3e code starts only after (1) the concurrency PR stack #175, #187 and #189 and the independent #184, and (2) #191, are merged to main, and (3) after
+R3d.7 (the seed refresh). R3e rewrites the lines those changes edit (`taskops.or`, the C tasks section, the snapshot, `update_seed.sh`), and the
+tables of this addendum must be re-derived from the merged tree before R3e.0 (`taskOpCount` 37, L0 at 1,163 lines). R3d.6 (the C preamble in place of
+the header inlines) should be in too, since both edit `backends/c/function.or` *(recommendation, not a dependency)*. R3c precedes R3e.5 only. Until
+then this addendum is the only R3e change: nothing in `runtime/`, `compiler/` or `tools/` moves.
