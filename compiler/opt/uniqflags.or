@@ -1,0 +1,604 @@
+// Unique receivers and results across calls (ADR-0038 addendum, lever 2, step T5; MIR v2.7, rules U2-U5).
+//
+// The pass sets the two `MFunction` flags by optimistic assumption and retraction, then adds the `makeunique` that the
+// accepted flags need at call sites:
+//   - `unique-in`  (candidate: an in/out function that starts by making its receiver Unique): the receiver, local 0, is
+//     Unique on entry, so the callee's own `makeunique` of it can go (opt/unique.or, T1). Every call site must pass a Unique
+//     receiver (rule U4).
+//   - `unique-out` (candidate: an in/out function, or a function with a reference result, whose result a caller can use):
+//     the value handed back is Unique at every return (rule U3), so the caller knows it is (rule U5).
+// All candidates are assumed first. A function is analysed with the local must-analysis of T1 (`UniqueSet`, at most as
+// permissive as the verifier) under the current flags; a `unique-out` whose returns are not all Unique is retracted
+// (its callers are analysed again, their facts depended on it), and so is a `unique-in` with a call site inside a loop whose
+// receiver is not Unique. A call site outside every loop never costs the flag: a `makeunique` is put before it (the callee starts
+// with the `makeunique` of its receiver, so the copy happens exactly where the callee would have made it, `cow_copies` does not
+// change, and it is paid once, not per iteration). Flags only go from set to cleared, so the loop ends after at most one
+// retraction per flag. The result is verified like the output of every pass; the verifier does not trust any of this.
+//
+// Compile-time budget (design gate: self-compile +1 %): only functions that can change a verdict are analysed. A function
+// without a loop cannot cost a `unique-in` flag, so it is not analysed for that: it gets the `makeunique` before every call of
+// a `unique-in` function unconditionally, and opt/unique.or removes the ones that turn out redundant. A `unique-out` is only a
+// candidate where a caller can use it (`markWanted`) and the return is plausibly Unique (`plausibleOut`), and the first round
+// analyses the callees before their callers.
+
+import { MProgram, MFunction, MBlock, Instr, Terminator, Operand } from "../mir";
+import { successors, succCount, succAt } from "../mir";
+import { RewritePlan, withBody } from "./rewrite";
+import { isRefTy, instrDef } from "./analysis";
+import { UniqueSet, uniqueEntry } from "./unique";
+
+// The locals of `f` that can hold its receiver: local 0 and every destination of a move from such a local.
+function receiverChain(f: MFunction): bool[] {
+  let r: bool[] = f.locals.map(l => false);
+  r[0] = true;
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const b of f.blocks) {
+      for (const i of b.instrs) {
+        match (i) {
+          IMove(d, s) => {
+            if (r[s] && !r[d]) {
+              r[d] = true;
+              changed = true;
+            }
+          },
+          _ => {},
+        }
+      }
+    }
+  }
+  return r;
+}
+
+// Does block 0 of `f` make its receiver Unique (so that it happens on every path through the function)?
+function startsWithMakeUnique(f: MFunction): bool {
+  const r = receiverChain(f);
+  return f.blocks[0].instrs.some(i => match (i) {
+    IMakeUnique(x) => r[x],
+    _ => false,
+  });
+}
+
+// Is block `b` on a cycle of the control flow graph?
+function inLoop(f: MFunction, b: usize): bool {
+  let seen: bool[] = f.blocks.map(x => false);
+  let stack: usize[] = successors(f.blocks[b].term);
+  while (stack.length > 0) {
+    const c = stack.pop().unwrap();
+    if (c == b) {
+      return true;
+    }
+    if (!seen[c]) {
+      seen[c] = true;
+      for (const s of successors(f.blocks[c].term)) {
+        stack.push(s);
+      }
+    }
+  }
+  return false;
+}
+
+function localOf(o: Operand): Option<usize> {
+  return match (o) {
+    OLocal(l) => Some(l),
+    _ => None,
+  };
+}
+
+// The receiver argument of a call of a function whose `unique-in` flag is set in `q`, with the callee.
+function uniqueInCall(q: MProgram, ins: Instr): Option<usize> {
+  return match (ins) {
+    ICall(_, g, args) => q.functions[g].uniqueIn ? localOf(args[0]) : None,
+    _ => None,
+  };
+}
+
+// What the analysis of one function finds wrong under the current flags: its own `unique-out` (some return is not Unique),
+// and the callees whose `unique-in` a call site here cannot satisfy.
+type Findings = { outFails: bool; badIn: usize[]; };
+
+// Is the value this terminator hands back Unique (rule U3)? Only a return hands anything back.
+function returnsUnique(f: MFunction, st: UniqueSet, t: Terminator): bool {
+  return match (t) {
+    TReturn(r) => {
+      if (f.inout) {
+        return st.u[0];
+      }
+      return match (r) {
+        Some(o) => match (o) {
+          OLocal(l) => st.u[l],
+          _ => false,
+        },
+        None => false,
+      };
+    },
+    _ => true,
+  };
+}
+
+function check(q: MProgram, fi: usize): Findings {
+  const f = q.functions[fi];
+  let found = Findings { outFails: false, badIn: [] };
+  const states = uniqueEntry(q, f);
+  let b: usize = 0;
+  while (b < f.blocks.length) {
+    match (states[b]) {
+      Some(u) => {
+        let st = new UniqueSet(u);
+        for (const ins of f.blocks[b].instrs) {
+          match (ins) {
+            ICall(_, g, args) => {
+              if (q.functions[g].uniqueIn) {
+                match (localOf(args[0])) {
+                  Some(x) => {
+                    if (!st.u[x] && inLoop(f, b)) {
+                      found.badIn.push(g);
+                    }
+                  },
+                  None => {
+                    found.badIn.push(g);
+                  },
+                }
+              }
+            },
+            _ => {},
+          }
+          st.step(q, f, ins);
+        }
+        if (f.uniqueOut && !returnsUnique(f, st, f.blocks[b].term)) {
+          found.outFails = true;
+        }
+      },
+      None => {},
+    }
+    b += 1;
+  }
+  return found;
+}
+
+// Marks `wanted[g]` for every `unique-out` candidate `g` whose result some call in `f` could use: the local that receives
+// the result (the receiver, for an in/out function) is, up to moves, one that `f` makes Unique (`makeunique`) or passes as the
+// receiver to a `unique-in` candidate. Only such flags can save anything, and every flag costs an analysis of its function.
+// (The relation is flow-insensitive and over-approximate: it only selects candidates.)
+function markWanted(q: MProgram, f: MFunction, cand: bool[]): usize[] {
+  let found: usize[] = [];
+  let r: bool[] = f.locals.map(l => false);
+  let seeded = false;
+  for (const b of f.blocks) {
+    for (const i of b.instrs) {
+      match (i) {
+        IMakeUnique(x) => {
+          r[x] = true;
+          seeded = true;
+        },
+        ICall(_, g, args) => {
+          if (q.functions[g].uniqueIn) {
+            match (localOf(args[0])) {
+              Some(x) => {
+                r[x] = true;
+                seeded = true;
+              },
+              None => {},
+            }
+          }
+        },
+        _ => {},
+      }
+    }
+  }
+  if (!seeded) {
+    return found;
+  }
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const b of f.blocks) {
+      for (const i of b.instrs) {
+        match (i) {
+          IMove(d, s) => {
+            if (r[d] != r[s]) {
+              r[d] = true;
+              r[s] = true;
+              changed = true;
+            }
+          },
+          _ => {},
+        }
+      }
+    }
+  }
+  for (const b of f.blocks) {
+    for (const i of b.instrs) {
+      match (i) {
+        ICall(dst, g, args) => {
+          if (cand[g]) {
+            const y = q.functions[g].inout ? localOf(args[0]) : dst;
+            match (y) {
+              Some(l) => {
+                if (r[l]) {
+                  found.push(g);
+                }
+              },
+              None => {},
+            }
+          }
+        },
+        _ => {},
+      }
+    }
+  }
+  return found;
+}
+
+// Could `f` hand back a Unique value? A flow-insensitive over-approximation that discards the candidates whose return
+// obviously cannot be Unique (a parameter, a field read, a duplicate) without running the dataflow on them. A local is
+// plausible when every definition is a fresh object (`structnew`, `arraynew`, closure, interface value), the result of a call of
+// a `unique-out` candidate, the receiver an in/out candidate hands back, or a move from a plausible local; or when the function
+// makes it Unique somewhere (`makeunique`); local 0 of a function that is `unique-in` is plausible from the start.
+function plausibleOut(q: MProgram, f: MFunction, cand: bool[]): bool {
+  let bad: bool[] = f.locals.map(l => false);
+  let defd: bool[] = f.locals.map(l => false);
+  let made: bool[] = f.locals.map(l => false);
+  if (f.uniqueIn) {
+    made[0] = true; // the receiver is Unique on entry
+  }
+  for (const b of f.blocks) {
+    for (const i of b.instrs) {
+      match (i) {
+        IMakeUnique(x) => {
+          made[x] = true;
+        },
+        ICall(_, g, args) => {
+          if (q.functions[g].inout) {
+            match (localOf(args[0])) {
+              Some(x) => {
+                defd[x] = true;
+              },
+              None => {},
+            }
+          }
+        },
+        _ => {},
+      }
+      match (instrDef(i)) {
+        Some(d) => {
+          defd[d] = true;
+        },
+        None => {},
+      }
+    }
+  }
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const b of f.blocks) {
+      for (const i of b.instrs) {
+        match (instrDef(i)) {
+          Some(d) => {
+            if (!bad[d]) {
+              const good = match (i) {
+                IStructNew(_, _, _) => true,
+                IArrayNew(_, _, _) => true,
+                IClosure(_, _, _) => true,
+                IIface(_, _, _) => true,
+                IMove(_, s) => made[s] || defd[s] && !bad[s],
+                ICall(_, g, _) => cand[g] && !q.functions[g].inout,
+                _ => false,
+              };
+              if (!good) {
+                bad[d] = true;
+                changed = true;
+              }
+            }
+          },
+          None => {},
+        }
+        match (i) {
+          ICall(_, g, args) => {
+            if (q.functions[g].inout) {
+              match (localOf(args[0])) {
+                Some(x) => {
+                  if (!bad[x] && !cand[g]) {
+                    bad[x] = true;
+                    changed = true;
+                  }
+                },
+                None => {},
+              }
+            }
+          },
+          _ => {},
+        }
+      }
+    }
+  }
+  if (f.inout) {
+    return made[0] || defd[0] && !bad[0];
+  }
+  for (const b of f.blocks) {
+    match (b.term) {
+      TReturn(r) => {
+        match (r) {
+          Some(o) => {
+            match (o) {
+              OLocal(l) => {
+                if (!(made[l] || defd[l] && !bad[l])) {
+                  return false;
+                }
+              },
+              _ => {
+                return false;
+              },
+            }
+          },
+          None => {
+            return false;
+          },
+        }
+      },
+      _ => {},
+    }
+  }
+  return true;
+}
+
+// Does the control flow graph of `f` have a cycle (a loop)?
+function hasLoop(f: MFunction): bool {
+  let color: usize[] = f.blocks.map(b => 0); // 0: not seen, 1: on the path, 2: done
+  let at: usize[] = f.blocks.map(b => 0);
+  let stack: usize[] = [0];
+  color[0] = 1;
+  while (stack.length > 0) {
+    const v = stack[stack.length - 1];
+    const t = f.blocks[v].term;
+    if (at[v] < succCount(t)) {
+      const w = succAt(t, at[v]);
+      at[v] += 1;
+      if (color[w] == 1) {
+        return true;
+      }
+      if (color[w] == 0) {
+        color[w] = 1;
+        stack.push(w);
+      }
+    } else {
+      color[v] = 2;
+      stack.pop();
+    }
+  }
+  return false;
+}
+
+// `f` with `makeunique x` before every call of a unique-in function (no analysis: opt/unique.or removes the redundant ones).
+function insertBeforeCalls(q: MProgram, f: MFunction): Option<MFunction> {
+  let blocks: MBlock[] = [];
+  let changed = false;
+  for (const blk of f.blocks) {
+    let plan = new RewritePlan(blk.instrs.length);
+    let i: usize = 0;
+    while (i < blk.instrs.length) {
+      match (uniqueInCall(q, blk.instrs[i])) {
+        Some(x) => {
+          plan.replace(i, [IMakeUnique(x), blk.instrs[i]]);
+        },
+        None => {},
+      }
+      i += 1;
+    }
+    if (plan.changes() > 0) {
+      changed = true;
+    }
+    blocks.push(plan.apply(blk));
+  }
+  return changed ? Some(withBody(f, f.locals, blocks)) : None;
+}
+
+// `f` with `makeunique x` before every call of a unique-in function whose receiver `x` is not certainly Unique.
+function insertForCalls(q: MProgram, f: MFunction): Option<MFunction> {
+  if (!f.blocks.some(b => b.instrs.some(i => uniqueInCall(q, i).isSome()))) {
+    return None;
+  }
+  let blocks: MBlock[] = [];
+  const states = uniqueEntry(q, f);
+  let changed = false;
+  let b: usize = 0;
+  while (b < f.blocks.length) {
+    const blk = f.blocks[b];
+    match (states[b]) {
+      Some(u) => {
+        let plan = new RewritePlan(blk.instrs.length);
+        let st = new UniqueSet(u);
+        let i: usize = 0;
+        while (i < blk.instrs.length) {
+          const ins = blk.instrs[i];
+          match (uniqueInCall(q, ins)) {
+            Some(x) => {
+              if (!st.u[x]) {
+                plan.replace(i, [IMakeUnique(x), ins]);
+              }
+            },
+            None => {},
+          }
+          st.step(q, f, ins);
+          i += 1;
+        }
+        if (plan.changes() > 0) {
+          changed = true;
+        }
+        blocks.push(plan.apply(blk));
+      },
+      None => {
+        blocks.push(blk);
+      },
+    }
+    b += 1;
+  }
+  return changed ? Some(withBody(f, f.locals, blocks)) : None;
+}
+
+// The largest function (blocks times locals) the pass analyses: the cost of the analysis grows with it, and the few very large
+// functions (generated parsers, the checker's dispatch) would take most of the compile-time budget for no benefit. A function over
+// the limit gets no `unique-out`, and when it has a loop that calls a `unique-in` candidate that candidate loses its flag.
+const WORK_LIMIT: usize = 12000;
+
+function tooBig(f: MFunction): bool {
+  return f.blocks.length * f.locals.length > WORK_LIMIT;
+}
+
+// `p` with the `unique-in` / `unique-out` flags that hold, and the `makeunique` before the calls that need one. `pinned`
+// marks the functions called through function values (closure targets, vtable entries): they get no flag.
+@Requires(pinned.length == p.functions.length)
+export function setUniqueFlags(p: MProgram, pinned: bool[]): MProgram {
+  let q = p;
+  const n = p.functions.length;
+  let hasIn = false;
+  let cand: bool[] = [];
+  let fi: usize = 0;
+  while (fi < n) {
+    const f = p.functions[fi];
+    const inout = f.inout && !pinned[fi];
+    if (inout && startsWithMakeUnique(f)) {
+      q.functions[fi].uniqueIn = true;
+      hasIn = true;
+    }
+    cand.push((inout || isRefTy(f.ret)) && !pinned[fi] && !tooBig(f));
+    fi += 1;
+  }
+  // the callers and callees of every function, and which functions call a unique-in candidate (the only calls that matter)
+  let callers: usize[][] = p.functions.map(f => []);
+  let callees: usize[][] = p.functions.map(f => []);
+  let callsIn: bool[] = p.functions.map(f => false);
+  fi = 0;
+  while (fi < n) {
+    for (const blk of p.functions[fi].blocks) {
+      for (const ins of blk.instrs) {
+        match (ins) {
+          ICall(_, g, _) => {
+            if (callers[g].length == 0 || callers[g][callers[g].length - 1] != fi) {
+              callers[g].push(fi);
+            }
+            if (callees[fi].length == 0 || callees[fi][callees[fi].length - 1] != g) {
+              callees[fi].push(g);
+            }
+            if (q.functions[g].uniqueIn) {
+              callsIn[fi] = true;
+            }
+          },
+          _ => {},
+        }
+      }
+    }
+    fi += 1;
+  }
+  // a function with a loop decides the flags of the unique-in functions it calls; one without a loop never does
+  let relevant: bool[] = p.functions.map(f => false);
+  let plain: bool[] = p.functions.map(f => false); // calls a unique-in candidate, has no loop, is not otherwise analysed
+  fi = 0;
+  while (fi < n) {
+    if (callsIn[fi]) {
+      const f = p.functions[fi];
+      if (!hasLoop(f)) {
+        plain[fi] = true;
+      } else if (tooBig(f)) {
+        for (const g of callees[fi]) {
+          q.functions[g].uniqueIn = false;
+        }
+      } else {
+        relevant[fi] = true;
+      }
+    }
+    fi += 1;
+  }
+  // keep a `unique-out` only where some caller can use it
+  let wanted: bool[] = p.functions.map(f => false);
+  fi = 0;
+  while (fi < n) {
+    for (const g of markWanted(q, p.functions[fi], cand)) {
+      wanted[g] = true;
+    }
+    fi += 1;
+  }
+  fi = 0;
+  while (fi < n) {
+    if (wanted[fi] && plausibleOut(q, q.functions[fi], cand)) {
+      q.functions[fi].uniqueOut = true;
+      relevant[fi] = true;
+    }
+    fi += 1;
+  }
+  // The first round runs the callees before their callers (depth-first post-order of the call graph), so a function is
+  // analysed once with the final `unique-out` of everything it calls, except around recursion.
+  let queued: bool[] = relevant.map(r => r);
+  let order: usize[] = [];
+  let state: usize[] = relevant.map(r => 0);
+  let at: usize[] = relevant.map(r => 0);
+  fi = 0;
+  while (fi < n) {
+    if (relevant[fi] && state[fi] == 0) {
+      let stack: usize[] = [fi];
+      state[fi] = 1;
+      while (stack.length > 0) {
+        const v = stack[stack.length - 1];
+        if (at[v] < callees[v].length) {
+          const w = callees[v][at[v]];
+          at[v] += 1;
+          if (relevant[w] && state[w] == 0) {
+            state[w] = 1;
+            stack.push(w);
+          }
+        } else {
+          state[v] = 2;
+          order.push(v);
+          stack.pop();
+        }
+      }
+    }
+    fi += 1;
+  }
+  let work: usize[] = [];
+  let k = order.length;
+  while (k > 0) {
+    k -= 1;
+    work.push(order[k]);
+  }
+  while (work.length > 0) {
+    const cur = work.pop().unwrap();
+    queued[cur] = false;
+    const found = check(q, cur);
+    if (found.outFails && q.functions[cur].uniqueOut) {
+      q.functions[cur].uniqueOut = false;
+      for (const c of callers[cur]) {
+        if (relevant[c] && !queued[c]) {
+          queued[c] = true;
+          work.push(c);
+        }
+      }
+    }
+    for (const g of found.badIn) {
+      if (q.functions[g].uniqueIn) {
+        q.functions[g].uniqueIn = false;
+        if (relevant[g] && !queued[g]) {
+          queued[g] = true;
+          work.push(g);
+        }
+      }
+    }
+  }
+  if (!hasIn) {
+    return q;
+  }
+  fi = 0;
+  while (fi < n) {
+    if (relevant[fi] || plain[fi]) {
+      match (relevant[fi] ? insertForCalls(q, q.functions[fi]) : insertBeforeCalls(q, q.functions[fi])) {
+        Some(g) => {
+          q.functions[fi] = g;
+        },
+        None => {},
+      }
+    }
+    fi += 1;
+  }
+  return q;
+}

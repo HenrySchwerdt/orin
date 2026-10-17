@@ -75,6 +75,12 @@ Mutation classes (id: injected bug -> required reaction)
   range-copy-index-ok       the index read through a copy (positive control)                        -> ACCEPTED
   range-addsub-ok           the index read through `(i + 1) - 1` (positive control)                 -> ACCEPTED
 
+  unique receivers and results (rules U2-U5, docs/mir.md v2.7; the callee's header seen by the mutated caller is edited as well):
+  uniq-flag-flip-in   `unique-in` set on the callee of a call whose receiver is not Unique -> ERROR to be Unique (U4)
+  uniq-flag-flip-out  `unique-out` set on a function that returns a value that is not Unique -> ERROR (rule U3)
+  uniq-in-shared-caller `t = dup x` before a call of a unique-in function              -> ERROR to be Unique (U4)
+  uniq-out-then-dup   `t = dup x` after a call of a unique-out function, a store through x follows -> ERROR to be Unique (U5)
+
 A mutant that is accepted without a new warning is a SURVIVOR, a finding, unless it is one of the
 explicitly classified BENIGN cases below (each has a precise, local reason). A mutant that is
 rejected, but without the error message of the injected bug, is reported as WRONG-REASON (the
@@ -111,13 +117,17 @@ class Func:
         self.header = header          # "fn3 name (params 1, owned l0) -> ref"
         self.locals = locals_         # list of (name, type)
         self.blocks = blocks          # list of [label, [instr lines], terminator line]
-        m = re.match(r"fn\d+ (.*) \(params (\d+)(?:, owned ([l0-9 ]+))?(, inout)?\) -> (\w+)$", header)
+        m = re.match(r"fn\d+ (.*) \(params (\d+)(?:, owned ([l0-9 ]+))?(, inout)?(, unique-in)?(, unique-out)?\) -> (\w+)$", header)
         self.name = m.group(1)
         self.nparams = int(m.group(2))
         self.owned = set(int(x[1:]) for x in (m.group(3) or "").split())
         self.inout = bool(m.group(4))     # v1.10: parameter 0 is handed back to the caller at every return
         self.extra = []                   # stub functions a mutant adds after the program's own (their index is len(funcs) + k)
         self._key = None
+        self.uin = bool(m.group(5))       # v2.7: the receiver is Unique on entry (rule U2)
+        self.uout = bool(m.group(6))      # v2.7: the value handed back is Unique (rules U3, U5)
+        self.ret = m.group(7)
+        self.peers = None                 # the functions of the program (set after parsing): the callees' flags
 
     def key(self):
         if self._key is None:
@@ -143,7 +153,20 @@ class Func:
     def clone(self):
         c = Func(self.header, list(self.locals), [[b[0], list(b[1]), b[2]] for b in self.blocks])
         c.extra = list(self.extra)
+        c.peers = self.peers
         return c
+
+    def with_flag(self, flag):
+        """A copy whose header also carries `unique-in` / `unique-out`."""
+        c = self.clone()
+        if flag == "unique-in":
+            h = re.sub(r"(, unique-out)?\) -> ", lambda m: ", unique-in" + (m.group(1) or "") + ") -> ", self.header, count=1)
+        else:
+            h = self.header.replace(") -> ", ", unique-out) -> ", 1)
+        d = Func(h, c.locals, c.blocks)
+        d.peers = self.peers
+        d.extra = list(self.extra)
+        return d
 
     def new_local(self, ty="ref"):
         self.locals.append(("l%d" % len(self.locals), ty))
@@ -234,9 +257,11 @@ def replace_obj(line, old, new):
 # ---------------------------------------------------------------- mutation sites
 
 class Mut:
-    def __init__(self, cls, f, loc, desc, benign, needle, expect):
+    def __init__(self, cls, f, loc, desc, benign, needle, expect, peer=None, flag=None):
         self.cls, self.f, self.desc, self.benign, self.needle, self.expect = cls, f, desc, benign, needle, expect
         self.bi, self.ii = loc
+        self.peer = peer    # (function index, flag): the stub of that function gets the flag in the mutant program
+        self.flag = flag    # the flag the mutated function itself gets
 
 
 def defs_of(f, x):
@@ -341,13 +366,29 @@ def reaches_return(f, bi):
 KEEP_READS = ("getfield", "getfieldu", "arrayget", "arraygetu", "tag", "forward")
 
 
+CALL_RE = re.compile(r"(?:l\d+ = )?call fn(\d+)\((.*)\)$")
+
+
+def call_parts(f, line):
+    """(callee Func, [argument locals or None for a constant]) of a `call` line, else (None, [])."""
+    m = CALL_RE.match(line)
+    if not m or not f.peers:
+        return None, []
+    args = [int(a.strip()[1:]) if re.fullmatch(r"l\d+", a.strip()) else None for a in m.group(2).split(",") if a.strip()]
+    return f.peers[int(m.group(1))], args
+
+
 def uniq_transfer(f, U, line):
     w, d, t = op(line), dest(line), toks(line)
     U = set(U)
     keep = set()
+    callee, cargs = call_parts(f, line) if w == "call" else (None, [])
     if w in ("call", "builtin", "callind") and (d is None or not f.is_ref(d)):
         # a call with no result or a scalar result cannot return an alias of its (borrowed) arguments
         keep = set(t) - ({d} if d is not None else set())
+        if callee is not None and callee.inout:
+            # an in/out callee can keep a counted reference to a borrowed argument in the receiver it hands back
+            keep = set()
     if w in STORES:
         keep = {t[0]}
     elif w in TAKES:
@@ -362,19 +403,26 @@ def uniq_transfer(f, U, line):
     U -= set(t) - keep
     if d is not None:
         U.discard(d)
-    if w in ("struct", "arraynew", "closure") and d is not None:
+    if w in ("struct", "arraynew", "closure", "iface") and d is not None:
         U.add(d)
     if w == "makeunique":
         U.add(t[0])
     if w == "move" and was:
         U.add(d)
+    if callee is not None and callee.uout:
+        # rule U5: the result of a unique-out function / the receiver an in/out unique-out function hands back
+        if callee.inout:
+            if cargs and cargs[0] is not None:
+                U.add(cargs[0])
+        elif d is not None:
+            U.add(d)
     return U
 
 
 def uniq_states(f):
     """In-state of every block (None = unreachable)."""
     ins = [None] * len(f.blocks)
-    ins[0] = set()
+    ins[0] = {0} if f.uin else set()   # rule U2
     work = [0]
     while work:
         b = work.pop()
@@ -496,6 +544,9 @@ def sites(f):
                 out += shape_sites(f, bi, ii, line)
             if w in ("getfield", "setfield"):
                 out += field_nofact_sites(f, bi, ii, line)
+            if w == "call":
+                out += unique_call_sites(f, bi, ii, line)
+    out += unique_out_sites(f)
     if f.inout:
         # v1.10: parameter 0 is handed back to the caller at every return
         for bi, (label, ins, term) in enumerate(f.blocks):
@@ -1128,6 +1179,70 @@ def apply_range(m, f):
     return f
 
 
+def unique_call_sites(f, bi, ii, line):
+    """v2.7, rules U4 / U5: the mutants at a call of an in/out or unique-out function."""
+    g, args = call_parts(f, line)
+    if g is None:
+        return []
+    n = int(CALL_RE.match(line).group(1))
+    ins = f.blocks[bi][1]
+    where = "(b%d i%d)" % (bi, ii)
+    out = []
+    x = args[0] if g.inout and args and args[0] is not None else None
+    if x is not None and not g.uin:
+        benign = "the receiver is certainly Unique at the call, so the flag would be justified here" if certainly_unique(f, bi, ii, x) else None
+        out.append(Mut("uniq-flag-flip-in", f, (bi, ii), "`unique-in` on fn%d for `%s` %s" % (n, line, where), benign,
+                       "to be Unique", "error", peer=(n, "unique-in")))
+    if x is not None and g.uin:
+        out.append(Mut("uniq-in-shared-caller", f, (bi, ii), "dup l%d before `%s` %s" % (x, line, where), None, "to be Unique", "error"))
+    if g.uout:
+        target = x if g.inout else dest(line)
+        if target is not None and f.is_ref(target):
+            later = None
+            cur = target
+            for k in range(ii + 1, len(ins)):
+                l2 = ins[k]
+                if cur not in toks(l2):
+                    continue
+                if store_obj(l2) == cur:
+                    later = k
+                elif op(l2) in KEEP_READS and dest(l2) != cur and cur in toks(l2)[1:]:
+                    continue
+                elif op(l2) == "move" and toks(l2)[1] == cur and dest(l2) != cur:
+                    cur = dest(l2)   # the dup'd object is moved on: it stays shared, and a store through the copy fails the same way
+                    continue
+                break
+            if later is not None:
+                out.append(Mut("uniq-out-then-dup", f, (bi, ii), "dup l%d after `%s`, before `%s` %s" % (target, line, ins[later], where),
+                               None, "to be Unique", "error"))
+    return out
+
+
+def unique_out_sites(f):
+    """v2.7, rule U3: `unique-out` on a function whose returns are not all Unique."""
+    if f.uout or not (f.inout or f.ret == "ref"):
+        return []
+    states = uniq_states(f)
+    all_unique, any_return = True, False
+    for b, (label, ins, term) in enumerate(f.blocks):
+        if not term.startswith("return") or states[b] is None:
+            continue
+        any_return = True
+        U = states[b]
+        for line in ins:
+            U = uniq_transfer(f, U, line)
+        m = re.match(r"return l(\d+)$", term)
+        target = 0 if f.inout else (int(m.group(1)) if m else None)
+        if target is None or target not in U:
+            all_unique = False
+    benign = None
+    if not any_return:
+        benign = "no return is reachable"
+    elif all_unique:
+        benign = "every return hands back a Unique value by the independent dataflow"
+    return [Mut("uniq-flag-flip-out", f, (0, 0), "`unique-out` on %s" % f.name, benign, "(rule U3)", "error", flag="unique-out")]
+
+
 def apply_forward(m, f):
     b = f.blocks[m.bi]
     ins = b[1]
@@ -1185,6 +1300,17 @@ def apply(m):
         return f
     if m.cls.startswith("range-"):
         return apply_range(m, f)
+    if m.cls == "uniq-flag-flip-out":
+        return f.with_flag("unique-out")
+    if m.cls == "uniq-flag-flip-in":
+        return f
+    if m.cls in ("uniq-in-shared-caller", "uniq-out-then-dup"):
+        line = ins[ii]
+        g, args = call_parts(f, line)
+        x = args[0] if g.inout else dest(line)
+        n = f.new_local()
+        ins.insert(ii if m.cls == "uniq-in-shared-caller" else ii + 1, "l%d = dup l%d" % (n, x))
+        return f
     line = ins[ii]
     t = toks(line)
     if m.cls.startswith("fwd-"):
@@ -1351,6 +1477,8 @@ def main():
             continue
         nprog += 1
         prefix, funcs = parse(text)
+        for fn in funcs:
+            fn.peers = funcs
         for i, fn in enumerate(funcs):
             k = fn.key()
             if k not in seen:
@@ -1390,7 +1518,11 @@ def main():
                 mf = apply(m)
                 mid = "m%d_%d" % (n, mi)
                 meta[mid] = ("mut", fn, m)
-                yield mid, program_text(prefix, funcs, i, mf)
+                fs = funcs
+                if m.peer:
+                    fs = list(funcs)
+                    fs[m.peer[0]] = funcs[m.peer[0]].with_flag(m.peer[1])
+                yield mid, program_text(prefix, fs, i, mf)
 
     out_lines = run_driver(exe, entries(), tmp, "mutants")
     tmpdir.cleanup()

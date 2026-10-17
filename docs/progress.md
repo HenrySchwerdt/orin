@@ -87,9 +87,10 @@ Census re-run 2026-10-16 (after lever 1 and T1/T3/T4) with the current lever ran
    reads (mutres 10.6x C instructions, pqueue 4.8x, nbody 3.7x, sieve 3.4x). Done: T3 (scalar stores without the run-time
    refmask test) and the `orin_stats` hot counters as a build option (#79); T1 (drop `makeunique` of a local proven `Unique`:
    nbody -13.8%, sieve -10.4% instructions); T4 (load forwarding: MIR v2.4 `IForward`, verifier rule F1, `orin2 compile --assert-facts`;
-   nbody -6.0%, mutres +0.05% instructions, the other three unchanged, self-compile unchanged; 77 forwarded loads in the compiler itself). T5 (#91, unique call flags / U2–U5) awaits the owner's benefit/TCB-cost decision;
-   T2 (#98, unchecked access / U1) is parked because its standalone gain was nil;
-   T6 (range facts) needs its own decision.
+   nbody -6.0%, mutres +0.05% instructions, the other three unchanged, self-compile unchanged; 77 forwarded loads in the compiler itself).
+   T5 (unique receivers and results across calls: MIR v2.7, verifier rules U2-U5, optimistic flags
+   `unique-in` / `unique-out`; mutres -5.6%, the other four unchanged, self-compile +0.83%; it also closed a hole where a borrowed `Unique` argument
+   stayed `Unique` after an in/out call). T2 (U1) and T6 (range facts) are separate entries.
    Lever 1 (verifier and optimiser data structures) is done: self-compile -23% allocations, -3.2% instructions; the
    remaining self-compile time is no longer allocation.
 2. **Performance, census row 1 (string intermediates) is done** (ADR-0038 addendum 2026-10-16, MIR v2.5: `IStrAppendNum`,
