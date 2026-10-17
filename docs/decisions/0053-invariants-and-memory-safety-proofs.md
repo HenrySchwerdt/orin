@@ -394,7 +394,7 @@ queries; today it depends on the query text only, which the deferred solver roun
 missing pieces are callee facts (U1, Z4), loop invariants (U4, Z6), and element or permutation invariants of the data (for
 example "`order` is a permutation of `0..n`"). U5 is handled there, not by reducing the query. The time lever stays the solver budget
 (Z1). The slicing code (`compiler/vc/slice.or`, `--slice`) was not merged; it is kept for reference in commit `c7d15f37` (branch
-`claude/project-thread-niggkx-verify-slice`, PR #28).
+`claude/project-thread-niggkx-verify-slice-code`, PR #28).
 
 ### Consequences
 
