@@ -71,16 +71,17 @@ component name.
   `--assert-facts` re-runs the omitted checks (`orin_assert_array`, exit 70).
 - **Owner layer.** (b) for U1 facts; (c) for emitting unchecked accesses only on U1 facts; (d) for the checked accesses
   (`orin_chk_slot`, array/string helpers); (e) for L0 memory functions.
-- **Claims.** C3 (array length is outside the model), C4, C5, C8, C10 (L0 memory functions, CBMC bounded). tcb.md rows: MIR
+- **Claims.** C3 (the interval rules of U1 are in the model, the code and T2 are not), C4, C5, C8, C10 (L0 memory functions, CBMC bounded). tcb.md rows: MIR
   ownership verifier (rule U1, the only fact an emitter trusts for memory safety), C backend / LLVM backend, L0 platform layer.
 - **Files.** `compiler/verify/unchecked.or` (`uncheckedJustified`, `accessFacts`), `compiler/verify/range.or`,
   `compiler/opt/bounds.or` (asks the verifier, not trusted), `compiler/backends/c/function.or`,
   `compiler/backends/llvm/function.or`, `runtime/core/orin_runtime.h` (`orin_chk_slot`), `runtime/platform/tests/cbmc_harness.c`,
   `tools/mutate_mir.py` (`bce-*`, `range-*`), `compiler/tests/verify_main.or`.
-- **Model.** Field index out of range is a `trap` in the Lean machine (`formal/Orin/Machine.lean`). Array length and U1 have no
-  lemma: U1 is not claimed as proved (tcb.md).
+- **Model.** Field index out of range is a `trap` in the Lean machine (`formal/Orin/Machine.lean`). The interval source of U1 (rules R1-R5, U1) is proved
+  sound in the Lean model against the array-length model (`formal/Orin/Range*.lean`, `u1_sound`, `u1_machine`, ADR-0053 M8); the Orin
+  code is not proved equal to it, the dominated-by-check source (T2) has no lemma, so U1 is not claimed as proved (tcb.md).
 - **Assurance level.** `TESTED_ONLY`.
-- **Gap.** ADR-0053 M8 (array-length facts in Lean), M7 (CBMC for L0), M9 (bounds of core-dialect accesses).
+- **Gap.** ADR-0053 M8 residual (code-to-model link for `range.or`, T2, the call contract `GenOK` derived from the ownership model), M7 (CBMC for L0), M9 (bounds of core-dialect accesses).
 
 ## S4 no invalid reinterpretation
 
