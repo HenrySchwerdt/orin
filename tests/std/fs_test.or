@@ -1,0 +1,156 @@
+// std:fs (ADR-0048): the typed FsError (kind, op, path, reason), fsErrorMessage, and the Result of exists / listDir.
+// Run by tools/test_std.sh with and without contract checking. Each test works in its own directory build/tests/std_fs_test_<name> (tests run in parallel).
+import { assert, assertEqString, assertEqBool, assertEqUsize } from "std:test";
+import { Host, useHost } from "std:host";
+import { ProcessGrant } from "std:process";
+import { shell } from "std:io";
+import {
+  FsGrant, FsError, FsErrorKind, FsOp, readFile, writeFile, exists, listDir, withFile, useFile, withUnder, withReadOnly,
+  fsErrorMessage, Read, Write, NotFound, NotDirectory, OutsideScope, ReadOnly, WrongMode, OpRead, OpWrite, OpOpen, OpList, OpStat,
+  OpClose, Denied, PermissionDenied, IsDirectory, AlreadyExists, TooManyFiles, Io
+} from "std:fs";
+
+const BASE: string = "build/tests/std_fs_test";
+
+function kindName(k: FsErrorKind): string {
+  return match (k) {
+    NotFound => "NotFound",
+    PermissionDenied => "PermissionDenied",
+    IsDirectory => "IsDirectory",
+    NotDirectory => "NotDirectory",
+    AlreadyExists => "AlreadyExists",
+    Denied => "Denied",
+    OutsideScope => "OutsideScope",
+    ReadOnly => "ReadOnly",
+    WrongMode => "WrongMode",
+    TooManyFiles => "TooManyFiles",
+    Io => "Io"
+  };
+}
+
+function opName(op: FsOp): string {
+  return match (op) {
+    OpRead => "read",
+    OpWrite => "write",
+    OpOpen => "open",
+    OpList => "list",
+    OpStat => "stat",
+    OpClose => "close"
+  };
+}
+
+function prepare(proc: ProcessGrant, DIR: string): void {
+  shell(proc, "rm -rf " + DIR + " && mkdir -p " + DIR + "/sub/inner " + DIR + "/other && printf 'hello\\n' > " + DIR + "/a.txt && printf x > "
+    + DIR + "/sub/b.txt");
+}
+
+function expectKind(label: string, e: FsError, kind: string, op: string, path: string): void {
+  assertEqString(kindName(e.kind), kind, label + ": kind");
+  assertEqString(opName(e.op), op, label + ": op");
+  assertEqString(e.path, path, label + ": path");
+  assert(e.reason.length > 0, label + ": reason");
+}
+
+@Test
+function readAndWrite(host: Host): void {
+  useHost(host, (fs, proc, stdio, clock) => {
+    const DIR = BASE + "_readAndWrite";
+    prepare(proc, DIR);
+    assertEqString(readFile(fs, DIR + "/a.txt").unwrap(), "hello\n", "read");
+    assert(writeFile(fs, DIR + "/c.txt", "data").isOk(), "write");
+    assertEqString(readFile(fs, DIR + "/c.txt").unwrap(), "data", "read back");
+
+    const missing = readFile(fs, DIR + "/missing.txt");
+    expectKind("missing", missing.unwrapErr(), "NotFound", "read", DIR + "/missing.txt");
+    assertEqString(
+      fsErrorMessage(missing.unwrapErr()),
+      "cannot read '" + DIR + "/missing.txt': No such file or directory",
+      "message of a missing file"
+    );
+    const noDir = writeFile(fs, DIR + "/nodir/x.txt", "x");
+    expectKind("write into a missing directory", noDir.unwrapErr(), "NotFound", "write", DIR + "/nodir/x.txt");
+    assert(readFile(fs, DIR).isErr(), "a directory cannot be read as a file");
+  });
+}
+
+@Test
+function existsIsAResult(host: Host): void {
+  useHost(host, (fs, proc, stdio, clock) => {
+    const DIR = BASE + "_existsIsAResult";
+    prepare(proc, DIR);
+    assertEqBool(exists(fs, DIR + "/a.txt").unwrap(), true, "file");
+    assertEqBool(exists(fs, DIR + "/sub").unwrap(), true, "directory");
+    assertEqBool(exists(fs, DIR + "/nothing").unwrap(), false, "absent");
+    assertEqBool(exists(fs, DIR + "/a.txt/below").unwrap(), false, "below a file");
+    const outside = withUnder(fs, DIR + "/sub", sub => exists(sub, DIR + "/a.txt"));
+    expectKind("outside the scope", outside.unwrapErr(), "OutsideScope", "stat", DIR + "/a.txt");
+    assertEqString(
+      fsErrorMessage(outside.unwrapErr()),
+      "cannot check '" + DIR + "/a.txt': outside the granted file scope",
+      "message of a refused query"
+    );
+    const inside = withUnder(fs, DIR + "/sub", sub => exists(sub, DIR + "/sub/b.txt"));
+    assertEqBool(inside.unwrap(), true, "inside the scope");
+  });
+}
+
+@Test
+function listDirIsAResult(host: Host): void {
+  useHost(host, (fs, proc, stdio, clock) => {
+    const DIR = BASE + "_listDirIsAResult";
+    prepare(proc, DIR);
+    const top = listDir(fs, DIR).unwrap();
+    assertEqString(top.join(","), "a.txt,other/,sub/", "entries in byte order, directories with a slash");
+    assertEqString(listDir(fs, DIR + "/sub").unwrap().join(","), "b.txt,inner/", "subdirectory");
+    assertEqUsize(listDir(fs, DIR + "/other").unwrap().length, 0, "an empty directory is Ok([])");
+    expectKind("missing", listDir(fs, DIR + "/nothing").unwrapErr(), "NotFound", "list", DIR + "/nothing");
+    expectKind("a file", listDir(fs, DIR + "/a.txt").unwrapErr(), "NotDirectory", "list", DIR + "/a.txt");
+    assertEqString(
+      fsErrorMessage(listDir(fs, DIR + "/nothing").unwrapErr()),
+      "cannot list '" + DIR + "/nothing': No such file or directory",
+      "message of a missing directory"
+    );
+    const outside = withUnder(fs, DIR + "/sub", sub => listDir(sub, DIR + "/other"));
+    expectKind("outside the scope", outside.unwrapErr(), "OutsideScope", "list", DIR + "/other");
+  });
+}
+
+@Test
+function grantsAndScopes(host: Host): void {
+  useHost(host, (fs, proc, stdio, clock) => {
+    const DIR = BASE + "_grantsAndScopes";
+    prepare(proc, DIR);
+    const ro = withReadOnly(fs, g => writeFile(g, DIR + "/ro.txt", "x"));
+    expectKind("read-only grant", ro.unwrapErr(), "ReadOnly", "write", DIR + "/ro.txt");
+    assertEqBool(exists(fs, DIR + "/ro.txt").unwrap(), false, "nothing was written");
+    const roRead = withReadOnly(fs, g => readFile(g, DIR + "/a.txt"));
+    assertEqString(roRead.unwrap(), "hello\n", "a read-only grant reads");
+    const out = withUnder(fs, DIR + "/sub", sub => readFile(sub, DIR + "/a.txt"));
+    expectKind("outside the scope", out.unwrapErr(), "OutsideScope", "read", DIR + "/a.txt");
+  });
+}
+
+@Test
+function scopeErrors(host: Host): void {
+  useHost(host, (fs, proc, stdio, clock) => {
+    const DIR = BASE + "_scopeErrors";
+    prepare(proc, DIR);
+    const noFile = withFile(fs, DIR + "/missing.txt", Read, f => f.readAll());
+    expectKind("open", noFile.unwrapErr(), "NotFound", "open", DIR + "/missing.txt");
+    assertEqString(
+      fsErrorMessage(noFile.unwrapErr()),
+      "cannot open '" + DIR + "/missing.txt': No such file or directory",
+      "message of a failed open"
+    );
+    const wrongMode = useFile(fs, DIR + "/a.txt", Read, f => { f.writeLine("x"); });
+    expectKind("write to a read-only file", wrongMode.unwrapErr(), "WrongMode", "close", DIR + "/a.txt");
+    assertEqString(
+      fsErrorMessage(wrongMode.unwrapErr()),
+      "I/O error on '" + DIR + "/a.txt': Bad file descriptor",
+      "message of a failure found at close"
+    );
+    const ok = withFile(fs, DIR + "/d.txt", Write, f => { f.writeLine("one"); return 1; });
+    assertEqBool(ok.isOk(), true, "a normal scope is Ok");
+    assertEqString(readFile(fs, DIR + "/d.txt").unwrap(), "one\n", "the scope wrote");
+  });
+}

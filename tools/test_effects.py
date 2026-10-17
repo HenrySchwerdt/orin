@@ -330,6 +330,58 @@ def main():
     rc, out, err = run(orin, ["effects", pv])
     check(rc == 1 and "error[E0473]" in err and "module store:" in out, "orin effects prints the policy violations (%s)" % err)
 
+    # ---- 5. --target=wasm64-orbit: the Orbit capability manifest (analysis/orbit.or, E0523) -----------------------
+    wdir = os.path.join(ROOT, "tests", "wasm_target")
+    marker = "/* Orbit capability manifest (ADR-0055): describes requirements, never authorises */"
+
+    def manifest_of(name):
+        out_c = os.path.join(tmp, name + ".c")
+        rc, out, err = run(orin, ["compile", os.path.join(wdir, name + ".or"), "-o", out_c, "--target=wasm64-orbit"])
+        text = open(out_c).read() if os.path.exists(out_c) else ""
+        return rc, err, text
+
+    def expected_tail(requires):
+        # the JSON, then its quotes escaped for the assembler (\") and again for the C string literal (\\\")
+        items = ",".join('"%s"' % r for r in requires)
+        asm = r'{"abi":1,"requires":[' + items + r'],"producer":"orin"}'
+        asm = asm.replace('"', '\\"')
+        c = r'.section .custom_section.orbit.manifest,"",@\n.ascii "' + asm + r'"\n.text\n'
+        c = c.replace('\\', '\\\\').replace('"', '\\"').replace('\\\\n', '\\n')
+        return marker + '\n__asm__("' + c + '");\n'
+    want = {
+        "hello": ["log/v1"],
+        "clock": ["clock/v1", "log/v1"],
+        "exit": ["log/v1"],
+        # Task.* and Channel.* need no capability (the guest runs tasks itself, one at a time); the spawned closure is an
+        # unresolved callback (Unknown.Callback), which adds clock/v1 like any function value
+        "task": ["clock/v1", "log/v1"],
+        "channel": ["clock/v1", "log/v1"],
+        "closure": ["clock/v1", "log/v1"],  # an unresolved call (Unknown.*): conservative, not an error
+    }
+    for name, req in want.items():
+        rc, err, text = manifest_of(name)
+        check(rc == 0 and text.endswith(expected_tail(req)), "wasm64-orbit %s: manifest %s ends the C file (%s)" % (name, req, err + text[-300:]))
+        check(text.count("orbit.manifest") == 1, "wasm64-orbit %s: exactly one manifest section" % name)
+    # the literal shape from the specification, for one case
+    rc, err, text = manifest_of("clock")
+    check(text.endswith(marker + '\n__asm__(".section .custom_section.orbit.manifest,\\"\\",@\\n.ascii \\"{\\\\\\"abi\\\\\\":1,\\\\\\"requires\\\\\\":'
+                        '[\\\\\\"clock/v1\\\\\\",\\\\\\"log/v1\\\\\\"],\\\\\\"producer\\\\\\":\\\\\\"orin\\\\\\"}\\"\\n.text\\n");\n'), "the manifest has the specified literal shape")
+    rc, err, text = manifest_of("fs")
+    check(rc == 1 and "error[E0523]" in err and "`main` needs Fs.ReadFile, which the wasm64-orbit target does not provide" in err
+          and "fs.or:4:" in err and text == "", "wasm64-orbit: an Fs program is rejected with E0523 and evidence (%s)" % err)
+    plain = os.path.join(tmp, "plain.c")
+    rc, out, err = run(orin, ["compile", os.path.join(wdir, "clock.or"), "-o", plain])
+    check(rc == 0 and "orbit.manifest" not in open(plain).read(), "without --target the C has no manifest (%s)" % err)
+    native = os.path.join(tmp, "native.c")
+    rc, out, err = run(orin, ["compile", os.path.join(wdir, "clock.or"), "-o", native, "--target=native"])
+    check(rc == 0 and open(native).read() == open(plain).read(), "--target=native is byte-identical to no --target (%s)" % err)
+    rc, out, err = run(orin, ["compile", os.path.join(wdir, "hello.or"), "-o", os.path.join(tmp, "l.ll"), "--target=wasm64-orbit", "--backend=llvm"])
+    check(rc == 2 and "needs the C backend" in err, "usage error: wasm64-orbit with --backend=llvm (%s)" % err)
+    rc, out, err = run(orin, ["compile", os.path.join(wdir, "hello.or"), "-o", os.path.join(tmp, "l.c"), "--target=wasm64-orbit", "--split", "2"])
+    check(rc == 2 and "needs the C backend" in err, "usage error: wasm64-orbit with --split (%s)" % err)
+    rc, out, err = run(orin, ["compile", os.path.join(wdir, "hello.or"), "-o", os.path.join(tmp, "l.c"), "--target=arm"])
+    check(rc == 2 and "unknown target `arm`" in err, "usage error: unknown target (%s)" % err)
+
     shutil.rmtree(tmp, ignore_errors=True)
     print("%d checks, %d failures" % (checks, len(failures)))
     sys.exit(1 if failures else 0)

@@ -18,6 +18,7 @@ import { FsGrant } from "std:fs";
 import { normalizePath } from "../loader";
 import { Workspace } from "./workspace";
 import { Analysis, analyze } from "./analyze";
+import { CompletionItem, stdModuleMembers } from "./symbols";
 
 // At most `capacity` entries (the oldest is dropped first); `order` lists the keys of `entries`.
 @Invariant(this.order.length <= this.capacity)
@@ -27,6 +28,8 @@ export class AnalysisCache {
   private entries: Map<string, Analysis>;
   private order: string[];
   private capacity: usize;
+  // Member lists of std modules by import path (`std:bytes`): the embedded sources never change, so these are never dropped.
+  private std: Map<string, CompletionItem[]>;
   // Number of requests answered from the cache / by running the analysis (observable by tests and benchmarks).
   hits: usize;
   misses: usize;
@@ -36,6 +39,7 @@ export class AnalysisCache {
     this.entries = new Map<string, Analysis>();
     this.order = [];
     this.capacity = capacity < 1 ? 1 : capacity;
+    this.std = new Map<string, CompletionItem[]>();
     this.hits = 0;
     this.misses = 0;
   }
@@ -67,6 +71,17 @@ export class AnalysisCache {
       }
     }
     return true;
+  }
+
+  // The members `ns.` offers for `import * as ns from "<p>"` with a std module `p`, parsed once per session.
+  stdMembers(p: string): CompletionItem[] {
+    const hit = this.std.get(p);
+    if (hit.isSome()) {
+      return hit.unwrap();
+    }
+    const items = stdModuleMembers(p);
+    this.std.set(p, items);
+    return items;
   }
 
   private forget(key: string): void {

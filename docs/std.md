@@ -82,15 +82,21 @@ cannot capture a grant: take all you need with `useHost`, pass grants as argumen
 
 ## std:fs (UNSTABLE: every function takes an `FsGrant` first, ADR-0027)
 
-Whole-file functions: `readFile(fs, path): Result<string, string>`, `writeFile(fs, path, data): Result<void, string>`,
-`exists(fs, path): bool` (traps on a denied path: a `bool` cannot carry a denial).
+Whole-file functions (ADR-0048): `readFile(fs, path): Result<string, FsError>`, `writeFile(fs, path, data): Result<void, FsError>`,
+`exists(fs, path): Result<bool, FsError>` (`Err` when the grant refuses the query; `Ok(false)` for an absent path),
+`listDir(fs, path): Result<string[], FsError>` (entries in byte order, subdirectories with a trailing `/`).
+
+`FsError` is a record `{ kind: FsErrorKind, op: FsOp, path: string, reason: string }`. `kind` is one of `NotFound`,
+`PermissionDenied`, `IsDirectory`, `NotDirectory`, `AlreadyExists`, `Denied` (host policy), `OutsideScope`, `ReadOnly`, `WrongMode`,
+`TooManyFiles`, `Io`; `op` says which operation failed (`OpRead`, `OpWrite`, `OpOpen`, `OpList`, `OpStat`, `OpClose`);
+`reason` is the system's text. `fsErrorMessage(e): string` renders it ("cannot read 'p': No such file or directory").
 
 Streaming through **resource handles** (ADR-0025, spec 06). `File` is a handle, not a value: it can only be a
 function parameter. You get one as the parameter of the callback of a scope function, which opens the file, runs
 the callback and closes the file on every path:
 
 ```
-type FsError = string                       type FileMode = Read | Write | Append
+type FileMode = Read | Write | Append
 withFile<T>(fs, path, mode, body: (file: File) => T): Result<T, FsError>
 useFile(fs, path, mode, body: (file: File) => void): Result<void, FsError>      // body returns nothing
 withFiles<T>(fs, pathA, modeA, pathB, modeB, body: (a: File, b: File) => T): Result<T, FsError>
@@ -128,10 +134,10 @@ useFiles(fs, "in.txt", Read, "out.txt", Write, (a, b) => { while (true) { const 
 Paths are byte strings with `/`; nothing touches the file system or the current directory; all functions
 are total and O(n). Behaviour follows Node's `path.posix`.
 
-`join(parts: string[]): string` (empty parts skipped, then `normalize`; `[]` -> `"."`; a later absolute
+`join(base, part): string` and `joinAll(parts: string[]): string` (ADR-0048; empty parts skipped, then `normalize`; `joinAll([])` -> `"."`; a later absolute
 part does not reset), `normalize(p)` (`""` -> `"."`, `..` above the root of an absolute path is dropped,
 leading `..` of relative paths kept, trailing `/` kept), `dirname(p)`, `basename(p)`, `extension(p)`
-(`".txt"`; `""` for `.bashrc`, `..`, no dot), `stem(p)`, `withExtension(p, ext)`, `isAbsolute(p)`,
+(`".txt"`; `""` for `.bashrc`, `..`, no dot), `stem(p)`, `replaceExtension(p, ext)` (`withExtension` is a deprecated alias), `isAbsolute(p)`,
 `resolveAgainst(base, p)`.
 
 ## std:json/legacy (integers only, deprecated)
@@ -160,7 +166,7 @@ U+FFFD); raw control characters in strings are errors; duplicate keys are kept a
 
 `nowMillis(clock: ClockGrant): int` (wall clock, ms since the Unix epoch, not monotonic; the grant comes from `useClock` / `useHost` of `std:host`). Durations are explicit-unit
 records `Duration { millis }`: `milliseconds/seconds/minutes/hours/days(n)`, `toMillis`, `toSeconds`,
-`addDuration`, `between(start, end)`, `plus(instant, d)`, `formatDuration` ("1h 2m 3s 5ms"). UTC calendar
+`addDuration`, `durationBetween(start, end)`, `instantAfter(instant, d)` (`between` and `plus` are deprecated aliases), `formatDuration` ("1h 2m 3s 5ms"). UTC calendar
 (proleptic Gregorian, no zones): `fromMillis(instant): DateTime`, `toInstant(dt): Option<int>` (validates
 the fields), `isLeapYear`, `daysInMonth`, `formatIso(instant)` ("2024-02-29T13:04:05.006Z").
 
@@ -930,10 +936,11 @@ above; a pool lives for one call (worker threads are started per operation, abou
 
 ## Bounded shell execution (unstable)
 
-`std:io.shellTimeout(proc: ProcessGrant, cmd: string, seconds: int): int` runs the
-same `/bin/sh -c` command as `shell`, with a strictly positive monotonic deadline.
-It returns 0..255 for ordinary exit, -2 for timeout, and -1 for invalid duration,
-spawn failure, signal termination or OS error. It retains process denial and
+`std:io.shellTimeout(proc: ProcessGrant, cmd: string, timeout: Duration): Result<int, ProcessError>` runs the
+same `/bin/sh -c` command as `shell`, with a strictly positive monotonic deadline (a fraction of a second rounds up).
+It returns `Ok(status)` (0..255) for an ordinary exit and `Err(ProcessError { kind, command })` otherwise: `Timeout`,
+`InvalidDuration` (zero or negative) or `Failed` (spawn failure, signal termination or OS error); `processErrorMessage(e)` renders it.
+`shell(proc, cmd): Result<int, ProcessError>` is the unbounded form (`Err(Failed)` when the command cannot run). It retains process denial and
 args-only restrictions. `shell` remains unlimited; shell commands are outside
 grant scopes after spawning. Bounded calls kill their process group on completion
 and reap the direct child. See [execution limits](testing.md#execution-deadlines)
@@ -945,11 +952,13 @@ Output is inherited, not captured or size-limited by this primitive.
 
 ```typescript
 import { Host, useProcess } from "std:host";
-import { shellTimeout } from "std:io";
+import { shellTimeout, processErrorMessage } from "std:io";
+import { seconds } from "std:time";
 function main(host: Host): void {
   useProcess(host, proc => {
-    const status = shellTimeout(proc, "printf hello", 1);
-    console.log(status.toString()); // 0, or -2 if the deadline expires
+    const r = shellTimeout(proc, "printf hello", seconds(1));
+    if (r.isOk()) { console.log(r.unwrap().toString()); } // "0"
+    else { console.log(processErrorMessage(r.unwrapErr())); } // e.g. "command timed out: printf hello"
   });
 }
 ```

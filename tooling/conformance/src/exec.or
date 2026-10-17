@@ -6,8 +6,27 @@
 // the number of workers.
 
 import { ProcessGrant } from "std:process";
-import { shellTimeout } from "std:io";
+import { shellTimeout, Timeout, shell } from "std:io";
+import { seconds } from "std:time";
 import { scopeProcess, spawnProcess, channel, TaskHandle } from "std:task";
+
+// Exit status 0..255 of the command, -1 when it could not be run (the tool keeps statuses as data).
+export function shellStatus(p: ProcessGrant, cmd: string): int {
+  const r = shell(p, cmd);
+  return r.isOk() ? r.unwrap() : 0 - 1;
+}
+
+// Exit status 0..255 of the command, -2 when the time ran out, -1 when it could not be run: the tool keeps statuses as data.
+export function shellTimeoutStatus(p: ProcessGrant, cmd: string, limit: int): int {
+  return match (shellTimeout(p, cmd, seconds(limit))) {
+    Ok(status) => status,
+    Err(e) => match (e.kind) {
+      Timeout => 0 - 2,
+      _ => 0 - 1
+    }
+  };
+}
+
 
 export type Job = { id: usize; compileCmd: string; ccCmd: string; runCmd: string; };
 
@@ -20,15 +39,15 @@ export type Outcome = { id: usize; compileRc: int; ccRc: int; runRc: int; };
 export const MAX_WORKERS: usize = 128;
 
 export function runJob(p: ProcessGrant, j: Job, compileTimeout: int, runTimeout: int): Outcome {
-  const rc0 = shellTimeout(p, j.compileCmd, compileTimeout);
+  const rc0 = shellTimeoutStatus(p, j.compileCmd, compileTimeout);
   if (rc0 != 0 || j.ccCmd == "") {
     return Outcome { id: j.id, compileRc: rc0, ccRc: NOT_RUN, runRc: NOT_RUN };
   }
-  const rc1 = shellTimeout(p, j.ccCmd, compileTimeout);
+  const rc1 = shellTimeoutStatus(p, j.ccCmd, compileTimeout);
   if (rc1 != 0) {
     return Outcome { id: j.id, compileRc: rc0, ccRc: rc1, runRc: NOT_RUN };
   }
-  const rc2 = shellTimeout(p, j.runCmd, runTimeout);
+  const rc2 = shellTimeoutStatus(p, j.runCmd, runTimeout);
   return Outcome { id: j.id, compileRc: rc0, ccRc: rc1, runRc: rc2 };
 }
 

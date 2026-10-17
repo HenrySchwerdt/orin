@@ -1,0 +1,289 @@
+// HTTP/1.1 over std:net and std:http. The shape is that of examples/http_server.or (read its header for the full story):
+//   - the main task owns the listener and only accepts; each accepted connection is MOVED into a bounded channel;
+//   - a fixed pool of worker tasks takes connections from it, parses requests, and asks the owner task (owner.or) for answers;
+//   - the listener is bound through a network grant narrowed to 127.0.0.1, so the program cannot open any other socket.
+// Everything is bounded: `workers` connections in service, `queue` waiting, request head 16 KiB, body 64 KiB, 100 requests per
+// connection, 5 s for a request and for sending an answer.
+import { Host, useNet } from "std:host";
+import { milliseconds } from "std:time";
+import { Scope, TaskHandle, scopeNetDo, spawn, channel, Receiver, Sender } from "std:task";
+import { Bytes, bytesFromString, emptyBytes } from "std:bytes";
+import {
+  Request, HttpLimits, NeedMore, Done, Failed, RequestParser, Http11, methodName, eqIgnoreCase,
+  versionMinor, standardStatus, tryHeaders, emptyHeaders, serializeResponse, Response,
+  ResponseParts, HttpError, BodyTooLarge, StartLineTooLong, HeaderLineTooLong, HeadersTooLarge,
+  TooManyHeaders, UnsupportedVersion,
+} from "std:http";
+import {
+  NetGrant, Listener, Stream, Peer, Accepted, Cancelled, useListener, acceptDetached,
+  serveAcceptedDo, dropAccepted, portOf, recv, sendAll, shutdownWrite, monotonicMillis, isTimeout,
+  netErrorMessage, RecvData, RecvTimeout,
+} from "std:net";
+import { Answer, errorAnswer } from "./api";
+import { Command, ownerLoop, ask } from "./owner";
+
+export type Settings = { port: int; maxConnections: int; workers: int; queue: int; };
+
+const REQUEST_MS: int = 5000;
+const SEND_MS: int = 5000;
+const IDLE_MS: int = 5000;
+const MAX_PER_CONN: int = 100;
+
+function limits(): HttpLimits {
+  return HttpLimits {
+    maxStartLine: 2048,
+    maxHeaderCount: 50,
+    maxHeaderLine: 4096,
+    maxHeaderBytes: 16384,
+    maxChunkLine: 256,
+    maxBody: 65536,
+  };
+}
+
+function statusFor(e: HttpError): int {
+  return match (e.kind) {
+    BodyTooLarge => 413,
+    StartLineTooLong => 414,
+    HeaderLineTooLong => 431,
+    HeadersTooLarge => 431,
+    TooManyHeaders => 431,
+    UnsupportedVersion => 505,
+    _ => 400,
+  };
+}
+
+// Sends one JSON response; false if it could not be sent (the connection is then useless).
+function respond(s: Stream, a: Answer, close: bool): bool {
+  const body = bytesFromString(a.body + "\n");
+  let names: string[] = ["Content-Length", "Content-Type"];
+  let values: string[] = [body.length().toString(), "application/json"];
+  if (close) {
+    names.push("Connection");
+    values.push("close");
+  }
+  const h = tryHeaders(names, values);
+  if (h.isErr()) {
+    return false;
+  }
+  const resp = Response.tryNew(ResponseParts {
+    status: standardStatus(a.code),
+    version: Http11,
+    headers: h.unwrap(),
+    body: body,
+    trailers: emptyHeaders(),
+    forHead: false,
+  });
+  if (resp.isErr()) {
+    return false;
+  }
+  return sendAll(s, serializeResponse(resp.unwrap()), milliseconds(SEND_MS)).isOk();
+}
+
+// After an error answer: FIN, then drop what the client still sends for at most 200 ms, so the OS does not answer unread
+// data with a reset that destroys the response.
+function drain(s: Stream): void {
+  shutdownWrite(s);
+  const end = monotonicMillis(s) + 200;
+  let n: int = 0;
+  while (monotonicMillis(s) < end && n < 16) {
+    const r = recv(s, 4096, milliseconds(50));
+    match (r) {
+      RecvData(b) => {
+        n += 1;
+      },
+      _ => {
+        n = 16;
+      },
+    }
+  }
+}
+
+// One connection: requests until the client goes away, asks for close or does something wrong.
+function serveConnection(s: Stream, commands: Sender<Command>): void {
+  let parser = new RequestParser(limits());
+  const none = emptyBytes();
+  let carry: Bytes = none;
+  let served: int = 0;
+  while (served < MAX_PER_CONN) {
+    parser.reset();
+    let first = true;
+    let deadline: int = 0;
+    let req: Option<Request> = None;
+    let fail: int = 0; // status to answer with a close, 0 = none
+    let quit = false; // close without an answer
+    while (req.isNone() && fail == 0 && !quit) {
+      let chunk: Bytes = none;
+      if (carry.length() > 0) {
+        chunk = carry;
+        carry = none;
+      } else {
+        const wait = first ? IDLE_MS : deadline - monotonicMillis(s);
+        if (wait <= 0) {
+          fail = 408;
+        } else {
+          const r = recv(s, 16384, milliseconds(wait));
+          match (r) {
+            RecvData(b) => {
+              chunk = b;
+            },
+            RecvTimeout => {
+              if (first) {
+                quit = true;
+              } else {
+                fail = 408;
+              }
+            },
+            _ => {
+              quit = true;
+            },
+          }
+        }
+      }
+      if (chunk.length() > 0) {
+        if (first) {
+          first = false;
+          deadline = monotonicMillis(s) + REQUEST_MS;
+        }
+        const pr = parser.feed(chunk);
+        match (pr) {
+          NeedMore => {},
+          Done(rq, used) => {
+            req = Some(rq);
+            carry = chunk.slice(used, chunk.length());
+          },
+          Failed(e) => {
+            fail = statusFor(e);
+          },
+        }
+      }
+    }
+    if (fail != 0) {
+      respond(s, errorAnswer(fail, "request refused"), true);
+      drain(s);
+      return;
+    }
+    if (quit) {
+      return;
+    }
+    const rq = req.unwrap();
+    const answer = ask(commands, methodName(rq.method()), rq.target(), rq.body().toRawString());
+    const conn = rq.headers().get("connection");
+    served += 1;
+    const closeIt = versionMinor(rq.version()) == 0
+        || conn.isSome() && eqIgnoreCase(conn.unwrap(), "close")
+        || served >= MAX_PER_CONN;
+    if (!respond(s, answer, closeIt)) {
+      return;
+    }
+    if (closeIt) {
+      drain(s);
+      return;
+    }
+  }
+}
+
+// A worker: serves the connections it receives until the channel is closed and empty.
+function workerLoop(rx: Receiver<Accepted>, commands: Sender<Command>): int {
+  let served: int = 0;
+  let going = true;
+  while (going) {
+    const next = rx.recv();
+    match (next) {
+      Some(a) => {
+        serveAcceptedDo(
+          a,
+          (s: Stream, peer: Peer) => {
+            serveConnection(s, commands);
+          },
+        );
+        served += 1;
+      },
+      None => {
+        going = false;
+      },
+    }
+  }
+  return served;
+}
+
+// The accepting task: moves each connection into the queue. Returns the number accepted.
+function acceptLoop(ln: Listener, tx: Sender<Accepted>, maxConns: int): int {
+  let n: int = 0;
+  while (maxConns == 0 || n < maxConns) {
+    const r = acceptDetached(ln, milliseconds(1000));
+    match (r) {
+      Ok(a) => {
+        n += 1;
+        if (!tx.send(a)) {
+          dropAccepted(a);
+        }
+      },
+      Err(e) => {
+        if (!isTimeout(e)) {
+          console.error("accept: " + netErrorMessage(e));
+        }
+      },
+    }
+  }
+  return n;
+}
+
+// The pool, inside scope `s`: the owner task, the workers, and (in this task) the accept loop. Shutdown is in dependency
+// order: stop accepting, let the workers finish what they hold, then close the command channel so the owner ends.
+function runPool(s: Scope, ln: Listener, cfg: Settings): void {
+  const conns = channel<Accepted>(cfg.queue.toUsize());
+  const cmds = channel<Command>(64);
+  const cmdRx = cmds.rx;
+  const owner = spawn(s, () => ownerLoop(cmdRx));
+  let hs: TaskHandle<int>[] = [];
+  let i: int = 0;
+  while (i < cfg.workers) {
+    const rx = conns.rx;
+    const tx = cmds.tx;
+    hs.push(spawn(s, () => workerLoop(rx, tx)));
+    i += 1;
+  }
+  const accepted = acceptLoop(ln, conns.tx, cfg.maxConnections);
+  conns.tx.close();
+  let served: int = 0;
+  for (const h of hs) {
+    served += h.join();
+  }
+  conns.rx.close();
+  cmds.tx.close();
+  const handled = owner.join();
+  cmds.rx.close();
+  console.error(
+    "accepted " + accepted.toString() + ", served " + served.toString() + ", requests "
+        + handled.toString(),
+  );
+}
+
+export function run(host: Host, cfg: Settings): void {
+  useNet(
+    host,
+    net => {
+      scopeNetDo(
+        net,
+        (s: Scope, g: NetGrant) => {
+          const r = useListener(
+            g,
+            "127.0.0.1",
+            cfg.port,
+            128,
+            (ln: Listener) => {
+              console.error("listening on 127.0.0.1:" + portOf(ln).toString());
+              runPool(s, ln, cfg);
+            },
+          );
+          match (r) {
+            Ok => {},
+            Err(e) => {
+              console.error("cannot listen: " + netErrorMessage(e));
+            },
+          }
+        },
+      );
+    },
+  );
+}
