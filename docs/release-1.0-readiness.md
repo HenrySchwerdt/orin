@@ -1,9 +1,9 @@
 # Orin 1.0 release-readiness audit
 
 Read-only audit, 2026-10-15. Source baseline: **`dddfd54c495221f58a97b1a0d261aa206247fca0`**
-(main after PRs [#83](https://github.com/HenrySchwerdt/orin/pull/83),
-[#84](https://github.com/HenrySchwerdt/orin/pull/84) and
-[#85](https://github.com/HenrySchwerdt/orin/pull/85)). This is a dated gap assessment, not a release
+(main after PRs [#83](https://github.com/orin-lang/orin-lang/pull/83),
+[#84](https://github.com/orin-lang/orin-lang/pull/84) and
+[#85](https://github.com/orin-lang/orin-lang/pull/85)). This is a dated gap assessment, not a release
 approval or a new language decision. No broad suites were rerun for this audit. Links to repository
 files describe that baseline; inspect it with `git show <baseline>:<path>` when main has moved. PR status also incorporates the coordinator's 22:30 Europe/Berlin checkpoint,
 with both integration heads confirmed open through GitHub.
@@ -18,12 +18,12 @@ library roadmap are separate rankings, not an assertion that all that work must 
 
 | Evidence | What it establishes and what it does not |
 |---|---|
-| [CI run 38802558215](https://github.com/HenrySchwerdt/orin/actions/runs/38802558215) on `dddfd54` | In progress when inspected. No completed green result for this baseline was observed. |
-| [CI run 38798869812](https://github.com/HenrySchwerdt/orin/actions/runs/38798869812) on `89d84d2` | Completed successfully. This predates the encoding merge; it does not certify the later tree. |
+| [CI run 38802558215](https://github.com/orin-lang/orin-lang/actions/runs/38802558215) on `dddfd54` | In progress when inspected. No completed green result for this baseline was observed. |
+| [CI run 38798869812](https://github.com/orin-lang/orin-lang/actions/runs/38798869812) on `89d84d2` | Completed successfully. This predates the encoding merge; it does not certify the later tree. |
 | Merged CLI, URL and encoding PRs above | Source implementations, tests and review evidence exist. Their inclusion in main does not put them into an older downloaded release. |
-| [PR #82](https://github.com/HenrySchwerdt/orin/pull/82), integration head `2734d9ba41c9f4556e5fc2d1b3aee3a996d2376f` | Open. Coordinator reports independent approval of the assertion fix (`9df7ebc`) and eight passing runtime cases; main integration freshly pushed, awaiting CI. Not part of this baseline. |
-| [PR #86](https://github.com/HenrySchwerdt/orin/pull/86), integration head `613b653cf3c4c41f5475404093f5f48ce96e94b5` | Open. Coordinator reports green CI and independent approval for worker head `48de511`, approval of the main integration, and fresh integration CI pending. Not fixed in this baseline. |
-| [Latest published alpha, v0.1.0-alpha.2](https://github.com/HenrySchwerdt/orin/releases/tag/v0.1.0-alpha.2) | Assets inspected: Linux x86-64 tarball, macOS arm64 tarball, `SHA256SUMS`. No Linux arm64 or Intel macOS asset was present. This is a pre-release, not a 1.0 artifact. |
+| [PR #82](https://github.com/orin-lang/orin-lang/pull/82), integration head `2734d9ba41c9f4556e5fc2d1b3aee3a996d2376f` | Open. Coordinator reports independent approval of the assertion fix (`9df7ebc`) and eight passing runtime cases; main integration freshly pushed, awaiting CI. Not part of this baseline. |
+| [PR #86](https://github.com/orin-lang/orin-lang/pull/86), integration head `613b653cf3c4c41f5475404093f5f48ce96e94b5` | Open. Coordinator reports green CI and independent approval for worker head `48de511`, approval of the main integration, and fresh integration CI pending. Not fixed in this baseline. |
+| [Latest published alpha, v0.1.0-alpha.2](https://github.com/orin-lang/orin-lang/releases/tag/v0.1.0-alpha.2) | Assets inspected: Linux x86-64 tarball, macOS arm64 tarball, `SHA256SUMS`. No Linux arm64 or Intel macOS asset was present. This is a pre-release, not a 1.0 artifact. |
 
 Statuses above are historical observations. A release reviewer must inspect current exact heads;
 an open PR or in-progress run is not a failed check, and an earlier success does not transfer to a merge.
