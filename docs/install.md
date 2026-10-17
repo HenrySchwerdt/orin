@@ -72,6 +72,23 @@ The installer only deletes a directory that it created itself (it writes a `.ori
 The latest release is found with the GitHub API (`/releases?per_page=1`), which is rate limited to 60
 requests per hour per IP for anonymous callers; pin `ORIN_VERSION` in CI.
 
+## Homebrew (macOS, Apple silicon)
+
+```sh
+brew install orin-lang/orin/orin
+orin doctor
+```
+
+The tap is [orin-lang/homebrew-orin](https://github.com/orin-lang/homebrew-orin). Its formula installs the
+`macos-arm64` release package (pinned URL and sha256) and runs `orin --version`, `orin doctor`, `orin run` and
+`orin build` as its test. `brew upgrade orin` updates, `brew uninstall orin` removes it. Intel macOS and Linux use
+the one-line install until their Homebrew smoke tests exist.
+
+How the tap is kept current: `tools/homebrew_formula.sh <version> --sums SHA256SUMS` renders `Formula/orin.rb`;
+the `homebrew` job of the release workflow runs it after each published release and opens a PR on the tap (repository
+secret `HOMEBREW_TAP_TOKEN`, write access to the tap only; without it the job only renders the formula). The tap's CI
+installs and tests the formula on macOS. The tap's README and workflow live in `dist/homebrew/tap/`.
+
 ## Manual tarball
 
 ```sh

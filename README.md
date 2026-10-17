@@ -176,7 +176,11 @@ curl -fsSL https://raw.githubusercontent.com/orin-lang/orin-lang/main/install.sh
 orin doctor        # checks the install and the C compiler, prints fixes
 ```
 
-**Homebrew**: planned, not available yet.
+**Homebrew** (macOS on Apple silicon):
+
+```bash
+brew install orin-lang/orin/orin
+```
 
 **Windows**: WSL2 works today ([docs/windows.md](docs/windows.md)); a native build is planned.
 
