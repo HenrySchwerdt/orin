@@ -91,6 +91,69 @@ def badOpenHole : Prog :=
   { n := 3, params := [],
     code := .op (.alloc 0 0) <| Code.structNew 1 [0] <| .op (.takeField 2 1 0) .nil }
 
+/-- an array of length `l0`: write element `l2 := 0`, read it back, read the length -/
+def exArray : Prog :=
+  { n := 6, params := [false],
+    code :=
+      .op (.arrayNew 1 0) <|
+      .op (.const 2 0) <|
+      .op (.const 3 7) <|
+      .op (.arraySet 1 2 3) <|
+      .op (.arrayGet 4 1 2 false) <|
+      .op (.arrayLen 5 1) <|
+      .op (.release 1) .nil }
+
+/-- array store through a shared (duplicated) array -/
+def badArraySetShared : Prog :=
+  { n := 5, params := [false],
+    code := .op (.arrayNew 1 0) <| .op (.dup 2 1) <| .op (.const 3 0) <| .op (.const 4 0) <|
+      .op (.arraySet 1 3 4) .nil }
+
+/-- the index must be an initialised scalar -/
+def badArrayIndexRef : Prog :=
+  { n := 4, params := [false],
+    code := .op (.arrayNew 1 0) <| .op (.alloc 2 0) <| .op (.arrayGet 3 1 2 false) .nil }
+
+/-- reading an element of an array after it was released -/
+def badArrayAfterRelease : Prog :=
+  { n := 4, params := [false],
+    code := .op (.arrayNew 1 0) <| .op (.const 2 0) <| .op (.release 1) <|
+      .op (.arrayGet 3 1 2 false) .nil }
+
+/-- a loop whose body weakens `Unique` to `Owned`: the invariant needs a second round -/
+def exLoop : Prog :=
+  { n := 3, params := [],
+    code :=
+      .op (.const 0 0) <|
+      .op (.alloc 1 0) <|
+      .loop 0 (.op (.dup 2 1) <| .op (.release 2) <| .op (.const 0 1) .nil) <|
+      .op (.release 1) .nil }
+
+/-- a loop body that releases a variable of the enclosing scope: second iteration double-frees -/
+def badLoopRelease : Prog :=
+  { n := 2, params := [],
+    code := .op (.const 0 0) <| .op (.alloc 1 0) <|
+      .loop 0 (.op (.release 1) .nil) .nil }
+
+/-- a loop body that moves a local out each round without refilling it -/
+def badLoopMove : Prog :=
+  { n := 3, params := [],
+    code := .op (.const 0 0) <| .op (.alloc 1 0) <|
+      .loop 0 (.op (.move 2 1) .nil) <| .op (.release 2) .nil }
+
+/-- the loop condition must be an initialised scalar -/
+def badLoopCond : Prog :=
+  { n := 2, params := [],
+    code := .op (.alloc 0 0) <| .loop 0 .nil .nil }
+
+example : check exLoop = true := by decide
+example : check badLoopRelease = false := by decide
+example : check badLoopMove = false := by decide
+example : check badLoopCond = false := by decide
+example : check exArray = true := by decide
+example : check badArraySetShared = false := by decide
+example : check badArrayIndexRef = false := by decide
+example : check badArrayAfterRelease = false := by decide
 example : check exBorrowDup = true := by decide
 example : check badMakeUniqueBorrowed = false := by decide
 example : check badStoreIntoParam = false := by decide
