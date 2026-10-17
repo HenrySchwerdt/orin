@@ -242,7 +242,7 @@ as `rules`. JSON: `{"results":[{"function","file","line","kind","clause","rules"
 | `every`, `some`, `map`, `filter` (pure lambda with an expression body) | quantifier over the indices; `map` / `filter` by their defining facts | well-definedness of the lambda body is part of a contract's goal | block-bodied lambdas; in code (not contracts) a lambda body with an index or call precondition |
 | `range(a, b).every(i => ..)` / `.some(..)`, `sum(xs)`, `sumBy(xs, f)` (`std:seq`) | bounded quantifier; recursive sum with the store lemma | | `sumBy` summands that need a block |
 | records, classes | datatype with one constructor; field read, write through nested places (`a.b.f = v`, `a[i].f = v`), `{ ...r, f: v }`; record `@Invariant`s of parameters and results are assumed (A3) | | generic records |
-| recursive records, classes, unions (a type that reaches itself) | uninterpreted sort with accessor functions, a constructor function and its selector axiom (a union: tester predicates, exactly one holds); see "Recursive types" | same as records / unions; a counterexample is never reported | generic recursive types; `==` on them |
+| recursive records, classes, unions (a type that reaches itself) | uninterpreted sort with accessor functions (a union: a variant tag and payload accessors); a built value is a fresh constant with its fields as facts; no quantifier; see "Recursive types" | same as records / unions; a counterexample is never reported | generic recursive types; `==` on them |
 | `Option<T>`, `Result<T, E>`, user unions | datatypes; `isSome`, `isNone`, `isOk`, `isErr`, `unwrap`, `unwrapOr`, `unwrapErr`, `Some`, `None`, `Ok`, `Err`, variant constructors, `match` (expression and statement) | `unwrap` needs the right variant (obligation `unwrap`) | nested patterns, `?` where the operand is not always evaluated (see "Effects inside an expression"), `==` on these types |
 | `Map<K, V>` | presence array, value array, size; `has`, `get`, `set`, `delete`, `keys`, `values`, `size`, `new Map` | | `entries`; map equality |
 | `string` | datatype (length, id); `length`, `+`, `==`, literals, `charCodeAt`, `charAt`, `substring`, `trim`, `startsWith`, `endsWith`, `includes`, `toString`, template literals | index / range in bounds | contents (see "Strings") |
@@ -332,22 +332,29 @@ bound more than once in one scope), or of a function whose signature is outside 
 
 A record, class or union that reaches itself through its fields or payloads (`type Tree = { value: int; kids: Tree[] }`, a
 scope with an `Option<Scope>` parent, `type Expr = Lit(int) | Add(Expr, Expr)`) has no finite SMT datatype. Its sort is
-uninterpreted (`Rec_Tree`) and is described by exactly what a datatype would say about it, minus well-foundedness:
+uninterpreted (`Rec_Tree`) and is described by what a datatype would say about the values that arise, minus
+well-foundedness, without any quantified axiom:
 
-- a record or class has an accessor function per field (`Rec_Tree.value`), a constructor function (`mkRec_Tree`) and the axiom
-  `accessor_i(mk(a_0 .. a_n)) = a_i` (triggered on the constructor application). A field read is the accessor, a field write or
-  a record literal builds a new value with the constructor, the other fields are carried over (value semantics, as for any
-  record), and the frame facts of a mutating method are equations between accessors.
-- a union has a constructor function and payload accessors per variant (named as in a datatype, `Uni_Expr.Add.0`) and a tester
-  predicate per variant. Axioms: a constructor application satisfies its own tester and returns its arguments; every value
-  satisfies exactly one tester. `match` and variant construction work as for any union (nested patterns are still unsupported).
+- a record or class has an accessor function per field (`Rec_Tree.value`). A field read is the accessor. A value built in
+  the code (a record literal, a field write, the receiver of a constructor, `this` after a loop that writes it) is a fresh
+  constant whose accessors are stated as facts: the written field gets the new value, the others are carried over (value
+  semantics, as for any record). The frame facts of a mutating method are equations between accessors.
+- a union has a tag function (`Uni_Expr.tag`, the index of the variant) and payload accessors per variant (named as in a
+  datatype, `Uni_Expr.Add.0`). The test for a variant is `tag = k`, so a value is of at most one variant; every value that
+  is read or passed in has a tag in range (a well-formedness fact, like a length that is not negative). A variant built
+  with a payload is a fresh constant with its tag and payload as facts; a nullary variant is a constant with its tag.
+  `match` and variant construction work as for any union (nested patterns are still unsupported).
+- no value of such a type can be built inside a quantifier body (UNKNOWN with the reason).
 
 What this does not say: that values are finite (no induction over the structure; a recursive function is proved by its own
 contract, A-CALL), and that two values with equal fields are equal (`==` on a record, class or union is unsupported anyway, so
-nothing depends on it). Every real value is a model of these axioms, so a VERIFIED result is as good as for other records. A
+nothing depends on it). Because the queries contain no quantifier for these types, the solver finds a model of a false
+claim quickly instead of searching until the timeout. Every real execution is a model of these facts, so a VERIFIED result is as good as for other records. A
 model of the solver need not be a real value (it may be cyclic), so **a function that uses a recursive type never gets a
 counterexample**: a wrong claim is UNKNOWN ("the fields of the recursive type `X` are modelled by uninterpreted accessors (a
-model need not be a finite value)"), never VERIFIED and never REFUTED. The class invariants of a recursive class are assumed
+model need not be a finite value)"), never VERIFIED and never REFUTED. For the same reason such a function skips the
+work that only looks for a counterexample: the bounded-search retry after `unknown`, the unrolled-loop pass and solving the
+return paths one by one. The class invariants of a recursive class are assumed
 and proved exactly where they are for other classes (A-INV, A-FRAME); the invariants of the type a field refers to are not
 assumed for the field's value unless the field is read from a parameter or result for which they are assumed already.
 Regression test: `tests/contracts/verify_rectypes.or`.

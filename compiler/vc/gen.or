@@ -488,122 +488,69 @@ function sortOfRec(g0: Gen, tab: Tab, name: string, key: string): Result<SortR, 
 }
 
 // A recursive record or class (it reaches itself through its fields) has no finite SMT datatype. Its sort is
-// uninterpreted; it gets one accessor function `Rec_X.f` per field, a constructor function `mkRec_X`, and the axiom
-// that the accessors return what the constructor was given. That is all the datatype would say apart from
-// well-foundedness and extensionality, which a proof never needs: every real value is a model of these axioms, so a
-// proof is sound; a model of the solver need not be a real value (it may be cyclic), so no counterexample about
-// such a function is trusted (`noteApprox`). Equality of the values themselves is not translated (expr.or).
-// The sort is registered before the field sorts are made (a field may mention the type again, directly or through
-// another recursive type).
+// uninterpreted and it gets one accessor function `Rec_X.f` per field. There is no constructor function and no axiom:
+// a value built in the code (a literal, a field write, the receiver after a loop or in a constructor) is a fresh
+// constant whose accessors are stated as facts (`cyclicMk`, ctx.or), so the queries stay free of quantifiers. That is
+// what a datatype would say about the values that arise, minus well-foundedness and extensionality, which a proof never
+// needs: every real value is a model, so a proof is sound; a model of the solver need not be a real value (it may be
+// cyclic), so no counterexample about such a function is trusted (`noteApprox`). Equality of the values themselves is
+// not translated (expr.or). The sort is registered before the field sorts are made (a field may mention the type
+// again, directly or through another recursive type).
 function sortOfCyclicRec(g0: Gen, tab: Tab, d: RecDef, sn: string, key: string): SortR {
   let g = g0;
   g.registerSort(key, sn);
   g.declare("(declare-sort " + sn + " 0)");
   g.noteApprox("the fields of the recursive type `" + bareOf(d.name) + "` are modelled by uninterpreted accessors (a model need not be a finite value)");
-  let sorts: string[] = [];
   let i: usize = 0;
   while (i < d.fields.length) {
     const fs = sortOfPart(g, tab, fieldTyOf(tab, d, i));
     g = fs.g;
-    sorts.push(fs.s);
     g.declare("(declare-fun " + sn + "." + d.fields[i] + " (" + sn + ") " + fs.s + ")");
     i += 1;
-  }
-  g.declare("(declare-fun mk" + sn + " (" + sorts.join(" ") + ") " + sn + ")");
-  if (sorts.length > 0) {
-    let binds: string[] = [];
-    let vars: string[] = [];
-    let k: usize = 0;
-    while (k < sorts.length) {
-      binds.push("(a" + k.toString() + " " + sorts[k] + ")");
-      vars.push("a" + k.toString());
-      k += 1;
-    }
-    const app = "(mk" + sn + " " + vars.join(" ") + ")";
-    let eqs: string[] = [];
-    let e: usize = 0;
-    while (e < sorts.length) {
-      eqs.push("(= (" + sn + "." + d.fields[e] + " " + app + ") a" + e.toString() + ")");
-      e += 1;
-    }
-    g.assert("(forall (" + binds.join(" ") + ") (! " + (eqs.length == 1 ? eqs[0] : "(and " + eqs.join(" ") + ")") + " :pattern (" + app + ")))");
   }
   return SortR { g: g, s: sn };
 }
 
-// A recursive union: an uninterpreted sort, a constructor function `Uni_X.V` and payload accessors `Uni_X.V.i` per
-// variant (the names of the datatype of a non-recursive union), and a tester predicate `Uni_X.is.V`. Axioms: a
-// constructor application satisfies its tester and returns its arguments; every value satisfies exactly one tester.
+// A recursive union: an uninterpreted sort, a tag function `Uni_X.tag` (the index of the variant, so a value is of
+// exactly one variant: the test for variant k is `tag = k`) and payload accessors `Uni_X.V.i` (the names of the
+// datatype of a non-recursive union). A nullary variant is a constant with its tag; a variant built with a payload is
+// a fresh constant with its tag and accessors as facts (`cyclicVariant`, ctx.or). No quantifier.
 function sortOfCyclicUni(g0: Gen, tab: Tab, u: UniDef, sn: string, key: string): SortR {
   let g = g0;
   g.registerSort(key, sn);
   g.declare("(declare-sort " + sn + " 0)");
-  g.noteApprox("the variants of the recursive union `" + bareOf(u.name) + "` are modelled by uninterpreted constructors (a model need not be a finite value)");
-  let testers: string[] = [];
-  for (const v of u.variants) {
-    const tester = sn + ".is." + v.name;
-    testers.push(tester);
-    g.declare("(declare-fun " + tester + " (" + sn + ") Bool)");
-  }
-  for (const v of u.variants) {
+  g.noteApprox("the variants of the recursive union `" + bareOf(u.name) + "` are modelled by uninterpreted accessors (a model need not be a finite value)");
+  g.declare("(declare-fun " + sn + ".tag (" + sn + ") Int)");
+  let k: usize = 0;
+  while (k < u.variants.length) {
+    const v = u.variants[k];
     const ctor = sn + "." + v.name;
-    let sorts: string[] = [];
     let i: usize = 0;
     while (i < v.payload.length) {
       const fs = sortOfPart(g, tab, payloadTy(tab, u, v.payload[i]));
       g = fs.g;
-      sorts.push(fs.s);
       g.declare("(declare-fun " + ctor + "." + i.toString() + " (" + sn + ") " + fs.s + ")");
       i += 1;
     }
-    if (sorts.length == 0) {
+    if (v.payload.length == 0) {
       g.declare("(declare-const " + ctor + " " + sn + ")");
-      g.assert("(" + sn + ".is." + v.name + " " + ctor + ")");
-    } else {
-      g.declare("(declare-fun " + ctor + " (" + sorts.join(" ") + ") " + sn + ")");
-      let binds: string[] = [];
-      let vars: string[] = [];
-      let k: usize = 0;
-      while (k < sorts.length) {
-        binds.push("(a" + k.toString() + " " + sorts[k] + ")");
-        vars.push("a" + k.toString());
-        k += 1;
-      }
-      const app = "(" + ctor + " " + vars.join(" ") + ")";
-      let parts: string[] = ["(" + sn + ".is." + v.name + " " + app + ")"];
-      let e: usize = 0;
-      while (e < sorts.length) {
-        parts.push("(= (" + ctor + "." + e.toString() + " " + app + ") a" + e.toString() + ")");
-        e += 1;
-      }
-      g.assert("(forall (" + binds.join(" ") + ") (! (and " + parts.join(" ") + ") :pattern (" + app + ")))");
+      g.declare("(assert (= (" + sn + ".tag " + ctor + ") " + k.toString() + "))");
     }
-  }
-  if (testers.length > 0) {
-    let one: string[] = [];
-    let a: usize = 0;
-    while (a < testers.length) {
-      one.push("(" + testers[a] + " x)");
-      a += 1;
-    }
-    let pats: string[] = [];
-    for (const t of testers) {
-      pats.push(":pattern ((" + t + " x))");
-    }
-    let excl: string[] = [];
-    let p: usize = 0;
-    while (p < testers.length) {
-      let q = p + 1;
-      while (q < testers.length) {
-        excl.push("(not (and " + one[p] + " " + one[q] + "))");
-        q += 1;
-      }
-      p += 1;
-    }
-    const body = excl.length == 0 ? "(or " + one.join(" ") + ")" : "(and (or " + one.join(" ") + ") " + excl.join(" ") + ")";
-    g.assert("(forall ((x " + sn + ")) (! " + body + " " + pats.join(" ") + "))");
+    k += 1;
   }
   return SortR { g: g, s: sn };
+}
+
+// The index of variant `name` in the union `u`.
+export function variantIndex(u: UniDef, name: string): Option<usize> {
+  let k: usize = 0;
+  while (k < u.variants.length) {
+    if (u.variants[k].name == name) {
+      return Some(k);
+    }
+    k += 1;
+  }
+  return None;
 }
 
 function sortOfUni(g0: Gen, tab: Tab, name: string, key: string): Result<SortR, string> {

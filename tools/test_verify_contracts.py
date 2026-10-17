@@ -14,7 +14,7 @@ verify_basic (int / bool, modular calls), verify_int_widths (exact ranges), veri
 verify_data (records, Option, Result, unions, Map, strings), verify_classes (invariants per method, constructors,
 frames, modular method calls), verify_loops (inferred bounds, user invariants, havoc, unrolling), verify_quantifiers
 (every / some / range, sorted, no duplicates, conservation, totals), verify_generics, verify_try (`?` as an early return and
-mutating calls inside expressions, hoisted in evaluation order), verify_rectypes (recursive records, classes and unions: accessors, constructors, testers; wrong claims are UNKNOWN), verify_soundness (places where a
+mutating calls inside expressions, hoisted in evaluation order), verify_rectypes (recursive records, classes and unions: accessors, built values, variant tags; wrong claims are UNKNOWN), verify_soundness (places where a
 careless encoding gives a wrong status), quality_vc (W046x), names/ (two units declaring the same function and type names:
 each call and type is resolved in the scope of its own unit). Run with the contract-checked compiler in CI
 (tools/test_compiler_contracts.sh), so the verifier's own contracts are exercised too.
