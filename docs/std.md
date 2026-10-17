@@ -5,6 +5,11 @@ source with signature, errors/absence, behaviour and complexity (the spec 08 val
 page is the map. `orin mcp` `inspect` answers `std:path.join`, `std:json/legacy.parse`, `std:json.parseDocument`, ... from its built-in
 API table (`compiler/mcp/apitable.or`).
 
+Importing (ADR-0048 addendum): `import { fromString } from "std:bytes";` brings single names, `import { empty as emptyBytes } from "std:bytes";` renames one,
+and `import * as bytes from "std:bytes";` binds a compile-time namespace, so `bytes.fromString(..)`, `bytes.Bytes` and `bytes.empty()` need no prefix in the name and
+cannot clash with `html.empty()`. The namespace is no value, and a local or parameter named like it is E0304 (name grants `grant` / `proc` when `fs` is a namespace).
+The examples below use the namespace form for bytes, encoding, html, path, json, fs, time and url.
+
 | Module | Implemented in | Status |
 |---|---|---|
 | `std:host` | Orin, `library/std/host.or` over the grant primitives of `std:fsraw` | the root of authority: `Host`, scope functions that derive grants (ADR-0027); **unstable** until the I/O freeze |
