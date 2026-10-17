@@ -71,6 +71,7 @@ the whole call (a `Param` local, `AS.pinned`).
 | `CallGen.lean` | `Site`, `StkW`, `GoodW`: the call-machine invariant with explicit call-site data; `goodW_step`, `goodW_reach` |
 | `CallLink.lean` | `callRI`, `RetGenOK`, `ret_genok`, `RetGenOK.exec`, `prog_ret_genok`: the contract `GenOK` of a call derived from the ownership model |
 | `OpLen.lean` | `mop_len`, `drain_len`, `mstep_len`: no builtin and no release step changes the length of an array behind a counted local; `mstep_len_param`, `mstep_len_pinned`: the same for a `Param` local (`Frozen`) |
+| `BuiltinSim.lean` | `miRI` (descriptor per machine instruction), `frameOf` (frame model with `ctd` = pin of the kinds), `KCls`, `genok_frame`, `sim_*` (one lemma per instruction), `mop_exec`, `ret_genok_k`, `prog_ret_genok_k`, `held_of_kind` |
 | `RangePin.lean` | T2 for a borrowed-only array parameter: `PinA`, `KeptI`, `pinA_exec`, `reachP_pin`, `held_of_pin`, `t2_param` |
 
 Headline statement: `range_accepted` + `u1_sound`: for a function whose worklist iteration ended
@@ -112,14 +113,32 @@ given by `NarrowRel`.
   operations `OpLen.lean` proves the facts the contract rests on, for the machine's own instructions:
   `mop_len` (no instruction frees an object or changes its number of slots), `drain_len` (a release step
   never frees the object of a counted local), `mstep_len` (no step changes the length of an array behind
-  a counted local). Remaining, stated: (a) the descriptor of a builtin (`dst`, `men`, `kept`) is not tied
-  per instruction to the machine's `MI` (only the length/liveness facts are); (b) the type discipline of
-  the result: `RetGenOK` takes `hcls` (an owned operand is a reference-class local) and `hres` (the
-  stored result respects the class of its local: a `usize` is never negative, a `bool` is 0 or 1);
-  the ownership model has no integer classes, so this stays an explicit hypothesis, as the class
-  conditions of `Exec`; (c) the ghost bit `ctd` is related to the ownership kinds only through the
-  hypothesis `ctd x -> pinned (kinds at the call) x` (`AS.pinned`: counted, or a `Param` local), i.e. the caller of the bridge supplies the
-  simulation between the range frame and the ownership analysis.
+  a counted local). **The three residuals of the previous step are closed as far as the model reaches**
+  (`BuiltinSim.lean`): (a) the descriptor of every builtin is fixed per machine instruction, `miRI`
+  (`borrow`, `dup`, `getField`, `takeField`, a run-time sized `arrayNew`: `gen (some d) [z] (keepNe d [z])`;
+  `release`: `gen none [x] []`; `setField`, `putField`: `gen none [x, v] [x]`), and `mop_exec` proves that a
+  successful machine step accepted by the kind transfer `stepL` is a step `Range.Exec cls (miRI i)` between
+  the frame models of the two states; for the `gen` ones `GenOK` is **derived** from the machine
+  (`sim_borrow`, `sim_dup`, `sim_release`, `sim_getField`, `sim_setField`, `sim_putField`, `sim_takeField`,
+  `sim_arrayNewDyn`, on top of `genok_frame`), for the instructions the analysis knows (`const`, `move`,
+  `alloc` = `arrayNew`, `makeUnique`, `arrayLen`, `arrayGet`, `arraySet`) the `Exec` rule is derived. (c) The
+  ghost bit is no longer supplied: `frameOf a st` takes the locals and the lengths from the machine state
+  and defines `ctd x` as the pin of the kinds, `pinOf a x = (gk a x).pinned`. `mop_exec` and `ret_genok_k` /
+  `prog_ret_genok_k` (the return of a call, `callFrame`) are stated for these frames, so the bit of the
+  result frame is computed from the kinds after the step, and `held_of_kind` reads `Held` off the kinds.
+  (b) `hcls` is derived (an owned operand is counted, so the class table gives it class `ref`), and so is
+  every reference-valued result: a reference lands in a local that the kinds call a reference, which
+  has class `ref` (`refkind_class`); a cleared local holds 0; the length of an array is not negative.
+  Hypotheses that stay, each explicit in the theorem: `KCls cls a` (the class table agrees with the
+  kinds at the point: a reference-kind local has class `ref`, an `init` local a scalar class; `wf.or` ties
+  them in the verifier), `MiWf` (`const` writes a legal value of the class of its local, `arrayLen` stores
+  into an `int`/`usize` local) and `SRes` / `hresS` (a **scalar** read from the heap or returned by a callee
+  respects the class of the local that receives it: `usize` not negative, `bool` 0 or 1); the machine has
+  neither integer classes nor array contents, so this cannot be derived from it. Not proved: that a run of
+  the structured `Code` of the machine is a run of the `RI` blocks of a function (the translation between
+  the two programs); `Held` along a prefix of `RI` instructions is therefore derived in the range model
+  (`t2_param`), and read off the kinds for a machine state (`held_of_kind`), but the two are not composed
+  into one theorem about one program.
 * **Integers** are mathematical; overflow, underflow and bounds traps stop the execution, so a trap has
   no successor. A `usize` is never negative (`Cls.okv`; `wf.or`). Every written value respects the class
   of its local.

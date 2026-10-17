@@ -40,6 +40,7 @@ import Orin.CallTop
 import Orin.CallGen
 import Orin.CallLink
 import Orin.OpLen
+import Orin.BuiltinSim
 import Orin.CallExamples
 import Orin.TypedCall
 import Orin.Range

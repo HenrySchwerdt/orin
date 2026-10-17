@@ -22,6 +22,8 @@ operands are the only locals the call clears, the others keep their value.
 What the ownership model does not give (explicit hypotheses): `hcls` (an owned operand is a
 reference-class local) and `hres` (the result respects the class of the local it is stored in:
 `usize` is never negative, a `bool` is 0 or 1).  Both are the type discipline of `wf.or`.
+`BuiltinSim.lean` (`ret_genok_k`) derives `hcls` and the reference case of `hres` from the class table
+against the kinds, defines the ghost bit from the kinds, and leaves only the class of a scalar result.
 -/
 
 namespace Orin

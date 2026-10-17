@@ -153,3 +153,8 @@ import Orin
 #print axioms Orin.pin_entry_param
 #print axioms Orin.mstep_len_param
 #print axioms Orin.mstep_len_pinned
+#print axioms Orin.mop_exec
+#print axioms Orin.genok_frame
+#print axioms Orin.ret_genok_k
+#print axioms Orin.prog_ret_genok_k
+#print axioms Orin.held_of_kind
