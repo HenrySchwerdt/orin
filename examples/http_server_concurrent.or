@@ -1,0 +1,305 @@
+// A CONCURRENT HTTP/1.1 server on std:net, std:http and std:task (ADR-0033, ADR-0017 Addendum C).
+//
+//   GET  /health   200 "ok"
+//   POST /echo     200 with the request body (and its Content-Type)
+//   anything else  404 / 405 / 400 / 408 / 413 / 414 / 431 as the case may be
+//
+// Usage:  http_server_concurrent [port] [maxConnections] [requestMs] [verbose] [workers] [queue]
+//   port            default 8080; 0 = a free port (printed on stderr: "listening on 127.0.0.1:PORT")
+//   maxConnections  accept this many connections, serve them all, then exit; 0 = forever (default)
+//   requestMs       deadline for one whole request (head and body) from its first byte: default 5000
+//   verbose         1 = one log line per request on stderr (default 0)
+//   workers         worker tasks, i.e. connections served at the same time: default 8, 1..256
+//   queue           accepted connections waiting for a free worker: default 16, 1..4096
+//
+// Shape. The main task owns the listener and does nothing but accept. Each accepted connection is MOVED out of the
+// accepting task (`acceptDetached`: the Stream leaves its grant table and becomes a one-shot token) and sent through a
+// bounded channel to a fixed pool of worker tasks; a worker adopts it (`serveAcceptedDo`), serves it and closes it.
+// Bounds, all fixed at start: `workers` connections in service, `queue` waiting; when both are full the accepting task blocks
+// in `send`, so further clients wait in the kernel's backlog (128) and then are refused by the kernel. Memory use is bounded by
+// workers x (one request: head 16 KiB + body 64 KiB) plus the queue (tokens, no buffers).
+//
+// Limits (a hostile client can make the server wait and buffer, never more than this): request line 2048 bytes, 50
+// headers, header line 4096, head 16 KiB, body 64 KiB, 100 requests per connection, idle wait for the next request 5 s,
+// request deadline `requestMs` (a slow client gets 408 when it passes), 5 s to accept the response. A slow or silent
+// client occupies ONE worker, for at most those deadlines. It listens on the loopback interface only, through a network
+// grant narrowed to that address: the program cannot open any other socket, whatever its code does.
+//
+// The connection is closed gracefully after an error answer (shutdown of the write side, bounded drain, close) so that the
+// client sees the answer and not a reset.
+
+import { Host, withProcess, useNet } from "std:host";
+import { milliseconds } from "std:time";
+import { Scope, TaskHandle, scopeNetDo, spawn, channel, Receiver, Sender } from "std:task";
+import { args } from "std:process";
+import { Bytes, bytesFromString, emptyBytes } from "std:bytes";
+import {
+  Request, Response, Headers, HttpLimits, ParseResult, NeedMore, Done, Failed, RequestParser, HttpError, Http11, methodName, eqIgnoreCase,
+  versionMinor, standardStatus, tryHeaders, emptyHeaders, serializeResponse, ResponseParts,
+  BodyTooLarge, StartLineTooLong, HeaderLineTooLong, HeadersTooLarge, TooManyHeaders, UnsupportedVersion
+} from "std:http";
+import {
+  NetGrant, Listener, Stream, Peer, Accepted, useListener, acceptDetached, serveAcceptedDo, dropAccepted, portOf, recv,
+  sendAll, shutdownWrite, monotonicMillis, isTimeout, netErrorMessage, RecvData, RecvEof, RecvTimeout, RecvReset, RecvError
+} from "std:net";
+
+type Config = { limits: HttpLimits; requestMs: int; idleMs: int; sendMs: int; maxPerConn: int; verbose: bool; };
+
+function clamp(v: int, lo: int, hi: int): int {
+  return v < lo ? lo : v > hi ? hi : v;
+}
+
+function intArg(xs: string[], i: usize, dflt: int): int {
+  if (i >= xs.length) {
+    return dflt;
+  }
+  return match (parseInt(xs[i])) {
+    Some(v) => v,
+    None => dflt
+  };
+}
+
+// The status code for a request the parser refused.
+function statusFor(e: HttpError): int {
+  return match (e.kind) {
+    BodyTooLarge => 413,
+    StartLineTooLong => 414,
+    HeaderLineTooLong => 431,
+    HeadersTooLarge => 431,
+    TooManyHeaders => 431,
+    UnsupportedVersion => 505,
+    _ => 400
+  };
+}
+
+// Sends one response; false if it could not be sent (the connection is then useless).
+function respond(s: Stream, cfg: Config, code: int, ctype: string, body: Bytes, close: bool): bool {
+  let names: string[] = ["Content-Length", "Content-Type"];
+  let values: string[] = [body.length().toString(), ctype];
+  if (close) {
+    names.push("Connection");
+    values.push("close");
+  }
+  const h = tryHeaders(names, values);
+  if (h.isErr()) {
+    return false;
+  }
+  const resp = Response.tryNew(ResponseParts {
+    status: standardStatus(code), version: Http11, headers: h.unwrap(), body: body, trailers: emptyHeaders(), forHead: false
+  });
+  if (resp.isErr()) {
+    return false;
+  }
+  return sendAll(s, serializeResponse(resp.unwrap()), milliseconds(cfg.sendMs)).isOk();
+}
+
+function text(code: int, msg: string): Bytes {
+  return bytesFromString(msg + "\n");
+}
+
+// What to answer: the status, content type and body for a request.
+type Answer = { code: int; ctype: string; body: Bytes; };
+
+function route(req: Request): Answer {
+  const target = req.target();
+  const m = methodName(req.method());
+  if (target == "/health") {
+    if (m == "GET") {
+      return Answer { code: 200, ctype: "text/plain", body: bytesFromString("ok\n") };
+    }
+    return Answer { code: 405, ctype: "text/plain", body: text(405, "use GET") };
+  }
+  if (target == "/echo") {
+    if (m == "POST") {
+      const ct = req.headers().get("content-type");
+      return Answer { code: 200, ctype: ct.unwrapOr("application/octet-stream"), body: req.body() };
+    }
+    return Answer { code: 405, ctype: "text/plain", body: text(405, "use POST") };
+  }
+  return Answer { code: 404, ctype: "text/plain", body: text(404, "not found") };
+}
+
+// After an error answer: send FIN, then read (and drop) what the client still sends for at most 200 ms, so that the OS does not
+// answer unread data with a reset that destroys the response.
+function drain(s: Stream): void {
+  shutdownWrite(s);
+  const end = monotonicMillis(s) + 200;
+  let n: int = 0;
+  while (monotonicMillis(s) < end && n < 16) {
+    const r = recv(s, 4096, milliseconds(50));
+    match (r) {
+      RecvData(b) => { n += 1; },
+      _ => { n = 16; }
+    }
+  }
+}
+
+// One connection: requests until the client goes away, asks for close or does something wrong. Returns the number of requests.
+function serveConnection(s: Stream, peer: Peer, cfg: Config): int {
+  let parser = new RequestParser(cfg.limits);
+  const none = emptyBytes();   // one empty chunk per connection, shared (a Bytes never changes)
+  let carry: Bytes = none;
+  let served: int = 0;
+  while (served < cfg.maxPerConn) {
+    parser.reset();
+    let first = true;
+    let deadline: int = 0;
+    let req: Option<Request> = None;
+    let fail: int = 0;     // status to answer with a close, 0 = none
+    let quit = false;      // close without an answer
+    while (req.isNone() && fail == 0 && !quit) {
+      let chunk: Bytes = none;
+      if (carry.length() > 0) {
+        chunk = carry;
+        carry = none;
+      } else {
+        const wait = first ? cfg.idleMs : deadline - monotonicMillis(s);
+        if (wait <= 0) {
+          fail = 408;
+        } else {
+          const r = recv(s, 16384, milliseconds(wait));
+          match (r) {
+            RecvData(b) => { chunk = b; },
+            RecvTimeout => { if (first) { quit = true; } else { fail = 408; } },
+            _ => { quit = true; }
+          }
+        }
+      }
+      if (chunk.length() > 0) {
+        if (first) {
+          first = false;
+          deadline = monotonicMillis(s) + cfg.requestMs;
+        }
+        const pr = parser.feed(chunk);
+        match (pr) {
+          NeedMore => {},
+          Done(rq, used) => {
+            req = Some(rq);
+            carry = chunk.slice(used, chunk.length());
+          },
+          Failed(e) => { fail = statusFor(e); }
+        }
+      }
+    }
+    if (fail != 0) {
+      respond(s, cfg, fail, "text/plain", text(fail, "request refused"), true);
+      if (cfg.verbose) { console.error(peer.host + " -> " + fail.toString()); }
+      drain(s);
+      return served;
+    }
+    if (quit) {
+      return served;
+    }
+    const rq = req.unwrap();
+    const ans = route(rq);
+    const conn = rq.headers().get("connection");
+    served += 1;
+    const closeIt = versionMinor(rq.version()) == 0 || (conn.isSome() && eqIgnoreCase(conn.unwrap(), "close")) || served >= cfg.maxPerConn;
+    if (cfg.verbose) { console.error(peer.host + " " + methodName(rq.method()) + " " + rq.target() + " -> " + ans.code.toString()); }
+    if (!respond(s, cfg, ans.code, ans.ctype, ans.body, closeIt)) {
+      return served;
+    }
+    if (closeIt) {
+      drain(s);
+      return served;
+    }
+  }
+  return served;
+}
+
+// A worker: serves the connections it receives until the channel is closed and empty.
+function workerLoop(rx: Receiver<Accepted>, cfg: Config): int {
+  let served: int = 0;
+  let going = true;
+  while (going) {
+    const next = rx.recv();
+    match (next) {
+      Some(a) => {
+        serveAcceptedDo(a, (s: Stream, peer: Peer) => {
+          serveConnection(s, peer, cfg);
+        });
+        served += 1;
+      },
+      None => { going = false; }
+    }
+  }
+  return served;
+}
+
+// The accepting task: moves each connection into the queue. Returns the number accepted.
+function acceptLoop(ln: Listener, tx: Sender<Accepted>, maxConns: int): int {
+  let n: int = 0;
+  while (maxConns == 0 || n < maxConns) {
+    const r = acceptDetached(ln, milliseconds(1000));
+    match (r) {
+      Ok(a) => {
+        n += 1;
+        if (!tx.send(a)) {
+          dropAccepted(a);
+        }
+      },
+      Err(e) => {
+        if (!isTimeout(e)) {
+          console.error("accept: " + netErrorMessage(e));
+        }
+      }
+    }
+  }
+  return n;
+}
+
+function runPool(s: Scope, ln: Listener, cfg: Config, maxConns: int, workers: int, queue: int): void {
+  const ch = channel<Accepted>(queue.toUsize());
+  let hs: TaskHandle<int>[] = [];
+  let i: int = 0;
+  while (i < workers) {
+    const rx = ch.rx;
+    hs.push(spawn(s, () => workerLoop(rx, cfg)));
+    i += 1;
+  }
+  const accepted = acceptLoop(ln, ch.tx, maxConns);
+  ch.tx.close();
+  let served: int = 0;
+  for (const h of hs) {
+    served += h.join();
+  }
+  ch.rx.close();
+  console.error("accepted " + accepted.toString() + ", served " + served.toString());
+}
+
+function runServer(net: NetGrant, port: int, maxConns: int, workers: int, queue: int, cfg: Config): void {
+  scopeNetDo(net, (s: Scope, g: NetGrant) => {
+    const r = useListener(g, "127.0.0.1", port, 128, (ln: Listener) => {
+      console.error("listening on 127.0.0.1:" + portOf(ln).toString());
+      runPool(s, ln, cfg, maxConns, workers, queue);
+    });
+    match (r) {
+      Ok => {},
+      Err(e) => {
+        console.error("cannot listen: " + netErrorMessage(e));
+      }
+    }
+  });
+}
+
+function main(host: Host): void {
+  const argv = withProcess(host, p => args(p));
+  const port = intArg(argv, 0, 8080);
+  const maxConns = intArg(argv, 1, 0);
+  const requestMs = intArg(argv, 2, 5000);
+  const cfg = Config {
+    limits: HttpLimits {
+      maxStartLine: 2048, maxHeaderCount: 50, maxHeaderLine: 4096, maxHeaderBytes: 16384, maxChunkLine: 256, maxBody: 65536
+    },
+    requestMs: requestMs,
+    idleMs: 5000,
+    sendMs: 5000,
+    maxPerConn: 100,
+    verbose: intArg(argv, 3, 0) == 1
+  };
+  const workers = clamp(intArg(argv, 4, 8), 1, 256);
+  const queue = clamp(intArg(argv, 5, 16), 1, 4096);
+  useNet(host, net => {
+    runServer(net, port, maxConns, workers, queue, cfg);
+  });
+}

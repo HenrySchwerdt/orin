@@ -45,6 +45,15 @@ char *getcwd(char *buf, size_t n) {
     for (size_t i = 0; i <= l; i++) buf[i] = g_cwd[i];
     return buf;
 }
+/* descriptors: the wake-source harnesses never create one (wake_fd is reached only from the waits); close / write are inert */
+int close(int fd) {
+    (void)fd;
+    return 0;
+}
+ssize_t write(int fd, const void *buf, size_t n) {
+    (void)fd, (void)buf;
+    return (ssize_t)n;
+}
 /* threads run nothing: the create stub only succeeds or fails, the join stub returns at once */
 int pthread_create(pthread_t *t, const pthread_attr_t *a, void *(*fn)(void *), void *arg) {
     (void)t, (void)a, (void)fn, (void)arg;
@@ -389,4 +398,99 @@ void harness_thread_handles(void) {
     assert(orin_platform_thread_join(a, &arg) == ORIN_PLATFORM_EINVAL);
     assert(orin_platform_thread_join(b, &arg) == 0);
     assert(orin_platform_thread_join(b, &arg) == ORIN_PLATFORM_EINVAL);
+}
+
+/* ---- wake sources (ADR-0017 Addendum D): the handle table and the token tree as a bounded STATE MACHINE. Reference model:
+ *      for each token ever opened, its handle, whether it is live, its own flag, its parent and the thread's binding. Steps:
+ *      open / close / signal / check / bind / bound on an issued or a forged handle. Checked at every step: a stale (closed,
+ *      even if its slot was reused under a new generation) or forged handle is ALWAYS refused (close EINVAL, signal 0, check 2)
+ *      and changes nothing; a child observes every live ancestor and stops at a stale one; closing the bound token rebinds
+ *      its parent; the table is never read out of bounds. The descriptors (eventfd, poll) are not created here: wake_fd runs
+ *      from the waits, which platform_test.c exercises on real sockets. */
+enum { WSTEPS = 5 };
+
+void harness_wake_state_machine(void) {
+    int64_t hs[WSTEPS], bound = 0;
+    int live[WSTEPS], setf[WSTEPS], par[WSTEPS];
+    unsigned issued = 0;
+    for (int step = 0; step < WSTEPS; step++) {
+        int op;
+        __CPROVER_assume(op >= 0 && op <= 5);
+        if (op == 0 || issued == 0) { /* open */
+            int64_t h = orin_platform_wake_open();
+            assert(h > 0); /* WSTEPS < the (shrunk) table, depth far below WAKE_DEPTH */
+            for (unsigned k = 0; k < issued; k++) assert(!live[k] || hs[k] != h);
+            par[issued] = -1;
+            for (unsigned k = 0; k < issued; k++)
+                if (live[k] && hs[k] == bound) par[issued] = (int)k;
+            hs[issued] = h, live[issued] = 1, setf[issued] = 0;
+            issued++;
+            bound = h;
+            assert(orin_platform_wake_bound() == h);
+            continue;
+        }
+        unsigned k;
+        int forged;
+        int64_t f, h;
+        __CPROVER_assume(k < issued);
+        h = forged ? f : hs[k];
+        if (forged) { /* any value that is not a live issued handle */
+            for (unsigned j = 0; j < issued; j++) __CPROVER_assume(!live[j] || hs[j] != h);
+            k = issued;
+        }
+        int known = !forged && live[k];
+        switch (op) {
+        case 1: /* close */
+            if (!known) assert(orin_platform_wake_close(h) == ORIN_PLATFORM_EINVAL);
+            else {
+                assert(orin_platform_wake_close(h) == 0);
+                live[k] = 0;
+                if (bound == h) bound = par[k] >= 0 ? hs[par[k]] : 0;
+            }
+            assert(orin_platform_wake_bound() == bound);
+            break;
+        case 2: /* signal: reports a change exactly once */
+            if (!known) assert(orin_platform_wake_signal(h) == 0);
+            else {
+                assert(orin_platform_wake_signal(h) == !setf[k]);
+                setf[k] = 1;
+                assert(orin_platform_wake_signal(h) == 0);
+            }
+            break;
+        case 3: { /* check: 2 stale, else whether it or a live ancestor is set */
+            int64_t r = orin_platform_wake_check(h);
+            if (!known) assert(r == 2);
+            else {
+                int any = 0;
+                for (int j = (int)k; j >= 0 && live[j]; j = par[j]) any |= setf[j];
+                assert(r == any);
+            }
+            break;
+        }
+        case 4: { /* bind returns the previous binding; any value binds (a stale one means "nothing") */
+            assert(orin_platform_wake_bind(h) == bound);
+            bound = h;
+            assert(orin_platform_wake_bound() == h);
+            break;
+        }
+        default:
+            break;
+        }
+    }
+    assert(orin_platform_wake_close(0) == ORIN_PLATFORM_EINVAL && orin_platform_wake_signal(0) == 0 && orin_platform_wake_check(-1) == 2);
+}
+
+/* a recycled slot gets a NEW generation: the handle of a closed token never names a later token in the same slot */
+void harness_wake_generation(void) {
+    int64_t a = orin_platform_wake_open();
+    assert(a > 0);
+    assert(orin_platform_wake_close(a) == 0);
+    int64_t b = orin_platform_wake_open();
+    assert(b > 0 && b != a);
+    assert(orin_platform_wake_signal(a) == 0 && orin_platform_wake_check(b) == 0);
+    assert(orin_platform_wake_close(a) == ORIN_PLATFORM_EINVAL);
+    assert(orin_platform_wake_check(a) == 2);
+    assert(orin_platform_wake_signal(b) == 1 && orin_platform_wake_check(b) == 1);
+    assert(orin_platform_wake_close(b) == 0);
+    assert(orin_platform_wake_bound() == 0);
 }

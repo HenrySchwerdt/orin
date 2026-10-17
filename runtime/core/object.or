@@ -1,0 +1,144 @@
+// $rt/object -- allocation of structs and arrays, written in Orin (ADR-0052 Addendum A, step R3d.3 (a)).
+//
+// The backends call these functions by name (compiler/mir/rt.or lists them; opt/prune.or keeps them) in place of the C runtime
+// functions `orin_struct_new`, `orin_variant1` and `orin_array_new`; the C shells of the runtime reach them through the
+// exported wrappers of the same names that the emitted code defines. An object is its address as a `usize`. The layout and the
+// heap block are described in heap.or. A failed allocation traps "out of memory" in `memAlloc` itself. Counters and the
+// live-object balance are updated exactly as the C versions did (the ORIN_STATS=1 report is the equivalence oracle). In a census build
+// (cfg 2) each object is preceded by the census prefix word (heap.or `pfx`) and the allocation is reported to the census (`siteAlloc`).
+
+import { load64, store8, store32, store64, memAlloc, memSet, heapBase, cfg, expect, wadd, wsub, wmul, shl, and } from "std:core";
+import { taskTrap } from "std:fsraw";
+import {
+  sbAlloc, sbRealloc, subAt, addAt, liveInc, statAlloc, statGrow, pfx, siteAlloc, siteGrow, S_ALLOC_STRING, S_ALLOC_STRUCT,
+  S_ALLOC_ARRAY, S_ARRAY_GROWS, FL_ARRAY, FL_N
+} from "./heap";
+
+// A new struct with all slots zero (null refs): `nslots` slots of 8 bytes behind the 32-byte header, rc 1. `refmask` bit i set:
+// slot i is a reference (at most 64 slots).
+@Inline
+export function structNew(tag: usize, nslots: usize, refmask: usize): usize {
+  if (nslots > 64) {
+    taskTrap("struct has more than 64 slots");
+  }
+  let s: usize = 0;
+  if (cfg(0) == 1 && nslots < 9) {
+    // the free list of this size: the next pointer is word 0 of a free object
+    const lp = wadd(heapBase(), shl(nslots, 3));
+    const head = load64(lp);
+    if (expect(head != 0, true)) {
+      store64(lp, load64(head));
+      subAt(wadd(wadd(heapBase(), FL_N), shl(nslots, 3)), 1);
+      s = wadd(head, pfx());
+    }
+  }
+  if (s == 0) {
+    s = wadd(memAlloc(wadd(wadd(32, shl(nslots, 3)), pfx())), pfx());
+  }
+  store64(s, 1);
+  store32(wadd(s, 8), 3);
+  store32(wadd(s, 12), tag);
+  store32(wadd(s, 16), nslots);
+  store32(wadd(s, 20), 0);
+  store64(wadd(s, 24), refmask);
+  // small records dominate: plain stores, no loop and no call
+  if (nslots > 4) {
+    memSet(wadd(s, 32), 0, shl(nslots, 3));
+  } else {
+    if (nslots >= 1) {
+      store64(wadd(s, 32), 0);
+    }
+    if (nslots >= 2) {
+      store64(wadd(s, 40), 0);
+    }
+    if (nslots >= 3) {
+      store64(wadd(s, 48), 0);
+    }
+    if (nslots >= 4) {
+      store64(wadd(s, 56), 0);
+    }
+  }
+  liveInc();
+  statAlloc(S_ALLOC_STRUCT, wadd(32, shl(nslots, 3)));
+  siteAlloc(s, 3, wadd(32, shl(nslots, 3)));
+  return s;
+}
+
+// A variant with one slot; consumes the slot's reference if the slot is a ref (`refmask` 0 or 1).
+@Inline
+export function variant1(tag: usize, refmask: usize, slot: usize): usize {
+  const o = structNew(tag, 1, and(refmask, 1));
+  store64(wadd(o, 32), slot);
+  return o;
+}
+
+// A new empty array of capacity `cap`; `isRef` != 0: the elements are references (retained / released).
+@Inline
+export function arrayNew(cap: usize, isRef: usize): usize {
+  if (cap > 1099511627776) {
+    taskTrap("array too large");
+  }
+  let a: usize = 0;
+  if (cfg(0) == 1) {
+    const lp = wadd(heapBase(), FL_ARRAY);
+    const head = load64(lp);
+    if (head != 0) {
+      store64(lp, load64(head));
+      subAt(wadd(wadd(heapBase(), FL_N), 72), 1);
+      a = wadd(head, pfx());
+    }
+  }
+  if (a == 0) {
+    a = wadd(memAlloc(wadd(48, pfx())), pfx());
+  }
+  store64(a, 1);
+  store32(wadd(a, 8), 2);
+  store32(wadd(a, 12), 0);
+  store64(wadd(a, 16), 0);
+  store64(wadd(a, 24), cap);
+  store64(wadd(a, 32), isRef != 0 ? 1 : 0);
+  store64(wadd(a, 40), cap != 0 ? sbAlloc(shl(cap, 3)) : 0);
+  liveInc();
+  statAlloc(S_ALLOC_ARRAY, wadd(48, shl(cap, 3)));
+  siteAlloc(a, isRef != 0 ? 2 : 1, wadd(48, shl(cap, 3)));
+  return a;
+}
+
+// A new string object of length `len` and capacity `cap` (at least `len`; the bytes are not written, the NUL terminator is): the
+// object and its data are one block of 32 + cap + 1 bytes.
+@Inline
+export function strAlloc(len: usize, cap0: usize): usize {
+  const cap = cap0 < len ? len : cap0;
+  if (cap > 281474976710656) {
+    taskTrap("string too large");
+  }
+  const total = wadd(cap, 33);
+  const s = wadd(sbAlloc(wadd(total, pfx())), pfx());
+  store64(s, 1);
+  store32(wadd(s, 8), 1);
+  store32(wadd(s, 12), 0);
+  store64(wadd(s, 16), len);
+  store64(wadd(s, 24), cap);
+  store8(wadd(wadd(s, 32), len), 0);
+  liveInc();
+  statAlloc(S_ALLOC_STRING, total);
+  siteAlloc(s, 0, total);
+  return s;
+}
+
+// `push` on a full array (len == cap): double the item buffer (4 slots at first), then store `slot`.
+export function arrayPushGrow(o: usize, slot: usize): void {
+  const cap0 = load64(wadd(o, 24));
+  const cap = cap0 != 0 ? wmul(cap0, 2) : 4;
+  const items = sbRealloc(load64(wadd(o, 40)), shl(cap0, 3), shl(cap, 3));
+  store64(wadd(o, 40), items);
+  statGrow(shl(wsub(cap, cap0), 3));
+  if (cfg(1) == 1) {
+    addAt(wadd(heapBase(), S_ARRAY_GROWS), 1);
+  }
+  siteGrow(o, shl(wsub(cap, cap0), 3));
+  store64(wadd(o, 24), cap);
+  const len = load64(wadd(o, 16));
+  store64(wadd(items, shl(len, 3)), slot);
+  store64(wadd(o, 16), wadd(len, 1));
+}

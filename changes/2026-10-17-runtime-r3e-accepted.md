@@ -1,0 +1,1 @@
+- ADR-0052 Addendum B (R3e task interface design) is accepted with all recommended answers.

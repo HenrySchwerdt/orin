@@ -30,8 +30,9 @@ for mode in plain asan; do
     [ "$mode" != asan ] || flags="-g -fsanitize=address,undefined -fno-sanitize-recover=undefined"
     $CC -Wall -Wextra $flags -Dorin_platform_dir_list=orin_platform_dir_list_real \
         -c runtime/platform/orin_platform.c -o $B/dir_adapter_platform_$mode.o
+    stub=$(ORIN2=${ORIN2:-build/bootstrap/orin2} CC=$CC tools/rt_stub.sh $B/dir_adapter_stub_$mode.o $flags)   # the object model: tools/rt_stub.or
     $CC -Wall -Wextra $flags -I runtime/core runtime/core/tests/dir_fault_test.c runtime/core/orin_runtime.c \
-        $B/dir_adapter_platform_$mode.o -lm -o $B/dir_adapter_$mode
+        $B/dir_adapter_platform_$mode.o $stub -lm -o $B/dir_adapter_$mode
     $B/dir_adapter_$mode
 done
 # the thread and monitor primitives (ADR-0017) are tested only: ThreadSanitizer is the evidence that they are race free
@@ -94,12 +95,12 @@ done
 # path_absolute, error_message and the handle validation (generation + liveness) of monitors and threads as bounded
 # state machines. The harness file includes orin_platform.c and stubs clock_gettime / getenv / getcwd / snprintf /
 # pthread_create / pthread_join: the table LOGIC is checked, not the interleavings (ThreadSanitizer above).
-# The handle tables (65,536 / 262,144 records) are shrunk to 8 in a COPY of orin_platform.c under $B/l0 (the 2^18-entry tables
+# The handle tables (65,536 / 262,144 / 65,536 wake records) are shrunk to 8 in a COPY of orin_platform.c under $B/l0 (the 2^18-entry tables
 # exhaust the solver's memory); the validation arithmetic does not depend on the table size. The source itself is untouched.
 mkdir -p "$B/l0"
-sed 's/THR_MAX = 1 << 16, MON_MAX = 1 << 18/THR_MAX = 8, MON_MAX = 8/' runtime/platform/orin_platform.c >"$B/l0/orin_platform.c"
+sed -e 's/THR_MAX = 1 << 16, MON_MAX = 1 << 18/THR_MAX = 8, MON_MAX = 8/' -e 's/WAKE_MAX = 1 << 16/WAKE_MAX = 8/' runtime/platform/orin_platform.c >"$B/l0/orin_platform.c"
 cp runtime/platform/orin_platform.h "$B/l0/"
-grep -q 'THR_MAX = 8, MON_MAX = 8' "$B/l0/orin_platform.c" || { echo "table-size line of orin_platform.c changed: adapt the sed above" >&2; exit 1; }
+grep -q 'THR_MAX = 8, MON_MAX = 8' "$B/l0/orin_platform.c" && grep -q 'WAKE_MAX = 8' "$B/l0/orin_platform.c" || { echo "table-size line of orin_platform.c changed: adapt the sed above" >&2; exit 1; }
 l0() { # harness:unwind extra-flags...
   fn=${1%%:*}; un=${1##*:}; shift
   printf '%s ... ' "$fn"
@@ -117,7 +118,8 @@ for h in harness_double_to_exp:34 harness_parse_double:8 harness_now_millis:4 ha
 done
 # handle validation: `(uint32_t)h - 1u` and `(uint64_t)h` deliberately wrap (h = 0 / a negative handle must give an index
 # that is >= the high-water mark, so unsigned-wrap and sign-conversion checks are off for these; signed overflow stays on)
-for h in harness_monitor_generation:4 harness_monitor_grow:6 harness_monitor_state_machine:7 harness_thread_handles:4; do
+for h in harness_monitor_generation:4 harness_monitor_grow:6 harness_monitor_state_machine:7 harness_thread_handles:4 \
+         harness_wake_generation:4 harness_wake_state_machine:7; do
   l0 "$h"
 done
 echo "[platform] ok"

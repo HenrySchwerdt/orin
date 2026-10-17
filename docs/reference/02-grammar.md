@@ -18,9 +18,10 @@ interface member, and a top-level declaration.
 ```ebnf
 module      = { item } EOF ;
 item        = { decoration } ( import | reexport | declaration ) ;
-import      = 'import' ( '{' [ names ] '}' | 'ox' ) 'from' STRING ';' ;     (* 'ox' = provider import, ADR-0043 *)
+import      = 'import' ( '{' [ names ] '}' | '*' 'as' IDENT | 'ox' ) 'from' STRING ';' ;     (* 'ox' = provider import, ADR-0043 *)
 reexport    = 'export' '{' [ names ] '}' 'from' STRING ';' ;
-names       = IDENT { ',' IDENT } [ ',' ] ;
+names       = name { ',' name } [ ',' ] ;
+name        = IDENT [ 'as' IDENT ] ;                                   (* alias: ADR-0048 addendum *)
 declaration = [ 'export' ] ( function | typeDecl | constDecl | classDecl | interfaceDecl ) ;
 ```
 
@@ -29,11 +30,15 @@ Declaration order does not matter (functions and types may be mutually recursive
 - Tests: `tests/run/mutual_recursion.or`, `tests/parse_edge/err0200_stmt_at_top.or`, `tests/parse_edge/ok_items.or`,
   `tests/parse_edge/err0200_stray_semi_top.or`.
 
-**GRM-2.** `import` and `export { ... } from` take a brace-enclosed name list (trailing comma allowed) and a string
-path; there is no `import x from`, `import * as`, `import { a as b }` or default export. A file selects at most one OX
-provider (`import ox from "..."`); a second one is E0200.
-- Tests: `tests/parse_edge/err0200_import_star.or`, `tests/parse_edge/err0200_import_as.or`,
-  `tests/parse_edge/err0200_import_default_named.or`, `tests/parse_edge/err0200_import_no_from.or`,
+**GRM-2.** `import` and `export { ... } from` take a brace-enclosed name list (trailing comma allowed; each name may be
+renamed, `a as b`) and a string path. `import` also has the namespace form `import * as m from "path";`; `import *`
+without `as <name>` is E0200. There is no `import x from` and no default export. A file selects at most one OX
+provider (`import ox from "..."`); a second one is E0200. (`as` is not a keyword: it is an identifier that has this meaning
+only after an imported name or after `*`.)
+- Tests: `tests/parse_edge/ok_import_namespace.or`, `tests/parse_edge/ok_import_alias.or`, `tests/parse_edge/ok_namespace_uses.or`,
+  `tests/parse_edge/err0200_import_star_no_as.or`, `tests/parse_edge/err0200_import_star_no_name.or`,
+  `tests/parse_edge/err0200_import_as_no_name.or`, `tests/parse_edge/err0200_import_as_twice.or`,
+  `tests/parse_edge/err0200_import_star_with_names.or`, `tests/parse_edge/err0200_import_default_named.or`, `tests/parse_edge/err0200_import_no_from.or`,
   `tests/parse_edge/ok_reexport_export_forms.or`, `tests/parse_edge/err0200_reexport_no_from.or`,
   `tests/next/run/ox_basic.or`, `tests/next/errors/ox_no_provider.or`.
 

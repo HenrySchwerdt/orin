@@ -44,6 +44,7 @@ ch.tx.close();  ch.rx.close();                // end of stream / cancellation; c
 | `select<T>(rxs): Result<Selected<T>, TaskError>`, `selectUntil(rxs, deadline)`, `selectTimeout(clock, rxs, timeout)` | C1: the first ready receiver in array order wins; `Selected<T> = { index: usize; value: T }`. Closed and drained receivers are skipped; `Err(Closed)` when all are. One value type for all receivers (use a variant for different kinds). Free functions: generic methods do not exist (E0460) |
 | `sleep(clock, timeout): Result<void, TaskError>`, `sleepUntil(deadline): void` | C1: blocks at least that long on the monotonic clock; never early |
 | `TaskError = { kind: TaskErrorKind }`, `TaskErrorKind = Timeout \| Closed \| ClockUnavailable \| InvalidDuration`, `taskErrorMessage(e)` | ADR-0048 section 3.1; `Timeout` is outcome `Deadline` and `Closed` is outcome `Closed` of ADR-0017 Addendum B (`Cancelled` joins in C2) |
+| `Scope.token(): CancelToken`, `Scope.cancel(): bool`, `Scope.isCancelled(): bool`, `CancelToken.cancel(): bool`, `.isCancelled(): bool`, `isCancelled(): bool` | C3: the cancellation token of a scope (a wake source of L0). `cancel()` is true when this call set it; it is permanent. The token is a copyable value a task may capture (the Scope itself cannot be, E0481). Every task of the scope, and of scopes nested in its tasks, blocked in a `std:net` accept / connect / recv / send wakes with `Err(Cancelled)`; the free `isCancelled()` is the cooperative check of the calling task. A token kept after its scope ended is stale: `cancel()` false, `isCancelled()` false. Channel waits do not observe it yet (C2). See "Gate 1, C3" |
 | `parallelMap(xs, f, parts): B[]` | `xs.map(f)` computed by `parts` tasks over contiguous chunks, results in order |
 | `forkJoin(chunks, workers, body): R[]`, `forkJoinUntil(chunks, workers, body, hit): R[]`, `parallelism(): usize` | the work-stealing fork/join pool behind `parallel()` on arrays (ADR-0039), see "Fork/join pool and lending" |
 | `movedCount()`, `copiedCount()` | how many values this task sent by move / by deep copy so far (`ORIN_STATS=1` prints the process totals too) |
@@ -68,7 +69,7 @@ monitors, copyable by design). Not sendable, and not even representable as a cap
 variable, a field, a result or a capture, and E0483 gives the task-specific message at `spawn`.
 
 **Resources.** A resource handle (`File`, grant, `Host`) is not a value: it cannot be captured by a task body (E0483), stored,
-returned or sent (E0450-E0452). Grants are delegated, see below.
+returned or sent (E0450-E0452). Grants are delegated (`spawnFs` ... `spawnNet`), see below; an accepted `Stream` is moved into a task (`acceptDetached` / `spawnAccepted` of `std:net`, ADR-0017 Addendum C), a `Listener` stays in the task that bound it.
 
 **Panics.** A trap on a task thread ends that task only (the runtime records the message, closes the task's grants and
 files, releases monitors it held, folds its counters, and exits the thread). `join` turns it into a trap of the joiner with
@@ -129,9 +130,10 @@ addresses, load / store, `size_of` and header access, and calls L0 only through 
 | trap hook in `orin_trap` (`task_active`, `task_trap`) | a trap on a task thread records the message, ends the task, never returns | `core.trap.endTask` (called by the Orin `core.trap`) |
 | `orin_rt_heap_exit()` | end of a task heap: revoke its grants, close its files, free its free lists and work stack, fold its counters | `core.heap.retire()` |
 | thread-local `g_live`, `orin_stats`, free lists, work stack, grant table, file table | the per-task heap state | fields of the Orin `core.heap.TaskHeap` record (R3 allocator), grant and file tables of `std:host` / `core.cap` |
+| thread-local net buffer `netbuf()` (replaces `g_netbuf`; freed in `orin_rt_heap_exit`) | the bulk buffer between `u8[]` and L0 for `recv` / `send` / `resolve`, one per task | a field of `core.heap.TaskHeap` |
 | `orin_rt_trap_str(msg)` | trap with an Orin string | `core.trap.fromString` |
 | `orin_mon_*` (11 forwarders) | trap when an L0 monitor call fails | `core.sync.*`, one line each; the L0 functions they call are unchanged |
-| `orin_cap_clone` / `orin_cap_move` / `orin_cap_adopt_*` | delegation of a grant (clone the record, detach it into a token, adopt it) | part of the `core.cap` module that replaces the C grant table |
+| `orin_cap_clone` / `orin_cap_move` / `orin_cap_adopt_*` (incl. `adopt_net`, `adopt_stream`, ADR-0017 Addendum C) | delegation of a grant, and the move of an accepted Stream (clone the record, detach it into a token, adopt it) | part of the `core.cap` module that replaces the C grant table |
 
 L0 functions (stay C, handle-checked, contracts in `runtime/platform/orin_platform.h`): `orin_platform_thread_create / join / exit /
 id`, `monitor_new / free / lock / unlock / wait / wait_until / notify / get / set / grow`, `runtime_lock / unlock`, and the pure `millis_split`. They do not move in R3.
@@ -144,7 +146,7 @@ one-character strings) are shared and published with a compare-and-swap (they ar
 
 | Where | Rule |
 |---|---|
-| checker (`compiler/check/tasks.or`) | **E0481** a task body (a closure literal passed to `spawn*`) captures a `Scope`. **E0482** `channel(0)`. **E0483** a task body captures a resource handle (the message points at `spawnFs` and friends) |
+| checker (`compiler/check/tasks.or`) | **E0481** a task body (a closure literal passed to `spawn*`) captures a `Scope`. **E0482** `channel(0)`. **E0483** a task body captures a resource handle (the message points at `spawnFs` and friends; a Listener or Stream too). **E0487** (library code) a Listener moved or a Stream cloned |
 | checker, existing rules that apply unchanged | E0450 (a resource as a type argument: `channel<FsGrant>`), E0451 / E0452 (a handle stored, returned, captured), E0301 (the task primitives live in the internal module `std:fsraw`; user code cannot import it), E0460 (generic methods) |
 | checker, internal | the primitives are one builtin `BTask(k)` (`compiler/hir/taskops.or`: names, C functions, result kinds). `transitPut` and `lendPut` take any value but a handle (E0480), `transitTake` needs an expected type (E0407), `grantClone` / `grantMove` take any family grant (E0471 otherwise) |
 | MIR verifier (v2.1, `compiler/verify`) | `grantClone` is an opener (authority: the parent handle), `grantMove` a closer that returns a token (a handle is moved exactly once on every path: never twice, never used or revoked afterwards, never left open at a return, never a parameter), `grantAdopt*` an opener whose argument is a token (it must not be a handle) and whose destination must be a bound handle that the function revokes exactly once. 14 cases in `compiler/tests/verify_main.or` |
@@ -193,6 +195,8 @@ allocated.
 | `compiler/tests/verify_main.or` (14 cases) | the grant move rules of the MIR verifier |
 | `tooling/clitests/src/osig.or` section 8 (`tools/clitests.sh osig`) | the task events of the OSIG |
 | `tests/concurrency/timed_waits.or`, `timed_join_panic.or` | C1: timeouts fire and never early, values arriving before the deadline, buffered value at an expired deadline, `Closed`, full-channel `sendTimeout`, `select` (ready channel, tie, skipping closed channels, all closed, woken by a send and by closes, timeout), `sleep` lower bound, `joinTimeout` on a blocked task (then a later `join`), a trapped task ends a timed join. Plain, TSan, ASan |
+| `tests/concurrency/cancel_tokens.or`, `cancel_storm.or` | C3: token semantics (once, permanent, seen by the body and by tasks spawned later), 200 rounds of stale tokens against reused slots, nesting (inner does not reach up, outer reaches every depth, 40 levels), a task cancelling its scope; storms: 12 rounds x 24 tasks blocked in accept / recv with 4 concurrent cancellers, 8 x 3 tasks in nested scopes, 16 tasks spawned into a cancelled scope. Plain, TSan, ASan |
+| `tests/net/interrupt.or` (`tools/test_net.sh` section 7) | C3: a task blocked in accept, recv, send and connect (to a listener whose queue swallows the SYN) wakes within a bound with `Cancelled`, not `Timeout`; a cancelled scope fails new calls at once; nested scopes; one deadline over many small reads (`readExactUntil`, `recvUntil` loop), over a non-reading peer (`sendAllUntil`) and over a hanging connect (`withConnectionUntil`). Plain and ThreadSanitizer |
 | `runtime/core/tests/task_test.c` (98 checks) | transfer (move, copy, shared children, immortals, scalars, a 200,000-deep chain), 64 tasks, trap in a task, ping-pong, cross-heap frees, grants moved and per task, invalid handles |
 | `runtime/platform/tests/platform_test.c` (+54 checks, 795 in all) | thread / monitor contracts, errors, mutual exclusion, condition queues, a thread dying with a lock held, concurrent stdout |
 | `tests/concurrency/stress_tasks.or`, `stress_messages.or`, `panic_chain.or`, `panic_many.or`, `move_counts.or` | 3,000 live tasks, a tree of 255 scopes, 20,000 short tasks (23,254 tasks in all), 40,000 messages through one channel with 8 producers and 4 consumers, 20,000 ping-pong round trips, structured messages checked on arrival; a panic crossing three tasks and 300 simultaneous unjoined panics (exit status 101, no hang or crash under the sanitizers); no live object at exit (`ORIN_STATS`); what the default build moves and what it copies |
@@ -279,7 +283,7 @@ pure functions for the outcome lattice (`Completed < Closed < Cancelled < Deadli
 `@Requires`/`@Ensures`/`@Invariant` contracts and tests in `tests/std/taskcancel_test.or`. The L0 budget for what follows is
 ADR-0054 (1,400 code lines).
 
-Next: scope cancellation in `std:task`, wired to these machines (C2); C3 interruptible network waits.
+Next: scope cancellation in `std:task`, wired to these machines (C2); C3 interruptible network waits (done, below).
 
 ## Gate 1, C1: timed and wakeable waits
 
@@ -308,6 +312,29 @@ How the std:task calls use it (all in Orin, `library/std/task.or`):
 
 Not in C1: cancellation of waits by a token (C2 adds `Cancelled` to `TaskErrorKind` and the token word to the checkpoints), a `timeout(d)` arm kind
 for `select`, receivers of different value types in one `select`.
+
+## Gate 1, C3: interruptible network waits and operation-wide deadlines (ADR-0017 Addendum D)
+
+**L0** (`runtime/platform`, 1,036 to 1,163 of 1,400 code lines) has a *wake source*: a cancellation token with a flag and an `eventfd` (a pipe off
+Linux) made on first use. A thread binds one (`orin_platform_wake_bind`, thread-local, so no platform signature changed); `accept`, `connect`, `recv`
+and `send` poll the socket together with the descriptors of the bound source and its ancestors and return `ORIN_PLATFORM_NET_CANCELLED` (1004) when
+one is set, also when it was set before the call. Sources form a tree (`wake_open` makes a child of the bound one and binds it, `wake_close` rebinds the
+parent), at most 33 levels. Handles are `generation << 32 | (index + 1)`; a closed source's handle is stale and harmless (`signal` 0, `check` 2,
+`close` EINVAL). The `connect` timeout now bounds all the addresses of a name together. Evidence: contracts in `orin_platform.h`; CBMC
+`harness_wake_state_machine` and `harness_wake_generation`; `platform_test.c` with real sockets and threads (plain, ASan + UBSan, ThreadSanitizer).
+
+**std:task.** `scope` opens a token (header word 4 of the task table) and `finish` closes it after the last task; `spawn` binds it in the new task.
+`Scope.token()`, `Scope.cancel()`, `CancelToken.cancel()` and `isCancelled()` are in the API table above.
+
+**std:net.** `NetErrorKind` has `Cancelled`; the absolute forms `recvUntil`, `sendUntil`, `sendAllUntil`, `StreamReader.readExactUntil` /
+`readDelimitedUntil`, `withAcceptedUntil`, `acceptDetachedUntil`, `withConnectionUntil`, `useConnectionUntil` take a `Deadline` shared by any number
+of calls; `withListenerNet` and `withConnectionBeside` return the value of their body. Header comment of `library/std/net.or`: "Time" and "Cancellation".
+
+**Limits, stated.** `getaddrinfo` (the lookup of `resolve` and the one `connect` makes for a name) is neither bounded nor interruptible; a resolver pool
+was not built (ADR-0017 Addendum D section 6). Channel waits, `join`, `select` and `sleep` do not observe the token (C2). Pure computation is not
+interrupted. A scope nested deeper than 33 levels has no token of its own.
+
+**Porting.** The wake functions are platform functions called directly by generated code (task operations 31-36): `core.*` has no counterpart to write.
 
 ## Not in stage 0 (and where it goes)
 
