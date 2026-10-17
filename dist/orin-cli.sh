@@ -262,6 +262,21 @@ Use `orin help <command>` for command help.
 Get started: orin init hello && cd hello && orin run
 HELP
 }
+# Fails for a word that is not an Orin command, with a hint for the names other toolchains use (npm, cargo, tsc, prettier).
+unknown_command() {
+  local hint=''
+  case $1 in
+    new|create) hint=" To create a project, run 'orin init <name>'." ;;
+    install|i|ci) hint=" To fetch dependencies, run 'orin fetch'." ;;
+    start|exec|node|ts-node|tsx) hint=" To build and run a program, run 'orin run [file.or]'." ;;
+    watch) hint=" To rebuild and restart on every change, run 'orin dev'." ;;
+    format|prettier) hint=" To format sources, run 'orin fmt'." ;;
+    lint|tsc|typecheck) hint=" To type-check without building, run 'orin check'." ;;
+    --verison|--versoin) hint=" Did you mean 'orin --version'?" ;;
+    *.or) hint=" To run a file, use 'orin run $1'." ;;
+  esac
+  fail "Unknown command '$1'.$hint Run 'orin --help' to see available commands." 2
+}
 help_command() {
   case $1 in
     workspace) echo 'Usage: orin workspace list|lock|check [--root <directory>]' ;;
@@ -273,7 +288,10 @@ help_command() {
     fmt) echo 'Usage: orin fmt [paths...] [--check | --stdout]' ;;
     check) echo 'Usage: orin check [path] [--format=json] [--deps] [--strict-contracts]' ;;
     fetch|deps|update|remove|clean) echo "Usage: orin $1 $([ "$1" = remove ] && echo '<name>' || true) [--locked] [--offline]" ;;
-    *) echo "Usage: orin $1 — see the compiler command reference in docs/" ;;
+    explain) echo 'Usage: orin explain <diagnostic-code>   e.g. orin explain E0401' ;;
+    doctor) echo 'Usage: orin doctor'; echo 'Checks the installation: version, layout, C compiler, PATH.' ;;
+    api|effects|graph|diff|verify|compile|mir|lsp|mcp) echo "Usage: orin $1 [path] [options] — see docs/cli.md" ;;
+    *) unknown_command "$1" ;;
   esac
 }
 init_project() {
@@ -353,6 +371,11 @@ project_target() {
   local path=${1:-}
   if [ -z "$path" ]; then need_project; target=$project; [ "$project" != "$PWD" ] || target=.
   elif [ -d "$path" ]; then project=$(cd "$path" && pwd); target=$project
+  elif [ ! -e "$path" ]; then
+    case $path in
+      *.or) fail "File not found: $path" ;;
+      *) fail "Not found: $path. Pass a .or file or a project directory (one that contains orin.toml)." ;;
+    esac
   else target=$path; project=$(cd "$(dirname "$path")" && pwd); fi
   local ancestor=$project
   while [ "$ancestor" != / ] && [ ! -f "$ancestor/orin.toml" ]; do ancestor=${ancestor%/*}; [ -n "$ancestor" ] || ancestor=/; done
@@ -723,7 +746,7 @@ fi
 case $command in
   --help|-h|help)
     if [ ${#args[@]} -gt 0 ]; then help_command "${args[0]}"; else help_main; fi ;;
-  --version|version) cat "$HERE/VERSION" ;;
+  --version|-V|version) cat "$HERE/VERSION" ;;
   lsp|mcp) exec "$BIN" "$command" "${args[@]}" ;;
   *)
     for arg in "${args[@]}"; do if [ "$arg" = --help ] || [ "$arg" = -h ]; then help_command "$command"; exit 0; fi; done
@@ -752,7 +775,17 @@ case $command in
         E0400) printf 'E0400: Type mismatch\n\nThe value does not match the expected type. Orin does not implicitly coerce values.\n' ;;
         E0200) printf 'E0200: Syntax error\n\nUse the highlighted source location to check punctuation and expression syntax.\n' ;;
         E0301) printf 'E0301: Module not found\n\nCheck the import path and dependency declaration. Run `orin fetch` for Git dependencies.\n' ;;
-        *) fail 'No extended explanation is available for this code yet.' 2;; esac ;;
+        E0201) printf 'E0201: `var` is not allowed\n\nDeclare with `const` (cannot be reassigned) or `let` (can be reassigned).\n' ;;
+        E0401) printf 'E0401: Assignment to an immutable binding\n\nA `const` binding, a parameter or a captured variable cannot be assigned, and a mutating method (one that assigns to `this`, or `push` on an array) can only be called on a `let` variable. Declare it with `let`.\n' ;;
+        E0402) printf 'E0402: Invalid or non-exhaustive match\n\nA `match` must cover every variant (or end with `_`). Patterns are a variant name with plain bindings, e.g. `Circle(r)`; nested patterns are not supported, match the inner value in a second `match`.\n' ;;
+        E0403) printf 'E0403: Missing return\n\nEvery path through a function with a result type must end in `return`. Add an `else` branch or a final `return`.\n' ;;
+        E0404) printf 'E0404: Wrong number of arguments\n\nThe call passes more or fewer arguments than the function declares. Orin has no optional or default parameters.\n' ;;
+        E0405) printf 'E0405: Unknown field, method or variant\n\nThe type has no member with that name. Check the spelling and the type; some JavaScript methods (for example `repeat`) do not exist in Orin.\n' ;;
+        E0406) printf 'E0406: Invalid use of `?`\n\nPostfix `?` works on a `Result<T, E>` inside a function that returns a `Result` with the same error type E. There is no optional chaining; use `match` on an `Option`.\n' ;;
+        E0407) printf 'E0407: Cannot infer a type\n\nAdd a type annotation, for example a parameter type in an arrow function or the element type of an empty array.\n' ;;
+        E0408) printf 'E0408: Construct not supported\n\nThe language deliberately has no class inheritance, interface fields, generic methods or similar constructs; the message names the alternative.\n' ;;
+        E0410) printf 'E0410: Invalid operand types\n\nThe operator is not defined for these types. Operands must have the same type; convert explicitly and use template literals to build strings.\n' ;;
+        *) fail "No extended explanation is available for ${args[0]} yet." 2;; esac ;;
       check|verify|api|effects|graph|mir)
         # Commands with no explicit path target the nearest project.
         haspath=false; expect=false; validation_path=
@@ -779,6 +812,6 @@ case $command in
         args+=(--runtime "$RT" --cc "$CC")
         compiler "$command" "${args[@]}" ;;
       diff) $json && args+=(--format=json); compiler "$command" "${args[@]}" ;;
-      *) fail "Unknown command '$command'. Run 'orin --help' to see available commands." 2 ;;
+      *) unknown_command "$command" ;;
     esac ;;
 esac

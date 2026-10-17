@@ -388,6 +388,10 @@ class CliTests(unittest.TestCase):
         self.assertIn("init", self.run_cli("--help").stdout)
         self.assertIn("--lib", self.run_cli("help", "init").stdout)
         self.run_cli("wat", code=2)
+        self.assertIn("orin init", self.run_cli("new", "demo", code=2).stderr)
+        self.assertIn("Unknown command", self.run_cli("help", "wat", code=2).stderr)
+        self.assertIn("File not found: nope.or", self.run_cli("run", "nope.or", code=1).stderr)
+        self.assertIn("E0401", self.run_cli("explain", "E0401").stdout)
         self.run_cli("build", "--unknown", code=2)
 
     def test_application_journey_and_cache(self):
