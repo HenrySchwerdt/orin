@@ -1,0 +1,58 @@
+// Concurrency with std:task: tasks, joins, channels and parallel pipelines.
+import { scope, spawn, channel } from "std:task";
+
+function sumRange(lo: int, hi: int): int {
+  let total = 0;
+  let i = lo;
+  while (i < hi) {
+    total += i;
+    i += 1;
+  }
+  return total;
+}
+
+function main(): void {
+  // 1. Two tasks; scope() returns only when every task started inside has ended.
+  const total = scope(s => {
+    const a = spawn(s, () => sumRange(0, 500000));
+    const b = spawn(s, () => sumRange(500000, 1000000));
+    return a.join() + b.join();
+  });
+  console.log("sum of 0..999999 = " + total.toString());
+
+  // 2. A bounded channel: a producer task sends, the main task receives.
+  const ch = channel<int>(4);
+  const received = scope(s => {
+    const producer = spawn(s, () => {
+      let i = 1;
+      while (i <= 5) {
+        ch.tx.send(i * i);
+        i += 1;
+      }
+      ch.tx.close();
+      return 0;
+    });
+    let sum = 0;
+    while (true) {
+      const m = ch.rx.recv();
+      if (m.isNone()) {
+        break;
+      }
+      console.log("got " + m.unwrap().toString());
+      sum += m.unwrap();
+    }
+    producer.join();
+    return sum;
+  });
+  console.log("received total " + received.toString());
+
+  // 3. A parallel pipeline over an array: same result as the sequential chain.
+  let xs: int[] = [];
+  let i = 1;
+  while (i <= 1000) {
+    xs.push(i);
+    i += 1;
+  }
+  const squares = xs.parallel().filter(x => x % 7 == 0).map(x => x * x).toArray();
+  console.log("multiples of 7: " + squares.length.toString() + ", last square " + squares[squares.length - 1].toString());
+}
