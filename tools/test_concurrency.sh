@@ -33,12 +33,16 @@ run_tsan() {
 }
 
 echo "[concurrency] runtime task tests"
+# the object model (allocator, destroy, make_unique) is Orin code: the C test links the stub that defines its C names (tools/rt_stub.sh)
 SRC="runtime/core/tests/task_test.c $(rt_src)"
-$CC -g -O1 -Wall -I runtime/core $SRC -lm -o $B/task_test
+STUB=$(ORIN2=$ORIN2 CC=$CC tools/rt_stub.sh $B/rt_stub.o -g -O1)
+$CC -g -O1 -Wall -I runtime/core $SRC $STUB -lm -o $B/task_test
 $B/task_test
-$CC -g -O1 -fsanitize=thread -I runtime/core $SRC -lm -o $B/task_test_tsan
+STUB_TSAN=$(ORIN2=$ORIN2 CC=$CC tools/rt_stub.sh $B/rt_stub_tsan.o -g -O1 -fsanitize=thread)
+$CC -g -O1 -fsanitize=thread -I runtime/core $SRC $STUB_TSAN -lm -o $B/task_test_tsan
 run_tsan $B/task_test_tsan
-$CC -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -I runtime/core $SRC -lm -o $B/task_test_asan
+STUB_ASAN=$(ORIN2=$ORIN2 CC=$CC tools/rt_stub.sh $B/rt_stub_asan.o -g -fsanitize=address,undefined -fno-sanitize-recover=undefined)
+$CC -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -I runtime/core $SRC $STUB_ASAN -lm -o $B/task_test_asan
 ASAN_OPTIONS=detect_leaks=0 $B/task_test_asan
 
 for t in tests/concurrency/*.or; do

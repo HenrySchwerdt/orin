@@ -1,0 +1,241 @@
+// $rt/str -- the string append family, written in Orin (ADR-0052 Addendum A, step R3d.4).
+//
+// The backends call these functions by name (compiler/mir/rt.or lists them; opt/prune.or keeps them) in place of the C runtime
+// functions `orin_str_concat`, `orin_str_append`, `orin_str_prepend`, `orin_str_append_sub`, `orin_str_append_int` and
+// `orin_str_append_usize`; the C unit tests of the runtime reach `strConcat` and `strAppend` through the wrappers of the same C
+// names. An object is its address as a `usize`; the layout is the frozen one (heap.or): string len@16 cap@24 data@32, the bytes
+// followed by a NUL. The sharing rule of every append is the C one: the string `a` (consumed, the result replaces it) is extended in
+// place only when its count is 1, else a fresh string is built and one count of `a` is released. The in-place path grows the
+// capacity to at least twice, 16 bytes at the least; the fresh one reserves a half more (append) so that a loop of appends on
+// a shared string turns into in-place appends. Counters are updated exactly as the C versions did (the ORIN_STATS=1 report is the
+// equivalence oracle).
+
+import { load64, store8, store64, memCopy, memMove, heapBase, cfg, wadd, wsub, wmul, shr } from "std:core";
+import { taskTrap } from "std:fsraw";
+import { sbRealloc, addAt, pfx, siteGrow, S_LIVE_BYTES, S_STRING_GROWS } from "./heap";
+import { strAlloc } from "./object";
+import { retain, release } from "./rc";
+
+// The unique string `a` (count 1) with a capacity of at least `n` bytes: the grown block (which may have moved).
+function strGrow(a: usize, n: usize): usize {
+  const oldCap = load64(wadd(a, 24));
+  let cap = wmul(oldCap, 2);
+  if (cap < n) {
+    cap = n;
+  }
+  if (cap < 16) {
+    cap = 16;
+  }
+  const x = wadd(sbRealloc(wsub(a, pfx()), wadd(wadd(oldCap, 33), pfx()), wadd(wadd(cap, 33), pfx())), pfx());
+  if (cfg(1) == 1) {
+    const h = heapBase();
+    addAt(wadd(h, S_LIVE_BYTES), wsub(cap, oldCap));
+    addAt(wadd(h, S_STRING_GROWS), 1);
+  }
+  siteGrow(x, wsub(cap, oldCap));
+  store64(wadd(x, 24), cap);
+  return x;
+}
+
+// The fresh string a ++ y (a shared or immortal `a`, or the strings are the same): `n` is the new length, `src` the address of the
+// `k` bytes to append. Reserves a half more than the length, releases one count of `a`. Out of line: the in-place path of the
+// callers stays small.
+function appendFresh(a: usize, src: usize, k: usize, n: usize): usize {
+  const r = strAlloc(n, wadd(n, wadd(shr(n, 1), 8)));
+  const xl = wsub(n, k);
+  if (xl != 0) {
+    memCopy(wadd(r, 32), wadd(a, 32), xl);
+  }
+  memCopy(wadd(wadd(r, 32), xl), src, k);
+  release(a);
+  return r;
+}
+
+// a ++ b as a new string, or the other operand shared when one is empty.
+export function strConcat(a: usize, b: usize): usize {
+  const xl = load64(wadd(a, 16));
+  const yl = load64(wadd(b, 16));
+  if (yl == 0) {
+    retain(a);
+    return a;
+  }
+  if (xl == 0) {
+    retain(b);
+    return b;
+  }
+  const n = wadd(xl, yl);
+  const r = strAlloc(n, n);
+  memCopy(wadd(r, 32), wadd(a, 32), xl);
+  memCopy(wadd(wadd(r, 32), xl), wadd(b, 32), yl);
+  return r;
+}
+
+// a = a ++ b. Consumes `a`; `b` is only read.
+export function strAppend(a: usize, b: usize): usize {
+  const yl = load64(wadd(b, 16));
+  if (yl == 0) {
+    return a;
+  }
+  const xl = load64(wadd(a, 16));
+  const n = wadd(xl, yl);
+  if (load64(a) == 1 && a != b) {
+    let x = a;
+    if (n > load64(wadd(a, 24))) {
+      x = strGrow(a, n);
+    }
+    memCopy(wadd(wadd(x, 32), xl), wadd(b, 32), yl);
+    store64(wadd(x, 16), n);
+    store8(wadd(wadd(x, 32), n), 0);
+    return x;
+  }
+  return appendFresh(a, wadd(b, 32), yl, n);
+}
+
+// a = a ++ s.substring(i, j) without the substring object. Consumes `a`; traps "substring out of range" unless i <= j <= len(s).
+export function strAppendSub(a: usize, s: usize, i: usize, j: usize): usize {
+  if (i > j || j > load64(wadd(s, 16))) {
+    taskTrap("substring out of range");
+  }
+  if (i == j) {
+    return a;
+  }
+  const k = wsub(j, i);
+  const xl = load64(wadd(a, 16));
+  const n = wadd(xl, k);
+  if (load64(a) == 1 && a != s) {
+    let x = a;
+    if (n > load64(wadd(a, 24))) {
+      x = strGrow(a, n);
+    }
+    memCopy(wadd(wadd(x, 32), xl), wadd(wadd(s, 32), i), k);
+    store64(wadd(x, 16), n);
+    store8(wadd(wadd(x, 32), n), 0);
+    return x;
+  }
+  return appendFresh(a, wadd(wadd(s, 32), i), k, n);
+}
+
+// Write the decimal digits of `v` (`digits` of them) so that they end just before `end`, and a minus sign before them when `neg` is 1.
+@Inline
+function putDigits(end: usize, v: usize, neg: usize): void {
+  let p = wsub(end, 1);
+  store8(p, wadd(48, v % 10));
+  let w = v / 10;
+  while (w != 0) {
+    p = wsub(p, 1);
+    store8(p, wadd(48, w % 10));
+    w = w / 10;
+  }
+  if (neg == 1) {
+    store8(wsub(p, 1), 45);
+  }
+}
+
+// a = a ++ decimal text of `v` (a minus sign first when `neg` is 1) for a shared or immortal `a`: a fresh string, one count of `a`
+// released. `n` is the new length, `k` the length of the text.
+function decimalFresh(a: usize, v: usize, neg: usize, k: usize, n: usize): usize {
+  const r = strAlloc(n, wadd(n, wadd(shr(n, 1), 8)));
+  const xl = wsub(n, k);
+  if (xl != 0) {
+    memCopy(wadd(r, 32), wadd(a, 32), xl);
+  }
+  const end = wadd(wadd(r, 32), n);
+  store8(end, 0);
+  putDigits(end, v, neg);
+  release(a);
+  return r;
+}
+
+// The number of decimal digits of `v` (at least 1). A ladder of compares for the common short numbers, a division loop from six digits on:
+// counting by repeated division would cost as much as writing the digits (R3d.5: it was +1.4 % instructions on `mapfreq`).
+@Inline
+function decimalDigits(v: usize): usize {
+  if (v < 10) {
+    return 1;
+  }
+  if (v < 100) {
+    return 2;
+  }
+  if (v < 1000) {
+    return 3;
+  }
+  if (v < 10000) {
+    return 4;
+  }
+  if (v < 100000) {
+    return 5;
+  }
+  let d: usize = 5;
+  let t = v / 100000;
+  while (t != 0) {
+    d = wadd(d, 1);
+    t = t / 10;
+  }
+  return d;
+}
+
+// a = a ++ decimal text of `v` (a minus sign first when `neg` is 1). The digits are written straight behind the old bytes.
+function appendDecimal(a: usize, v: usize, neg: usize): usize {
+  const k = wadd(decimalDigits(v), neg);
+  const n = wadd(load64(wadd(a, 16)), k);
+  if (load64(a) != 1) {
+    return decimalFresh(a, v, neg, k, n);
+  }
+  let r = a;
+  if (n > load64(wadd(a, 24))) {
+    r = strGrow(a, n);
+  }
+  store64(wadd(r, 16), n);
+  const end = wadd(wadd(r, 32), n);
+  store8(end, 0);
+  putDigits(end, v, neg);
+  return r;
+}
+
+// a = a ++ decimal text of the unsigned `v`.
+export function strAppendUsize(a: usize, v: usize): usize {
+  return appendDecimal(a, v, 0);
+}
+
+// a = a ++ decimal text of the signed `v`.
+export function strAppendInt(a: usize, v: int): usize {
+  if (v < 0) {
+    return appendDecimal(a, wadd((-(v + 1)).toUsize(), 1), 1);
+  }
+  return appendDecimal(a, v.toUsize(), 0);
+}
+
+// The fresh string b ++ a of length `n` (a shared or immortal, or a is b), one count of `a` released.
+function prependFresh(a: usize, b: usize, n: usize): usize {
+  const yl = load64(wadd(b, 16));
+  const xl = load64(wadd(a, 16));
+  const r = strAlloc(n, n);
+  memCopy(wadd(r, 32), wadd(b, 32), yl);
+  if (xl != 0) {
+    memCopy(wadd(wadd(r, 32), yl), wadd(a, 32), xl);
+  }
+  release(a);
+  return r;
+}
+
+// a = b ++ a. Consumes `a`; `b` is only read.
+export function strPrepend(a: usize, b: usize): usize {
+  const yl = load64(wadd(b, 16));
+  if (yl == 0) {
+    return a;
+  }
+  const xl = load64(wadd(a, 16));
+  const n = wadd(xl, yl);
+  if (load64(a) == 1 && a != b) {
+    let x = a;
+    if (n > load64(wadd(a, 24))) {
+      x = strGrow(a, n);
+    }
+    memMove(wadd(wadd(x, 32), yl), wadd(x, 32), xl);
+    memCopy(wadd(x, 32), wadd(b, 32), yl);
+    store64(wadd(x, 16), n);
+    store8(wadd(wadd(x, 32), n), 0);
+    return x;
+  }
+  return prependFresh(a, b, n);
+}

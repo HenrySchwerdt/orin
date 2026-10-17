@@ -2,7 +2,7 @@
 // Part of the semantic index (check/index/build.or).
 
 import { Span, SourceMap } from "../../diag";
-import { Ident, Item, TypeDecl, TypeExpr, ClassDecl, CtorDecl, InterfaceDecl, ContractClause } from "../../syntax";
+import { Ident, Item, ImportDecl, importedName, TypeDecl, TypeExpr, ClassDecl, CtorDecl, InterfaceDecl, ContractClause } from "../../syntax";
 import { LoadedProgram, ImportTarget } from "../../loader";
 import { Program, SkFunction, SkRecord, SkUnion, SkVariant, SkAlias, SkField, SkInterface } from "../../hir";
 import { contractText, paramsText, renderTE, tpList, tpListB, variantText } from "./render";
@@ -231,13 +231,13 @@ export function declareInterface(p: P1, unitName: string, k: InterfaceDecl, sm: 
 
 function importOf(item: Item): Option<ImportDeclRe> {
   return match (item) {
-    IImport(d) => Some(ImportDeclRe { names: d.names, reexport: false }),
-    IReExport(d) => Some(ImportDeclRe { names: d.names, reexport: true }),
+    IImport(d) => Some(ImportDeclRe { decl: d, reexport: false }),
+    IReExport(d) => Some(ImportDeclRe { decl: d, reexport: true }),
     _ => None
   };
 }
 
-type ImportDeclRe = { names: Ident[]; reexport: bool; };
+type ImportDeclRe = { decl: ImportDecl; reexport: bool; };
 
 function isUnionDef(w: W, d: usize): bool {
   return match (w.defs[d].kind) {
@@ -265,25 +265,50 @@ export function resolveImports(p: P1, unit: usize, prog: LoadedProgram, tabs: Un
           continue;
         }
         const src = tabs[j];
-        for (const n of d.names) {
-          const td = src.exportedType(n.name);
-          const vd = src.exportedVal(n.name);
+        // The entries to bind: the export `member` under the name `local` (the variants of a union under `vprefix` + name).
+        // A named import binds each name (or its alias); a namespace import binds `m.x` for every `m.x` the file wrote.
+        let members: string[] = [];
+        let locals: string[] = [];
+        let vprefixes: string[] = [];
+        let spans: Span[] = [];
+        let k: usize = 0;
+        while (k < d.decl.names.length) {
+          members.push(d.decl.names[k].name);
+          locals.push(importedName(d.decl, k).name);
+          vprefixes.push("");
+          spans.push(d.decl.names[k].span);
+          k += 1;
+        }
+        if (d.decl.namespace.isSome()) {
+          const pre = d.decl.namespace.unwrap().name + ".";
+          for (const us of d.decl.uses) {
+            members.push(us.name.substring(pre.length, us.name.length));
+            locals.push(us.name);
+            vprefixes.push(pre);
+            spans.push(us.span);
+          }
+        }
+        k = 0;
+        while (k < members.length) {
+          const td = src.exportedType(members[k]);
+          const vd = src.exportedVal(members[k]);
           if (td.isSome()) {
-            w = addRef(w, n.span, td.unwrap());
+            w = addRef(w, spans[k], td.unwrap());
           } else if (vd.isSome()) {
-            w = addRef(w, n.span, vd.unwrap());
+            w = addRef(w, spans[k], vd.unwrap());
           }
           if (td.isSome()) {
-            tab.importType(n.name, td.unwrap(), d.reexport);
+            tab.importType(locals[k], td.unwrap(), d.reexport);
             if (isUnionDef(w, td.unwrap())) {
-              for (const k of children(w.defs, td.unwrap())) {
-                tab.importVal(w.defs[k].name, k, d.reexport);
+              for (const c of children(w.defs, td.unwrap())) {
+                tab.importVal(vprefixes[k] + w.defs[c].name, c, d.reexport);
               }
             }
           }
           if (vd.isSome()) {
-            tab.importVal(n.name, vd.unwrap(), d.reexport);
+            tab.importVal(locals[k], vd.unwrap(), d.reexport);
           }
+          k += 1;
         }
       },
       ImportStd(_) => {}
