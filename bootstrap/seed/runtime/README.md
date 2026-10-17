@@ -16,3 +16,7 @@ shared with the live runtime. Deletion order: ADR-0052 Addendum A section 4 (R3d
 **Additive exceptions.** New runtime entry points that std modules call on every program path must also exist here, or the
 legacy world cannot link those programs. They are appended verbatim from `runtime/core/` and change nothing that existed at the
 snapshot: `orin_rt_task_watch` and `orin_mon_wait_until` (ADR-0017 Addendum B, C1; the `done_mon` field of `RtTask`).
+
+**ADR-0048 exception (std:fs).** `orin_fs_exists` returns a negative denial code instead of trapping and `orin_fs_list_dir`
+returns `Result<string[],string>` (the same two edits as `runtime/core/`), because the seed is the compiler compiled with the
+migrated `std:fs` and its stage 0 and stage 1 link this snapshot.
