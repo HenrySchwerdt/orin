@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Check that every test path cited in docs/reference exists.
 
-A citation is any `tests/...` path in a Markdown file under docs/reference (inside backticks or plain text).
+A citation is any `tests/...`, `compiler/tests/...` or `tools/test_...` path in a Markdown file under docs/reference
+(inside backticks or plain text).
 Trailing punctuation is ignored; a path ending in `/` or naming a directory must be an existing directory.
 Also reports how many distinct tests are cited. Exit status 1 when a cited path is missing.
 
@@ -13,7 +14,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 REF = ROOT / "docs" / "reference"
-PATH_RE = re.compile(r"tests/[A-Za-z0-9_./+-]+")
+PATH_RE = re.compile(r"(?<![A-Za-z0-9_/.])(?:tests/|compiler/tests/|tools/test_)[A-Za-z0-9_./+-]*")
 
 
 def main() -> int:
