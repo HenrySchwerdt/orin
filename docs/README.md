@@ -8,7 +8,7 @@ that a feature has shipped. [Progress](progress.md) records implementation statu
 ## Using Orin
 
 - [Install and packages](install.md), [project CLI](cli.md), [testing](testing.md).
-- [Language specification](../spec/spec.md), [TypeScript migration guide](ts-developers.md).
+- [Language reference](reference/README.md) (normative, as implemented), [language specification](../spec/spec.md) (design RFC), [TypeScript migration guide](ts-developers.md).
 - [Standard library](std.md), [capabilities and effects](capabilities.md).
 - [Encoding](std-encoding.md), [URL components/query pairs](std-url.md).
 - [std:meta, the annotation-processor interface (unstable, ADR-0046 S3)](std-meta.md).
