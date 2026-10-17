@@ -118,7 +118,7 @@ void orin_trap(const char *msg) __attribute__((noreturn, cold));
  * frees plus the net of all finished tasks (an object moved between tasks is allocated by one and freed by another). */
 int64_t orin_live_count(void);
 
-void orin_destroy(OrinObj *o); /* internal: free an object whose count reached 0 */
+void orin_destroy(OrinObj *o); /* internal: free an object whose count reached 0 (an Orin function of runtime/core/rc.or, ADR-0052 R3d.3 (b)) */
 
 /* ---------------------------------------------------------------- tasks (ADR-0017 stage 0, docs/concurrency.md)
  * TEMPORARY interface (spec 19 R3): the part of task support that needs the object model. Each function maps 1:1 onto
@@ -344,7 +344,7 @@ static inline void orin_release(OrinObj *o) {
 
 /* Returns o if o->rc == 1, else a shallow copy (ref children retained) and releases one
  * count of o. Consumes the caller's reference to o, returns an owned one. */
-OrinObj *orin_make_unique_slow(OrinObj *o); /* internal: the copying path */
+OrinObj *orin_make_unique_slow(OrinObj *o); /* internal: the copying path (an Orin function of runtime/core/rc.or, R3d.3 (b)) */
 static inline OrinObj *orin_make_unique(OrinObj *o) {
     if (ORIN_LIKELY(o->rc == 1)) {
         ORIN_STAT(orin_stats.cow_inplace++);

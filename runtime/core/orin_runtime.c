@@ -441,6 +441,11 @@ static void sb_drain(void) {
 
 /* ---------------------------------------------------------------- destroy */
 
+/* orin_destroy and orin_make_unique_slow are Orin functions of $rt/rc.or now (ADR-0052 R3d.3 (b)); the code the program is compiled to
+ * defines them under these names for the header inlines (orin_release, orin_make_unique) and the C shells. A census build
+ * (-DORIN_SITE_STATS) keeps the C versions (the census hooks are C; they go with the census in R3d.5). */
+#ifdef ORIN_SITE_STATS
+
 /* t_dstack / t_dcap: the work stack of orin_destroy: per task, freed when the task ends */
 
 void orin_destroy(OrinObj *o) {
@@ -520,6 +525,7 @@ void orin_destroy(OrinObj *o) {
 #undef PUSH
 #undef DEC
 }
+#endif
 
 /* ---------------------------------------------------------------- structs */
 
@@ -576,6 +582,7 @@ OrinObj *orin_variant1(uint32_t tag, uint64_t refmask, uint64_t slot) {
 
 /* ---------------------------------------------------------------- make_unique */
 
+#ifdef ORIN_SITE_STATS
 OrinObj *orin_make_unique_slow(OrinObj *o) {
     ORIN_STAT(orin_stats.cow_copies++);
     ORIN_SITE_RC(o, ORIN_SITE_COW_COPY);
@@ -607,6 +614,7 @@ OrinObj *orin_make_unique_slow(OrinObj *o) {
     orin_release(o);
     return r;
 }
+#endif
 
 /* ---------------------------------------------------------------- strings */
 
