@@ -192,3 +192,53 @@ A `select` of several arms is one monitor wait on a shared wake word, not a poll
 
 **7. What is not changed.** Isolation, move-or-copy transfer, non-atomic RC, bounded channels and 1:1 threads in stage 0 stay.
 A trap inside a task still never unwinds the process; it becomes the `Error` outcome of that task.
+
+## Addendum C: network ownership for concurrent servers (C4) (2026-10-17)
+
+Status: accepted per [roadmap](../roadmaps/orin-1.0.md) default D1 (owner default 2026-10-16). Implements work package C4 and the
+concurrent server example of C5. Related: ADR-0033 (net primitives), ADR-0048 (naming), ADR-0025.
+
+**Problem.** `Listener` and `Stream` are resource handles in the owning thread's grant table. They cannot be captured, returned, stored
+or sent (E0450-E0452, E0483), task delegation covered fs / process / stdio / clock but not net, and the bulk buffer between byte arrays
+and L0 (`g_netbuf`) was one global. A server could serve one connection at a time.
+
+**Decision: delegate and move, no new value kind.** A socket stays a handle. It crosses a task boundary through the machinery that
+already moves grants (`grantClone` / `grantMove` / `grantAdopt*`, a one-shot token), now with two more kinds:
+
+1. **NetGrant delegation.** `spawnNet(scope, net, body)` clones the grant (same listen address, connect pattern and ports, same
+   `ORIN_DENY` policy), moves the clone into the task and hands it to `body(g)`; the task revokes it when it ends, also on a trap.
+   `scopeNet` / `scopeNetDo` carry the grant into a scope. Authority is never widened: the clone is a copy of the parent's record.
+2. **Stream move.** `grantMove(stream)` ends the handle in the parent (its slot leaves the parent's grant table; the MIR verifier treats
+   it as a closer, so no use, close or second move afterwards, and it must happen on every path or the stream is "not closed") and
+   returns a token; `grantAdoptStream(token)` in the child defines a fresh `Stream` handle in the child's table, which the child must
+   close exactly once. The socket descriptor travels with the token. A token can be adopted once; a second adoption traps ("invalid
+   grant token"), a forged one too.
+3. **std:net on top (ADR-0048 naming).** `acceptDetached(ln, timeoutMs): Result<Accepted, NetError>` accepts and moves; `Accepted` is
+   a plain value `{ token, peer }` that can travel in a `channel<Accepted>`; `serveAccepted(a, body)` / `serveAcceptedDo` adopt, run and
+   close; `dropAccepted(a)` closes unserved; `spawnAccepted(scope, ln, timeoutMs, body)` / `spawnAcceptedDo` accept and start a task.
+   A bounded pool of N workers receiving `Accepted` from a bounded channel gives a server with at most N connections in service.
+4. **Per-task net buffer.** `g_netbuf` is replaced by a thread-local buffer allocated on first use and freed in `orin_rt_heap_exit`;
+   concurrent tasks never share it.
+
+**What stays forbidden.** A task body cannot capture a `Listener`, a `Stream` or any grant (E0483, text extended). A `Listener`
+never leaves the task that bound it (the accepting task accepts and moves the `Stream`). A `Stream` is moved, never duplicated.
+
+**Checker and verifier rules.**
+
+| Code | Rule |
+|---|---|
+| E0487 | (library code, the primitives of `std:fsraw`) `grantMove` of a `Listener`, or `grantClone` of a `Stream`, is rejected; `grantClone` / `grantMove` also accept a `NetGrant`, `grantMove` also a `Stream` |
+| E0471 | now lists net among the families a grant primitive accepts (the Host is still rejected) |
+| E0483 | text extended to Listener and Stream captures |
+| MIR verifier | no new code: `grantMove` of a Stream is a closer (double move, use after move, move on one branch only, moving a Stream parameter are the existing "not open" / "dead" / "closed" / "parameter" errors), `grantAdoptStream` / `grantAdoptNet` are openers of a token (a handle argument is rejected). `compiler/tests/verify_main.or` pins the cases |
+
+E0475 and E0476 belong to the parallel ADR-0034 work and are not used; E0487 is the next free code after E0486.
+
+**Runtime.** `orin_cap_clone` accepts `GK_NET` (copying the scope record), `orin_cap_move` accepts a stream and traps for the Host or
+a Listener, `orin_cap_adopt_net` / `orin_cap_adopt_stream` are new, the net buffer is thread-local. All are listed in the porting
+table of [concurrency.md](../concurrency.md); `runtime/platform` is unchanged.
+
+**Example and tests.** `examples/http_server_concurrent.or` (bounded workers, request-size limits, per-connection deadlines),
+`tools/test_net.sh` section 6 (Python clients: held connections, 408 at the deadline, queueing behind a full pool, many clients; an
+Orin client with 64 and 256 `spawnNet` tasks; the same server under ThreadSanitizer when available), `tests/next/run/net_task_move.or`,
+error tests for E0483 and E0450, library-level E0487 tests in `tests/net/libcheck`.
