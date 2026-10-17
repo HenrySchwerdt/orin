@@ -63,10 +63,10 @@ theorem op_arrayGet {d x i : Nat} {r : Bool} (hI : Inv ext a s)
     have hil : i < s.locals.length := hI.len ▸ hi
     obtain ⟨n, hn⟩ := (hI.cl i).ini hinit
     by_cases h0 : 0 ≤ n
-    · have hop : opArrayGet s d x i r = opGetField s d x n.toNat r := by
+    · have hop : opArrayGet s d x i r = opGetFieldE .trap s d x n.toNat r := by
         simp [opArrayGet, hil, hn, h0]
       rw [hop]
-      exact op_getField hI (np := np) (i := n.toNat) (by simpa [stepL] using h)
+      exact op_getFieldE .trap oob_trap_ok hI (np := np) (i := n.toNat) (by simpa [stepL] using h)
     · obtain ⟨hd, ho, _, hrefo⟩ := stepGet_pre h
       have hdl : d < s.locals.length := hI.len ▸ hd
       have hol : x < s.locals.length := hI.len ▸ ho
@@ -90,10 +90,10 @@ theorem op_arraySet {x i v : Nat} (hI : Inv ext a s)
     have hil : i < s.locals.length := hI.len ▸ hi
     obtain ⟨n, hn⟩ := (hI.cl i).ini hinit
     by_cases h0 : 0 ≤ n
-    · have hop : opArraySet s x i v = opSetField s x n.toNat v := by
+    · have hop : opArraySet s x i v = opSetFieldE .trap s x n.toNat v := by
         simp [opArraySet, hil, hn, h0]
       rw [hop]
-      exact op_setField hI (np := np) (i := n.toNat) (by simpa [stepL] using h)
+      exact op_setFieldE .trap oob_trap_ok hI (np := np) (i := n.toNat) (by simpa [stepL] using h)
     · simp only [stepSet] at h
       split at h
       · rename_i hc2
@@ -146,7 +146,7 @@ theorem arrayGet_oob {s : St} {d a i l : Nat} {n : Int} {ob : Obj} {r : Bool}
   by_cases h0 : 0 ≤ n
   · have hb' : ob.fields.length ≤ n.toNat := by omega
     have hnone : ob.fields[n.toNat]? = none := List.getElem?_eq_none hb'
-    simp [opArrayGet, hi, hn, h0, opGetField, hd, ha, hl, ho, hnone]
+    simp [opArrayGet, hi, hn, h0, opGetFieldE, hd, ha, hl, ho, hnone]
   · simp [opArrayGet, hi, hn, h0, hd, ha, hl, ho]
 
 /-- An in-range index reads the element (reference element into a reference destination). -/
@@ -155,6 +155,6 @@ theorem arrayGet_inb {s : St} {d a i l m : Nat} {n : Int} {ob : Obj}
     (hn : s.get i = .int n) (h0 : 0 ≤ n) (hl : s.get a = .ref l)
     (ho : s.heap.objs l = some ob) (hw : ob.fields[n.toNat]? = some (.ref m)) :
     opArrayGet s d a i true = .ok (s.setL d (.ref m)) := by
-  simp [opArrayGet, hi, hn, h0, opGetField, hd, ha, hl, ho, hw]
+  simp [opArrayGet, hi, hn, h0, opGetFieldE, hd, ha, hl, ho, hw]
 
 end Orin

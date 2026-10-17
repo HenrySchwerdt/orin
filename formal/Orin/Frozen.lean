@@ -87,8 +87,13 @@ theorem opBorrow_heap (h : opBorrow s d x = .ok s') : s'.heap = s.heap := by
 theorem opRelease_heap (h : opRelease s x = .ok s') : s'.heap = s.heap := by
   unfold opRelease at h; res_cases h
 
-theorem opGetField_heap (h : opGetField s d o i r = .ok s') : s'.heap = s.heap := by
-  unfold opGetField at h; res_cases h
+theorem opGetFieldE_heap (oob : Res St) (hoob : ∀ s', oob ≠ .ok s')
+    (h : opGetFieldE oob s d o i r = .ok s') : s'.heap = s.heap := by
+  unfold opGetFieldE at h
+  repeat' (first | split at h | (cases h; rfl) | exact absurd h (hoob _) | cases h)
+
+theorem opGetField_heap (h : opGetField s d o i r = .ok s') : s'.heap = s.heap :=
+  opGetFieldE_heap .ill (fun _ hh => by cases hh) h
 
 theorem opArrayLen_heap (h : opArrayLen s d x = .ok s') : s'.heap = s.heap := by
   unfold opArrayLen at h; res_cases h
@@ -122,19 +127,24 @@ theorem opAllocN_frozen (hI : Inv ext a s) (h : opAllocN s d n = .ok s') :
   · cases h
 
 
-theorem opSetField_frozen (hI : Inv ext a s) {x i v : Nat} (hu : gk a x = .unique)
-    (h : opSetField s x i v = .ok s') : Frozen ext s.heap s'.heap := by
+theorem opSetFieldE_frozen (hI : Inv ext a s) {x i v : Nat} (hu : gk a x = .unique)
+    (oob : Res St) (hoob : ∀ s', oob ≠ .ok s')
+    (h : opSetFieldE oob s x i v = .ok s') : Frozen ext s.heap s'.heap := by
   obtain ⟨l, o, hl, ho, hrc⟩ := (hI.cl x).uniq hu
-  unfold opSetField at h
+  unfold opSetFieldE at h
   split at h
   · simp only [hl, ho, hrc, ne_eq, not_true_eq_false, ite_false] at h
     cases hf : o.fields[i]? with
-    | none => simp [hf] at h
+    | none => simp only [hf] at h; exact absurd h (hoob _)
     | some old =>
       simp only [hf] at h
       cases h
       exact frozen_unique hI hu hl ho hrc (fun k hk => by simp [Heap.setObj_objs, hk])
   · cases h
+
+theorem opSetField_frozen (hI : Inv ext a s) {x i v : Nat} (hu : gk a x = .unique)
+    (h : opSetField s x i v = .ok s') : Frozen ext s.heap s'.heap :=
+  opSetFieldE_frozen hI hu .ill (fun _ hh => by cases hh) h
 
 theorem opTakeField_frozen (hI : Inv ext a s) {d x i : Nat} (hu : gk a x = .unique)
     (h : opTakeField s d x i = .ok s') : Frozen ext s.heap s'.heap := by
@@ -254,7 +264,7 @@ theorem opArrayGet_heap (h : opArrayGet s d o i r = .ok s') : s'.heap = s.heap :
     · cases h
     · rename_i n hn
       by_cases h0 : 0 ≤ n
-      · rw [if_pos h0] at h; exact opGetField_heap h
+      · rw [if_pos h0] at h; exact opGetFieldE_heap .trap (fun _ hh => by cases hh) h
       · rw [if_neg h0] at h
         res_cases h
   · cases h
@@ -295,7 +305,7 @@ theorem op_frozen (hI : Inv ext a s) {i : MI} {a1 : List AS} (hL : stepL np a i 
       · cases h
       · rename_i n hn
         by_cases h0 : 0 ≤ n
-        · rw [if_pos h0] at h; exact opSetField_frozen hI hu h
+        · rw [if_pos h0] at h; exact opSetFieldE_frozen hI hu .trap (fun _ hh => by cases hh) h
         · rw [if_neg h0] at h; res_cases h
     · cases h
   | arrayNew d nl =>
