@@ -35,6 +35,16 @@ kill_server() { if [ -n "$SERVER_PID" ]; then kill "$SERVER_PID" 2>/dev/null || 
 fail() { echo "FAIL: $1" >&2; for f in $B/server.err; do [ -f $f ] && tail -8 $f >&2; done; kill_server; exit 1; }
 trap kill_server EXIT
 note() { echo "$1"; echo "$1" >> $RESULTS; }
+# limit SECONDS CMD...: runs CMD, killed after SECONDS (coreutils `timeout` is missing on macOS)
+limit() {
+  if command -v timeout >/dev/null 2>&1; then timeout "$@"; return; fi
+  _secs=$1; shift
+  "$@" & _pid=$!
+  ( sleep "$_secs"; kill -9 $_pid 2>/dev/null ) & _guard=$!
+  wait $_pid; _rc=$?
+  kill $_guard 2>/dev/null; wait $_guard 2>/dev/null
+  return $_rc
+}
 now_ms() { python3 -c 'import time; print(int(time.monotonic()*1000))'; }
 
 # --- descriptors: 1,024 clients need more than the usual soft limit of 1,024 (or 256 on macOS)
@@ -136,7 +146,7 @@ stop_server() {
 # load TAG N BODY: N parallel clients, every answer checked
 load() {
   t=$(now_ms)
-  timeout 90 $B/clients $PORT $2 $3 > $B/load.out 2>&1 || fail "$1: $2 clients: $(head -3 $B/load.out)"
+  limit 90 $B/clients $PORT $2 $3 > $B/load.out 2>&1 || fail "$1: $2 clients: $(head -3 $B/load.out)"
   grep -qx "parallel: $2 ok" $B/load.out || fail "$1: $2 clients: $(head -3 $B/load.out)"
   d=$(( $(now_ms) - t ))
   note "$1: $2 clients ok in $d ms"
