@@ -246,16 +246,14 @@ static void stats_add(OrinStats *d, const OrinStats *s) {
 }
 
 /* The C services that Orin runtime code reaches through the core operation `hook` (hir/coreops.or, number 27; the numbers are the HK_*
- * constants of runtime/core/heap.or): the process environment and stderr, the runtime lock and the process-wide totals of finished
- * tasks (g_fold, g_fold_live, written by orin_rt_heap_exit) for the report of runtime/core/stats.or, and the allocation-site census. */
+ * constants of runtime/core/heap.or): the process-wide totals of finished tasks (g_fold, g_fold_live, written by
+ * orin_rt_heap_exit) for the report of runtime/core/stats.or, and the allocation-site census. The environment, the runtime lock and
+ * stderr (hooks 0..3 until R3e.1) are L0 functions that Orin code calls with the core operation `plat`. */
 uint64_t orin_core_hook(uint64_t k, uint64_t a, uint64_t b, uint64_t c) {
+    (void)a;
     (void)b;
     (void)c;
     switch (k) {
-    case 0: return (uint64_t)(uintptr_t)orin_platform_getenv((const char *)(uintptr_t)a); /* HK_GETENV */
-    case 1: orin_platform_runtime_lock(); return 0;                                     /* HK_LOCK */
-    case 2: orin_platform_runtime_unlock(); return 0;                                   /* HK_UNLOCK */
-    case 3: orin_platform_write_line(ORIN_PLATFORM_STDERR, (const char *)(uintptr_t)a, (size_t)b); return 0; /* HK_WRITE_LINE */
     case 4: return (uint64_t)(uintptr_t)&g_fold;                                        /* HK_FOLD_STATS */
     case 5: return (uint64_t)(uintptr_t)&g_fold_live;                                   /* HK_FOLD_LIVE */
     case 6: return ORIN_STAT_ON;                                                        /* HK_STATS_ON */
