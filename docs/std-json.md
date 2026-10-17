@@ -133,7 +133,7 @@ InvalidUtf8; syntax, surrogate and duplicate errors belong to parsing only.
 Precedence is invalid options, input byte budget, whole-source UTF-8, then parsing
 left to right. A bad UTF-8 byte later in a document can therefore precede an
 earlier grammar error. JsonInvalidUtf8 points to the start of the first invalid
-sequence, matching std:utf8.checkUtf8 (not necessarily its failing continuation).
+sequence, matching std:utf8.validate (not necessarily its failing continuation).
 Within parsing:
 
 - Missing expected bytes/digits/terminators at EOF report source length. Other
