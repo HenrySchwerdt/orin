@@ -162,6 +162,24 @@ separator is raised through `process.exit(101)` after printing the same message.
     `tools/verify_platform.sh`. The prune root set for L1 entries and the `--freelist` / `--stats` driver flags of `cfg` are
     not needed before the first L1 function is called by name (R3d.2 / R3d.3).
 
+  - **R3d.2 the first L1 functions (done, ADR-0052 Addendum A sections 3 and 5).** `runtime/core/leaf.or` (module `$rt/leaf`): `optUnwrap`,
+    `resUnwrap`, `resUnwrapErr`, `vUnwrap` (all `@Inline`), `trapShape`, `assertFact`, `assertArray`. Generated code calls them by name:
+    `compiler/mir/rt.or` is the table (`rtNames`, `rtIds` find the function in the program), the backends cast an object to its address
+    (`(uint64_t)(uintptr_t)` in C, `ptrtoint` in LLVM) and call `orin_fn_<i>_..` in place of the C function; `opt/prune.or` keeps `trapShape` always
+    and the others where an instruction implies them (`rtImplied`: the unwrap builtins, `IForward`, `IArrayGetU/SetU`). A program without the
+    entries (`--c-builtins`, hand-built MIR) emits the old C calls, so the frozen snapshot runtime serves that world. Traps are `taskTrap`
+    (same message and exit 101 as `orin_trap`); the two checks of `--assert-facts` print through `console.error` and `exit(70)` (stdout is now
+    flushed first). `trapShape` is called by the inline LLVM helpers (`orinl_slot`, `orinl_array_*`); C builds keep `orin_trap_shape` in C because
+    the header inlines and the runtime call it (they move to the preamble in R3d.6). `orin_struct_copy_slot` had no caller in generated code
+    or runtime and is deleted without a port. **Static nullary:** each payload-less variant tag a program uses is a static immortal object
+    (`orin_nz<tag>`: C `static struct` in every unit that uses it, also in the split header and data unit; LLVM `internal global`), so
+    `orin_nullary` (table, acquire load, compare-and-swap) is no longer called by generated code; for the C shells the header keeps a
+    static-inline `orin_nullary` for tags 0 and 1. Deleted from `runtime/core/orin_runtime.c`: `orin_nullary`, `orin_assert_fact`,
+    `orin_assert_array`, `orin_struct_copy_slot`, `orin_opt_unwrap`, `orin_res_unwrap`, `orin_res_unwrap_err`, `orin_v_unwrap`.
+    Measured (valgrind, executed instructions, C / LLVM): bintrees 6,299,146,435 -> 5,591,750,641 (-11.2 %) / 6,029,451,956 -> 5,406,269,923
+    (-10.3 %); mutres, pqueue, sortedmap, strings unchanged to 30 instructions; selfcompile (C) 24,781,316,263 -> 24,788,630,444 (+0.03 %).
+    `ORIN_STATS` counters identical (`orin_nullary` was never counted).
+
   - **R3d.1 the per-thread heap block (done, ADR-0052 Addendum A section 5).** `g_live`, the free lists, the small-block cache, the
     work stack of `orin_destroy` and `orin_stats` are fields of one exported `__thread OrinHeap orin_heap` (1024 bytes, zero-initialised,
     the block `heapBase()` returns), so Orin code reaches each at a fixed offset. ADR-0017 behaviour is unchanged (per task, returned in

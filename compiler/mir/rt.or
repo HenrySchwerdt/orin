@@ -1,0 +1,117 @@
+// The L1 entries (ADR-0052 Addendum A section 3, step R3d.2): functions of the embedded runtime root `$rt`
+// (runtime/core/*.or) that the backends call by name, because neither HIR nor MIR shows the call: a builtin or a runtime
+// helper of the emitted code is replaced by a call of the Orin function. Three users share this table:
+//   * the backends find the function of an entry in the program (`rtIds`); when it is absent (a program without `$rt`:
+//     `--c-builtins`, the hand-built MIR of the emitter tests) they emit the old call of the C runtime instead,
+//   * `opt/prune.or` keeps the entries that the instructions of a live function imply (`rtImplied`) and `trapShape` always,
+//   * `nullaryTags` lists the immortal payload-less variants the program uses (emitted as static objects when `$rt` is there).
+// An entry takes and returns plain words: an object is its address as a `usize` (the backends cast), a slot a `usize`.
+// A new entry is added to `rtNames`, to `implied` when it is not always needed, and to the backends.
+
+import { Builtin } from "../hir";
+import { MProgram, MFunction, Instr, isAggTy } from "./mir";
+
+export const RT_OPT_UNWRAP: usize = 0;
+export const RT_RES_UNWRAP: usize = 1;
+export const RT_RES_UNWRAP_ERR: usize = 2;
+export const RT_V_UNWRAP: usize = 3;
+export const RT_TRAP_SHAPE: usize = 4;
+export const RT_ASSERT_FACT: usize = 5;
+export const RT_ASSERT_ARRAY: usize = 6;
+
+// The qualified names of the entries, by number (the module `$rt/leaf.or`).
+export function rtNames(): string[] {
+  return [
+    "$rt/leaf.optUnwrap", "$rt/leaf.resUnwrap", "$rt/leaf.resUnwrapErr", "$rt/leaf.vUnwrap", "$rt/leaf.trapShape",
+    "$rt/leaf.assertFact", "$rt/leaf.assertArray"
+  ];
+}
+
+// The function index of every entry in `prog`, -1 when the program has none: `ids[RT_*]`.
+@Ensures(result.length == rtNames().length)
+export function rtIds(prog: MProgram): int[] {
+  const names = rtNames();
+  let ids: int[] = [];
+  for (const n of names) {
+    ids.push(-1);
+  }
+  let i: usize = 0;
+  while (i < prog.functions.length) {
+    const fname = prog.functions[i].name;
+    if (fname.startsWith("$rt/leaf.")) {
+      let k: usize = 0;
+      while (k < names.length) {
+        if (names[k] == fname) {
+          ids[k] = i.toInt();
+        }
+        k += 1;
+      }
+    }
+    i += 1;
+  }
+  return ids;
+}
+
+// True when the program carries the L1 entries (`trapShape` is always kept, so its presence says that `$rt` was loaded).
+@Requires(ids.length == rtNames().length)
+export function rtLoaded(ids: int[]): bool {
+  return ids[RT_TRAP_SHAPE] >= 0;
+}
+
+// The entries that instruction `ins` makes the emitted code call.
+function implied(ins: Instr): usize[] {
+  return match (ins) {
+    IBuiltin(_, b, _) => match (b) {
+      BOptUnwrap => [RT_OPT_UNWRAP, RT_V_UNWRAP],
+      BResUnwrap => [RT_RES_UNWRAP, RT_V_UNWRAP],
+      BResUnwrapErr => [RT_RES_UNWRAP_ERR, RT_V_UNWRAP],
+      _ => [],
+    },
+    IForward(_, _, _, _) => [RT_ASSERT_FACT],
+    IArrayGetU(_, _, _) => [RT_ASSERT_ARRAY],
+    IArraySetU(_, _, _) => [RT_ASSERT_ARRAY],
+    _ => [],
+  };
+}
+
+// The entries a live function `f` needs beyond its calls (see the file comment).
+export function rtImplied(f: MFunction): usize[] {
+  let out: usize[] = [];
+  for (const b of f.blocks) {
+    for (const ins of b.instrs) {
+      for (const e of implied(ins)) {
+        out.push(e);
+      }
+    }
+  }
+  return out;
+}
+
+// The tags of the payload-less variants that the functions use as an immortal object (`INullary` of a boxed local, and the
+// empty environment of a closure without captures: tag 0), ascending, without repeats.
+export function nullaryTags(prog: MProgram): usize[] {
+  let seen = new Map<usize, bool>();
+  let tags: usize[] = [];
+  for (const f of prog.functions) {
+    for (const b of f.blocks) {
+      for (const ins of b.instrs) {
+        match (ins) {
+          INullary(d, t) => {
+            if (!isAggTy(f.locals[d].ty) && !seen.has(t)) {
+              seen.set(t, true);
+              tags.push(t);
+            }
+          },
+          IClosure(_, _, caps) => {
+            if (caps.length == 0 && !seen.has(0)) {
+              seen.set(0, true);
+              tags.push(0);
+            }
+          },
+          _ => {},
+        }
+      }
+    }
+  }
+  return tags.sort((a, b) => a < b ? -1 : (a > b ? 1 : 0));
+}
