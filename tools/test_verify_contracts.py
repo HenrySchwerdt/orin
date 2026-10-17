@@ -148,7 +148,7 @@ def check_extras(orinc):
     # Recursive types: a wrong claim is never VERIFIED (and, as a model of the solver need not be a finite value, never REFUTED).
     rep = json.loads(run(orinc, "--format=json", "tests/contracts/verify_rectypes.or", case="_extras").stdout.decode())
     wrong = {"rootValueWrong", "setValueWrong", "setValueWrongFrame", "makeLeafWrong", "sameValue", "aliasFree", "mutualWrong", "depthWrong",
-             "negIsLitWrong", "litRoundTripWrong", "unconstrained", "Scope.setParentWrong", "useScopeWrong"}
+             "negIsLitWrong", "litRoundTripWrong", "unconstrained", "fnArityWrong", "Scope.setParentWrong", "useScopeWrong"}
     seen = [x for x in rep["results"] if x["function"] in wrong and x["kind"] == "ensures"]
     check({x["function"] for x in seen} == wrong, "verify_rectypes: wrong claims not all reported: %r" % sorted(wrong - {x["function"] for x in seen}))
     check(all(x["status"] == "UNKNOWN" for x in seen), "verify_rectypes: a wrong claim is not UNKNOWN: %r" % [x["function"] for x in seen if x["status"] != "UNKNOWN"])
