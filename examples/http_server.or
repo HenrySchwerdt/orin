@@ -34,7 +34,7 @@
 
 import { Host, withProcess, useNet } from "std:host";
 import { milliseconds } from "std:time";
-import { Scope, TaskHandle, CancelToken, scopeDo, scopeNetDo, spawn, channel, Receiver, Sender } from "std:task";
+import { Scope, TaskHandle, CancelToken, scopeNetDo, spawn, channel, Receiver, Sender } from "std:task";
 import { args } from "std:process";
 import { Bytes, bytesFromString, emptyBytes } from "std:bytes";
 import {
@@ -265,42 +265,42 @@ function acceptLoop(ln: Listener, tx: Sender<Accepted>, maxConns: int): int {
   return n;
 }
 
-// `s` holds the workers. The accepting task runs in a scope NESTED in it, so that its token can be cancelled alone (shutdown:
-// cancellation flows down, never up): the workers keep serving what they already hold.
-function runPool(s: Scope, ln: Listener, cfgOf: (stop: CancelToken) => Config, maxConns: int, workers: int, queue: int): void {
-  scopeDo((acc: Scope) => {
-    const cfg = cfgOf(acc.token());
-    const ch = channel<Accepted>(queue.toUsize());
-    let hs: TaskHandle<int>[] = [];
-    let i: int = 0;
-    while (i < workers) {
-      const rx = ch.rx;
-      hs.push(spawn(s, () => workerLoop(rx, cfg)));
-      i += 1;
-    }
-    const accepted = acceptLoop(ln, ch.tx, maxConns);
-    ch.tx.close();
-    let served: int = 0;
-    for (const h of hs) {
-      served += h.join();
-    }
-    ch.rx.close();
-    console.error("accepted " + accepted.toString() + ", served " + served.toString());
-  });
+// `s` holds the workers; `acc` is a scope NESTED in it, in which the accepting task (this one) runs, so that its token can be
+// cancelled alone (shutdown: cancellation flows down, never up): the workers keep serving what they already hold.
+function runPool(s: Scope, acc: Scope, ln: Listener, cfgOf: (stop: CancelToken) => Config, maxConns: int, workers: int, queue: int): void {
+  const cfg = cfgOf(acc.token());
+  const ch = channel<Accepted>(queue.toUsize());
+  let hs: TaskHandle<int>[] = [];
+  let i: int = 0;
+  while (i < workers) {
+    const rx = ch.rx;
+    hs.push(spawn(s, () => workerLoop(rx, cfg)));
+    i += 1;
+  }
+  const accepted = acceptLoop(ln, ch.tx, maxConns);
+  ch.tx.close();
+  let served: int = 0;
+  for (const h of hs) {
+    served += h.join();
+  }
+  ch.rx.close();
+  console.error("accepted " + accepted.toString() + ", served " + served.toString());
 }
 
 function runServer(net: NetGrant, port: int, maxConns: int, workers: int, queue: int, cfgOf: (stop: CancelToken) => Config): void {
   scopeNetDo(net, (s: Scope, g: NetGrant) => {
-    const r = useListener(g, "127.0.0.1", port, 128, (ln: Listener) => {
-      console.error("listening on 127.0.0.1:" + portOf(ln).toString());
-      runPool(s, ln, cfgOf, maxConns, workers, queue);
-    });
-    match (r) {
-      Ok => {},
-      Err(e) => {
-        console.error("cannot listen: " + netErrorMessage(e));
+    scopeNetDo(g, (acc: Scope, g2: NetGrant) => {
+      const r = useListener(g2, "127.0.0.1", port, 128, (ln: Listener) => {
+        console.error("listening on 127.0.0.1:" + portOf(ln).toString());
+        runPool(s, acc, ln, cfgOf, maxConns, workers, queue);
+      });
+      match (r) {
+        Ok => {},
+        Err(e) => {
+          console.error("cannot listen: " + netErrorMessage(e));
+        }
       }
-    }
+    });
   });
 }
 
