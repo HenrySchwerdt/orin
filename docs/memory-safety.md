@@ -79,7 +79,7 @@ component name.
   `tools/mutate_mir.py` (`bce-*`, `range-*`), `compiler/tests/verify_main.or`.
 - **Model.** Field index out of range is a `trap` in the Lean machine (`formal/Orin/Machine.lean`). The interval source of U1 (rules R1-R5, U1) is proved
   sound in the Lean model against the array-length model (`formal/Orin/Range*.lean`, `u1_sound`, `u1_machine`, ADR-0053 M8); the Orin
-  code is not proved equal to it. Its call contract `GenOK` is derived from the call machine (`CallLink.lean`), the iteration terminates (`RangeTerm.lean`), and the dominated-by-check source (T2) is proved sound (`RangeDom.lean`: `dom_sound`, `t2_machine`) for an array local that is a counted reference, with a scalar index and no array stored into itself; a borrowed-only array (parameter) is not covered by that theorem. U1 is still not claimed as proved: code equality (C4), the emitters and the borrowed case remain (tcb.md).
+  code is not proved equal to it. Its call contract `GenOK` is derived from the call machine (`CallLink.lean`), the iteration terminates (`RangeTerm.lean`), and the dominated-by-check source (T2) is proved sound (`RangeDom.lean`: `dom_sound`, `t2_machine`) for an array local that is a pinned reference (counted, or a parameter lent by the caller: `RangePin.lean`, `t2_param`, with the pin derived from `Frozen`), with a scalar index and no array stored into itself. U1 is still not claimed as proved: code equality (C4) and the emitters remain (tcb.md).
 - **Assurance level.** `TESTED_ONLY`.
 - **Gap.** ADR-0053 M8 residual (code-to-model link for `range.or`, T2, the call contract `GenOK` derived from the ownership model), M7 (CBMC for L0), M9 (bounds of core-dialect accesses).
 

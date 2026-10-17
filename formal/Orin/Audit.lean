@@ -144,3 +144,12 @@ import Orin
 #print axioms Orin.Range.t2_sound
 #print axioms Orin.Range.t2_block
 #print axioms Orin.Range.t2_machine
+#print axioms Orin.Range.pinA_exec
+#print axioms Orin.Range.pinA_run
+#print axioms Orin.Range.held_of_pin
+#print axioms Orin.Range.reachP_pin
+#print axioms Orin.Range.t2_param
+#print axioms Orin.pinA_of_inv
+#print axioms Orin.pin_entry_param
+#print axioms Orin.mstep_len_param
+#print axioms Orin.mstep_len_pinned

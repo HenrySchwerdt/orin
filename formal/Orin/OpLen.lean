@@ -304,4 +304,29 @@ theorem mstep_len {ext : List Val} {a : List AS} (hI : Inv ext a s) {code : Code
         · simp at h
       · simp at h
 
+/-- **The same for a parameter lent by the caller** (`Param` kind): its object is reachable from an
+anchor of the caller, which no step of the machine frees or resizes (`frozen_step`). -/
+theorem mstep_len_param {sg : List Sig} {np : Nat} {E : AState → Prop} {a : AState} {code : Code}
+    {ext : List Val} (hC : Cont sg np E a code) (hI : Inv ext a.ls s) {c' : Code × St}
+    (h : mstep (code, s) = some (.ok c')) {y l : Nat} (hy : gk a.ls y = .param)
+    (hyl : s.get y = .ref l) {o : Obj} (ho : s.heap.objs l = some o) :
+    ∃ o', c'.2.heap.objs l = some o' ∧ o'.fields.length = o.fields.length := by
+  obtain ⟨p, hp, hd⟩ := (hI.cl y).prm hy
+  rw [hyl] at hd
+  obtain ⟨o', ho', hf⟩ := frozen_step hC hI h p l o hp hd ho
+  exact ⟨o', ho', by rw [hf]⟩
+
+/-- **No step of the machine changes the length of the array behind a pinned local** (counted, or a
+lent parameter). -/
+theorem mstep_len_pinned {sg : List Sig} {np : Nat} {E : AState → Prop} {a : AState} {code : Code}
+    {ext : List Val} (hC : Cont sg np E a code) (hI : Inv ext a.ls s) {c' : Code × St}
+    (h : mstep (code, s) = some (.ok c')) {y l : Nat} (hy : (gk a.ls y).pinned = true)
+    (hyl : s.get y = .ref l) {o : Obj} (ho : s.heap.objs l = some o) :
+    ∃ o', c'.2.heap.objs l = some o' ∧ o'.fields.length = o.fields.length := by
+  by_cases hc : (gk a.ls y).counted = true
+  · exact mstep_len hI h hc hyl ho
+  · have : gk a.ls y = .param := by
+      cases hk : gk a.ls y <;> simp_all [AS.pinned, AS.counted]
+    exact mstep_len_param hC hI h this hyl ho
+
 end Orin

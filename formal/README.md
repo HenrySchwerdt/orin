@@ -50,7 +50,8 @@ interval domain (sentinels `NEG`/`BIG` as "no bound"), the abstract transfer `st
 `refine`, the worklist `feed`/`procBlock`, `joinInto` with widening to a threshold, the narrowing
 round `narrowAt` and the access test `accessOk`, and prove them sound against an **array-length
 model** `len : Nat -> Option Nat` (the machine's `Obj.fields.length`; `lensOf`, `Rel`, `u1_machine`).
-Array contents are not tracked. A ghost bit `ctd x` says that the local holds a counted reference.
+Array contents are not tracked. A ghost bit `ctd x` says that the local holds a *pinned* reference: counted, or lent by the caller for
+the whole call (a `Param` local, `AS.pinned`).
 
 | File | Content |
 |---|---|
@@ -69,7 +70,8 @@ Array contents are not tracked. A ghost bit `ctd x` says that the local holds a 
 | `RangeTerm.lean` | termination: `Valid` (bounds stay in the lattice, `valid_step`, `valid_outEdge`), the measure (blocks without state, changes before widening, position of the bounds among the thresholds, length of the worklist), `feed_dec`, `wstep_dec`, `fix_acc`, `fix_total` (the iteration reaches an empty worklist, whatever the pop order, and the table is sound), `fix_every_run_ends`, `u1_total` |
 | `CallGen.lean` | `Site`, `StkW`, `GoodW`: the call-machine invariant with explicit call-site data; `goodW_step`, `goodW_reach` |
 | `CallLink.lean` | `callRI`, `RetGenOK`, `ret_genok`, `RetGenOK.exec`, `prog_ret_genok`: the contract `GenOK` of a call derived from the ownership model |
-| `OpLen.lean` | `mop_len`, `drain_len`, `mstep_len`: no builtin and no release step changes the length of an array behind a counted local |
+| `OpLen.lean` | `mop_len`, `drain_len`, `mstep_len`: no builtin and no release step changes the length of an array behind a counted local; `mstep_len_param`, `mstep_len_pinned`: the same for a `Param` local (`Frozen`) |
+| `RangePin.lean` | T2 for a borrowed-only array parameter: `PinA`, `KeptI`, `pinA_exec`, `reachP_pin`, `held_of_pin`, `t2_param` |
 
 Headline statement: `range_accepted` + `u1_sound`: for a function whose worklist iteration ended
 and whose narrowing round ran, an instruction that `accessOk` accepts at its program point
@@ -116,7 +118,7 @@ given by `NarrowRel`.
   stored result respects the class of its local: a `usize` is never negative, a `bool` is 0 or 1);
   the ownership model has no integer classes, so this stays an explicit hypothesis, as the class
   conditions of `Exec`; (c) the ghost bit `ctd` is related to the ownership kinds only through the
-  hypothesis `ctd x -> counted (kinds at the call) x`, i.e. the caller of the bridge supplies the
+  hypothesis `ctd x -> pinned (kinds at the call) x` (`AS.pinned`: counted, or a `Param` local), i.e. the caller of the bridge supplies the
   simulation between the range frame and the ownership analysis.
 * **Integers** are mathematical; overflow, underflow and bounds traps stop the execution, so a trap has
   no successor. A `usize` is never negative (`Cls.okv`; `wf.or`). Every written value respects the class
@@ -145,9 +147,18 @@ given by `NarrowRel`.
   instruction keeps it (`pass_inb`, by cases over `Exec`; the `gen` case uses the `own` clause of
   `GenOK`). Assumptions, each named in the theorem: the index is a scalar (`wf.or`), an element store
   never stores the array into itself (`NoSelf`, `wf.or`'s `valueOk`), and **`Held`**: whenever the
-  array local holds a reference it is a counted one (the `ctd` bit). The last one is the stated
-  residual: for an array that is only *borrowed* in the frame (a parameter) the range frame has no
-  `ctd` bit, so that case rests on the prose argument of `docs/tcb.md` (a live local excludes
-  `rc == 1`), not on this theorem.
+  array local holds a reference it is a pinned one (the `ctd` bit: counted, or a parameter lent by the
+  caller). For a counted array it stays a hypothesis of
+  `dom_sound` / `t2_sound`. **For a borrowed-only array parameter it is proved** (`RangePin.lean`):
+  `pinA_exec` (an instruction that does not mention the local, or keeps it, preserves the pin and the
+  length, across a `gen` too, `GenOK.own`), `reachP_pin` (in every block entry reachable from a pinned
+  entry frame), `held_of_pin`, `t2_param` (= `t2_sound` without `Held`). Its hypotheses: the function uses
+  the parameter only in kept positions (`KeptI`; `compiler/verify` rejects every other use of a `Param`
+  local: it cannot be moved, consumed, redefined or mutated; the statement is about the `RI` function, the
+  equality with the verifier's check is C4) and the entry frames carry the pin. The machine side:
+  `CallLink.lean` (`RetGenOK`, `ret_genok`) and `OpLen.lean` (`mstep_len_param`, `mstep_len_pinned`)
+  derive the `own` clause of `GenOK` for a `Param` local from `Frozen` (the caller's anchors keep their
+  objects and slots), `pinA_of_inv` and `pin_entry_param` give the pin of a lent parameter from the
+  ownership invariant (`Inv`).
 * **Not modelled.** Array contents, the cost guard `MAX_CELLS` (refusing is sound), the equality of the
   Orin code with this transcription (C4 level), and the emitters.

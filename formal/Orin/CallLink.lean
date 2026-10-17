@@ -1,6 +1,7 @@
 import Orin.CallGen
 import Orin.CallTop
 import Orin.RangeNarrow
+import Orin.RangePin
 
 /-!
 # The ownership contract of the interval analysis, derived from the call machine
@@ -95,10 +96,20 @@ theorem VOk_of_ref {c : Range.Cls} (h : c = .ref) (w : Val) : Range.VOk c w := b
   | int n => exact Or.inl h
   | ref l => exact h
 
+theorem pinned_midK (own : List Nat) (a : List AS) (i : Nat) :
+    (gk (midK own a) i).pinned = (if i ∈ own then false else (gk a i).pinned) := by
+  rw [gk_midK]
+  by_cases h : i ∈ own
+  · simp [h, AS.pinned]
+  · simp only [h, if_false]
+    cases hk : gk a i with
+    | borrowed r => by_cases hr : r ∈ own <;> simp [hr, AS.pinned]
+    | _ => simp [AS.pinned]
+
 /-- The relation of a call's frame before and after: a frame model `s0` of the caller before the
 call (its locals are the locals at the call, its array lengths are those of the heap at the call, a
-ghost count `ctd` implies that the ownership analysis counts the local) and the frame `s1` after
-the call (the caller's locals with the result stored, the lengths of the current heap, the counted
+ghost bit `ctd` implies that the ownership analysis pins the local: counted, or a lent parameter) and the frame `s1` after
+the call (the caller's locals with the result stored, the lengths of the current heap, the pinned
 locals the call did not change) stand in the relation `GenOK` for `callRI`. -/
 def RetGenOK (site : Site) (fr : Frame) (st : St) : Prop :=
   ∀ (cls : List Range.Cls),
@@ -106,10 +117,10 @@ def RetGenOK (site : Site) (fr : Frame) (st : St) : Prop :=
     Range.VOk (Range.clsOf cls fr.d) (st.get fr.ret) →
     ∀ (s0 : Range.CS), s0.loc = site.L0 →
     (∀ l, s0.len l = Range.lensOf ⟨site.H0, site.L0, []⟩ l) →
-    (∀ x, s0.ctd x = true → (gk site.b x).counted = true) →
+    (∀ x, s0.ctd x = true → (gk site.b x).pinned = true) →
     ∃ s1 : Range.CS, s1.loc = fr.L.set fr.d (st.get fr.ret) ∧
       (∀ l, s1.len l = Range.lensOf st l) ∧
-      (∀ x, s1.ctd x = true → (gk site.a1.ls x).counted = true) ∧
+      (∀ x, s1.ctd x = true → (gk site.a1.ls x).pinned = true) ∧
       Range.GenOK cls (callRI fr.d site.args site.ps) s0 s1
 
 /-- **The return step of a call is a `GenOK` step** (why a borrowed call may keep the array).
@@ -133,13 +144,13 @@ theorem ret_genok {sg : List Sig} {site : Site} {ss : List Site} {fr : Frame} {r
     simp only [Bool.and_eq_true, decide_eq_true_eq] at hx
     obtain ⟨hx0, hxo, hxd⟩ := hx
     have hc := hctd x hx0
-    have hm : (gk site.mid x).counted = true := by
-      show (gk (midK site.own site.b) x).counted = true
-      rw [counted_midK]; simp [hxo, hc]
+    have hm : (gk site.mid x).pinned = true := by
+      show (gk (midK site.own site.b) x).pinned = true
+      rw [pinned_midK]; simp [hxo, hc]
     rw [ha1, gk_defK _ _ _ _ (by rw [Site.mid, length_midK]; exact hdb)]
     simp only [hxd, ite_false]
     by_cases hb : gk site.mid x = .borrowed fr.d
-    · rw [hb] at hm; simp [AS.counted] at hm
+    · rw [hb] at hm; simp [AS.pinned] at hm
     · simp only [hb, ite_false]; exact hm
   · refine ⟨?_, ?_, ?_, ?_⟩
     · simp [hloc, hL, clrL_length]
@@ -169,19 +180,30 @@ theorem ret_genok {sg : List Sig} {site : Site} {ss : List Site} {fr : Frame} {r
         simp only [Range.lensOf, Option.map_eq_some_iff] at hxn
         obtain ⟨o, ho, hon⟩ := hxn
         have hc := hctd x hxc
-        have hm : (gk site.mid x).counted = true := by
-          show (gk (midK site.own site.b) x).counted = true
-          rw [counted_midK]; simp [hxo, hc]
         have hxlf : fr.L[x]? = some (.ref l) := by
           rw [hL, clrL_getElem?]; simp [hxo]; rw [hloc] at hxl; exact hxl
-        have hmem : Val.ref l ∈ ext := by
-          rw [he]
-          apply List.mem_append_left
-          apply List.mem_iff_getElem?.mpr
-          refine ⟨x, ?_⟩
-          rw [projL_getElem?, hxlf]
-          simp [pv, hm]
-        obtain ⟨o', ho', hf⟩ := hFz l l o hmem Desc.self ho
+        have hanch : ∃ p, Val.ref p ∈ ext ∧ Desc site.H0 p (.ref l) := by
+          by_cases hpar : gk site.b x = .param
+          · obtain ⟨p, hp, hd⟩ := (hIb.cl x).prm hpar
+            have hget : (⟨site.H0, site.L0, []⟩ : St).get x = .ref l := by
+              rw [hloc] at hxl
+              simp [St.get, List.getD_eq_getElem?_getD, hxl]
+            rw [hget] at hd
+            exact ⟨p, by rw [he]; exact List.mem_append_right _ hp, hd⟩
+          · have hcn : (gk site.b x).counted = true := by
+              cases hk : gk site.b x <;> simp_all [AS.pinned, AS.counted]
+            have hm : (gk site.mid x).counted = true := by
+              show (gk (midK site.own site.b) x).counted = true
+              rw [counted_midK]; simp [hxo, hcn]
+            refine ⟨l, ?_, Desc.self⟩
+            rw [he]
+            apply List.mem_append_left
+            apply List.mem_iff_getElem?.mpr
+            refine ⟨x, ?_⟩
+            rw [projL_getElem?, hxlf]
+            simp [pv, hm]
+        obtain ⟨p, hmem, hdp⟩ := hanch
+        obtain ⟨o', ho', hf⟩ := hFz p l o hmem hdp ho
         show Range.lensOf st l = some n
         have ho'' : st.heap.objs l = some o' := ho'
         simp [Range.lensOf, ho'', hf, hon]
@@ -194,10 +216,49 @@ theorem RetGenOK.exec {site : Site} {fr : Frame} {st : St} (h : RetGenOK site fr
     (hres : Range.VOk (Range.clsOf cls fr.d) (st.get fr.ret))
     (s0 : Range.CS) (hloc : s0.loc = site.L0)
     (hlen : ∀ l, s0.len l = Range.lensOf ⟨site.H0, site.L0, []⟩ l)
-    (hctd : ∀ x, s0.ctd x = true → (gk site.b x).counted = true) :
+    (hctd : ∀ x, s0.ctd x = true → (gk site.b x).pinned = true) :
     ∃ s1 : Range.CS, Range.Exec cls (callRI fr.d site.args site.ps) s0 s1 := by
   obtain ⟨s1, _, _, _, hg⟩ := h cls hcls hres s0 hloc hlen hctd
   exact ⟨s1, Range.Exec.gen (callRI_wf _ _ _) hg⟩
+
+/-- **A pinned local with its ghost bit set holds a live object.**  The ghost bit of a frame model
+`s` of the machine state `st` (`Range.Rel`) is only trusted on locals that the ownership kinds pin
+(counted, or a lent parameter); such a local holds a reference to a live object (`Inv.live`), and the
+frame model gives that object its number of slots. -/
+theorem pinA_of_inv {ext : List Val} {a : List AS} {st : St} (hI : Inv ext a st) {s : Range.CS}
+    (hr : Range.Rel s st) {x : Nat} (hx : (gk a x).pinned = true) (hc : s.ctd x = true) :
+    Range.PinA x s := by
+  have hroot : (gk a x).isRoot = true := by
+    cases hk : gk a x <;> simp_all [AS.pinned, AS.isRoot]
+  have hrefk : (gk a x).isRef = true := by
+    cases hk : gk a x <;> simp_all [AS.pinned, AS.isRef]
+  obtain ⟨l, hl⟩ := (hI.cl x).ref hrefk
+  obtain ⟨o, ho⟩ : ∃ o, st.heap.objs l = some o := by
+    have := hI.live hrefk
+    rw [hl] at this
+    exact this
+  have hlt : x < st.locals.length := by
+    have : gk a x ≠ .dead := by intro e; rw [e] at hx; simp [AS.pinned] at hx
+    exact hI.len ▸ lt_of_gk_ne_dead this
+  refine ⟨l, o.fields.length, ?_, hc, ?_⟩
+  · rw [hr.1]
+    have : st.locals[x]? = some (st.get x) := by
+      simp [St.get, List.getD_eq_getElem?_getD, List.getElem?_eq_getElem hlt]
+    rw [this, hl]
+  · rw [hr.2 l]; simp [Range.lensOf, ho]
+
+/-- **The entry pin of a borrowed parameter.**  In the entry frame of a callee (the machine state
+`initFn`, the entry kinds) a parameter of mode `borrowed` is a `Param` local; with the ghost bit set it
+satisfies `PinA`, the entry hypothesis of `Range.t2_param`. -/
+theorem pin_entry_param {fn : Fn} {ext : List Val} {H : Heap} {vals : List Val}
+    (hI : Inv ext fn.entry.ls (initFn fn H vals)) {s0 : Range.CS}
+    (hr : Range.Rel s0 (initFn fn H vals)) {a : Nat} (ha : fn.params[a]? = some PM.borrowed)
+    (hc : s0.ctd a = true) : Range.PinA a s0 := by
+  refine pinA_of_inv hI hr ?_ hc
+  have : gk fn.entry.ls a = .param := by
+    show gk (entryLs fn.params fn.n) a = .param
+    rw [gk_entryLs, ha]; rfl
+  rw [this]; rfl
 
 variable {fns : List Fn}
 
