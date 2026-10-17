@@ -2,7 +2,9 @@
 # Resource handles (ADR-0025): properties the conformance runner cannot see.
 #   1. a trap / process.exit inside a scope: the runtime's exit hook flushes and closes the file, so the bytes
 #      written before the trap are on disk;
-#   2. ORIN_STATS: every opened file was closed (file_opens == file_closes) and no heap object leaks.
+#   2. ORIN_STATS: every opened file was closed (file_opens == file_closes) and no heap object leaks;
+#   3. the allocation-site census build (--stats-sites, -DORIN_SITE_STATS; the allocator is the Orin one, the census hooks are C):
+#      the objects the census attributes to sites are exactly the objects the counters report, and nothing leaks.
 set -eu
 cd "$(dirname "$0")/.."
 . tools/runtime_files.sh   # the runtime source list: tools/runtime-sources.txt
@@ -44,4 +46,17 @@ for t in fs_stream_basic fs_scope_errors fs_borrowed_handles fs_copy_two_files f
   [ "$opens" = "$closes" ] || fail "$t: $opens files opened but $closes closed"
   [ "$live" = 0 ] || fail "$t: $live live objects at exit"
 done
-echo "resources: exit hook and counters ok"
+
+# 3. census build: per-site allocations add up to the counters of the same run
+for t in fs_stream_basic fs_copy_two_files; do
+  $ORIN2 compile --stats-sites tests/next/run/$t.or -o build/resources/$t.census.c
+  cc -O1 -w -DORIN_SITE_STATS $(rt_inc) build/resources/$t.census.c $(rt_src) -lm -o build/resources/$t.census
+  ORIN_STATS=sites ORIN_SITES_OUT=build/resources/$t.sites build/resources/$t.census 2>build/resources/$t.err >/dev/null </dev/null
+  allocs=$(sed -n 's/.*"alloc_total":\([0-9]*\).*/\1/p' build/resources/$t.err)
+  live=$(sed -n 's/.*"live_objs_at_exit":\(-*[0-9]*\).*/\1/p' build/resources/$t.err)
+  sited=$(awk -F'\t' '$1 == "site" { n += $3 + $4 + $5 + $6 } END { print n + 0 }' build/resources/$t.sites)
+  [ -n "$allocs" ] && [ "$allocs" -gt 0 ] || fail "$t: no alloc_total in the census run"
+  [ "$allocs" = "$sited" ] || fail "$t: census attributes $sited objects to sites but the counters say $allocs"
+  [ "$live" = 0 ] || fail "$t: $live live objects at exit in the census build"
+done
+echo "resources: exit hook, counters and census ok"

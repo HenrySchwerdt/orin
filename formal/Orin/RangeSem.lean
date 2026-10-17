@@ -6,8 +6,10 @@ import Orin.RangeStep
 The concrete state `CS` is a MIR frame (`Val` locals, as in `Heap.lean`) plus the **array-length
 model**: `len l = some n` says that location `l` holds a live array with `n` slots (the machine's
 `Obj.fields.length`; the bridge is `lensOf` in `RangeCfg.lean`).  Array contents are not tracked:
-the analysis never looks at an element.  `ctd x` is a ghost bit: the local `x` holds a *counted*
-reference (`Owned`/`Unique` in the ownership analysis); `arraynew` gives it, `move` hands it over.
+the analysis never looks at an element.  `ctd x` is a ghost bit: the local `x` holds a *pinned*
+reference, i.e. its object cannot be freed or resized by an instruction that does not mention `x`:
+a counted reference (`Owned`/`Unique` in the ownership analysis) or a reference lent by the caller for the
+whole call (a `Param` local; `AS.pinned`).  `arraynew` gives it, `move` hands it over.
 
 `Exec cls ins s s'` is the semantics of one instruction.  Integers are mathematical; every value
 written to a local respects the local's class (`Cls.okv`: a `usize` is never negative; this is the
@@ -21,8 +23,9 @@ assumption is the **ownership contract** `GenOK`, the formal form of "why a borr
 it" (`docs/mir.md`, R2): a local that the instruction neither mentions nor defines keeps its value,
 and a *counted* reference keeps its object (alive, with the same number of slots) unless the
 instruction mentions the local and does not keep it: nobody else can change or free an object that
-a local holds a count of.  In the Lean ownership model this is `Frozen`/`frozen_step`
-(`Frozen.lean`, `CallStep.lean`).
+a local holds a count of.  For calls this is **derived** from the ownership model
+(`CallLink.lean`: `ret_genok`, from `Frozen`/`frozen_step`; for the machine's builtins `OpLen.lean`);
+this file states it as the interface of `gen`.
 -/
 
 namespace Orin

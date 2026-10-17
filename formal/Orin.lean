@@ -37,6 +37,10 @@ import Orin.Call
 import Orin.CallRun
 import Orin.CallStep
 import Orin.CallTop
+import Orin.CallGen
+import Orin.CallLink
+import Orin.OpLen
+import Orin.BuiltinSim
 import Orin.CallExamples
 import Orin.TypedCall
 import Orin.Range
@@ -50,3 +54,6 @@ import Orin.RangeJoin
 import Orin.RangeCfg
 import Orin.RangeFix
 import Orin.RangeNarrow
+import Orin.RangeTerm
+import Orin.RangeDom
+import Orin.RangePin

@@ -17,7 +17,7 @@ API table (`compiler/mcp/apitable.or`).
 | `std:bytes` | Orin, `library/std/bytes.or` | `Bytes`, `ByteBuilder`, `ByteReader`; provable-std layer 1 (ADR-0030), contract standard |
 | `std:url` | Orin, `library/std/url.or` | percent encode/decode over bytes or strict UTF-8, ordered query pairs; explicit `FormSpace` mode (`PlusAsSpace` or `PercentSpace`) and structured byte offsets; [API and policies](std-url.md) |
 | `std:utf8` | Orin, `library/std/utf8.or` | validated decoding, encoding, `Utf8String` ("always valid UTF-8"), `CodePointCursor`; ADR-0030 |
-| `std:collections` | Orin, `library/std/collections.or` | `IntSet`, `StringSet`, `Deque<T>`, `SortedMap<V>`, `SortedStringMap<V>`, `PriorityQueue<T>`; ADR-0030 |
+| `std:collections` | Orin, `library/std/collections.or` | `Set<T extends Hash>`, `OrderedMap<K extends Ord, V>`, `MinHeap<T extends Ord>` (ADR-0034), `IntSet`, `StringSet`, `Deque<T>`, `SortedMap<V>`, `SortedStringMap<V>`, `PriorityQueue<T>`; ADR-0030 |
 | `std:http` | Orin, `library/std/http.or` | the **pure** part of HTTP/1.1: `Request`, `Response`, `Headers`, `Status`, an incremental request and response parser (smuggling-safe, limits as parameters) and a serializer with a round-trip contract; the sockets are `std:net` (ADR-0033); `examples/http_server.or` joins them; ADR-0030 |
 | `std:net` | Orin, `library/std/net.or` over the network primitives of `std:fsraw` (L0: ADR-0033) | blocking TCP: `Listener`, `Stream` (resources), `connect`, `resolve`, `readExact`, `readUntil`, deadlines, half-close; takes a `NetGrant` first, narrowed by `useListen` / `useConnect`; **unstable** (ADR-0033, below) |
 | `std:seq` | Orin, `library/std/seq.or` | `range(lo, hi)`, `sum(xs)`, `sumBy(xs, f)`: pure aggregates for contracts and code; `orin verify --contracts` reads them as bounded quantifiers and recursive sums (ADR-0036) |
@@ -169,7 +169,8 @@ ordinary programs. All functions return `void`; `msg` ("" allowed) is part of th
 `assertEqUsize`, `assertEqString` (values shown in quotes), `assertEqBool`
 ("assertEq failed: msg: expected 3, got 2"), `assertNear(actual: float, expected: float, tolerance: float,
 msg)` (|actual - expected| <= tolerance; NaN always fails), `fail(msg)`. One `assertEq*` per type because
-Orin has no generic equality or `toString`.
+Orin has no generic `toString`. For any `Eq` type (records, unions, `Option`, arrays, strings, classes with `equals`) there is
+`assertEqual<T extends Eq>(actual: T, expected: T, msg)` (ADR-0034): it traps with "assertEq failed: msg: values differ" and shows no values.
 
 ## std:graph (spec 06 cyclic graphs)
 
@@ -178,10 +179,11 @@ generic class (ADR-0026) and, like every class, a value: a copy is independent.
 
 ```
 type GraphId<T> = { tag: int; index: usize; gen: int }     // obtain only through add (T is phantom)
-type GraphError = StaleId | ForeignId
+type GraphErrorKind = StaleId | ForeignId
+type GraphError = { kind: GraphErrorKind }        // rule 3.1: every error record has a `kind`
 class Graph<T> {
   constructor(tag: int)
-  size(): usize                                   contains(id): bool
+  size(): usize    isEmpty(): bool                has(id): bool      // contains(id) is a deprecated wrapper of has
   add(value: T): GraphId<T>                       // mutating, never fails
   get(id): Result<T, GraphError>
   set(id, value): Result<void, GraphError>        // mutating
@@ -251,19 +253,23 @@ class Bytes                                           // new Bytes(data: u8[], s
   slice(lo, hi): Bytes       trySlice(lo, hi): Option<Bytes>   // O(1); slice: @Requires(lo <= hi && hi <= length())
   concat(o): Bytes           equals(o): bool          startsWith(p): bool     indexOf(b: u8): Option<usize>   // O(n)
   toArray(): u8[]            toRawString(): string    toHex(): string          // O(n)
-emptyBytes()  bytesFromArray(u8[])  bytesFromInts(int[]) @Requires(allBytes(xs))  bytesFromString(s)  bytesFromHex(s): Option<Bytes>
+  includes(b: u8): bool      indexOfBytes(needle: Bytes, begin: usize): Option<usize>   // O(n * needle.length()) worst case
+empty()  fromArray(u8[])  fromInts(int[]) @Requires(allBytes(xs))  fromString(s)       // ADR-0048: `import * as bytes`
 allBytes(xs: int[]): bool
+// hex has one home, std:encoding: hexEncode / hexDecode / hexDecodeText; Bytes.toHex() is what hexEncode calls.
+// Deprecated for one release: emptyBytes bytesFromArray bytesFromInts bytesFromString bytesFromHex(s): Option<Bytes>
 
 class ByteBuilder                                     // invariant: capacity >= length
-  length()  reserved()  byteAt(i)  reserve(extra)  clear()  build(): Bytes
-  appendU8(u8)  appendU16be/le(u16)  appendU32be/le(u32)  appendBytes(Bytes)  appendString(s)   // amortised O(1) per byte
+  length()  isEmpty()  capacity()  byteAt(i)  reserve(extra)  clear()  build(): Bytes      // reserved() is deprecated
+  appendU8(u8)  appendU16Be/Le(u16)  appendU32Be/Le(u32)  appendBytes(Bytes)  appendString(s)   // amortised O(1) per byte
+                                                      // appendU16be/le, appendU32be/le are deprecated spellings
 
-type ReadError = { position: usize; needed: usize; remaining: usize }
+type BytesError = { offset: usize; needed: usize; remaining: usize }    // alias ReadError; no `kind`: one cause only
 class ByteReader                                      // invariant: pos <= src.length(): the cursor never passes the end
   position()  remaining()  isAtEnd()  peekAt(offset): Option<u8>
-  readU8(): Result<u8, ReadError>      readU16be/le(): Result<u16, ReadError>     readU32be/le(): Result<u32, ReadError>
-  readExact(n): Result<Bytes, ReadError>   skip(n): Result<void, ReadError>   rest(): Bytes
-readErrorMessage(e)
+  readU8(): Result<u8, BytesError>      readU16Be/Le(): Result<u16, BytesError>     readU32Be/Le(): Result<u32, BytesError>
+  readExact(n): Result<Bytes, BytesError>   skip(n): Result<void, BytesError>   takeRest(): Bytes   // moves the cursor
+bytesErrorMessage(e)                                  // readErrorMessage, rest(), readU16be/le, readU32be/le: deprecated
 ```
 
 Contracts that matter: every `read*` is `Ok` **iff** at least that many bytes remain (`result.isOk() ==
@@ -273,7 +279,7 @@ grow the length by exactly the bytes appended and put the right bytes at the end
 byte; `concat` states length and both seams. There are no bitwise operators in Orin, so multi-byte values use `*`,
 `/` and `%` on `int`. `reserve` is bookkeeping (`capacity`): the runtime has no array reserve, arrays still grow
 geometrically on `push`. A `u8` array element costs 8 bytes at run time (ADR-0022); strings are the compact form
-(`toRawString` / `bytesFromString` are O(n) conversions, byte for byte, no validation).
+(`toRawString` / `fromString` are O(n) conversions, byte for byte, no validation).
 
 ### std:utf8
 
@@ -281,13 +287,15 @@ Orin strings are byte strings that are only *expected* to hold UTF-8; `Utf8Strin
 
 ```
 type Utf8ErrorKind = InvalidLead | TruncatedSequence | InvalidContinuation | Overlong | Surrogate | TooLarge
-type Utf8Error = { position: usize; length: usize; kind: Utf8ErrorKind }
-validate(b: Bytes): Result<Utf8String, Utf8Error>        validateString(s: string): Result<Utf8String, Utf8Error>   // O(n)
-checkUtf8(s): Result<void, Utf8Error>   isValidUtf8(s): bool   utf8ErrorMessage(e)  encode(s: Utf8String): Bytes
-isScalarValue(cp: int): bool   utf8Len(cp): int  @Requires(isScalarValue(cp))   encodeCodePoint(cp): Option<string>
+type Utf8Error = { kind: Utf8ErrorKind; offset: usize; length: usize }
+decode(b: Bytes): Result<Utf8String, Utf8Error>          Utf8String.tryFrom(s: string): Result<Utf8String, Utf8Error>   // O(n)
+validate(s): Result<void, Utf8Error>   isValid(s): bool   utf8ErrorMessage(e)  encode(s: Utf8String): Bytes
+isScalarValue(cp: int): bool   encodedLength(cp): int  @Requires(isScalarValue(cp))   encodeCodePoint(cp): Option<string>
 fromCodePoints(cps: int[]): Option<Utf8String>
+// deprecated for one release: checkUtf8 -> validate, isValidUtf8 -> isValid, validateString -> Utf8String.tryFrom, utf8Len -> encodedLength
+// (the old `validate(b: Bytes)` is now `decode(b)`: the same name with another parameter type has no wrapper)
 
-@Invariant(isValidUtf8(this.text))
+@Invariant(isValid(this.text))
 class Utf8String                                          // new Utf8String(text) validates and traps on invalid input
   asString()  byteLength()  isEmpty()  toBytes()  codePointCount()  codePoints(): int[]  codePointAt(i): Option<int>
   isCharBoundary(i)  concat(o): Utf8String  trySlice(lo, hi): Option<Utf8String>   // slices only at boundaries
@@ -339,25 +347,39 @@ itself; `sumBy` is generic and so outside the fragment. Tests: `tests/std/seq_te
 class IntSet / StringSet          // on Map; invariants: map size == key count, every stored flag true
   size() isEmpty() has(x) add(x): bool remove(x): bool clear() toArray()   // expected O(1); add/remove say whether the set changed
   isSubsetOf(o) union(o) intersection(o) difference(o)                       // O(n + m)
+class Set<T extends Hash>         // the generic set, same algorithm and operations as IntSet (Set<int>) / StringSet (Set<string>); any
+                                  // Hash element: records, unions, Option, arrays, classes with hash/equals. has/add/remove/size/
+                                  // isEmpty/clear/toArray/isSubsetOf/union/intersection/difference
 class Deque<T>                    // ring buffer, doubling from 4 slots, wrap by conditional subtraction; invariants:
                                   // len <= capacity, head in range, a filler value exists exactly when there is storage
   size() isEmpty() capacity() pushBack(x) pushFront(x) popFront() popBack() front() back() get(i) clear() toArray()   // amortised O(1)
 class SortedMap<V>                // int keys: a B-tree in an arena; new SortedMap<V>(minDegree) with minDegree >= 2, use 16
 class SortedStringMap<V>          // the same with string keys in compareStrings order (byte-wise lexicographic)
-  size() isEmpty() height() has(k) get(k): Option<V> put(k, v): bool remove(k): Option<V>   // all O(t log_t n) = O(log n)
-  firstKey() lastKey() floorKey(k) ceilKey(k)   popFirst() popLast(): Option<SortedEntry<V>>  keyArray() valueArray() clear()
+  size() isEmpty() height() has(k) get(k): Option<V> set(k, v): bool remove(k): Option<V>   // all O(t log_t n) = O(log n)
+  firstKey() lastKey() floorKey(k) ceilKey(k)   first() last() popFirst() popLast(): Option<SortedEntry<V>>
+  keys() values() entries(): SortedEntry<V>[]  clear()   // O(n); put -> set, keyArray -> keys, valueArray -> values are deprecated wrappers
+class OrderedMap<K extends Ord, V>  // the generic sorted map: the same B-tree as SortedMap / SortedStringMap (generated from the
+                                  // same template), keys in the order of their Ord instance (records field by field, Option None
+                                  // first, arrays lexicographic, classes by compare); new OrderedMap<K, V>(minDegree), use 16
+  // same methods as SortedMap (set, keys, values, entries, first, last; no deprecated wrappers); entries are OrderedEntry<K, V>.
+  // The contract helpers (isStrictlyIncreasingOrd, OrdNode, btreeOrd*, lowerBoundOrd) are in std:collections/internal
+class MinHeap<T extends Ord>      // the generic queue: the same 4-ary heap, ordered by the value itself, FIFO among equal values
+  size() isEmpty() peek(): Option<T> push(x) pop(): Option<T> allAtLeast(x) clear()   // push/pop O(log n)
 class PriorityQueue<T>            // 4-ary min-heap in three parallel arrays; invariants: equal lengths, heap property (strict,
                                   // on (priority, insertion number)), every insertion number < the counter, which never decreases
-  size() isEmpty() minPriority() peek() push(priority: int, value: T) pop(): Option<PQEntry<T>> allAtLeast(p) clear()   // push/pop O(log n)
+  size() isEmpty() minPriority() peek() push(priority: int, value: T) pop(): Option<PqEntry<T>> allAtLeast(p) clear()   // push/pop O(log n)
 ```
 
-Contracts: `add`/`put` return whether the key was new and the size grows by exactly 1 in that case (`result ==>
+Contracts: `add`/`set` return whether the key was new and the size grows by exactly 1 in that case (`result ==>
 size == old(size) + 1`, `!result ==> size == old(size)`), `has(k)` holds afterwards; `remove` makes `has(k)` false and
 shrinks the size by exactly 1 iff the key was present; `get` is `Some` iff `has`; `floorKey`/`ceilKey` return a present
 key on the right side of `k` and, on `None`, the first/last key proves there is none; `popFirst`/`popLast` return
 `old(firstKey())` / `old(lastKey())` and the remaining keys are strictly beyond it; `PriorityQueue.pop` returns the
 priority `old(minPriority())`, shrinks the size by 1 and every remaining priority is `>=` it (`allAtLeast`), `push`
-makes `minPriority` equal `min(priority, old(minPriority()))`; equal priorities leave first-in first-out. Deque pushes
+makes `minPriority` equal `min(priority, old(minPriority()))`; the generic classes state value equality: `Set.add(x)` makes `has(x)`
+true for any value equal to x, `OrderedMap.set(k, v)` makes `floorKey(k)` the key `k` (equal under `Ord`), `MinHeap.pop()` returns
+a value equal to `old(peek())` and `<=` every value left (`get` after `set` returning `v` itself is not in the contract because `V`
+is unbounded: it would need `V extends Eq`, so the tests check it on `int` and string values); equal priorities leave first-in first-out. Deque pushes
 grow the size by 1 and make the pushed end present, pops shrink it by 1 iff non-empty. Set operations state subset
 relations (`union` contains both operands, `intersection` is contained in both, `difference` is disjoint from the
 other and sizes add up).
@@ -370,28 +392,28 @@ other and sizes add up).
 | `PriorityQueue` | 4-ary implicit heap, struct of arrays (priorities, insertion numbers, values), hole-based sifting (one write per level), FIFO among equal priorities through the insertion number | equal array lengths; every entry leaves strictly before its up to four children (`isMinHeap4`); insertion numbers below a monotone counter | 200,000 random pushes + pops: boxed binary heap with swaps 300 ms, binary SoA hole 164 ms, **4-ary SoA hole 122 ms**, 8-ary 137 ms |
 | `Deque` | ring buffer with doubling growth, wrap by conditional subtraction, no per-element allocation | `len <= capacity`, head in range, filler exists iff there is storage | 500,000 push/pop rounds: `Option<T>` slots with `%` 128 ms, **plain slots 84 ms** (see the gap below) |
 | `IntSet`, `StringSet` | the prelude's open-addressing hash map (`Map<K, bool>`, expected O(1)); `union` copies the larger set and inserts the smaller, `intersection` walks the smaller and probes the larger | map size == key count, every flag true | reviewed: a hash set is the best known structure and the prelude map is already open addressing with an index table; no change |
-| `Bytes`, `ByteBuilder`, `ByteReader` | views over one shared `u8[]` (O(1) slices, cursor reads without copying), geometric `push` growth | `start + len <= data.length`; `pos <= length`; `capacity >= length` | reviewed: `concat` by `push` loop 108 ms vs built-in `slice` + `concat` 104 ms for 20 x 1 MB (no gain), `equals` 1.9 ms/MB, `bytesFromString` 1.2 ms/MB, `toRawString` 6 ms/MB (one 1-byte string per byte: see the gap below); no change |
-| `std:utf8` | Hoehrmann DFA + ASCII runs (see above) | `Utf8String`: `isValidUtf8(text)`; cursor: position on a code point boundary | 1 MB: DFA 0.6 / 1.0 / 1.2 ms (ASCII / mixed / CJK) vs decoder 22 / 16 / 9 ms |
+| `Bytes`, `ByteBuilder`, `ByteReader` | views over one shared `u8[]` (O(1) slices, cursor reads without copying), geometric `push` growth | `start + len <= data.length`; `pos <= length`; `capacity >= length` | reviewed: `concat` by `push` loop 108 ms vs built-in `slice` + `concat` 104 ms for 20 x 1 MB (no gain), `equals` 1.9 ms/MB, `fromString` 1.2 ms/MB, `toRawString` 6 ms/MB (one 1-byte string per byte: see the gap below); no change |
+| `std:utf8` | Hoehrmann DFA + ASCII runs (see above) | `Utf8String`: `isValid(text)`; cursor: position on a code point boundary | 1 MB: DFA 0.6 / 1.0 / 1.2 ms (ASCII / mixed / CJK) vs decoder 22 / 16 / 9 ms |
 
 ### Limitations of this layer (language friction, honest list)
 
 * `Map<K, V>` accepts any `Hash` key (ADR-0034, slice 1: integers, `bool`, `string`, records, unions, `Option`, `Result`, arrays and
-  classes with `hash`; a key type parameter is `K extends Hash`). The std collections are not generic over the key yet: `Set<T>`,
-  `SortedMap<K extends Ord, V>` and `PriorityQueue<T extends Ord>` (ADR-0034 §Consequences) are the next slice, so for now the sets and
-  maps are specialised by key class (`IntSet`/`StringSet`, `SortedMap<V>`/`SortedStringMap<V>`); `Deque<T>`, the values `V` and the
-  queue elements `T` are generic.
-* The same missing `==` on type parameters means the contracts of the generic containers cannot say "the value that
-  comes back is the one that was put in" (`get` after `put`, the popped element is the pushed one); they state sizes,
-  membership, key/priority order and presence. The tests check the values on `int` and `string` instances and against
-  naive reference models on pseudo-random operation sequences.
+  classes with `hash`; a key type parameter is `K extends Hash`). The generic collections of slice 2 are `Set<T extends Hash>`,
+  `OrderedMap<K extends Ord, V>` and `MinHeap<T extends Ord>`. The names `SortedMap` and `PriorityQueue` of ADR-0034 §Consequences
+  are taken by the specialised classes (`SortedMap<V>` with int keys, `PriorityQueue<T>` with an explicit `int` priority), so the generic
+  ones have their own names until the std freeze decides which names stay. The specialised classes remain and are not aliases: they
+  keep their direct `int` / `string` comparisons, which skip the derived `compare` dispatch of the generic code. `Deque<T>`, the values `V` and the
+  queue elements of `PriorityQueue<T>` are generic.
+* A type parameter has one bound (ADR-0026): `V` of `OrderedMap` is unbounded, so its contracts cannot say "the value that comes back
+  is the one that was put in"; they state it for keys (`K extends Ord`), set elements and heap elements. The tests check values with
+  `assertEqual` and against reference models on pseudo-random operation sequences.
 * A contract cannot call a function value (E0416), so a comparator closure stored in a class could not appear in the heap
   invariant: `PriorityQueue<T>` takes an explicit `int` priority until the Eq/Ord ADR lands. A `T extends Ranked`
   interface would do for ordered classes, but cannot cover `int`/`string` without wrapper classes.
 * **Tooling gaps found while applying the algorithm rule** (feed ADR-0031 A and the Eq/Ord/Hash constraints ADR):
-  1. no equality/ordering/hash on type parameters (E0410, E0400 for `Map<K, _>`; **fixed in the language by ADR-0034 slice 1,
-     `T extends Eq/Ord/Hash`; the std is not rewritten on it yet**): no generic `Set<T>`, `SortedMap<K, V>`,
-     comparator queue; the B-tree needed a code generator to exist for two key types; contracts cannot say "the same
-     value comes back";
+  1. no equality/ordering/hash on type parameters (E0410, E0400 for `Map<K, _>`; **fixed by ADR-0034: slice 1 added
+     `T extends Eq/Ord/Hash`, slice 2 the generic `Set<T>`, `OrderedMap<K, V>` and `MinHeap<T>`**); the B-tree template is generated for
+     three key types (int, string, any `Ord`) because the specialised ones keep direct comparisons;
   2. no uninitialised or default value for a type parameter (a `MaybeUninit`/`default<T>()` or a `T[]` with capacity):
      the ring buffer must either box every slot in `Option<T>` (statable invariant "exactly the live slots are Some",
      but an allocation per element) or hold a filler value in dead slots (fast, the invariant cannot name the dead slots);
@@ -478,8 +500,8 @@ makeStatus  makeRequest  makeResponse  headersFromLists  reasonName  reasonText 
 ```ts
 import { RequestParser, Done, NeedMore, Failed, defaultLimits, methodName } from "std:http";
 let p = new RequestParser(defaultLimits());
-match (p.feed(bytesFromString("GET /a HTT"))) { NeedMore => ..., Done(q, used) => ..., Failed(e) => ... }  // NeedMore
-match (p.feed(bytesFromString("P/1.1\r\nHost: h\r\n\r\nGET /b"))) {
+match (p.feed(fromString("GET /a HTT"))) { NeedMore => ..., Done(q, used) => ..., Failed(e) => ... }  // NeedMore
+match (p.feed(fromString("P/1.1\r\nHost: h\r\n\r\nGET /b"))) {
   Done(q, used) => { /* q is GET /a; the chunk's remaining bytes (from `used`) start the next message */ p.reset(); }
   ...
 }
@@ -896,6 +918,7 @@ above; a pool lives for one call (worker threads are started per operation, abou
 * Generic methods do not exist (E0460); `Graph<T>` has no edge weights and needs a caller-supplied tag.
 * Diagnostics print std types with their unit name (`$stdlib/graph.GraphId<int>`).
 * `std:clock` is importable but internal; so is `std:fsraw` (the raw open/close and grant primitives behind `std:fs` and `std:host`; only library code may import it).
+* `std:collections/internal` and `std:bytes/internal` (files `collections_internal.or`, `bytes_internal.or`) hold the contract helpers (`allTrue`, `isStrictlyIncreasing`, `isMinHeap4`, the B-tree shape and order checks, `allBytes`, ...) and the generated B-tree node types behind the public modules (ADR-0048 rule 7.3). They are not API and can change in any release; user code does not import them.
 * `std:fs` streaming: text/byte-string API without seek, no directory operations, at most 256 open files.
 
 ## Bounded shell execution (unstable)

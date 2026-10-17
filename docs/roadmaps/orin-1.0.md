@@ -268,7 +268,7 @@ R4 refinement proofs, `@NoTrap` modes beyond Stage A, lineage.
 
 | Item | Today | Needed |
 |---|---|---|
-| Language reference | `spec/` is a design RFC ("pre-implementation specification (v0.1)", `spec/spec.md`); no normative, traceable reference exists (roadmap.md step 4 lists one) | Write a reference from the implemented language: grammar, types, semantics, errors, each rule traced to a test. Size L. Prerequisite for the freeze claim |
+| Language reference | `spec/` is a design RFC ("pre-implementation specification (v0.1)", `spec/spec.md`); no normative, traceable reference exists (roadmap.md step 4 lists one) **Draft written (2026-10-17):** [docs/reference](../reference/README.md), 10 chapters, each rule cites its tests, gaps listed per chapter, `tools/check_reference.py` checks the citations; review and gap-closing remain. | Write a reference from the implemented language: grammar, types, semantics, errors, each rule traced to a test. Size L. Prerequisite for the freeze claim |
 | Tutorial / website | none found (`docs/ts-developers.md` says it is "not a tutorial") | Tutorial (getting started, a CLI tool, a service, tests, contracts) and a static site. Hosting under the new org is an owner decision |
 | Std reference | hand-written `docs/std*.md` and `apitable.or` | Generated from source (ADR-0048 section 8) |
 | Honest limits | [known-limitations.md](../known-limitations.md), [tcb.md](../tcb.md) have known staleness | Gate R4: reconcile README, std.md, limits, TCB, install |
