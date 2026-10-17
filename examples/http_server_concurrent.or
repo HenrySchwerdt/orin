@@ -29,19 +29,21 @@
 // client sees the answer and not a reset.
 
 import { Host, withProcess, useNet } from "std:host";
+import { milliseconds } from "std:time";
 import { Scope, TaskHandle, scopeNetDo, spawn, channel, Receiver, Sender } from "std:task";
 import { args } from "std:process";
 import { Bytes, bytesFromString, emptyBytes } from "std:bytes";
 import {
-  Request, Response, Headers, Limits, ParseResult, NeedMore, Done, Failed, RequestParser, HttpError, Http11, methodName, eqIgnoreCase, versionMinor,
-  standardStatus, makeResponse, headersFromLists, reasonName, emptyHeaders, serializeResponse
+  Request, Response, Headers, HttpLimits, ParseResult, NeedMore, Done, Failed, RequestParser, HttpError, Http11, methodName, eqIgnoreCase,
+  versionMinor, standardStatus, tryHeaders, emptyHeaders, serializeResponse, ResponseParts,
+  BodyTooLarge, StartLineTooLong, HeaderLineTooLong, HeadersTooLarge, TooManyHeaders, UnsupportedVersion
 } from "std:http";
 import {
   NetGrant, Listener, Stream, Peer, Accepted, useListener, acceptDetached, serveAcceptedDo, dropAccepted, portOf, recv,
-  sendAll, shutdownWrite, nowMillis, isTimeout, RecvData, RecvEof, RecvTimeout, RecvReset, RecvError
+  sendAll, shutdownWrite, monotonicMillis, isTimeout, netErrorMessage, RecvData, RecvEof, RecvTimeout, RecvReset, RecvError
 } from "std:net";
 
-type Config = { limits: Limits; requestMs: int; idleMs: int; sendMs: int; maxPerConn: int; verbose: bool; };
+type Config = { limits: HttpLimits; requestMs: int; idleMs: int; sendMs: int; maxPerConn: int; verbose: bool; };
 
 function clamp(v: int, lo: int, hi: int): int {
   return v < lo ? lo : v > hi ? hi : v;
@@ -59,20 +61,15 @@ function intArg(xs: string[], i: usize, dflt: int): int {
 
 // The status code for a request the parser refused.
 function statusFor(e: HttpError): int {
-  const r = reasonName(e.reason);
-  if (r == "BodyTooLarge") {
-    return 413;
-  }
-  if (r == "StartLineTooLong") {
-    return 414;
-  }
-  if (r == "HeaderLineTooLong" || r == "HeadersTooLarge" || r == "TooManyHeaders") {
-    return 431;
-  }
-  if (r == "UnsupportedVersion") {
-    return 505;
-  }
-  return 400;
+  return match (e.kind) {
+    BodyTooLarge => 413,
+    StartLineTooLong => 414,
+    HeaderLineTooLong => 431,
+    HeadersTooLarge => 431,
+    TooManyHeaders => 431,
+    UnsupportedVersion => 505,
+    _ => 400
+  };
 }
 
 // Sends one response; false if it could not be sent (the connection is then useless).
@@ -83,15 +80,17 @@ function respond(s: Stream, cfg: Config, code: int, ctype: string, body: Bytes, 
     names.push("Connection");
     values.push("close");
   }
-  const h = headersFromLists(names, values);
+  const h = tryHeaders(names, values);
   if (h.isErr()) {
     return false;
   }
-  const resp = makeResponse(standardStatus(code), Http11, h.unwrap(), body, emptyHeaders(), false);
+  const resp = Response.tryNew(ResponseParts {
+    status: standardStatus(code), version: Http11, headers: h.unwrap(), body: body, trailers: emptyHeaders(), forHead: false
+  });
   if (resp.isErr()) {
     return false;
   }
-  return sendAll(s, serializeResponse(resp.unwrap()), cfg.sendMs).isOk();
+  return sendAll(s, serializeResponse(resp.unwrap()), milliseconds(cfg.sendMs)).isOk();
 }
 
 function text(code: int, msg: string): Bytes {
@@ -124,10 +123,10 @@ function route(req: Request): Answer {
 // answer unread data with a reset that destroys the response.
 function drain(s: Stream): void {
   shutdownWrite(s);
-  const end = nowMillis(s) + 200;
+  const end = monotonicMillis(s) + 200;
   let n: int = 0;
-  while (nowMillis(s) < end && n < 16) {
-    const r = recv(s, 4096, 50);
+  while (monotonicMillis(s) < end && n < 16) {
+    const r = recv(s, 4096, milliseconds(50));
     match (r) {
       RecvData(b) => { n += 1; },
       _ => { n = 16; }
@@ -154,11 +153,11 @@ function serveConnection(s: Stream, peer: Peer, cfg: Config): int {
         chunk = carry;
         carry = none;
       } else {
-        const wait = first ? cfg.idleMs : deadline - nowMillis(s);
+        const wait = first ? cfg.idleMs : deadline - monotonicMillis(s);
         if (wait <= 0) {
           fail = 408;
         } else {
-          const r = recv(s, 16384, wait);
+          const r = recv(s, 16384, milliseconds(wait));
           match (r) {
             RecvData(b) => { chunk = b; },
             RecvTimeout => { if (first) { quit = true; } else { fail = 408; } },
@@ -169,7 +168,7 @@ function serveConnection(s: Stream, peer: Peer, cfg: Config): int {
       if (chunk.length() > 0) {
         if (first) {
           first = false;
-          deadline = nowMillis(s) + cfg.requestMs;
+          deadline = monotonicMillis(s) + cfg.requestMs;
         }
         const pr = parser.feed(chunk);
         match (pr) {
@@ -231,7 +230,7 @@ function workerLoop(rx: Receiver<Accepted>, cfg: Config): int {
 function acceptLoop(ln: Listener, tx: Sender<Accepted>, maxConns: int): int {
   let n: int = 0;
   while (maxConns == 0 || n < maxConns) {
-    const r = acceptDetached(ln, 1000);
+    const r = acceptDetached(ln, milliseconds(1000));
     match (r) {
       Ok(a) => {
         n += 1;
@@ -241,7 +240,7 @@ function acceptLoop(ln: Listener, tx: Sender<Accepted>, maxConns: int): int {
       },
       Err(e) => {
         if (!isTimeout(e)) {
-          console.error("accept: " + e.message);
+          console.error("accept: " + netErrorMessage(e));
         }
       }
     }
@@ -277,7 +276,7 @@ function runServer(net: NetGrant, port: int, maxConns: int, workers: int, queue:
     match (r) {
       Ok => {},
       Err(e) => {
-        console.error("cannot listen: " + e.message);
+        console.error("cannot listen: " + netErrorMessage(e));
       }
     }
   });
@@ -289,7 +288,9 @@ function main(host: Host): void {
   const maxConns = intArg(argv, 1, 0);
   const requestMs = intArg(argv, 2, 5000);
   const cfg = Config {
-    limits: new Limits(2048, 50, 4096, 16384, 256, 65536),
+    limits: HttpLimits {
+      maxStartLine: 2048, maxHeaderCount: 50, maxHeaderLine: 4096, maxHeaderBytes: 16384, maxChunkLine: 256, maxBody: 65536
+    },
     requestMs: requestMs,
     idleMs: 5000,
     sendMs: 5000,

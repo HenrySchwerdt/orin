@@ -143,6 +143,7 @@ uint64_t orin_rt_lend(OrinObj *box);             /* lend the value of a two-slot
 uint64_t orin_rt_par_threads(void);              /* the thread count of parallel pipelines */
 uint64_t orin_rt_task_spawn(uint64_t token);
 uint64_t orin_rt_task_join(uint64_t thread);
+void orin_rt_task_watch(uint64_t monitor);         /* the calling task sets word 1 of the monitor to 1 and notifies queue 0 when it ends */
 OrinObj *orin_rt_task_message(void);
 void orin_rt_trap_str(OrinObj *msg) __attribute__((noreturn)); /* trap with the text of an Orin string */
 void orin_rt_heap_exit(void);                                   /* end of a task's heap (called by the runtime itself) */
@@ -154,6 +155,7 @@ void orin_mon_unlock(uint64_t m);
 void orin_mon_wait(uint64_t m, uint64_t cond);       /* cond: 0 or 1, the two condition queues of a monitor */
 void orin_mon_notify_all(uint64_t m, uint64_t cond);
 void orin_mon_notify_one(uint64_t m, uint64_t cond);
+uint64_t orin_mon_wait_until(uint64_t m, uint64_t cond, uint64_t deadline_ms); /* 1: the deadline passed, 0: notified */
 uint64_t orin_mon_get(uint64_t m, uint64_t i);
 void orin_mon_set(uint64_t m, uint64_t i, uint64_t v);
 void orin_mon_grow(uint64_t m, uint64_t nwords);

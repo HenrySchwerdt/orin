@@ -4,20 +4,36 @@
 // fuzz tests: http_prop_test.or.
 import { assert, assertEq, assertEqUsize, assertEqString, assertEqBool, fail } from "std:test";
 import { Bytes, bytesFromString, emptyBytes } from "std:bytes";
-import { Request, Response, Headers, Status, Limits, ParseResult, NeedMore, Done, Failed, Method, Get, Head, Post, Put, Delete,
-  Connect, Options, Trace, Patch, Ext, HttpVersion, Http10, Http11, RequestParser, ResponseParser, HttpError, defaultLimits,
-  parseRequest, parseResponse, parseResponseToEof, methodName, methodFromToken, isValidMethod, isValidTarget, methodEquals,
-  reasonName, reasonText, versionText, isToken, isFieldValue, isReasonPhrase, isHostValue, isTokenChar, isFieldByte, charClass,
-  eqIgnoreCase, toLowerAscii, parseContentLength, emptyHeaders, headersFromLists, makeRequest, makeResponse, makeStatus,
-  standardStatus, standardReason, statusHasNoBody, requestProblem, responseProblem, edgeAllowed, stateName, hexString,
-  httpError, headerErrorMessage, serializeRequest, serializeResponse } from "std:http";
+import {
+  Request, Response, Headers, Status, HttpLimits, ParseResult, NeedMore, Done, Failed, Method, Get, Head, Post, Put,
+  Delete, Connect, Options, Trace, Patch, Ext, HttpVersion, Http10, Http11, RequestParser, ResponseParser, HttpError,
+  defaultLimits, parseRequest, parseResponse, parseResponseToEof, methodName, methodFromToken, isValidMethod,
+  isValidTarget, methodEquals, httpErrorKindName, httpErrorKindText, versionText, isToken, isFieldValue,
+  isReasonPhrase, isHostValue, isTokenChar, isFieldByte, charClass, eqIgnoreCase, toLowerAscii, parseContentLength,
+  emptyHeaders, tryHeaders, standardStatus, standardReason,
+  statusHasNoBody, RequestParts, ResponseParts, makeStatus, makeRequest, makeResponse, headersFromLists, reasonName, reasonText,
+  isValidLimits, InvalidMethod, InvalidHeaderName, InvalidHeaderValue, MismatchedLists, edgeAllowed, stateName, hexString, httpError, headerErrorMessage,
+  serializeRequest, serializeResponse, ToHead, ToOther, httpErrorMessage
+} from "std:http";
 
 function bs(s: string): Bytes {
   return bytesFromString(s);
 }
 
-function lim(startLine: usize, count: usize, line: usize, head: usize, chunkLine: usize, body: usize): Limits {
-  return new Limits(startLine, count, line, head, chunkLine, body);
+function tryRequest(m: Method, target: string, v: HttpVersion, h: Headers, body: Bytes, trailers: Headers): Result<Request, HttpError> {
+  return Request.tryNew(RequestParts { method: m, target: target, version: v, headers: h, body: body, trailers: trailers });
+}
+
+function tryResponse(st: Status, v: HttpVersion, h: Headers, body: Bytes, trailers: Headers, forHead: bool): Result<Response, HttpError> {
+  return Response.tryNew(ResponseParts { status: st, version: v, headers: h, body: body, trailers: trailers, forHead: forHead });
+}
+
+function kindOf(e: HttpError): string {
+  return httpErrorKindName(e.kind);
+}
+
+function lim(startLine: usize, count: usize, line: usize, head: usize, chunkLine: usize, body: usize): HttpLimits {
+  return HttpLimits { maxStartLine: startLine, maxHeaderCount: count, maxHeaderLine: line, maxHeaderBytes: head, maxChunkLine: chunkLine, maxBody: body };
 }
 
 // A complete request that must parse; returns it (and checks that all of the bytes were used).
@@ -26,7 +42,7 @@ function okReq(msg: string): Request {
   return match (r) {
     Done(q, used) => q,
     NeedMore => failReq("NeedMore for: " + msg),
-    Failed(e) => failReq("refused: " + e.message + " for: " + msg)
+    Failed(e) => failReq("refused: " + httpErrorMessage(e) + " for: " + msg)
   };
 }
 
@@ -36,11 +52,11 @@ function failReq(why: string): Request {
 }
 
 function okRes(msg: string, forHead: bool): Response {
-  const r = parseResponseToEof(bs(msg), defaultLimits(), forHead);
+  const r = parseResponseToEof(bs(msg), defaultLimits(), (forHead ? ToHead : ToOther));
   return match (r) {
     Done(q, used) => q,
     NeedMore => failRes("NeedMore for: " + msg),
-    Failed(e) => failRes("refused: " + e.message + " for: " + msg)
+    Failed(e) => failRes("refused: " + httpErrorMessage(e) + " for: " + msg)
   };
 }
 
@@ -54,13 +70,13 @@ function expectFail(msg: string, reason: string, pos: usize): void {
   expectFailWith(msg, defaultLimits(), reason, pos);
 }
 
-function expectFailWith(msg: string, l: Limits, reason: string, pos: usize): void {
+function expectFailWith(msg: string, l: HttpLimits, reason: string, pos: usize): void {
   const r = parseRequest(bs(msg), l);
   match (r) {
     Failed(e) => {
-      assertEqString(reasonName(e.reason), reason, "reason for: " + msg);
-      assertEqUsize(e.position, pos, "position for: " + msg);
-      assert(e.message.length > 0, "message");
+      assertEqString(httpErrorKindName(e.kind), reason, "reason for: " + msg);
+      assertEqUsize(e.offset, pos, "position for: " + msg);
+      assert(httpErrorMessage(e).length > 0, "message");
     },
     NeedMore => { fail("NeedMore, expected " + reason + " for: " + msg); },
     Done(q, used) => { fail("accepted, expected " + reason + " for: " + msg); }
@@ -68,11 +84,11 @@ function expectFailWith(msg: string, l: Limits, reason: string, pos: usize): voi
 }
 
 function expectResFail(msg: string, forHead: bool, reason: string, pos: usize): void {
-  const r = parseResponseToEof(bs(msg), defaultLimits(), forHead);
+  const r = parseResponseToEof(bs(msg), defaultLimits(), (forHead ? ToHead : ToOther));
   match (r) {
     Failed(e) => {
-      assertEqString(reasonName(e.reason), reason, "reason for: " + msg);
-      assertEqUsize(e.position, pos, "position for: " + msg);
+      assertEqString(httpErrorKindName(e.kind), reason, "reason for: " + msg);
+      assertEqUsize(e.offset, pos, "position for: " + msg);
     },
     NeedMore => { fail("NeedMore, expected " + reason + " for: " + msg); },
     Done(q, used) => { fail("accepted, expected " + reason + " for: " + msg); }
@@ -83,7 +99,7 @@ function expectNeedMore(msg: string): void {
   const r = parseRequest(bs(msg), defaultLimits());
   match (r) {
     NeedMore => { assert(true, ""); },
-    Failed(e) => { fail("refused: " + e.message + " for: " + msg); },
+    Failed(e) => { fail("refused: " + httpErrorMessage(e) + " for: " + msg); },
     Done(q, used) => { fail("complete, expected NeedMore for: " + msg); }
   };
 }
@@ -93,7 +109,7 @@ function outcome(r: ParseResult<Request>): string {
   return match (r) {
     NeedMore => "NeedMore",
     Done(q, used) => "Done",
-    Failed(e) => reasonName(e.reason)
+    Failed(e) => httpErrorKindName(e.kind)
   };
 }
 
@@ -255,11 +271,11 @@ function requestTargetForms(): void {
 @Test
 function headersBasics(): void {
   let h = emptyHeaders();
-  assertEqUsize(h.count(), 0, "empty");
+  assertEqUsize(h.size(), 0, "empty");
   assertEqBool(h.add("Content-Type", "text/plain").isOk(), true, "add");
   assertEqBool(h.add("X-A", "1").isOk(), true, "add 2");
   assertEqBool(h.add("x-a", "2").isOk(), true, "add same name, other case");
-  assertEqUsize(h.count(), 3, "count");
+  assertEqUsize(h.size(), 3, "count");
   assertEqString(h.get("content-type").unwrap(), "text/plain", "case-insensitive get");
   assertEqString(h.get("X-A").unwrap(), "1", "first of several");
   assertEqUsize(h.countOf("X-a"), 2, "countOf");
@@ -278,7 +294,7 @@ function headersBasics(): void {
   assertEqBool(h.add("N", "a\x00b").isErr(), true, "NUL");
   assertEqBool(h.add("N", " a").isErr(), true, "leading blank");
   assertEqBool(h.add("N\r\nX", "a").isErr(), true, "CRLF in a name");
-  assertEqUsize(h.count(), 3, "failed adds change nothing");
+  assertEqUsize(h.size(), 3, "failed adds change nothing");
   assertEqBool(h.add("Empty", "").isOk(), true, "empty value is valid");
 }
 
@@ -291,12 +307,12 @@ function headersSetRemoveEquals(): void {
   assertEqBool(h.set("A", "9").isOk(), true, "set");
   assertEqUsize(h.countOf("a"), 1, "set leaves one");
   assertEqString(h.get("a").unwrap(), "9", "set value");
-  assertEqUsize(h.count(), 2, "count after set");
+  assertEqUsize(h.size(), 2, "count after set");
   assertEqBool(h.set("A", "x\ny").isErr(), true, "set validates");
   assertEqString(h.get("A").unwrap(), "9", "failed set changes nothing");
   assertEqUsize(h.remove("b"), 1, "remove returns the count");
   assertEqUsize(h.remove("b"), 0, "remove of an absent name");
-  assertEqUsize(h.count(), 1, "count after remove");
+  assertEqUsize(h.size(), 1, "count after remove");
   let g = emptyHeaders();
   g.add("A", "9").unwrap();
   assertEqBool(h.equals(g), true, "equal");
@@ -312,18 +328,18 @@ function headersSetRemoveEquals(): void {
 
 @Test
 function headersFromListsChecksEverything(): void {
-  assertEqBool(headersFromLists(["A", "B"], ["1", "2"]).isOk(), true, "ok");
-  assertEqBool(headersFromLists(["A"], ["1", "2"]).isErr(), true, "length mismatch");
-  assertEqBool(headersFromLists(["A B"], ["1"]).isErr(), true, "bad name");
-  assertEqBool(headersFromLists(["A"], ["1\r\n"]).isErr(), true, "bad value");
-  assertEqString(headerErrorMessage(headersFromLists(["A B"], ["1"]).unwrapErr()).substring(0, 13), "invalid field", "message");
+  assertEqBool(tryHeaders(["A", "B"], ["1", "2"]).isOk(), true, "ok");
+  assertEqBool(tryHeaders(["A"], ["1", "2"]).isErr(), true, "length mismatch");
+  assertEqBool(tryHeaders(["A B"], ["1"]).isErr(), true, "bad name");
+  assertEqBool(tryHeaders(["A"], ["1\r\n"]).isErr(), true, "bad value");
+  assertEqString(headerErrorMessage(tryHeaders(["A B"], ["1"]).unwrapErr()).substring(0, 13), "invalid field", "message");
 }
 
 @Test
 function headersOrderIsKept(): void {
   const q = okReq("GET / HTTP/1.1\r\nZ: 1\r\nHost: a\r\nA: 2\r\nz: 3\r\n\r\n");
   const h = q.headers();
-  assertEqUsize(h.count(), 4, "count");
+  assertEqUsize(h.size(), 4, "count");
   assertEqString(h.nameAt(0), "Z", "order 0");
   assertEqString(h.nameAt(1), "Host", "order 1");
   assertEqString(h.nameAt(2), "A", "order 2");
@@ -339,16 +355,16 @@ function statusInvariants(): void {
   const s = new Status(404, "Not Found");
   assertEq(s.code(), 404, "code");
   assertEqString(s.reason(), "Not Found", "reason");
-  assertEqBool(makeStatus(99, "x").isErr(), true, "99");
-  assertEqBool(makeStatus(600, "x").isErr(), true, "600");
-  assertEqBool(makeStatus(100, "x").isOk(), true, "100");
-  assertEqBool(makeStatus(599, "").isOk(), true, "599, empty reason");
-  assertEqBool(makeStatus(200, "O\r\nK").isErr(), true, "CRLF in the reason phrase");
-  assertEqBool(makeStatus(-1, "x").isErr(), true, "negative");
+  assertEqBool(Status.tryNew(99, "x").isErr(), true, "99");
+  assertEqBool(Status.tryNew(600, "x").isErr(), true, "600");
+  assertEqBool(Status.tryNew(100, "x").isOk(), true, "100");
+  assertEqBool(Status.tryNew(599, "").isOk(), true, "599, empty reason");
+  assertEqBool(Status.tryNew(200, "O\r\nK").isErr(), true, "CRLF in the reason phrase");
+  assertEqBool(Status.tryNew(-1, "x").isErr(), true, "negative");
   assertEqString(standardStatus(200).reason(), "OK", "OK");
   assertEqString(standardStatus(599).reason(), "Unknown Status", "unregistered");
-  assertEqString(standardReason(418), "I'm a teapot", "418");
-  assertEqString(standardReason(299), "", "unregistered is empty");
+  assertEqString(standardReason(418).unwrap(), "I'm a teapot", "418");
+  assertEqBool(standardReason(299).isNone(), true, "unregistered is None");
   assertEqBool(statusHasNoBody(100), true, "100");
   assertEqBool(statusHasNoBody(199), true, "199");
   assertEqBool(statusHasNoBody(200), false, "200");
@@ -368,42 +384,42 @@ function statusInvariants(): void {
 function requestConstructionRules(): void {
   let h = emptyHeaders();
   h.add("Host", "a").unwrap();
-  assertEqBool(makeRequest(Get, "/", Http11, h, emptyBytes(), emptyHeaders()).isOk(), true, "valid");
-  assertEqBool(makeRequest(Get, "/", Http11, emptyHeaders(), emptyBytes(), emptyHeaders()).isErr(), true, "HTTP/1.1 needs Host");
-  assertEqBool(makeRequest(Get, "/", Http10, emptyHeaders(), emptyBytes(), emptyHeaders()).isOk(), true, "HTTP/1.0 needs no Host");
-  assertEqBool(makeRequest(Get, "x", Http11, h, emptyBytes(), emptyHeaders()).isErr(), true, "bad target");
-  assertEqBool(makeRequest(Ext("GET"), "/", Http11, h, emptyBytes(), emptyHeaders()).isErr(), true, "non-canonical method");
-  assertEqBool(makeRequest(Get, "/", Http11, h, bs("x"), emptyHeaders()).isErr(), true, "body without framing");
+  assertEqBool(tryRequest(Get, "/", Http11, h, emptyBytes(), emptyHeaders()).isOk(), true, "valid");
+  assertEqBool(tryRequest(Get, "/", Http11, emptyHeaders(), emptyBytes(), emptyHeaders()).isErr(), true, "HTTP/1.1 needs Host");
+  assertEqBool(tryRequest(Get, "/", Http10, emptyHeaders(), emptyBytes(), emptyHeaders()).isOk(), true, "HTTP/1.0 needs no Host");
+  assertEqBool(tryRequest(Get, "x", Http11, h, emptyBytes(), emptyHeaders()).isErr(), true, "bad target");
+  assertEqBool(tryRequest(Ext("GET"), "/", Http11, h, emptyBytes(), emptyHeaders()).isErr(), true, "non-canonical method");
+  assertEqBool(tryRequest(Get, "/", Http11, h, bs("x"), emptyHeaders()).isErr(), true, "body without framing");
   let h2 = emptyHeaders();
   h2.add("Host", "a").unwrap();
   h2.add("Host", "b").unwrap();
-  assertEqBool(makeRequest(Get, "/", Http11, h2, emptyBytes(), emptyHeaders()).isErr(), true, "two Hosts");
+  assertEqBool(tryRequest(Get, "/", Http11, h2, emptyBytes(), emptyHeaders()).isErr(), true, "two Hosts");
   let h3 = emptyHeaders();
   h3.add("Host", "a").unwrap();
   h3.add("Content-Length", "3").unwrap();
-  assertEqBool(makeRequest(Post, "/", Http11, h3, bs("abc"), emptyHeaders()).isOk(), true, "CL matches");
-  assertEqBool(makeRequest(Post, "/", Http11, h3, bs("ab"), emptyHeaders()).isErr(), true, "CL does not match");
+  assertEqBool(tryRequest(Post, "/", Http11, h3, bs("abc"), emptyHeaders()).isOk(), true, "CL matches");
+  assertEqBool(tryRequest(Post, "/", Http11, h3, bs("ab"), emptyHeaders()).isErr(), true, "CL does not match");
   h3.add("Transfer-Encoding", "chunked").unwrap();
-  assertEqBool(makeRequest(Post, "/", Http11, h3, bs("abc"), emptyHeaders()).isErr(), true, "CL and TE");
-  assertEqString(requestProblem(Post, "/", Http11, h3, bs("abc"), emptyHeaders()), "both Content-Length and Transfer-Encoding", "problem text");
+  assertEqBool(tryRequest(Post, "/", Http11, h3, bs("abc"), emptyHeaders()).isErr(), true, "CL and TE");
+  assertEqString(kindOf(tryRequest(Post, "/", Http11, h3, bs("abc"), emptyHeaders()).unwrapErr()), "ContentLengthWithTransferEncoding", "kind");
 }
 
 @Test
 function responseConstructionRules(): void {
   let h = emptyHeaders();
-  assertEqBool(makeResponse(standardStatus(200), Http11, h, emptyBytes(), emptyHeaders(), false).isOk(), true, "valid");
-  assertEqBool(makeResponse(standardStatus(200), Http11, h, bs("x"), emptyHeaders(), false).isOk(), true, "close-delimited body");
-  assertEqBool(makeResponse(standardStatus(204), Http11, h, bs("x"), emptyHeaders(), false).isErr(), true, "204 with a body");
-  assertEqBool(makeResponse(standardStatus(200), Http11, h, bs("x"), emptyHeaders(), true).isErr(), true, "HEAD response with a body");
+  assertEqBool(tryResponse(standardStatus(200), Http11, h, emptyBytes(), emptyHeaders(), false).isOk(), true, "valid");
+  assertEqBool(tryResponse(standardStatus(200), Http11, h, bs("x"), emptyHeaders(), false).isOk(), true, "close-delimited body");
+  assertEqBool(tryResponse(standardStatus(204), Http11, h, bs("x"), emptyHeaders(), false).isErr(), true, "204 with a body");
+  assertEqBool(tryResponse(standardStatus(200), Http11, h, bs("x"), emptyHeaders(), true).isErr(), true, "HEAD response with a body");
   let c = emptyHeaders();
   c.add("Content-Length", "5").unwrap();
-  assertEqBool(makeResponse(standardStatus(200), Http11, c, emptyBytes(), emptyHeaders(), true).isOk(), true, "HEAD response with CL");
-  assertEqBool(makeResponse(standardStatus(304), Http11, c, emptyBytes(), emptyHeaders(), false).isOk(), true, "304 with CL");
-  assertEqBool(makeResponse(standardStatus(204), Http11, c, emptyBytes(), emptyHeaders(), false).isErr(), true, "204 with CL");
-  assertEqBool(makeResponse(standardStatus(101), Http11, c, emptyBytes(), emptyHeaders(), false).isErr(), true, "101 with CL");
-  assertEqBool(makeResponse(standardStatus(200), Http11, c, bs("12345"), emptyHeaders(), false).isOk(), true, "CL matches");
-  assertEqBool(makeResponse(standardStatus(200), Http11, c, bs("123"), emptyHeaders(), false).isErr(), true, "CL mismatch");
-  const r = makeResponse(standardStatus(204), Http11, h, emptyBytes(), emptyHeaders(), false).unwrap();
+  assertEqBool(tryResponse(standardStatus(200), Http11, c, emptyBytes(), emptyHeaders(), true).isOk(), true, "HEAD response with CL");
+  assertEqBool(tryResponse(standardStatus(304), Http11, c, emptyBytes(), emptyHeaders(), false).isOk(), true, "304 with CL");
+  assertEqBool(tryResponse(standardStatus(204), Http11, c, emptyBytes(), emptyHeaders(), false).isErr(), true, "204 with CL");
+  assertEqBool(tryResponse(standardStatus(101), Http11, c, emptyBytes(), emptyHeaders(), false).isErr(), true, "101 with CL");
+  assertEqBool(tryResponse(standardStatus(200), Http11, c, bs("12345"), emptyHeaders(), false).isOk(), true, "CL matches");
+  assertEqBool(tryResponse(standardStatus(200), Http11, c, bs("123"), emptyHeaders(), false).isErr(), true, "CL mismatch");
+  const r = tryResponse(standardStatus(204), Http11, h, emptyBytes(), emptyHeaders(), false).unwrap();
   assertEqBool(r.isBodyless(), true, "204 is bodyless");
   assertEqBool(r.isForHead(), false, "not for HEAD");
 }
@@ -420,13 +436,13 @@ function parsesASimpleGet(): void {
       assertEqString(methodName(q.method()), "GET", "method");
       assertEqString(q.target(), "/index.html?x=1", "target");
       assertEqString(versionText(q.version()), "HTTP/1.1", "version");
-      assertEqUsize(q.headers().count(), 3, "headers");
+      assertEqUsize(q.headers().size(), 3, "headers");
       assertEqString(q.headers().get("user-agent").unwrap(), "orin", "ua");
       assertEqUsize(q.body().length(), 0, "no body");
       assertEqBool(q.isChunked(), false, "not chunked");
     },
     NeedMore => { fail("need more"); },
-    Failed(e) => { fail(e.message); }
+    Failed(e) => { fail(httpErrorMessage(e)); }
   };
 }
 
@@ -448,7 +464,7 @@ function parsesChunkedBodies(): void {
   const q = okReq("POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n");
   assertEqString(q.body().toRawString(), "hello world", "decoded body");
   assertEqBool(q.isChunked(), true, "chunked");
-  assertEqUsize(q.trailers().count(), 0, "no trailers");
+  assertEqUsize(q.trailers().size(), 0, "no trailers");
   const u = okReq("POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: Chunked\r\n\r\nA\r\n0123456789\r\nff\r\n" + rep("x", 255) + "\r\n0\r\n\r\n");
   assertEqUsize(u.body().length(), 265, "hex sizes, any case");
   const e = okReq("POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n");
@@ -466,10 +482,10 @@ function chunkExtensionsAreIgnoredAndTrailersParsed(): void {
     + "0;last=1\r\nX-Checksum: abc123\r\nX-Other:   spaced  \r\n\r\n";
   const q = okReq(msg);
   assertEqString(q.body().toRawString(), "helloabcxy", "body without extensions");
-  assertEqUsize(q.trailers().count(), 2, "two trailers");
+  assertEqUsize(q.trailers().size(), 2, "two trailers");
   assertEqString(q.trailers().get("x-checksum").unwrap(), "abc123", "trailer");
   assertEqString(q.trailers().get("X-Other").unwrap(), "spaced", "trailer value trimmed");
-  assertEqUsize(q.headers().count(), 2, "trailers are not merged into the headers");
+  assertEqUsize(q.headers().size(), 2, "trailers are not merged into the headers");
   assertEqBool(q.headers().has("X-Checksum"), false, "not in the headers");
 }
 
@@ -496,7 +512,7 @@ function targetsAndVersions(): void {
   assertEqString(okReq("GET http://example.com/a?b HTTP/1.1\r\nHost: example.com\r\n\r\n").target(), "http://example.com/a?b", "absolute-form");
   const old = okReq("GET / HTTP/1.0\r\n\r\n");
   assertEqString(versionText(old.version()), "HTTP/1.0", "HTTP/1.0");
-  assertEqUsize(old.headers().count(), 0, "HTTP/1.0 without Host");
+  assertEqUsize(old.headers().size(), 0, "HTTP/1.0 without Host");
   const lower = okReq("get / HTTP/1.0\r\n\r\n");
   assertEqString(methodName(lower.method()), "get", "lower-case method is an extension");
 }
@@ -525,11 +541,11 @@ function parsesPipelinedRequestsAndReset(): void {
           assertEqUsize(used2, b.length, "second used");
         },
         NeedMore => { fail("second need more"); },
-        Failed(e) => { fail(e.message); }
+        Failed(e) => { fail(httpErrorMessage(e)); }
       };
     },
     NeedMore => { fail("need more"); },
-    Failed(e) => { fail(e.message); }
+    Failed(e) => { fail(httpErrorMessage(e)); }
   };
 }
 
@@ -541,7 +557,7 @@ function feedAfterDoneOrFailureIsRefusedWithoutConsuming(): void {
   const at = p.consumed();
   const r = p.feed(bs("GET / HTTP/1.0\r\n\r\n"));
   match (r) {
-    Failed(e) => { assertEqString(reasonName(e.reason), "ParserFinished", "after done"); },
+    Failed(e) => { assertEqString(httpErrorKindName(e.kind), "ParserFinished", "after done"); },
     NeedMore => { fail("need more"); },
     Done(q, used) => { fail("done twice"); }
   };
@@ -558,7 +574,7 @@ function feedAfterDoneOrFailureIsRefusedWithoutConsuming(): void {
 // ------------------------------------------------------------------------------------------- equality
 
 function mkReq(m: Method, target: string, v: HttpVersion, names: string[], values: string[], body: string, tn: string[], tv: string[]): Request {
-  return makeRequest(m, target, v, headersFromLists(names, values).unwrap(), bs(body), headersFromLists(tn, tv).unwrap()).unwrap();
+  return tryRequest(m, target, v, tryHeaders(names, values).unwrap(), bs(body), tryHeaders(tn, tv).unwrap()).unwrap();
 }
 
 @Test
@@ -583,11 +599,11 @@ function requestEqualityComparesEveryPart(): void {
   assertEqBool(mkReq(Ext("PURGE"), "/", Http11, ["Host"], ["a"], "", [], []).equals(mkReq(Ext("PUSH"), "/", Http11, ["Host"], ["a"], "", [], [])), false, "different extension methods");
   assertEqBool(old.isChunked(), false, "not chunked");
   assertEqBool(base.isChunked(), true, "chunked");
-  assertEqUsize(base.trailers().count(), 1, "trailers accessor");
+  assertEqUsize(base.trailers().size(), 1, "trailers accessor");
 }
 
 function mkRes(code: int, reason: string, v: HttpVersion, names: string[], values: string[], body: string, tn: string[], tv: string[], head: bool): Response {
-  return makeResponse(new Status(code, reason), v, headersFromLists(names, values).unwrap(), bs(body), headersFromLists(tn, tv).unwrap(), head).unwrap();
+  return tryResponse(new Status(code, reason), v, tryHeaders(names, values).unwrap(), bs(body), tryHeaders(tn, tv).unwrap(), head).unwrap();
 }
 
 @Test
@@ -607,6 +623,116 @@ function responseEqualityComparesEveryPart(): void {
   assertEqBool(plain.isForHead(), false, "not for HEAD");
   assertEqBool(plain.isBodyless(), false, "has a body");
   assertEqBool(mkRes(204, "No Content", Http11, [], [], "", [], [], false).isBodyless(), true, "204");
-  assertEqUsize(base.trailers().count(), 1, "trailers accessor");
+  assertEqUsize(base.trailers().size(), 1, "trailers accessor");
   assertEqUsize(plain.body().length(), 1, "body accessor");
+}
+
+// ------------------------------------------------------------------------------- ADR-0048: typed twins and errors
+
+@Test
+function statusTryNewReportsTheKind(): void {
+  assertEqString(kindOf(Status.tryNew(99, "x").unwrapErr()), "InvalidStatusCode", "99");
+  assertEqString(kindOf(Status.tryNew(600, "x").unwrapErr()), "InvalidStatusCode", "600");
+  const bad = Status.tryNew(200, "O\r\nK").unwrapErr();
+  assertEqString(kindOf(bad), "InvalidStatusReason", "CRLF in the phrase");
+  assertEqUsize(bad.offset, 1, "offset of the first offending byte");
+  assertEqUsize(Status.tryNew(200, "OK\x00").unwrapErr().offset, 2, "NUL at the end");
+  assertEqString(Status.tryNew(404, "Not Found").unwrap().reason(), "Not Found", "ok");
+  assertEqBool(httpErrorMessage(bad).length > 0, true, "message");
+}
+
+@Test
+function requestAndResponseTryNewReportTheRule(): void {
+  let h = emptyHeaders();
+  h.add("Host", "a").unwrap();
+  assertEqString(kindOf(tryRequest(Ext("GET"), "/", Http11, h, emptyBytes(), emptyHeaders()).unwrapErr()), "InvalidMethod", "method");
+  assertEqString(kindOf(tryRequest(Get, "x", Http11, h, emptyBytes(), emptyHeaders()).unwrapErr()), "InvalidTarget", "target");
+  assertEqString(kindOf(tryRequest(Get, "/", Http11, emptyHeaders(), emptyBytes(), emptyHeaders()).unwrapErr()), "MissingHost", "no Host");
+  let two = emptyHeaders();
+  two.add("Host", "a").unwrap();
+  two.add("Host", "b").unwrap();
+  assertEqString(kindOf(tryRequest(Get, "/", Http11, two, emptyBytes(), emptyHeaders()).unwrapErr()), "DuplicateHost", "two Hosts");
+  assertEqString(kindOf(tryRequest(Get, "/", Http11, h, bs("x"), emptyHeaders()).unwrapErr()), "MissingFraming", "body without framing");
+  let cl = emptyHeaders();
+  cl.add("Host", "a").unwrap();
+  cl.add("Content-Length", "3").unwrap();
+  assertEqString(kindOf(tryRequest(Post, "/", Http11, cl, bs("ab"), emptyHeaders()).unwrapErr()), "BodyLengthMismatch", "CL mismatch");
+  let bad = emptyHeaders();
+  bad.add("Content-Length", "x").unwrap();
+  assertEqString(kindOf(tryResponse(standardStatus(200), Http11, bad, emptyBytes(), emptyHeaders(), false).unwrapErr()), "InvalidContentLength", "CL");
+  assertEqString(kindOf(tryResponse(standardStatus(204), Http11, emptyHeaders(), bs("x"), emptyHeaders(), false).unwrapErr()), "UnexpectedBody", "204 body");
+  let ok = tryRequest(Get, "/", Http11, h, emptyBytes(), emptyHeaders());
+  assertEqBool(ok.isOk(), true, "the valid request");
+  assertEqBool(ok.unwrap().equals(new Request(Get, "/", Http11, h, emptyBytes(), emptyHeaders())), true, "tryNew builds the same request");
+}
+
+@Test
+function headersSizeAndErrors(): void {
+  const e = emptyHeaders();
+  assertEqBool(e.isEmpty(), true, "empty");
+  assertEqUsize(e.size(), 0, "size 0");
+  let h = emptyHeaders();
+  h.add("A", "1").unwrap();
+  assertEqBool(h.isEmpty(), false, "not empty");
+  assertEqUsize(h.size(), 1, "size 1");
+  assertEqUsize(h.count(), 1, "the deprecated count() is size()");
+  assertEqString(headerErrorMessage(tryHeaders(["A"], ["1", "2"]).unwrapErr()).substring(0, 9), "the lists", "MismatchedLists");
+  const n = h.add("A B", "1").unwrapErr();
+  assertEqString(headerErrorMessage(n).substring(0, 13), "invalid field", "InvalidHeaderName");
+  match (n.kind) {
+    InvalidHeaderName => {},
+    _ => { fail("wrong kind for a bad name"); }
+  }
+  match (h.add("A", "1\r\n").unwrapErr().kind) {
+    InvalidHeaderValue => {},
+    _ => { fail("wrong kind for a bad value"); }
+  }
+  match (tryHeaders(["A"], []).unwrapErr().kind) {
+    MismatchedLists => {},
+    _ => { fail("wrong kind for lists of different lengths"); }
+  }
+}
+
+@Test
+function limitsRecordIsCheckedByTheParsers(): void {
+  const d = defaultLimits();
+  assertEqBool(isValidLimits(d), true, "the default is valid");
+  assertEqUsize(d.maxBody, 1048576, "1 MiB");
+  const small = HttpLimits { ...d, maxBody: 4 };
+  assertEqUsize(small.maxStartLine, 8192, "spread keeps the other fields");
+  assertEqBool(isValidLimits(small), true, "valid");
+  assertEqBool(isValidLimits(HttpLimits { ...d, maxStartLine: 15 }), false, "start line below 16");
+  assertEqBool(isValidLimits(HttpLimits { ...d, maxHeaderCount: 0 }), false, "no headers");
+  assertEqBool(isValidLimits(HttpLimits { ...d, maxHeaderBytes: 63 }), false, "head below 64");
+  assertEqBool(isValidLimits(HttpLimits { ...d, maxChunkLine: 7 }), false, "chunk line below 8");
+  assertEqBool(isValidLimits(HttpLimits { ...d, maxBody: 1099511627777 }), false, "body above 2^40");
+  assertEqBool(isValidLimits(HttpLimits { ...d, maxHeaderLine: 1048577 }), false, "header line above 1 MiB");
+}
+
+@Test
+function responseToIsTheNamedHeadFlag(): void {
+  const msg = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n";
+  match (parseResponse(bs(msg), defaultLimits(), ToHead)) {
+    Done(q, used) => { assertEqBool(q.isForHead(), true, "ToHead"); assertEqUsize(used, msg.length, "no body bytes"); },
+    _ => { fail("a HEAD response with Content-Length is complete"); }
+  }
+  match (parseResponse(bs(msg), defaultLimits(), ToOther)) {
+    NeedMore => {},
+    _ => { fail("the same bytes need the body for another request"); }
+  }
+}
+
+@Test
+function deprecatedWrappersStillWork(): void {
+  assertEqBool(makeStatus(99, "x").isErr(), true, "makeStatus");
+  assertEqBool(makeStatus(200, "OK").isOk(), true, "makeStatus ok");
+  assertEqBool(headersFromLists(["A"], ["1"]).isOk(), true, "headersFromLists");
+  assertEqBool(headersFromLists(["A"], []).isErr(), true, "headersFromLists mismatch");
+  let h = emptyHeaders();
+  h.add("Host", "a").unwrap();
+  assertEqBool(makeRequest(Get, "/", Http11, h, emptyBytes(), emptyHeaders()).isOk(), true, "makeRequest");
+  assertEqString(makeRequest(Get, "x", Http11, h, emptyBytes(), emptyHeaders()).unwrapErr(), "invalid request-target", "makeRequest text");
+  assertEqBool(makeResponse(standardStatus(204), Http11, h, bs("x"), emptyHeaders(), false).isErr(), true, "makeResponse");
+  assertEqString(reasonName(InvalidMethod), "InvalidMethod", "reasonName");
+  assertEqBool(reasonText(InvalidMethod).length > 0, true, "reasonText");
 }

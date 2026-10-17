@@ -3,11 +3,12 @@
 // Usage: parallel_clients <port> <N> <bodyBytes>
 // Prints "parallel: N ok" when every task got status 200 with exactly its own body, else a line per failure and "parallel: FAIL".
 import { Host, withProcess, useNet } from "std:host";
+import { milliseconds } from "std:time";
 import { args } from "std:process";
 import { Bytes, bytesFromString } from "std:bytes";
-import { ResponseParser, NeedMore, Done, Failed, defaultLimits } from "std:http";
+import { ResponseParser, NeedMore, Done, Failed, ToOther, defaultLimits } from "std:http";
 import { Scope, TaskHandle, scopeNetDo, spawnNet } from "std:task";
-import { NetGrant, Stream, useConnect, withConnection, sendAll, recv, RecvData } from "std:net";
+import { NetGrant, Stream, useConnect, withConnection, sendAll, recv, RecvData, netErrorMessage } from "std:net";
 
 function body(i: int, n: int): string {
   let s = "client " + i.toString() + ":";
@@ -21,15 +22,15 @@ function body(i: int, n: int): string {
 function exchange(s: Stream, i: int, n: int): string {
   const payload = body(i, n);
   const req = "POST /echo HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Type: text/plain\r\nContent-Length: " + payload.length.toString() + "\r\n\r\n" + payload;
-  const sent = sendAll(s, bytesFromString(req), 5000);
+  const sent = sendAll(s, bytesFromString(req), milliseconds(5000));
   if (sent.isErr()) {
-    return "send: " + sent.unwrapErr().message;
+    return "send: " + netErrorMessage(sent.unwrapErr());
   }
-  let p = new ResponseParser(defaultLimits(), false);
+  let p = new ResponseParser(defaultLimits(), ToOther);
   let out = "no response";
   let going = true;
   while (going) {
-    const r = recv(s, 16384, 5000);
+    const r = recv(s, 16384, milliseconds(5000));
     match (r) {
       RecvData(b) => {
         const pr = p.feed(b);
@@ -55,9 +56,9 @@ function exchange(s: Stream, i: int, n: int): string {
 }
 
 function one(net: NetGrant, port: int, i: int, n: int): string {
-  const r = withConnection(net, "127.0.0.1", port, 5000, (s: Stream) => exchange(s, i, n));
+  const r = withConnection(net, "127.0.0.1", port, milliseconds(5000), (s: Stream) => exchange(s, i, n));
   if (r.isErr()) {
-    return "connect: " + r.unwrapErr().message;
+    return "connect: " + netErrorMessage(r.unwrapErr());
   }
   return r.unwrap();
 }

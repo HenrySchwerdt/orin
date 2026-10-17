@@ -1,0 +1,188 @@
+// Timed and wakeable waits (ADR-0017 Addendum B, C1; tools/test_concurrency.sh: plain, ThreadSanitizer, ASan + UBSan).
+// Lower bounds are exact (a timed call never returns before its deadline); upper bounds are seconds, never tight.
+//  1. recvTimeout: times out on an empty channel (not early), delivers a value that arrives before the deadline, delivers an
+//     already buffered value although the deadline is 0, reports Closed once drained, rejects a negative timeout;
+//  2. sendTimeout: times out on a full channel, succeeds when a slot frees, reports Closed;
+//  3. select: picks the ready channel, ties go to the lowest index, skips closed channels, all closed is Closed, wakes up when a
+//     value is sent to any channel while it waits, times out when nothing arrives;
+//  4. sleep: lower bound of its duration; sleepUntil of a past deadline returns at once;
+//  5. joinTimeout: times out on a task that is still blocked, the handle stays valid, a later join returns the result;
+//     joinTimeout of a task that has ended returns the result.
+import { Host, useClock } from "std:host";
+import { ClockGrant, monotonicNow, milliseconds, seconds, Deadline, MonotonicInstant } from "std:time";
+import { scopeClock, spawn, spawnDo, spawnClock, channel, select, selectTimeout, sleep, sleepUntil, taskErrorMessage, TaskError, Selected } from "std:task";
+
+function nowMs(clock: ClockGrant): int {
+  return monotonicNow(clock).unwrap().millis;
+}
+
+function showInt(r: Result<int, TaskError>): string {
+  if (r.isOk()) {
+    return "ok " + r.unwrap().toString();
+  }
+  return "err " + taskErrorMessage(r.unwrapErr());
+}
+
+function showVoid(r: Result<void, TaskError>): string {
+  if (r.isOk()) {
+    return "ok";
+  }
+  return "err " + taskErrorMessage(r.unwrapErr());
+}
+
+function check(label: string, cond: bool): void {
+  console.log(label + ": " + (cond ? "yes" : "NO"));
+}
+
+function testRecv(clock: ClockGrant): void {
+  const ch = channel<int>(4);
+  const t0 = nowMs(clock);
+  console.log("empty: " + showInt(ch.rx.recvTimeout(clock, milliseconds(150))));
+  const waited = nowMs(clock) - t0;
+  check("not early", waited >= 150);
+  check("not stuck", waited < 20000);
+  console.log("negative: " + showInt(ch.rx.recvTimeout(clock, milliseconds(-1))));
+  // a value that arrives before the deadline
+  const got = scopeClock(clock, (s, c) => {
+    const p = spawnDo(s, () => {
+      ch.tx.send(42);
+    });
+    const r = ch.rx.recvTimeout(c, seconds(30));
+    p.join();
+    return showInt(r);
+  });
+  console.log("arrives: " + got);
+  // buffered value and a deadline that has passed
+  ch.tx.send(7);
+  console.log("buffered, timeout 0: " + showInt(ch.rx.recvTimeout(clock, milliseconds(0))));
+  console.log("empty, timeout 0: " + showInt(ch.rx.recvTimeout(clock, milliseconds(0))));
+  ch.tx.close();
+  console.log("closed: " + showInt(ch.rx.recvTimeout(clock, seconds(30))));
+}
+
+function testSend(clock: ClockGrant): void {
+  const ch = channel<int>(1);
+  console.log("send 1: " + showVoid(ch.tx.sendTimeout(clock, 1, seconds(30))));
+  const t0 = nowMs(clock);
+  console.log("send 2 (full): " + showVoid(ch.tx.sendTimeout(clock, 2, milliseconds(100))));
+  check("not early", nowMs(clock) - t0 >= 100);
+  const r = scopeClock(clock, (s, c) => {
+    const p = spawn(s, () => ch.rx.recv());
+    const sent = ch.tx.sendTimeout(c, 3, seconds(30));
+    p.join();
+    return showVoid(sent);
+  });
+  console.log("send 3 (a receiver frees a slot): " + r);
+  ch.rx.close();
+  console.log("send 4 (closed): " + showVoid(ch.tx.sendTimeout(clock, 4, seconds(30))));
+}
+
+function showSel(r: Result<Selected<int>, TaskError>): string {
+  if (r.isOk()) {
+    const v = r.unwrap();
+    return "ok #" + v.index.toString() + " = " + v.value.toString();
+  }
+  return "err " + taskErrorMessage(r.unwrapErr());
+}
+
+function testSelect(clock: ClockGrant): void {
+  const a = channel<int>(4);
+  const b = channel<int>(4);
+  const c = channel<int>(4);
+  const all = [a.rx, b.rx, c.rx];
+  b.tx.send(20);
+  console.log("ready channel: " + showSel(select(all)));
+  a.tx.send(10);
+  b.tx.send(21);
+  console.log("tie, lowest index: " + showSel(select(all)));
+  console.log("then: " + showSel(select(all)));
+  const t0 = nowMs(clock);
+  console.log("nothing: " + showSel(selectTimeout(clock, all, milliseconds(120))));
+  check("not early", nowMs(clock) - t0 >= 120);
+  // wakes up when another task sends to the LAST channel while select waits
+  const woken = scopeClock(clock, (s, cg) => {
+    const p = spawnClock(s, cg, g => {
+      sleep(g, milliseconds(100)).unwrap();
+      c.tx.send(99);
+      return true;
+    });
+    const r = select(all);
+    p.join();
+    return showSel(r);
+  });
+  console.log("woken by a send: " + woken);
+  // closed channels are skipped; a value on the open one is still found; all closed is Closed
+  a.tx.close();
+  b.tx.close();
+  const mixed = scopeClock(clock, (s, cg) => {
+    const p = spawnClock(s, cg, g => {
+      sleep(g, milliseconds(50)).unwrap();
+      c.tx.send(5);
+      return true;
+    });
+    const r = select(all);
+    p.join();
+    return showSel(r);
+  });
+  console.log("two closed, one open: " + mixed);
+  c.tx.close();
+  console.log("all closed: " + showSel(select(all)));
+  // a close wakes a waiting select
+  const x = channel<int>(1);
+  const y = channel<int>(1);
+  const closing = scopeClock(clock, (s, cg) => {
+    const p = spawnClock(s, cg, g => {
+      sleep(g, milliseconds(50)).unwrap();
+      x.tx.close();
+      y.tx.close();
+      return true;
+    });
+    const r = select([x.rx, y.rx]);
+    p.join();
+    return showSel(r);
+  });
+  console.log("woken by closes: " + closing);
+}
+
+function testSleep(clock: ClockGrant): void {
+  const t0 = nowMs(clock);
+  console.log("sleep: " + showVoid(sleep(clock, milliseconds(200))));
+  const waited = nowMs(clock) - t0;
+  check("slept at least 200 ms", waited >= 200);
+  check("did not oversleep by seconds", waited < 20000);
+  console.log("sleep -1: " + showVoid(sleep(clock, milliseconds(-1))));
+  const t1 = nowMs(clock);
+  sleepUntil(Deadline { at: MonotonicInstant { millis: 0 } });
+  sleepUntil(Deadline { at: MonotonicInstant { millis: t1 } });
+  check("past deadline returns at once", nowMs(clock) - t1 < 20000);
+  console.log("sleep 0: " + showVoid(sleep(clock, milliseconds(0))));
+}
+
+function testJoin(clock: ClockGrant): void {
+  const gate = channel<int>(1);
+  const out = scopeClock(clock, (s, c) => {
+    const slow = spawn(s, () => {
+      const v = gate.rx.recv();
+      return v.unwrap() + 1;
+    });
+    const fast = spawn(s, () => 5);
+    const quick = showInt(fast.joinTimeout(c, seconds(30)));
+    const t0 = nowMs(c);
+    const early = showInt(slow.joinTimeout(c, milliseconds(150)));
+    const waited = nowMs(c) - t0;
+    gate.tx.send(100);
+    const late = showInt(slow.joinTimeout(c, seconds(30)));
+    return quick + " | " + early + " (waited long enough: " + (waited >= 150 ? "yes" : "NO") + ") | " + late;
+  });
+  console.log("join: " + out);
+}
+
+function main(host: Host): void {
+  useClock(host, clock => {
+    testRecv(clock);
+    testSend(clock);
+    testSelect(clock);
+    testSleep(clock);
+    testJoin(clock);
+  });
+}

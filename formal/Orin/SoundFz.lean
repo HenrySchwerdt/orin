@@ -62,6 +62,6 @@ theorem frozen_step_nopending {E : AState → Prop} {a : AState} {code : Code}
   | call _ _ _ => intro s hI hp c' h; simp [mstep, hp] at h
   | @weak E a b code hF hk ih =>
     intro s hI hp c' h
-    exact ih s (hI.weaken hF) hp c' h
+    exact ih s (hI.weaken hF.1) hp c' h
 
 end Orin
