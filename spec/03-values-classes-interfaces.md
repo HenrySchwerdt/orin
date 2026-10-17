@@ -81,6 +81,24 @@ class Circle implements Shape, Named {            // conformance is declared, ne
   mutation of the original is not observable), and interface values are immutable.
 - `==` / `!=` on interface values is E0410 (no identity, no structural equality).
 
+## Equality, order and hashing (ADR-0034)
+
+- **Built-in constraints.** `Eq`, `Ord` and `Hash` need no declaration. They bound a type parameter like any interface
+  (`function max<T extends Ord>(a: T, b: T): T`, `class Counter<K extends Hash>`) and appear in `implements` lists. `Ord` and
+  `Hash` imply `Eq`. `Eq` gives `==`, `!=` and `a.equals(b): bool`; `Ord` gives `<`, `<=`, `>`, `>=` and `a.compare(b): int`
+  (negative, zero, positive); `Hash` gives `a.hash(): usize` and makes the type a `Map` key. A type that does not satisfy a
+  bound is E0475 at the instantiation.
+- **Derived (tier 1).** The integers, `usize`, `bool` and `string` have all three. Records, tagged unions, `Option`, `Result` and
+  arrays have the constraint when all their components do; the order is lexicographic (fields in order; a union by the
+  position of its variant, then its payload; `None` before `Some`; `Ok` before `Err`; arrays element by element, then by length).
+  `float` / `f32` as a component have none of the three (NaN); function values, interface values, resource handles and `Map`
+  have none. `==`/`<` on a type without the instance is E0410 with the reason.
+- **Explicit (tier 2).** A class declares public, non-mutating `equals(other: C): bool`, `compare(other: C): int` and/or
+  `hash(): usize` and then satisfies the constraint with them (E0476 for a wrong signature, a static, private or mutating method).
+  `class C implements Eq` (or `Ord`, `Hash`) with no such method asks for the structural instance of its fields; with an
+  explicit `equals` it also needs the explicit `hash` (and `compare` for `Ord`), because a derived one could disagree. Records and
+  unions have no methods, so only classes have tier 2.
+
 ## Identity and resources
 
 Ordinary classes do not have independently observable shared mutable identity. Database connections, socket handles and actors are not ordinary value-class instances. They MUST use special trusted resource/actor APIs with escape and lifetime validation (`06-memory-model-oim.md`). The compiler MUST prevent resource duplication through normal value copying.
