@@ -84,3 +84,13 @@ import Orin
 #print axioms Orin.prog_no_use_after_free
 #print axioms Orin.prog_no_shared_store
 #print axioms Orin.fcheck_cont
+
+-- typed calls
+#print axioms Orin.Cont.nil_invP
+#print axioms Orin.Cont.call_invP
+#print axioms Orin.fcheck_contH
+#print axioms Orin.entryFn_tinv
+#print axioms Orin.StkIT.ty
+#print axioms Orin.good_stepT
+#print axioms Orin.goodT_reach
+#print axioms Orin.prog_sound_ill
