@@ -1,0 +1,53 @@
+// The owner task. Tasks in Orin share no mutable state (docs/concurrency.md: every heap object belongs to one task), so the one
+// store lives in ONE task, and the workers talk to it through a channel. A request is a Command that carries a private
+// reply channel; the owner handles commands one at a time, in arrival order, which also makes every request atomic.
+import { Sender, Receiver, channel } from "std:task";
+import { emptyStore } from "./store";
+import { Answer, handle, errorAnswer } from "./api";
+
+export type Command = { method: string; target: string; body: string; reply: Sender<Answer>; };
+
+// Runs until the command channel is closed and drained; returns the number of commands handled.
+export function ownerLoop(commands: Receiver<Command>): int {
+  let store = emptyStore();
+  let handled: int = 0;
+  let going = true;
+  while (going) {
+    const next = commands.recv();
+    match (next) {
+      Some(c) => {
+        const r = handle(store, c.method, c.target, c.body);
+        store = r.store;
+        c.reply.send(r.answer);
+        handled += 1;
+      },
+      None => {
+        going = false;
+      },
+    }
+  }
+  return handled;
+}
+
+// What a worker calls: one request/response round trip with the owner.
+export function ask(
+  commands: Sender<Command>,
+  method: string,
+  target: string,
+  body: string,
+): Answer {
+  const reply = channel<Answer>(1);
+  const sent = commands.send(Command {
+    method: method,
+    target: target,
+    body: body,
+    reply: reply.tx,
+  });
+  if (!sent) {
+    return errorAnswer(503, "service is shutting down");
+  }
+  const got = reply.rx.recv();
+  reply.rx.close();
+  reply.tx.close();
+  return got.isSome() ? got.unwrap() : errorAnswer(500, "no answer");
+}

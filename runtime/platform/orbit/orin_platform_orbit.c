@@ -12,8 +12,11 @@
  *   args / env        one argument "main", no environment; ORIN_DENY does not exist (the host grant is the policy);
  *   files, processes, network
  *                     not available: every call returns ORIN_PLATFORM_EPERM (or -1 where the contract has no code);
- *   threads           none: a task runs to completion inside orin_platform_thread_create; a monitor wait that no other
- *                     task could ever notify traps instead of deadlocking;
+ *   threads           one WebAssembly thread runs every task, one at a time, to completion (run-on-block): create only queues
+ *                     the task; it runs when a context would block (join of it, monitor wait) or when main returns. The
+ *                     runtime's per-task state is __thread data, which the build (-D__thread=...section("orin_tls")) gathers
+ *                     into one block; a switch saves that block, installs its pristine image and restores it afterwards.
+ *                     A wait with no queued task, and a trapping task, end the module with a "wasm64-orbit:" message;
  *   exit              flushes, records the status (export orin_exit_status) and traps: WebAssembly has no unwinding here.
  * Entry point: the export `orin_main` runs the program's main and returns its exit status. */
 #include "../orin_platform.h"
@@ -75,9 +78,13 @@ int64_t orin_platform_shell_timeout(const char *cmd, size_t n, int64_t seconds) 
 }
 
 int main(int argc, char **argv); /* emitted by the compiler */
+static void tls_prime(void);
+static void run_queued(void);
 
 __attribute__((export_name("orin_main"))) int32_t orin_main(void) {
+    tls_prime(); /* the block is still pristine here */
     g_exit_status = main(1, g_argv0);
+    run_queued(); /* tasks nobody joined still run before the program ends */
     run_at_exit();
     orin_platform_flush();
     return g_exit_status;
@@ -228,51 +235,136 @@ int64_t orin_platform_path_real(const char *abs, size_t alen, char *out, size_t 
     return (int64_t)alen;
 }
 
-/* ---------------------------------------------------------------- threads and monitors: one thread */
+/* ---------------------------------------------------------------- threads and monitors: one thread, run-on-block */
 
-uint64_t orin_platform_thread_id(void) { return 1; }
 uint64_t orin_platform_cpu_count(void) { return 1; }
 
-enum { THR_MAX = 1 << 12, MON_MAX = 1 << 14 };
+enum { THR_MAX = 1 << 16, MON_MAX = 1 << 14, TH_FREE = 0, TH_QUEUED, TH_RUNNING, TH_DONE };
 typedef struct {
+    void (*entry)(void *);
     void *arg;
-    uint32_t gen;
-    int live;
+    uint32_t gen, prev, next, st; /* prev / next: the run queue; next also chains the free slots (index + 1, 0 = none) */
 } Thr;
-static Thr g_thr[THR_MAX];
-static uint32_t g_thr_hi, g_thr_free[THR_MAX], g_thr_nfree;
+static Thr *g_thr;
+static uint32_t g_thr_cap, g_thr_hi, g_thr_free, g_q_head, g_q_tail, g_cur; /* g_cur: the running task (index + 1), 0 = main */
+static int64_t g_wake_bound; /* the wake source bound to the running context (below) */
+static uint64_t g_tid = 1, g_tid_last = 1;                                  /* thread id of the running context */
 
 static int64_t slot_handle(uint32_t gen, uint32_t i) { return (int64_t)(((uint64_t)gen << 32) | (uint64_t)(i + 1)); }
 static uint32_t slot_index(int64_t h) { return (uint32_t)((uint64_t)h & 0xffffffffu) - 1u; }
 static uint32_t slot_gen(int64_t h) { return (uint32_t)((uint64_t)h >> 32); }
 
+uint64_t orin_platform_thread_id(void) { return g_tid; }
+
+/* The runtime's per-task state: every __thread object is built into the section orin_tls (see the header comment). */
+extern char __start_orin_tls[] __attribute__((weak)), __stop_orin_tls[] __attribute__((weak));
+extern char orin_heap[] __attribute__((weak)); /* the heap block of orin_runtime.c: a __thread object, must be inside the section */
+static char *g_tls_pristine;
+static size_t tls_size(void) { return (size_t)(__stop_orin_tls - __start_orin_tls); }
+static void tls_prime(void) {
+    if (tls_size() && (g_tls_pristine = (char *)orin_platform_alloc(tls_size()))) orin_platform_mem_copy(g_tls_pristine, __start_orin_tls, tls_size());
+}
+
+/* Ends the module with a message the test runner recognises (the prefix "wasm64-orbit: "). */
+__attribute__((noreturn)) static void fatal(const char *what, const char *detail, int status) {
+    static char buf[1100];
+    size_t n = 0;
+    const char *parts[] = {"wasm64-orbit: ", what, detail};
+    for (int k = 0; k < 3; k++)
+        for (const char *p = parts[k]; *p && n < sizeof buf - 1; p++) buf[n++] = *p;
+    orin_platform_flush();
+    orin_platform_write_line(ORIN_PLATFORM_STDERR, buf, n);
+    g_exit_status = status;
+    __builtin_trap();
+}
+__attribute__((noreturn)) static void deadlock(void) {
+    fatal("deadlock: a task waits for a notification that no queued task can send (tasks run one at a time, to completion)", "", -1);
+}
+
+static Thr *thr_ref(int64_t h) {
+    uint32_t i = slot_index(h);
+    return h > 0 && i < g_thr_hi && g_thr[i].st != TH_FREE && g_thr[i].gen == slot_gen(h) ? &g_thr[i] : NULL;
+}
+static void q_remove(uint32_t i) {
+    Thr *t = &g_thr[i];
+    if (t->prev) g_thr[t->prev - 1].next = t->next;
+    else g_q_head = t->next;
+    if (t->next) g_thr[t->next - 1].prev = t->prev;
+    else g_q_tail = t->prev;
+}
+
+/* Runs queued task i to completion on the current stack, in a fresh copy of the runtime's per-task state. */
+static void run_task(uint32_t i) {
+    size_t n = tls_size();
+    char *saved = n ? (char *)orin_platform_alloc(n) : NULL;
+    if (n && (!saved || !g_tls_pristine)) fatal("out of memory", "", -1);
+    q_remove(i);
+    void (*entry)(void *) = g_thr[i].entry;
+    void *arg = g_thr[i].arg;
+    g_thr[i].st = TH_RUNNING;
+    uint32_t cur = g_cur;
+    uint64_t tid = g_tid;
+    int64_t wake = g_wake_bound; /* a new task starts with no wake source bound */
+    orin_platform_mem_copy(saved, __start_orin_tls, n);
+    orin_platform_mem_copy(__start_orin_tls, g_tls_pristine, n);
+    g_cur = i + 1, g_tid = ++g_tid_last, g_wake_bound = 0;
+    entry(arg);
+    orin_platform_mem_copy(__start_orin_tls, saved, n);
+    orin_platform_free(saved);
+    g_cur = cur, g_tid = tid, g_wake_bound = wake;
+    g_thr[i].st = TH_DONE;
+}
+static void run_queued(void) {
+    while (g_q_head) run_task(g_q_head - 1);
+}
+
 int64_t orin_platform_thread_create(void (*entry)(void *), void *arg) {
     uint32_t i;
-    if (g_thr_nfree) i = g_thr_free[--g_thr_nfree];
-    else if (g_thr_hi < THR_MAX) i = g_thr_hi++;
-    else return 0;
+    if (orin_heap && (orin_heap < __start_orin_tls || orin_heap >= __stop_orin_tls)) /* built without -D__thread=... */
+        fatal("the runtime was built without -D__thread=... (section orin_tls): tasks would share their state", "", -1);
+    if (g_thr_free) {
+        i = g_thr_free - 1;
+        g_thr_free = g_thr[i].next;
+    } else {
+        if (g_thr_hi == g_thr_cap) {
+            uint32_t nc = g_thr_cap ? g_thr_cap * 2 : 64;
+            Thr *p = g_thr_cap == THR_MAX ? NULL : (Thr *)orin_platform_realloc(g_thr, nc * sizeof(Thr));
+            if (!p) return 0;
+            orin_platform_mem_set(p + g_thr_cap, 0, (nc - g_thr_cap) * sizeof(Thr));
+            g_thr = p, g_thr_cap = nc;
+        }
+        i = g_thr_hi++;
+    }
     Thr *t = &g_thr[i];
-    t->gen++;
-    t->arg = arg;
-    t->live = 1;
-    entry(arg); /* runs to completion: there is no second thread */
+    t->gen++, t->entry = entry, t->arg = arg, t->st = TH_QUEUED, t->prev = g_q_tail, t->next = 0;
+    if (g_q_tail) g_thr[g_q_tail - 1].next = i + 1;
+    else g_q_head = i + 1;
+    g_q_tail = i + 1;
     return slot_handle(t->gen, i);
 }
 int orin_platform_thread_join(int64_t h, void **arg) {
-    uint32_t i = slot_index(h);
-    if (h <= 0 || i >= g_thr_hi || !g_thr[i].live || g_thr[i].gen != slot_gen(h)) return ORIN_PLATFORM_EINVAL;
-    *arg = g_thr[i].arg;
-    g_thr[i].live = 0;
-    g_thr_free[g_thr_nfree++] = i;
+    Thr *t = thr_ref(h);
+    if (!t) return ORIN_PLATFORM_EINVAL;
+    uint32_t i = (uint32_t)(t - g_thr);
+    if (t->st == TH_QUEUED) run_task(i);
+    else if (t->st == TH_RUNNING) deadlock(); /* it waits (below this call on the stack) for the task that joins it */
+    t = &g_thr[i]; /* the table may have grown */
+    *arg = t->arg;
+    t->st = TH_FREE, t->next = g_thr_free, g_thr_free = i + 1;
     return 0;
 }
-void orin_platform_thread_exit(void) { __builtin_trap(); } /* a trapping task cannot be unwound: the instance traps */
+/* A task trapped (the runtime has recorded its message): WebAssembly cannot unwind to the join, so the module ends. */
+void orin_platform_thread_exit(void) {
+    const char *p = g_cur ? (const char *)g_thr[g_cur - 1].arg : NULL; /* RtTask: tok, trapped, done_mon, msg[480] (orin_runtime.c) */
+    fatal("a task trapped: ", p && *(const int *)(p + 8) == 1 ? p + 24 : "(no message)", 101); /* the instance ends: see ADR-0055 */
+}
 
 typedef struct {
     uint64_t *w;
     size_t n;
+    uint64_t owner;
     uint32_t gen;
-    int live, locked;
+    int live, locked, nwait;
 } Mon;
 static Mon g_mon[MON_MAX];
 static uint32_t g_mon_hi, g_mon_free[MON_MAX], g_mon_nfree;
@@ -280,6 +372,10 @@ static uint32_t g_mon_hi, g_mon_free[MON_MAX], g_mon_nfree;
 static Mon *mon_ref(int64_t h) {
     uint32_t i = slot_index(h);
     return h > 0 && i < g_mon_hi && g_mon[i].live && g_mon[i].gen == slot_gen(h) ? &g_mon[i] : NULL;
+}
+static Mon *mon_held(int64_t h) { /* the monitor, locked by the running context */
+    Mon *m = mon_ref(h);
+    return m && m->locked && m->owner == g_tid ? m : NULL;
 }
 
 int64_t orin_platform_monitor_new(size_t nwords) {
@@ -295,13 +391,13 @@ int64_t orin_platform_monitor_new(size_t nwords) {
     }
     Mon *m = &g_mon[i];
     m->gen++;
-    m->w = w, m->n = nwords, m->live = 1, m->locked = 0;
+    m->w = w, m->n = nwords, m->live = 1, m->locked = 0, m->nwait = 0;
     return slot_handle(m->gen, i);
 }
 int orin_platform_monitor_free(int64_t h) {
     Mon *m = mon_ref(h);
     if (!m) return ORIN_PLATFORM_EINVAL;
-    if (m->locked) return ORIN_PLATFORM_EBUSY;
+    if (m->locked || m->nwait) return ORIN_PLATFORM_EBUSY;
     orin_platform_free(m->w);
     m->w = NULL, m->live = 0;
     g_mon_free[g_mon_nfree++] = (uint32_t)(m - g_mon);
@@ -310,53 +406,59 @@ int orin_platform_monitor_free(int64_t h) {
 int orin_platform_monitor_lock(int64_t h) {
     Mon *m = mon_ref(h);
     if (!m) return ORIN_PLATFORM_EINVAL;
-    if (m->locked) return ORIN_PLATFORM_EDEADLK;
-    m->locked = 1;
+    if (m->locked && m->owner == g_tid) return ORIN_PLATFORM_EDEADLK;
+    if (m->locked) deadlock(); /* held by a context suspended below this one on the stack: it cannot run before we end */
+    m->locked = 1, m->owner = g_tid;
     return 0;
 }
 int orin_platform_monitor_unlock(int64_t h) {
-    Mon *m = mon_ref(h);
-    if (!m || !m->locked) return ORIN_PLATFORM_EINVAL;
+    Mon *m = mon_held(h);
+    if (!m) return ORIN_PLATFORM_EINVAL;
     m->locked = 0;
     return 0;
 }
-static void deadlock(void) {
-    static const char msg[] = "deadlock: a task waits for a notification, but WebAssembly under Orbit runs one task at a time";
-    orin_platform_write_line(ORIN_PLATFORM_STDERR, msg, sizeof msg - 1);
-    __builtin_trap();
+/* The caller would sleep until another task notifies: with one thread, run the next queued task to completion instead (the
+ * monitor is released meanwhile) and let the caller re-check its condition, which the contract allows (spurious wake-up). */
+static void block_on(Mon *m) {
+    if (!g_q_head) deadlock();
+    m->locked = 0, m->nwait++;
+    run_task(g_q_head - 1);
+    m->nwait--;
+    if (m->locked) deadlock(); /* a task ended holding the monitor */
+    m->locked = 1, m->owner = g_tid;
 }
 int orin_platform_monitor_wait(int64_t h, int cond) {
-    Mon *m = mon_ref(h);
-    if (!m || !m->locked || (cond != 0 && cond != 1)) return ORIN_PLATFORM_EINVAL;
-    deadlock(); /* the caller holds the only thread: nobody can notify */
+    Mon *m = mon_held(h);
+    if (!m || (cond != 0 && cond != 1)) return ORIN_PLATFORM_EINVAL;
+    block_on(m);
     return 0;
 }
 int orin_platform_monitor_wait_until(int64_t h, int cond, int64_t deadline_ms) {
-    Mon *m = mon_ref(h);
-    if (!m || !m->locked || (cond != 0 && cond != 1) || deadline_ms < 0) return ORIN_PLATFORM_EINVAL;
-    return ORIN_PLATFORM_WAIT_TIMEOUT; /* nobody can notify, so the wait ends at the deadline; returning early is allowed
-                                           only by notification, so the caller sees the timeout and re-checks */
+    Mon *m = mon_held(h);
+    if (!m || (cond != 0 && cond != 1) || deadline_ms < 0) return ORIN_PLATFORM_EINVAL;
+    if (!g_q_head) return ORIN_PLATFORM_WAIT_TIMEOUT; /* nobody can notify, so the wait ends at the deadline (no sleeping here) */
+    block_on(m);
+    return 0;
 }
 int orin_platform_monitor_notify(int64_t h, int cond, int all) {
     (void)all;
-    Mon *m = mon_ref(h);
-    return !m || !m->locked || (cond != 0 && cond != 1) ? ORIN_PLATFORM_EINVAL : 0;
+    return !mon_held(h) || (cond != 0 && cond != 1) ? ORIN_PLATFORM_EINVAL : 0; /* a waiter re-checks after the task it ran */
 }
 int orin_platform_monitor_get(int64_t h, size_t i, uint64_t *out) {
-    Mon *m = mon_ref(h);
-    if (!m || !m->locked || i >= m->n) return ORIN_PLATFORM_EINVAL;
+    Mon *m = mon_held(h);
+    if (!m || i >= m->n) return ORIN_PLATFORM_EINVAL;
     *out = m->w[i];
     return 0;
 }
 int orin_platform_monitor_set(int64_t h, size_t i, uint64_t v) {
-    Mon *m = mon_ref(h);
-    if (!m || !m->locked || i >= m->n) return ORIN_PLATFORM_EINVAL;
+    Mon *m = mon_held(h);
+    if (!m || i >= m->n) return ORIN_PLATFORM_EINVAL;
     m->w[i] = v;
     return 0;
 }
 int orin_platform_monitor_grow(int64_t h, size_t nwords) {
-    Mon *m = mon_ref(h);
-    if (!m || !m->locked || nwords < m->n) return ORIN_PLATFORM_EINVAL;
+    Mon *m = mon_held(h);
+    if (!m || nwords < m->n) return ORIN_PLATFORM_EINVAL;
     uint64_t *w = (uint64_t *)orin_platform_realloc(m->w, nwords * sizeof(uint64_t));
     if (!w) return ORIN_PLATFORM_ENOMEM;
     orin_platform_mem_set(w + m->n, 0, (nwords - m->n) * sizeof(uint64_t));
@@ -423,7 +525,6 @@ typedef struct {
 } Wake;
 static Wake g_wake[WAKE_MAX];
 static uint32_t g_wake_hi, g_wake_free[WAKE_MAX], g_wake_nfree;
-static int64_t g_wake_bound;
 
 static Wake *wake_ref(int64_t h) {
     uint32_t i = slot_index(h);
