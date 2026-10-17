@@ -393,9 +393,11 @@ static void t_net_stale(void) {
 }
 /* the slot of a closed stream is reused by the next one with a NEW generation: the old handle stays dead (generation-tagged handles) */
 static void t_net_stale_after_reuse(void) {
-    int64_t c1 = orin_net_connect(n_net, orin_str_new("127.0.0.1", 9), orin_net_port(n_lis), 1000, 0);
+    OrinObj *host = orin_str_new("127.0.0.1", 9); /* borrowed by connect; released before the trap (LeakSanitizer) */
+    int64_t c1 = orin_net_connect(n_net, host, orin_net_port(n_lis), 1000, 0);
     orin_net_close(c1);
-    int64_t c2 = orin_net_connect(n_net, orin_str_new("127.0.0.1", 9), orin_net_port(n_lis), 1000, 0);
+    int64_t c2 = orin_net_connect(n_net, host, orin_net_port(n_lis), 1000, 0);
+    orin_release(host);
     if (c2 == c1 || (c2 & 0xff) != (c1 & 0xff)) _exit(3); /* the test needs the same slot under another generation */
     orin_release(orin_net_recv(c1, 4, 10));
 }
