@@ -421,6 +421,11 @@ class CliTests(unittest.TestCase):
         self.assertEqual(module[:4], b"\0asm")
         self.assertIn(b'orbit.manifest{"abi":1,"requires":["log/v1"],"producer":"orin"}', module)
         self.assertNotIn(b"wasi_snapshot_preview1", module)
+        # tasks run one at a time inside the one WebAssembly thread: the program builds (no E0523) and keeps the orin_tls section
+        (project / "src/main.or").write_text('import { scope, spawn } from "std:task";\n'
+                                              'function main(): void { console.log(scope(s => spawn(s, () => 6 * 7).join()).toString()); }\n')
+        self.run_cli("build", "--target=wasm64-orbit", cwd=project, env={"CC": "clang"})
+        self.assertIn(b"orin_tls", (project / "build/dev/hello.wasm").read_bytes())
         self.assertIn("does not support --target=wasm64-orbit", self.run_cli("run", "--target=wasm64-orbit", cwd=project, code=2).stderr)
         self.assertIn("C backend", self.run_cli("build", "--target=wasm64-orbit", "--backend=llvm", cwd=project, code=2).stderr)
         self.assertIn("Unknown target", self.run_cli("build", "--target=arm", cwd=project, code=2).stderr)
