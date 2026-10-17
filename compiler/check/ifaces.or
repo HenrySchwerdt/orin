@@ -9,11 +9,12 @@ import { Span, Diagnostic, diag } from "../diag";
 import { Ident, FunctionDecl } from "../syntax";
 import { Type, VTable } from "../hir";
 import {
-  Env, FuncInfo, IfaceSig, EntIface, findType, typeEq, showType, showIfaceSig, boundOf, ifaceMethodIndex, originOf
+  Env, FuncInfo, IfaceSig, TypeEnt, EntIface, findType, typeEq, showType, showIfaceSig, boundOf, ifaceMethodIndex, originOf,
+  cmpKindOfIface, builtinIface
 } from "./env";
 import { plainScope, resolveType, instFunc } from "./types";
 import { abstractInfo } from "./gclass";
-import { classOfRec, findMethod, satisfies, boundIface } from "./classes";
+import { classOfRec, findMethod, satisfies, boundIface, cmpProblem, cmpBoundError } from "./classes";
 
 export type IfaceRes = { env: Env; diags: Diagnostic[]; };
 
@@ -78,7 +79,14 @@ export function resolveImpls(env0: Env): IfaceRes {
     const scope = env.units[env.classes[ci].unit].scope;
     let ids: usize[] = [];
     for (const n of env.classes[ci].implNames) {
-      match (findType(scope, n.name)) {
+      const found: Option<TypeEnt> = match (findType(scope, n.name)) {
+        Some(te) => Some(te),
+        None => match (builtinIface(env, n.name)) {
+          Some(bi) => Some(EntIface(bi)),
+          None => None,
+        },
+      };
+      match (found) {
         None => {
           diags.push(diag("E0300", n.span, "unknown interface `" + n.name + "`"));
         },
@@ -144,6 +152,19 @@ function sameSig(m: IfaceSig, params: Type[], ret: Type): bool {
 export function checkImpls(env: Env): Diagnostic[] {
   let diags: Diagnostic[] = [];
   for (const ci of env.classes) {
+    // `implements Eq` / `Ord` / `Hash` (ADR-0034): the explicit methods are well formed or the structural instance exists.
+    // A generic class is checked on each instance when it is created.
+    let q: usize = 0;
+    while (q < ci.impls.length) {
+      const ck = cmpKindOfIface(env, ci.impls[q]);
+      if (ck > 0 && ci.gid < 0) {
+        const pr = cmpProblem(env, TyRecord(ci.rec), ck);
+        if (pr.isSome()) {
+          diags.push(diag(pr.unwrap().code, ci.implNames[q].span, pr.unwrap().msg));
+        }
+      }
+      q += 1;
+    }
     let k: usize = 0;
     while (k < ci.impls.length) {
       const info = env.ifaces[ci.impls[k]];
@@ -227,7 +248,13 @@ export function checkBounds(env: Env, unit: usize, decl: FunctionDecl, tys: Type
       Some(b) => {
         match (boundIface(env, unit, b)) {
           Ok(i) => {
-            if (!satisfies(env, tys[k], i)) {
+            const ck = cmpKindOfIface(env, i);
+            if (ck > 0) {
+              const bad = cmpBoundError(env, tys[k], ck, "`" + decl.name.name + "`", span);
+              if (bad.isSome()) {
+                return bad;
+              }
+            } else if (!satisfies(env, tys[k], i)) {
               return Some(unsatisfied(env, decl, k, tys[k], i, span));
             }
           },

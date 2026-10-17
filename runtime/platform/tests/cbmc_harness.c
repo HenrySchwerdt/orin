@@ -285,3 +285,26 @@ void harness_path_within(void) {
     assert(orin_platform_path_within("/a/b", 4, "/a/bc", 5) == 0);
     assert(orin_platform_path_within("/", 1, a, al) == 1);
 }
+
+/* ---- millis_split (the timespec of a timed monitor wait): exact, no overflow. Nondeterministic |ms| <= 10^6 (64-bit division
+ * is too slow for the solver, as for fmt_u64), plus the concrete extremes 0, INT64_MAX and -1. */
+static void check_split(int64_t ms) {
+    int64_t sec = -7, nsec = -7;
+    int rc = orin_platform_millis_split(ms, &sec, &nsec);
+    if (ms < 0) {
+        assert(rc == ORIN_PLATFORM_EINVAL && sec == -7 && nsec == -7);
+        return;
+    }
+    assert(rc == 0 && sec >= 0 && nsec >= 0 && nsec < 1000000000 && nsec % 1000000 == 0);
+    assert(sec == ms / 1000 && nsec / 1000000 == ms % 1000);
+    assert(sec * 1000 + nsec / 1000000 == ms);
+}
+
+void harness_millis_split(void) {
+    int64_t ms;
+    __CPROVER_assume(ms >= -1000000 && ms <= 1000000);
+    check_split(ms);
+    check_split(0);
+    check_split(-1);
+    check_split(INT64_MAX);
+}

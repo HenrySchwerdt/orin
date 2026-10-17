@@ -505,6 +505,17 @@ static void th_wait_for_flag(void *arg) { /* waits until word 1 is set, then pub
     orin_platform_monitor_unlock(g_m);
 }
 
+static void th_wait_for_flag_timed(void *arg) { /* as th_wait_for_flag, with a far deadline: a notification must end it */
+    (void)arg;
+    uint64_t v = 0;
+    int64_t far = orin_platform_monotonic_millis() + 60000;
+    orin_platform_monitor_lock(g_m);
+    while (orin_platform_monitor_get(g_m, 1, &v) == 0 && v == 0)
+        if (orin_platform_monitor_wait_until(g_m, 0, far) == ORIN_PLATFORM_WAIT_TIMEOUT) break;
+    orin_platform_monitor_set(g_m, 2, v + 1);
+    orin_platform_monitor_unlock(g_m);
+}
+
 /* sleeps on queue 1 until word 1 is non-zero, consumes that (sets it back to 0) and counts itself out of word 3 */
 static void th_wait_queue1(void *arg) {
     (void)arg;
@@ -593,6 +604,37 @@ static void test_threads_and_monitors(void) {
     CHECK(orin_platform_monitor_notify(0, 0, 1) == ORIN_PLATFORM_EINVAL);
     orin_platform_monitor_unlock(g_m);
     CHECK(orin_platform_monitor_notify(g_m, 0, 1) == ORIN_PLATFORM_EINVAL); /* not held */
+
+    /* timed wait on an absolute CLOCK_MONOTONIC deadline: times out, never early; a past deadline returns at once;
+       a notification before the deadline returns 0; bad arguments are refused */
+    {
+        int64_t sec = -1, nsec = -1;
+        CHECK(orin_platform_millis_split(1234567, &sec, &nsec) == 0 && sec == 1234 && nsec == 567000000);
+        CHECK(orin_platform_millis_split(-1, &sec, &nsec) == ORIN_PLATFORM_EINVAL && sec == 1234);
+        CHECK(orin_platform_monitor_wait_until(g_m, 0, 5) == ORIN_PLATFORM_EINVAL); /* not held */
+        CHECK(orin_platform_monitor_lock(g_m) == 0);
+        int64_t t1 = orin_platform_monotonic_millis();
+        CHECK(orin_platform_monitor_wait_until(g_m, 0, t1 + 60) == ORIN_PLATFORM_WAIT_TIMEOUT);
+        CHECK(orin_platform_monotonic_millis() >= t1 + 60);
+        CHECK(orin_platform_monitor_wait_until(g_m, 1, 0) == ORIN_PLATFORM_WAIT_TIMEOUT); /* long past */
+        CHECK(orin_platform_monitor_wait_until(g_m, 2, t1 + 60) == ORIN_PLATFORM_EINVAL);
+        CHECK(orin_platform_monitor_wait_until(g_m, 0, -1) == ORIN_PLATFORM_EINVAL);
+        CHECK(orin_platform_monitor_unlock(g_m) == 0); /* the monitor was held again after every return */
+        orin_platform_monitor_lock(g_m);
+        orin_platform_monitor_set(g_m, 1, 0);
+        orin_platform_monitor_unlock(g_m);
+        w = orin_platform_thread_create(th_wait_for_flag_timed, NULL); /* waits with a deadline 60 s away */
+        CHECK(w > 0);
+        orin_platform_monitor_lock(g_m);
+        orin_platform_monitor_set(g_m, 1, 6);
+        orin_platform_monitor_notify(g_m, 0, 1);
+        orin_platform_monitor_unlock(g_m);
+        CHECK(orin_platform_thread_join(w, &arg) == 0);
+        orin_platform_monitor_lock(g_m);
+        orin_platform_monitor_get(g_m, 2, &v);
+        CHECK(v == 7);
+        orin_platform_monitor_unlock(g_m);
+    }
 
     /* two condition queues: a notify of queue 0 does not wake a waiter of queue 1; notify_one wakes one waiter */
     CHECK(orin_platform_monitor_lock(g_m) == 0);

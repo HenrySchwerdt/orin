@@ -140,22 +140,28 @@ big.toU8();                      // trap: integer conversion out of range
 Tests: `ts_dev_ints.or`, `ts_dev_trap_overflow.or`, `ts_dev_trap_divzero.or`,
 `ts_dev_trap_convert.or`, `ts_dev_trap_index.or`.
 
-### 1.6 `==` works on scalars and strings only
+### 1.6 `==` is structural, never reference equality (ADR-0034)
 
-This is the biggest surprise for "it looks the same" code. `==` / `!=` are defined for integers,
-`float`/`f32`, `bool` and `string`. They are **not defined** for records, classes, arrays, `Option`,
-`Result`, tagged unions (even unit-like ones such as `Red`), `Map`, functions or interface values.
-It is not reference equality and not structural equality; it is a compile error:
+`==` / `!=` and `<`, `<=`, `>`, `>=` compare **values**. Integers, `bool` and `string` have all of them; `float` / `f32`
+have them too, as in every language (NaN is not equal to itself). Records, tagged unions (even unit-like ones such as `Red`),
+`Option`, `Result` and arrays compare structurally, field by field, variant by variant, element by element: `==` when all
+their components have `==`, and the orderings lexicographically (a union orders by the position of its variant, `None`
+before `Some`, `Ok` before `Err`).
 
 ```ts
 type Point = { x: int; y: int; };
 const p = Point { x: 1, y: 2 };
-const q = Point { x: 1, y: 2 };
-p == q;   // error[E0410]: operator is not defined for type `Point`
+const q = Point { x: 1, y: 3 };
+p == q;   // false
+p < q;    // true (x equal, then y)
 ```
 
-Compare the parts (`a.x == b.x && a.y == b.y`), or `match`. `a == Some(1)` is E0410 as well; use
-`match` or `isSome()`. Strings have `==` but no `<`/`>` (also E0410). Test: `ts_dev_match_union.or`.
+What has no `==` is a type that contains a `float` (a record with a `float` field, `Option<float>`, `float[]`), a function
+value, an interface value, a resource handle and `Map`: `error[E0410]: operator is not defined for type ...` with the
+reason. A class is not compared by reference either; it has no `==` unless it declares `equals` (and `compare` / `hash` for
+the orderings and `Map` keys), or asks for the structural instance with `implements Eq` (`Ord`, `Hash`). The same
+operations on a type parameter need a bound: `function max<T extends Ord>(a: T, b: T): T`. Tests: `ts_dev_match_union.or`,
+`ts_dev_e0410_record_eq.or`, `eqord_*.or`.
 
 ### 1.7 Closures capture values, not variables
 
@@ -262,7 +268,7 @@ error (``error[E0410]: operands have different types `string` and `int` ``), and
 | Bit operators `& \| ^ ~ << >>` | Reserved for after 1.0 (ADR-0016): `6 & 3` is a syntax error today. No bit tricks on integers yet; `\|` already means union in type position. |
 | 128-bit integers | `i128`/`u128` are `E0431` until post-1.0. |
 | `number \| string`, untagged unions, intersection types | Tagged unions (1.9). No `&` in types. |
-| Structural typing, object literals `{ a: 1 }`, `Record<K,V>`, index signatures | Named record types and a literal that names its type: `Point { x: 1, y: 2 }`. Use `Map<K, V>` (keys `int`, `usize`, `bool`, `string`) with `m.get(k): Option<V>`. |
+| Structural typing, object literals `{ a: 1 }`, `Record<K,V>`, index signatures | Named record types and a literal that names its type: `Point { x: 1, y: 2 }`. Use `Map<K, V>` (any `Hash` key: integers, `bool`, `string`, and records, unions, `Option`, arrays and classes with `hash` built from them) with `m.get(k): Option<V>`. |
 | `any`, `unknown`, `object`, `number`, `Array<T>`, `Promise<T>` | `unknown type` (E0300). Use `int`/`float`, `T[]`, generics. |
 | Conditional/mapped/template-literal types, `typeof`, `keyof`, `as` casts | None. Conversions are methods (`x.toI32()`). |
 | `null`, `undefined`, `?.`, `??`, truthiness | `Option<T>`, `match`; conditions must be `bool`. |
@@ -287,7 +293,7 @@ error (``error[E0410]: operands have different types `string` and `int` ``), and
 | `class B extends A` | composition, or `interface` + `implements` |
 | `interface I { x: T }` (fields) | `interface I { x(): T }` (methods only), declared with `implements` |
 | `const b = a` (shares the object) | `const b = a` (independent copy) |
-| `a == b` on objects (reference) | not allowed (E0410); compare fields |
+| `a == b` on objects (reference) | structural: `a == b` compares the fields (records, unions, `Option`, arrays); a class needs `equals` or `implements Eq`; types with a `float` have no `==` (E0410) |
 | `arr[i]` out of range gives `undefined` | `arr[i]` traps; `arr.get(i)` gives `Option<T>` |
 | `arr.length` | `arr.length` (a `usize`) |
 | `{ ...p, y: 9 }` | `Point { ...p, y: 9 }` |

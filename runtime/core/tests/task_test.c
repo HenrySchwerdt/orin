@@ -211,6 +211,45 @@ static void body_echo(OrinObj *env) { /* words: 0 = state (0 empty, 1 ping, 2 po
     }
 }
 
+/* C1: orin_rt_task_watch (a task announces its end, by return or by trap) and orin_mon_wait_until (timed wait) */
+static void body_watched(OrinObj *env) {
+    orin_rt_task_watch(orin_struct_get(env, 0));
+    if (orin_struct_get(env, 1)) orin_trap("watched task trapped");
+}
+
+static int wait_done(uint64_t m, int64_t millis) { /* 1 when word 1 became 1 within `millis`, else 0 */
+    int64_t deadline = orin_platform_monotonic_millis() + millis;
+    orin_mon_lock(m);
+    while (orin_mon_get(m, 1) == 0)
+        if (orin_mon_wait_until(m, 0, (uint64_t)deadline)) break;
+    int done = orin_mon_get(m, 1) != 0;
+    orin_mon_unlock(m);
+    return done;
+}
+
+static void test_timed(void) {
+    uint64_t m = orin_mon_new(2);
+    orin_mon_lock(m);
+    int64_t t0 = orin_platform_monotonic_millis();
+    CHECK(orin_mon_wait_until(m, 1, (uint64_t)t0 + 50) == 1); /* nobody notifies: the deadline passes */
+    CHECK(orin_platform_monotonic_millis() >= t0 + 50);
+    CHECK(orin_mon_wait_until(m, 0, 0) == 1); /* long past: returns at once */
+    orin_mon_unlock(m);
+    CHECK(wait_done(m, 30) == 0);
+    for (int trapped = 0; trapped < 2; trapped++) { /* the end of a task, by return and by trap, wakes the timed waiter */
+        uint64_t w = orin_mon_new(2);
+        OrinObj *e = orin_struct_new(0, 2, 0);
+        orin_struct_init(e, 0, w);
+        orin_struct_init(e, 1, (uint64_t)trapped);
+        uint64_t th = start(body_watched, e);
+        CHECK(wait_done(w, 60000) == 1);
+        CHECK(orin_rt_task_join(th) == (uint64_t)trapped);
+        if (trapped) orin_release(orin_rt_task_message());
+        orin_mon_free(w);
+    }
+    orin_mon_free(m);
+}
+
 static void test_pingpong(void) {
     uint64_t m = orin_mon_new(2);
     uint64_t th = start(body_echo, env_of(m, 2000));
@@ -450,6 +489,7 @@ int main(void) {
     test_transfer();
     test_tasks();
     test_trap();
+    test_timed();
     test_pingpong();
     test_cross_heap_free();
     test_grants();
