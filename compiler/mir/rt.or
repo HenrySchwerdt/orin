@@ -1,0 +1,250 @@
+// The L1 entries (ADR-0052 Addendum A section 3, step R3d.2): functions of the embedded runtime root `$rt`
+// (runtime/core/*.or) that the backends call by name, because neither HIR nor MIR shows the call: a builtin or a runtime
+// helper of the emitted code is replaced by a call of the Orin function. Three users share this table:
+//   * the backends find the function of an entry in the program (`rtIds`); when it is absent (a program without `$rt`:
+//     `--c-builtins`, the hand-built MIR of the emitter tests) they emit the old call of the C runtime instead,
+//   * `opt/prune.or` keeps the entries that the instructions of a live function imply (`rtImplied`) and `trapShape` always,
+//   * `nullaryTags` lists the immortal payload-less variants the program uses (emitted as static objects when `$rt` is there).
+// An entry takes and returns plain words: an object is its address as a `usize` (the backends cast), a slot a `usize`.
+// A new entry is added to `rtNames`, to `implied` when it is not always needed, and to the backends.
+
+import { Builtin } from "../hir";
+import { MProgram, MFunction, Instr, isAggTy } from "./mir";
+
+export const RT_OPT_UNWRAP: usize = 0;
+export const RT_RES_UNWRAP: usize = 1;
+export const RT_RES_UNWRAP_ERR: usize = 2;
+export const RT_V_UNWRAP: usize = 3;
+export const RT_TRAP_SHAPE: usize = 4;
+export const RT_ASSERT_FACT: usize = 5;
+export const RT_ASSERT_ARRAY: usize = 6;
+export const RT_STRUCT_NEW: usize = 7;
+export const RT_VARIANT1: usize = 8;
+export const RT_ARRAY_NEW: usize = 9;
+export const RT_DESTROY: usize = 10;
+export const RT_MAKE_UNIQUE_SLOW: usize = 11;
+export const RT_SB_ALLOC: usize = 12;
+export const RT_SB_FREE: usize = 13;
+export const RT_SB_REALLOC: usize = 14;
+export const RT_STR_ALLOC: usize = 15;
+export const RT_ARRAY_PUSH_GROW: usize = 16;
+export const RT_STR_CONCAT: usize = 17;
+export const RT_STR_APPEND: usize = 18;
+export const RT_STR_APPEND_SUB: usize = 19;
+export const RT_STR_APPEND_USIZE: usize = 20;
+export const RT_STR_APPEND_INT: usize = 21;
+export const RT_STR_PREPEND: usize = 22;
+export const RT_ARRAY_SLICE: usize = 23;
+export const RT_ARRAY_CONCAT: usize = 24;
+export const RT_ARRAY_EXTEND: usize = 25;
+export const RT_BYTES_TO_STRING: usize = 26;
+export const RT_STRING_TO_BYTES: usize = 27;
+
+// The qualified names of the entries, by number (the modules of runtime/core).
+export function rtNames(): string[] {
+  return [
+    "$rt/leaf.optUnwrap", "$rt/leaf.resUnwrap", "$rt/leaf.resUnwrapErr", "$rt/leaf.vUnwrap", "$rt/leaf.trapShape",
+    "$rt/leaf.assertFact", "$rt/leaf.assertArray", "$rt/object.structNew", "$rt/object.variant1", "$rt/object.arrayNew",
+    "$rt/rc.destroy", "$rt/rc.makeUniqueSlow", "$rt/heap.sbAlloc", "$rt/heap.sbFree", "$rt/heap.sbRealloc", "$rt/object.strAlloc",
+    "$rt/object.arrayPushGrow", "$rt/str.strConcat", "$rt/str.strAppend", "$rt/str.strAppendSub", "$rt/str.strAppendUsize",
+    "$rt/str.strAppendInt", "$rt/str.strPrepend", "$rt/array.arraySlice", "$rt/array.arrayConcat", "$rt/array.arrayExtend",
+    "$rt/array.bytesToString", "$rt/array.stringToBytes"
+  ];
+}
+
+// An entry that the C shells of the runtime call under its C name (`orin_struct_new` ...): the emitted code defines a wrapper
+// of that name (a C function, an LLVM function) that casts the C types to words and calls the entry. `ret` and `params` are
+// the C types: "o" an `OrinObj *`, "p" a `void *`, "u32", "u64", "i64", "v" (no result). The prototypes stay in
+// runtime/core/orin_runtime.h; a program without the L1 entries (`--c-builtins`) links the frozen C runtime that defines them.
+export type RtWrap = { entry: usize; name: string; ret: string; params: string[]; };
+
+// The wrappers, in the order they are emitted. Every one of these entries is kept alive by `opt/prune.or` (`rtAlways`).
+export function rtWraps(): RtWrap[] {
+  return [
+    RtWrap { entry: RT_STRUCT_NEW, name: "orin_struct_new", ret: "o", params: ["u32", "u32", "u64"] },
+    RtWrap { entry: RT_VARIANT1, name: "orin_variant1", ret: "o", params: ["u32", "u64", "u64"] },
+    RtWrap { entry: RT_ARRAY_NEW, name: "orin_array_new", ret: "o", params: ["u64", "i64"] },
+    RtWrap { entry: RT_DESTROY, name: "orin_destroy", ret: "v", params: ["o"] },
+    RtWrap { entry: RT_MAKE_UNIQUE_SLOW, name: "orin_make_unique_slow", ret: "o", params: ["o"] },
+    RtWrap { entry: RT_SB_ALLOC, name: "orin_sb_alloc", ret: "p", params: ["u64"] },
+    RtWrap { entry: RT_SB_FREE, name: "orin_sb_free", ret: "v", params: ["p", "u64"] },
+    RtWrap { entry: RT_SB_REALLOC, name: "orin_sb_realloc", ret: "p", params: ["p", "u64", "u64"] },
+    RtWrap { entry: RT_STR_ALLOC, name: "orin_str_alloc", ret: "o", params: ["u64", "u64"] },
+    RtWrap { entry: RT_ARRAY_PUSH_GROW, name: "orin_array_push_grow", ret: "v", params: ["o", "u64"] },
+    RtWrap { entry: RT_STR_CONCAT, name: "orin_str_concat", ret: "o", params: ["o", "o"] },
+    RtWrap { entry: RT_STR_APPEND, name: "orin_str_append", ret: "o", params: ["o", "o"] },
+    RtWrap { entry: RT_ARRAY_SLICE, name: "orin_array_slice", ret: "o", params: ["o", "u64", "u64"] },
+    RtWrap { entry: RT_ARRAY_CONCAT, name: "orin_array_concat", ret: "o", params: ["o", "o"] },
+    RtWrap { entry: RT_ARRAY_EXTEND, name: "orin_array_extend", ret: "o", params: ["o", "o"] },
+    RtWrap { entry: RT_BYTES_TO_STRING, name: "orin_bytes_to_string", ret: "o", params: ["o", "u64", "u64"] },
+    RtWrap { entry: RT_STRING_TO_BYTES, name: "orin_string_to_bytes", ret: "o", params: ["o"] },
+  ];
+}
+
+// The entries of the string and array functions that no C code calls: the emitted code calls them directly and defines no wrapper
+// (`name` is the C function they replace, which a program without `$rt` and a census build still call).
+export function rtPlain(): RtWrap[] {
+  return [
+    RtWrap { entry: RT_STR_APPEND_SUB, name: "orin_str_append_sub", ret: "o", params: ["o", "o", "u64", "u64"] },
+    RtWrap { entry: RT_STR_APPEND_USIZE, name: "orin_str_append_usize", ret: "o", params: ["o", "u64"] },
+    RtWrap { entry: RT_STR_APPEND_INT, name: "orin_str_append_int", ret: "o", params: ["o", "i64"] },
+    RtWrap { entry: RT_STR_PREPEND, name: "orin_str_prepend", ret: "o", params: ["o", "o"] },
+  ];
+}
+
+// The C signature of the entry `k` when it replaces a C runtime function (`rtWraps` and `rtPlain`), else None.
+export function rtSig(k: usize): Option<RtWrap> {
+  for (const w of rtWraps()) {
+    if (w.entry == k) {
+      return Some(w);
+    }
+  }
+  for (const w of rtPlain()) {
+    if (w.entry == k) {
+      return Some(w);
+    }
+  }
+  return None;
+}
+
+// The L1 entry that a builtin calls, if it has one.
+export function l1Builtin(op: Builtin): Option<usize> {
+  return match (op) {
+    BArrSlice => Some(RT_ARRAY_SLICE),
+    BArrConcat => Some(RT_ARRAY_CONCAT),
+    BBytesToString => Some(RT_BYTES_TO_STRING),
+    BStringToBytes => Some(RT_STRING_TO_BYTES),
+    _ => None,
+  };
+}
+
+// The slow paths of the string and array functions that the backends keep out of line (`noinline`): the in-place path of an append is
+// a few instructions, and a fresh allocation inlined into it would make every caller save the registers of the cold code.
+export function rtCold(name: string): bool {
+  return name == "$rt/str.strGrow" || name == "$rt/str.appendFresh" || name == "$rt/str.decimalFresh" || name == "$rt/str.prependFresh"
+      || name == "$rt/array.growItems" || name == "$rt/array.extendCopy";
+}
+
+// The entries a live program always needs when `$rt` is loaded: the shape trap (the LLVM helpers and the C inlines call it) and
+// every entry with a wrapper (the C shells call those).
+export function rtAlways(): usize[] {
+  let out: usize[] = [RT_TRAP_SHAPE];
+  for (const w of rtWraps()) {
+    out.push(w.entry);
+  }
+  return out;
+}
+
+// The function index of every entry in `prog`, -1 when the program has none: `ids[RT_*]`.
+@Ensures(result.length == rtNames().length)
+export function rtIds(prog: MProgram): int[] {
+  const names = rtNames();
+  let ids: int[] = [];
+  for (const n of names) {
+    ids.push(-1);
+  }
+  let i: usize = 0;
+  while (i < prog.functions.length) {
+    const fname = prog.functions[i].name;
+    if (fname.startsWith("$rt/")) {
+      let k: usize = 0;
+      while (k < names.length) {
+        if (names[k] == fname) {
+          ids[k] = i.toInt();
+        }
+        k += 1;
+      }
+    }
+    i += 1;
+  }
+  return ids;
+}
+
+// `rtIds`, and for the allocation-site census build (`--stats-sites`) without the entries that replace C runtime functions of the
+// object model (`rtWraps`, `rtPlain`): the census hooks live in the C runtime, so a census build keeps calling its C allocator (compiled in
+// under -DORIN_SITE_STATS until the census moves, R3d.5).
+export function rtIdsFor(prog: MProgram, sites: bool): int[] {
+  let ids = rtIds(prog);
+  if (sites) {
+    for (const w of rtWraps()) {
+      ids[w.entry] = -1;
+    }
+    for (const w of rtPlain()) {
+      ids[w.entry] = -1;
+    }
+  }
+  return ids;
+}
+
+// True when the program carries the L1 entries (`trapShape` is always kept, so its presence says that `$rt` was loaded).
+@Requires(ids.length == rtNames().length)
+export function rtLoaded(ids: int[]): bool {
+  return ids[RT_TRAP_SHAPE] >= 0;
+}
+
+// The entries that instruction `ins` makes the emitted code call.
+function implied(ins: Instr): usize[] {
+  return match (ins) {
+    IBuiltin(_, b, _) => match (b) {
+      BOptUnwrap => [RT_OPT_UNWRAP, RT_V_UNWRAP],
+      BResUnwrap => [RT_RES_UNWRAP, RT_V_UNWRAP],
+      BResUnwrapErr => [RT_RES_UNWRAP_ERR, RT_V_UNWRAP],
+      BArrSlice => [RT_ARRAY_SLICE],
+      BArrConcat => [RT_ARRAY_CONCAT],
+      BBytesToString => [RT_BYTES_TO_STRING],
+      BStringToBytes => [RT_STRING_TO_BYTES],
+      _ => [],
+    },
+    IStrAppend(_, _) => [RT_STR_APPEND],
+    IStrAppendSub(_, _, _, _) => [RT_STR_APPEND_SUB],
+    IStrAppendNum(_, _, uns) => [uns ? RT_STR_APPEND_USIZE : RT_STR_APPEND_INT],
+    IStrPrepend(_, _) => [RT_STR_PREPEND],
+    IArrayExtend(_, _) => [RT_ARRAY_EXTEND],
+    IForward(_, _, _, _) => [RT_ASSERT_FACT],
+    IArrayGetU(_, _, _) => [RT_ASSERT_ARRAY],
+    IArraySetU(_, _, _) => [RT_ASSERT_ARRAY],
+    _ => [],
+  };
+}
+
+// The entries a live function `f` needs beyond its calls (see the file comment).
+export function rtImplied(f: MFunction): usize[] {
+  let out: usize[] = [];
+  for (const b of f.blocks) {
+    for (const ins of b.instrs) {
+      for (const e of implied(ins)) {
+        out.push(e);
+      }
+    }
+  }
+  return out;
+}
+
+// The tags of the payload-less variants that the functions use as an immortal object (`INullary` of a boxed local, and the
+// empty environment of a closure without captures: tag 0), ascending, without repeats.
+export function nullaryTags(prog: MProgram): usize[] {
+  let seen = new Map<usize, bool>();
+  let tags: usize[] = [];
+  for (const f of prog.functions) {
+    for (const b of f.blocks) {
+      for (const ins of b.instrs) {
+        match (ins) {
+          INullary(d, t) => {
+            if (!isAggTy(f.locals[d].ty) && !seen.has(t)) {
+              seen.set(t, true);
+              tags.push(t);
+            }
+          },
+          IClosure(_, _, caps) => {
+            if (caps.length == 0 && !seen.has(0)) {
+              seen.set(0, true);
+              tags.push(0);
+            }
+          },
+          _ => {},
+        }
+      }
+    }
+  }
+  return tags.sort((a, b) => a < b ? -1 : (a > b ? 1 : 0));
+}

@@ -1,10 +1,32 @@
-// std:encoding: strict RFC 4648 byte codecs. See docs/std-encoding.md for
-// padding policy, error precedence, allocation and complexity. No crypto claims.
-import { Bytes, ByteBuilder } from "std:bytes";
+// std:encoding: strict RFC 4648 byte codecs (hex, Base64, Base64url) and the one home of hex (ADR-0048 section 7.2).
+// See docs/std-encoding.md for padding policy, error precedence, allocation and complexity. No crypto claims.
+//
+// Shape of the API (ADR-0048 sections 1.2, 2.5, 3.1): codec functions are `<codec>Encode` / `<codec>Decode`; the
+// decoders take `Bytes`, and `<codec>DecodeText` takes the same input as a `string`. The Base64 padding policy is a
+// named variant, `Padding = Padded | Unpadded`, not a `bool`. Errors are `EncodingError { kind, offset }` with the
+// renderer `encodingErrorMessage`.
+import { Bytes, ByteBuilder, fromString } from "std:bytes";
 
+// Why a decoder refused its input. InvalidByte: a byte outside the alphabet; InvalidLength: the length cannot be
+// valid; InvalidPadding: `=` where padding is not allowed, missing or misplaced; NonCanonical: nonzero unused bits.
 export type EncodingErrorKind = InvalidByte | InvalidLength | InvalidPadding | NonCanonical;
-export type EncodingError = { position: usize; kind: EncodingErrorKind; };
 
+// offset is the byte offset in the input where the problem was found (the input length for a length error).
+export type EncodingError = { kind: EncodingErrorKind; offset: usize; };
+
+// Base64 padding policy: Padded requires `=` padding to a multiple of four on decode and writes it on encode;
+// Unpadded forbids it on both (ADR-0048 rule 2.5; replaces the `padded: bool` parameter).
+export type Padding = Padded | Unpadded;
+
+function isPadded(p: Padding): bool {
+  return match (p) {
+    Padded => true,
+    Unpadded => false,
+  };
+}
+
+// encodingErrorMessage(e): string -- diagnostic text, "encoding error at byte <offset>: <cause>". Never fails; O(1),
+// allocates the message.
 @Ensures(result.length > 0)
 export function encodingErrorMessage(e: EncodingError): string {
   const why = match (e.kind) {
@@ -13,11 +35,11 @@ export function encodingErrorMessage(e: EncodingError): string {
     InvalidPadding => "invalid padding",
     NonCanonical => "nonzero unused bits",
   };
-  return `encoding error at byte ${e.position.toString()}: ${why}`;
+  return `encoding error at byte ${e.offset.toString()}: ${why}`;
 }
 
-function bad(position: usize, kind: EncodingErrorKind): Result<Bytes, EncodingError> {
-  return Err(EncodingError { position: position, kind: kind });
+function bad(offset: usize, kind: EncodingErrorKind): Result<Bytes, EncodingError> {
+  return Err(EncodingError { kind: kind, offset: offset });
 }
 
 function hexValue(c: int): int {
@@ -33,27 +55,17 @@ function hexValue(c: int): int {
   return -1;
 }
 
-// Lowercase ASCII hex. O(n) time/storage; one final conversion to string.
+// hexEncode(src): string -- lower-case ASCII hex, two digits per byte (`src.toHex()`). Never fails; O(n) time and
+// storage, one final conversion to string.
 @Ensures(result.length / 2 == src.length() && result.length % 2 == 0)
 export function hexEncode(src: Bytes): string {
-  const digits = "0123456789abcdef";
-  const data = src.storage();
-  const start = src.storageStart();
-  const n = src.length();
-  let out = new ByteBuilder();
-  let i: usize = 0;
-  while (i < n) {
-    const b = data[start + i].toInt();
-    out.appendU8(digits.charCodeAt((b / 16).toUsize()).toU8());
-    out.appendU8(digits.charCodeAt((b % 16).toUsize()).toU8());
-    i += 1;
-  }
-  return out.build().toRawString();
+  return src.toHex();
 }
 
-// Both cases accepted. Invalid bytes precede odd-length errors. O(n).
+// hexDecode(src): Result<Bytes, EncodingError> -- both cases accepted. Err(InvalidByte) at the first non-hex byte, which
+// takes precedence over Err(InvalidLength) (offset = length) for an odd number of digits. Never traps; O(n).
 @Ensures(result.isOk() ==> src.length() % 2 == 0 && result.unwrap().length() == src.length() / 2)
-@Ensures(result.isErr() ==> result.unwrapErr().position <= src.length())
+@Ensures(result.isErr() ==> result.unwrapErr().offset <= src.length())
 export function hexDecode(src: Bytes): Result<Bytes, EncodingError> {
   const data = src.storage();
   const start = src.storageStart();
@@ -77,6 +89,13 @@ export function hexDecode(src: Bytes): Result<Bytes, EncodingError> {
     i += 2;
   }
   return Ok(out.build());
+}
+
+// hexDecodeText(s): Result<Bytes, EncodingError> -- `hexDecode` of the bytes of a string. Same errors and offsets.
+@Ensures(result.isOk() ==> s.length % 2 == 0 && result.unwrap().length() == s.length / 2)
+@Ensures(result.isErr() ==> result.unwrapErr().offset <= s.length)
+export function hexDecodeText(s: string): Result<Bytes, EncodingError> {
+  return hexDecode(fromString(s));
 }
 
 function alphabet(url: bool): string {
@@ -217,34 +236,54 @@ function decode64(src: Bytes, padded: bool, url: bool): Result<Bytes, EncodingEr
   return Ok(out.build());
 }
 
-// RFC 4648 standard alphabet; padded selects required padding versus forbidden.
-@Ensures(padded ==> result.length % 4 == 0)
-@Ensures(padded
+// base64Encode(src, padding): string -- RFC 4648 standard alphabet; Padded writes `=` up to a multiple of four,
+// Unpadded writes none. Never fails; O(n) time and allocation.
+@Ensures(isPadded(padding) ==> result.length % 4 == 0)
+@Ensures(isPadded(padding)
     ==> result.length / 4 == src.length() / 3 + (src.length() % 3 == 0 ? 0 : 1).toUsize())
-@Ensures(!padded ==> result.length / 4 == src.length() / 3)
-@Ensures(!padded ==> result.length % 4 == (src.length() % 3 == 0 ? 0 : src.length() % 3 + 1))
-export function base64Encode(src: Bytes, padded: bool): string {
-  return encode64(src, padded, false);
+@Ensures(!isPadded(padding) ==> result.length / 4 == src.length() / 3)
+@Ensures(!isPadded(padding) ==> result.length % 4 == (src.length() % 3 == 0 ? 0 : src.length() % 3 + 1))
+export function base64Encode(src: Bytes, padding: Padding): string {
+  return encode64(src, isPadded(padding), false);
 }
 
-@Ensures(result.isErr() ==> result.unwrapErr().position <= src.length())
+// base64Decode(src, padding): Result<Bytes, EncodingError> -- strict RFC 4648 standard alphabet. Err(InvalidByte |
+// InvalidPadding | InvalidLength | NonCanonical) with the offset of the first problem; no partial result. Never
+// traps; O(n) time and allocation.
+@Ensures(result.isErr() ==> result.unwrapErr().offset <= src.length())
 @Ensures(result.isOk() ==> result.unwrap().length() <= src.length())
-export function base64Decode(src: Bytes, padded: bool): Result<Bytes, EncodingError> {
-  return decode64(src, padded, false);
+export function base64Decode(src: Bytes, padding: Padding): Result<Bytes, EncodingError> {
+  return decode64(src, isPadded(padding), false);
 }
 
-// RFC 4648 URL alphabet; padding policy identical to standard Base64.
-@Ensures(padded ==> result.length % 4 == 0)
-@Ensures(padded
+// base64DecodeText(s, padding): Result<Bytes, EncodingError> -- `base64Decode` of the bytes of a string.
+@Ensures(result.isErr() ==> result.unwrapErr().offset <= s.length)
+@Ensures(result.isOk() ==> result.unwrap().length() <= s.length)
+export function base64DecodeText(s: string, padding: Padding): Result<Bytes, EncodingError> {
+  return decode64(fromString(s), isPadded(padding), false);
+}
+
+// base64UrlEncode(src, padding): string -- RFC 4648 URL alphabet (`-` and `_`); padding policy as `base64Encode`.
+// Never fails; O(n) time and allocation.
+@Ensures(isPadded(padding) ==> result.length % 4 == 0)
+@Ensures(isPadded(padding)
     ==> result.length / 4 == src.length() / 3 + (src.length() % 3 == 0 ? 0 : 1).toUsize())
-@Ensures(!padded ==> result.length / 4 == src.length() / 3)
-@Ensures(!padded ==> result.length % 4 == (src.length() % 3 == 0 ? 0 : src.length() % 3 + 1))
-export function base64UrlEncode(src: Bytes, padded: bool): string {
-  return encode64(src, padded, true);
+@Ensures(!isPadded(padding) ==> result.length / 4 == src.length() / 3)
+@Ensures(!isPadded(padding) ==> result.length % 4 == (src.length() % 3 == 0 ? 0 : src.length() % 3 + 1))
+export function base64UrlEncode(src: Bytes, padding: Padding): string {
+  return encode64(src, isPadded(padding), true);
 }
 
-@Ensures(result.isErr() ==> result.unwrapErr().position <= src.length())
+// base64UrlDecode(src, padding): Result<Bytes, EncodingError> -- strict, URL alphabet; errors as `base64Decode`.
+@Ensures(result.isErr() ==> result.unwrapErr().offset <= src.length())
 @Ensures(result.isOk() ==> result.unwrap().length() <= src.length())
-export function base64UrlDecode(src: Bytes, padded: bool): Result<Bytes, EncodingError> {
-  return decode64(src, padded, true);
+export function base64UrlDecode(src: Bytes, padding: Padding): Result<Bytes, EncodingError> {
+  return decode64(src, isPadded(padding), true);
+}
+
+// base64UrlDecodeText(s, padding): Result<Bytes, EncodingError> -- `base64UrlDecode` of the bytes of a string.
+@Ensures(result.isErr() ==> result.unwrapErr().offset <= s.length)
+@Ensures(result.isOk() ==> result.unwrap().length() <= s.length)
+export function base64UrlDecodeText(s: string, padding: Padding): Result<Bytes, EncodingError> {
+  return decode64(fromString(s), isPadded(padding), true);
 }

@@ -38,6 +38,12 @@ ch.tx.close();  ch.rx.close();                // end of stream / cancellation; c
 | `Sender<T>.send(v): bool`, `.close()` | `send` blocks while the channel is full. `true`: handed over (moved if unique, copied otherwise). `false`: the channel is closed by either end and `v` is dropped |
 | `Receiver<T>.recv(): Option<T>`, `.close()` | `recv` blocks while empty. `None` once closed by the sender **and** drained, or cancelled by `rx.close()`. `rx.close()` drops what is buffered and makes senders get `false` |
 | `scopeFs(fs, (s, g) => ..)`, `scopeProcess`, `scopeStdio`, `scopeClock` (+ `...Do`), `spawnFs(s, g, fsg => ..)`, `spawnProcess`, `spawnStdio`, `spawnClock` | delegating a grant to a task, see "Grants" |
+| `Receiver<T>.recvUntil(deadline): Result<T, TaskError>`, `.recvTimeout(clock, timeout)` | C1: `recv` with an absolute monotonic `Deadline` (std:time) or a `Duration` from now. `Err(Timeout)`, or `Err(Closed)` once closed and drained; a value already there is delivered even at an expired deadline |
+| `Sender<T>.sendUntil(v, deadline): Result<void, TaskError>`, `.sendTimeout(clock, v, timeout)` | C1: `send` that gives up with `Err(Timeout)` while the channel stays full, `Err(Closed)` when closed (`v` is dropped on an error) |
+| `TaskHandle<T>.joinUntil(deadline): Result<T, TaskError>`, `.joinTimeout(clock, timeout)` | C1: `Err(Timeout)` if the task has not ended; the handle stays valid. Otherwise exactly `join()` (a panicked task still traps the joiner) |
+| `select<T>(rxs): Result<Selected<T>, TaskError>`, `selectUntil(rxs, deadline)`, `selectTimeout(clock, rxs, timeout)` | C1: the first ready receiver in array order wins; `Selected<T> = { index: usize; value: T }`. Closed and drained receivers are skipped; `Err(Closed)` when all are. One value type for all receivers (use a variant for different kinds). Free functions: generic methods do not exist (E0460) |
+| `sleep(clock, timeout): Result<void, TaskError>`, `sleepUntil(deadline): void` | C1: blocks at least that long on the monotonic clock; never early |
+| `TaskError = { kind: TaskErrorKind }`, `TaskErrorKind = Timeout \| Closed \| ClockUnavailable \| InvalidDuration`, `taskErrorMessage(e)` | ADR-0048 section 3.1; `Timeout` is outcome `Deadline` and `Closed` is outcome `Closed` of ADR-0017 Addendum B (`Cancelled` joins in C2) |
 | `parallelMap(xs, f, parts): B[]` | `xs.map(f)` computed by `parts` tasks over contiguous chunks, results in order |
 | `forkJoin(chunks, workers, body): R[]`, `forkJoinUntil(chunks, workers, body, hit): R[]`, `parallelism(): usize` | the work-stealing fork/join pool behind `parallel()` on arrays (ADR-0039), see "Fork/join pool and lending" |
 | `movedCount()`, `copiedCount()` | how many values this task sent by move / by deep copy so far (`ORIN_STATS=1` prints the process totals too) |
@@ -117,6 +123,8 @@ addresses, load / store, `size_of` and header access, and calls L0 only through 
 | `orin_rt_transfer_count(which)` | moves / copies counters of this task | `core.stats.transfer(which)` |
 | `orin_rt_lend(box)`, `orin_rt_par_threads()` | lend the value of a two-slot record (ADR-0039 §4, below); the thread count of parallel pipelines | `core.lend.put`, `core.task.threads` |
 | `orin_rt_task_spawn(tok)` | start a thread whose entry takes the closure out of the token, runs it and ends | `core.task.spawn(tok: usize): usize` (calls L0 `thread_create` with the Orin entry `core.task.main`; the entry calls the closure through an indirect call, which the core dialect has already) |
+| `orin_rt_task_watch(m)` | C1: called by a task on its own thread (`spawn`): when the task ends, by return or by trap, the runtime sets word 1 of monitor `m` to 1 and notifies queue 0 under `m`'s lock, so that `joinUntil` can wait with a deadline instead of blocking in the thread join | `core.task.watch`; the end-of-task hook of `core.task.main` / `core.trap.endTask` calls L0 `monitor_lock / set / notify / unlock` |
+| `orin_mon_wait_until(m, queue, deadline_ms)` | C1: forwarder for the timed monitor wait; returns 1 when the absolute `CLOCK_MONOTONIC` deadline passed, 0 when notified (or spuriously); traps on an invalid handle | `core.sync.waitUntil`, one line |
 | `orin_rt_task_join(h)`, `orin_rt_task_message()` | wait; trapped? (the message of the last joined task) | `core.task.join`, `core.task.message` |
 | trap hook in `orin_trap` (`task_active`, `task_trap`) | a trap on a task thread records the message, ends the task, never returns | `core.trap.endTask` (called by the Orin `core.trap`) |
 | `orin_rt_heap_exit()` | end of a task heap: revoke its grants, close its files, free its free lists and work stack, fold its counters | `core.heap.retire()` |
@@ -126,7 +134,7 @@ addresses, load / store, `size_of` and header access, and calls L0 only through 
 | `orin_cap_clone` / `orin_cap_move` / `orin_cap_adopt_*` | delegation of a grant (clone the record, detach it into a token, adopt it) | part of the `core.cap` module that replaces the C grant table |
 
 L0 functions (stay C, handle-checked, contracts in `runtime/platform/orin_platform.h`): `orin_platform_thread_create / join / exit /
-id`, `monitor_new / free / lock / unlock / wait / notify / get / set / grow`, `runtime_lock / unlock`. They do not move in R3.
+id`, `monitor_new / free / lock / unlock / wait / wait_until / notify / get / set / grow`, `runtime_lock / unlock`, and the pure `millis_split`. They do not move in R3.
 
 The rest of the change in `runtime/` is mechanical and disappears with the C object model: `__thread` on `g_live`,
 `orin_stats`, the free lists and the work stack of `orin_destroy`; the two tables of immortal singletons (`orin_nullary`,
@@ -184,6 +192,7 @@ allocated.
 | `tests/std/taskcore_test.or` (5 `@Test`), `tests/std/task_test.or` (7) and `tests/std/expect_trap/task_*.or` (4) | the invariants and contracts of `Ring` and `Ledger` (checked by `orin test`; all 35 contract obligations of `std:taskcore` are `VERIFIED` by `orin verify --contracts`), channel semantics in one task, the move / copy counters, joins in any order, `parallelMap` against `map`; traps that hold without contracts (join twice, a panic reaching the joiner, use of a released channel, capacity 0). `tools/mutation.sh std --module taskcore`: 16 mutants, 16 killed (14 by a contract) |
 | `compiler/tests/verify_main.or` (14 cases) | the grant move rules of the MIR verifier |
 | `tooling/clitests/src/osig.or` section 8 (`tools/clitests.sh osig`) | the task events of the OSIG |
+| `tests/concurrency/timed_waits.or`, `timed_join_panic.or` | C1: timeouts fire and never early, values arriving before the deadline, buffered value at an expired deadline, `Closed`, full-channel `sendTimeout`, `select` (ready channel, tie, skipping closed channels, all closed, woken by a send and by closes, timeout), `sleep` lower bound, `joinTimeout` on a blocked task (then a later `join`), a trapped task ends a timed join. Plain, TSan, ASan |
 | `runtime/core/tests/task_test.c` (98 checks) | transfer (move, copy, shared children, immortals, scalars, a 200,000-deep chain), 64 tasks, trap in a task, ping-pong, cross-heap frees, grants moved and per task, invalid handles |
 | `runtime/platform/tests/platform_test.c` (+54 checks, 795 in all) | thread / monitor contracts, errors, mutual exclusion, condition queues, a thread dying with a lock held, concurrent stdout |
 | `tests/concurrency/stress_tasks.or`, `stress_messages.or`, `panic_chain.or`, `panic_many.or`, `move_counts.or` | 3,000 live tasks, a tree of 255 scopes, 20,000 short tasks (23,254 tasks in all), 40,000 messages through one channel with 8 producers and 4 consumers, 20,000 ping-pong round trips, structured messages checked on arrival; a panic crossing three tasks and 300 simultaneous unjoined panics (exit status 101, no hang or crash under the sanitizers); no live object at exit (`ORIN_STATS`); what the default build moves and what it copies |
@@ -260,10 +269,50 @@ live counters no longer wrap to 2^64 - 1 for a task whose own frees exceed its a
 * The sandbox / CI cost of a full compiler build (7-8 minutes under load) dominated the loop; a one-stage `-O0` build
   of the compiler with the previous compiler (27 s) was used for iteration, the fixed point was checked separately.
 
+## Gate 1, C0: cancellation and outcomes (ADR-0017 Addendum B)
+
+C0 adds the semantics and the pure state machines only; nothing blocks differently yet. `std:taskcore` gains `CancelState` (a token's
+first-cause-wins cancellation cause plus an absolute monotonic deadline that only moves earlier, with `observe`/`budget`),
+`CancelScope` (a scope's counters; a trapping child cancels the scope), `TaskCell` (a result settled once and taken once), and
+pure functions for the outcome lattice (`Completed < Closed < Cancelled < Deadline < Error`, `outcomeJoin`), checkpoint precedence
+(`checkpointOutcome`) and deadline arithmetic (`deadlineMin`, saturating `deadlineAfterMillis`, `deadlineExpired`, `waitBudget`), all with
+`@Requires`/`@Ensures`/`@Invariant` contracts and tests in `tests/std/taskcancel_test.or`. The L0 budget for what follows is
+ADR-0054 (1,400 code lines).
+
+Next: scope cancellation in `std:task`, wired to these machines (C2); C3 interruptible network waits.
+
+## Gate 1, C1: timed and wakeable waits
+
+L0 got `orin_platform_monitor_wait_until(h, cond, deadline_ms)` (0 = notified or spurious, `ORIN_PLATFORM_WAIT_TIMEOUT` = the absolute deadline passed,
+`EINVAL` as `wait`) and the pure `orin_platform_millis_split`; the L0 code is now 1,036 of the 1,400 lines (ADR-0054, +37). A monitor's two
+condition variables are created with `CLOCK_MONOTONIC` (`pthread_condattr_setclock`) on Linux, so `pthread_cond_timedwait` takes the same
+instants as `monotonic_millis`; macOS has no `setclock`, so there the remaining time is computed from `monotonic_millis` and passed to
+`pthread_cond_timedwait_relative_np` (not run in CI here). `millis_split` has a CBMC harness (`harness_millis_split`: exact timespec, no
+overflow); the wait itself is TESTED_ONLY like the other thread primitives (CBMC cannot model threads): `platform_test.c` checks timeout, a
+past deadline, a notification before the deadline and argument errors, plain, under ASan and under ThreadSanitizer.
+
+How the std:task calls use it (all in Orin, `library/std/task.or`):
+
+* **Deadlines are absolute.** A timed wait loop re-waits with the SAME instant after a spurious wake-up, so nothing stretches it; the relative forms
+  read the clock once (`ClockGrant`, ADR-0027) and add with the saturating `deadlineAfterMillis` of std:taskcore. The `Until` forms need no
+  grant: a `Deadline` can only come from a clock reading. After a timeout the condition is checked once more, so a value that arrives at the
+  deadline is delivered (the precedence of `checkpointOutcome`: completing beats closed beats timing out).
+* **`recvUntil` / `sendUntil`** wait on the channel's own condition queue with `wait_until`.
+* **`joinUntil`**: `spawn` makes the result monitor two words; word 1 is set by the runtime when the task ends (`orin_rt_task_watch`, also on a
+  trap), and `joinUntil` waits for it before the ordinary `join`, whose thread join then returns at once.
+* **`select`**: channels gained a watcher list (monitor words 4 and 5, `CH_HDR` = 6). A select creates one private monitor whose word 0 is a
+  ticket, registers it with every channel, and waits on it. Every `send` and every close bumps the ticket of each watcher (channel lock, then watcher lock);
+  the selector reads the ticket, scans the receivers in order without holding its monitor, and sleeps only while the ticket is unchanged, so a
+  send between the scan and the sleep is not lost. It is one timed wait, not a poll loop. Cost on the plain `send` path: one extra monitor read.
+* **`sleep`** is a timed wait on a private monitor nobody notifies.
+
+Not in C1: cancellation of waits by a token (C2 adds `Cancelled` to `TaskErrorKind` and the token word to the checkpoints), a `timeout(d)` arm kind
+for `select`, receivers of different value types in one `select`.
+
 ## Not in stage 0 (and where it goes)
 
 `async` / `await` (ADR-0017: only if blocking tasks prove insufficient); cancellation beyond `rx.close()` and cooperative
-sibling cancellation at the scope boundary; timeouts and `select`; a M:N scheduler (a task is a thread: thousands fine,
+sibling cancellation at the scope boundary (C2; timeouts, `select` and `sleep` are C1, above); a M:N scheduler (a task is a thread: thousands fine,
 hundreds of thousands not; the L1 scheduler of ADR-0017 is future work and std:task's `Ledger` / `Ring` logic is the part
 that carries over); deadlock detection; `Shared<T>` for read-only sharing (post-1.0 option of ADR-0017); per-task regions
 (ADR-0038); a real `std:net` server with one task per connection (std:net had not landed on `main`; the CPU-parallel example

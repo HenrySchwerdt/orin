@@ -22,6 +22,7 @@
 #     tools/conformance.sh --suite all; tools/test_std.sh; tools/test_tooling.sh; ...
 set -eu
 cd "$(dirname "$0")/.."
+. tools/runtime_files.sh   # the runtime source list: tools/runtime-sources.txt
 D=build/dev
 B=build/bootstrap
 CC=${CC:-cc}
@@ -69,7 +70,9 @@ build() {
     rm -f $D/orin.h $D/orin.data.c $D/orin.[0-9]*.c
   else
     $host compile compiler/main.or -o $D/orin.c
-    $CC -O1 -w -I runtime/core $D/orin.c runtime/core/orin_runtime.c runtime/platform/orin_platform.c -lm -o $D/orin.tmp
+    # C from the seed compiler (orin0) links the frozen legacy runtime, as in tools/bootstrap.sh
+    world=core; [ "$host" = $B/orin0 ] && world=legacy
+    $CC -O1 -w $(rt_inc $world) $D/orin.c $(rt_src $world) -lm -o $D/orin.tmp
   fi
   mv $D/orin.tmp $D/orin
   echo "$stamp" > $D/stamp

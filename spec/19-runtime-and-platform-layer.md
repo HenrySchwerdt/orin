@@ -22,7 +22,7 @@ model) cover the runtime as well.
 
 Rules:
 - Safe user code can never name core intrinsics; using them outside a `core` module is a compile
-  error. Annotations (spec 05) cannot generate core-intrinsic uses.
+  error (R3d.0: a `core` module is a module of the embedded root `$rt`, see "R3d.0 preparation"). Annotations (spec 05) cannot generate core-intrinsic uses.
 - The platform API is a **closed list** declared in one header/interface file; adding a function
   needs an ADR. L1/L2 may call L0 only through that list.
 - The compiler links L1/L2 like any Orin code (whole-program, inlinable), so moving logic into
@@ -114,13 +114,13 @@ separator is raised through `process.exit(101)` after printing the same message.
   runtime (frozen) or links the generated C of L1.
   - **R3a core operations (done, ADR-0052).** The first piece of the core dialect: ONE builtin family
     `BCore(k)` (table and doc in `compiler/hir/coreops.or`, same pattern as the task primitives `BTask`),
-    exported by the internal module `std:fsraw`. An address is a plain `usize`; there is no new type and no
-    operation that turns an address back into a reference. Library code only (user code gets E0301); the gate
-    narrows to runtime modules with the first R3 module. All operations are impure for contracts and effects
-    (loads read mutable memory). Both backends emit the same behaviour: loads and stores are native-endian and
+    exported by the internal module `std:core` (R3a: `std:fsraw`; moved in R3d.0, see below). An address is a plain
+    `usize`; there is no new type and no operation that turns an address back into a reference. All operations
+    that touch memory are impure for contracts and effects (loads read mutable memory); the bit operations,
+    `expect` and `cfg` added in R3d.0 are pure. Both backends emit the same behaviour: loads and stores are native-endian and
     unaligned-safe (C: `__builtin_memcpy` of a constant size, LLVM: `align 1`); the memory operations are
     the L0 functions in C and libc malloc/free plus the LLVM intrinsics in LLVM. Self-test: `std:coreprobe`
-    (`library/std/coreprobe.or`, `tests/run/core_ops.or`, compared on both backends).
+    (`runtime/core/coreprobe.or`, `tests/run/core_ops.or`, compared on both backends).
 
     | operation | meaning |
     |---|---|
@@ -128,11 +128,102 @@ separator is raised through `process.exit(101)` after printing the same message.
     | `loadF64(addr) -> float` | 8-byte IEEE load |
     | `store8/store32/store64(addr, v: usize)` | store of the low 8/32/64 bits |
     | `storeF64(addr, v: float)` | 8-byte IEEE store |
-    | `memAlloc(n) -> usize` | `orin_platform_alloc` (never 0; `n = 0` gives one byte) |
+    | `memAlloc(n) -> usize` | `orin_platform_alloc` (never 0: `n = 0` gives one byte, and a failed allocation traps "out of memory", R3d.0) |
     | `memFree(addr)` | `orin_platform_free` |
     | `memCopy(dst, src, n)` | `orin_platform_mem_copy` (no overlap) |
     | `memSet(dst, byte, n)` | `orin_platform_mem_set` (low 8 bits of `byte`) |
-    | `addrOf(x) -> usize` | object address of a string, array or record; read-only, the reference count is unchanged |
+    | `addrOf(x) -> usize` | object address of a string, array or record; read-only, the reference count is unchanged. An escape: the optimiser never unboxes, scalar-replaces or removes the operand (`opt/unbox.or`, R3d.0) |
+    | `and/or/xor/shl/shr(a, b: usize) -> usize` (R3d.0) | bit operations (the language has none); a shift of 64 or more gives 0; pure |
+    | `expect(b, likely) -> bool` (R3d.0) | `b` itself with a branch hint (`__builtin_expect`, `llvm.expect.i1`); `likely` should be a literal; pure |
+    | `cfg(k) -> usize` (R3d.0) | build configuration: 0 free lists on, 1 hot counters, 2 site census; other `k` give 0; a constant, pure. The LLVM backend returns 1, 0, 0 until the driver flags of R3d.3 |
+    | `heapBase() -> usize` (R3d.0) | address of the zero-initialised per-thread block `orin_heap` (`OrinHeap`, 128 words, `__thread`, local-exec; fields: "R3d.1" below); executables only |
+    | `memRealloc(addr, n) -> usize` (R3d.0) | `orin_platform_realloc`, never 0 (traps "out of memory", the old block stays valid) |
+    | `memMove(dst, src, n)` (R3d.0) | `orin_platform_mem_move` (ranges may overlap) |
+    | `memCmp(a, b, n) -> int` (R3d.0) | `orin_platform_mem_cmp` normalised to -1, 0 or 1 (unsigned bytes) |
+
+  - **R3d.0 preparation (done, ADR-0052 Addendum A; each item is a working assumption of its section 6 until the owner
+    confirms it).** (1) *The `$rt` root* (question 1): `runtime/core/*.or` is the fourth embedded prelude root
+    (`tools/embed_prelude.py`, `compiler/loader/prelude.or`), entry `$rt/module.or`, loaded into every compiled program but
+    not by `noPreludeRoots()` (`check`, `api`, the language server, `--c-builtins`); the marker of a core module is the
+    path prefix `$rt/`, not a manifest key `core = true` (the key is added when a second runtime needs user-visible core
+    packages). (2) *The gate*: the internal module `std:core` exports exactly the core operations and only `$rt/` modules can
+    import it (E0301 otherwise: `tests/next/errors/e0301_core_ops_are_internal.or`, `compiler/tests/loader_classes_test.or`);
+    `std:fsraw` no longer exports them; `std:coreprobe` resolves to `$rt/coreprobe.or` (like `std:math`). (3) *Out of memory*
+    (question 5): `memAlloc` and `memRealloc` trap "out of memory" (exit 101) on failure in both backends
+    (`tests/run/core_oom_trap.or`, `core_oom_realloc_trap.or`). (4) *Seed bridge* (question 2): the runtime as it was before
+    R3d is frozen in `bootstrap/seed/runtime/` and linked by stage 0 and stage 1 of `tools/bootstrap.sh` (stage 2 on links
+    `runtime/core/`) and by the `--c-builtins` side of `tools/differential.sh --mode builtins`, which therefore compares the new
+    world against the legacy world; programs of the core dialect (`std:coreprobe`) are skipped there. The C copies of the
+    R1/R3b functions stay in the live runtime for now. (5) *One runtime source list*: `tools/runtime-sources.txt` names the
+    files a program is linked with, per world (`core`, `legacy`); the shell tools (`tools/runtime_files.sh`), the Python tools
+    (`tools/runtime_files.py`) and the Orin harnesses (`tooling/conformance`, `tooling/differential`) read it. Not yet
+    converted (they name the installed layout or are literals in CI): `dist/orin-cli.sh`, `compiler/testing/runner.or`,
+    `compiler/mcp/tools.or`, `tooling/mutation/src/{ox,net}_check.or`, `tooling/protocol/src/main.or`, `tooling/clitests/src/fmt.or`, `.github/workflows/{ci,bench}.yml`,
+    `tools/verify_platform.sh`. The prune root set for L1 entries and the `--freelist` / `--stats` driver flags of `cfg` are
+    not needed before the first L1 function is called by name (R3d.2 / R3d.3).
+
+  - **R3d.2 the first L1 functions (done, ADR-0052 Addendum A sections 3 and 5).** `runtime/core/leaf.or` (module `$rt/leaf`): `optUnwrap`,
+    `resUnwrap`, `resUnwrapErr`, `vUnwrap` (all `@Inline`), `trapShape`, `assertFact`, `assertArray`. Generated code calls them by name:
+    `compiler/mir/rt.or` is the table (`rtNames`, `rtIds` find the function in the program), the backends cast an object to its address
+    (`(uint64_t)(uintptr_t)` in C, `ptrtoint` in LLVM) and call `orin_fn_<i>_..` in place of the C function; `opt/prune.or` keeps `trapShape` always
+    and the others where an instruction implies them (`rtImplied`: the unwrap builtins, `IForward`, `IArrayGetU/SetU`). A program without the
+    entries (`--c-builtins`, hand-built MIR) emits the old C calls, so the frozen snapshot runtime serves that world. Traps are `taskTrap`
+    (same message and exit 101 as `orin_trap`); the two checks of `--assert-facts` print through `console.error` and `exit(70)` (stdout is now
+    flushed first). `trapShape` is called by the inline LLVM helpers (`orinl_slot`, `orinl_array_*`); C builds keep `orin_trap_shape` in C because
+    the header inlines and the runtime call it (they move to the preamble in R3d.6). `orin_struct_copy_slot` had no caller in generated code
+    or runtime and is deleted without a port. **Static nullary:** each payload-less variant tag a program uses is a static immortal object
+    (`orin_nz<tag>`: C `static struct` in every unit that uses it, also in the split header and data unit; LLVM `internal global`), so
+    `orin_nullary` (table, acquire load, compare-and-swap) is no longer called by generated code; for the C shells the header keeps a
+    static-inline `orin_nullary` for tags 0 and 1. Deleted from `runtime/core/orin_runtime.c`: `orin_nullary`, `orin_assert_fact`,
+    `orin_assert_array`, `orin_struct_copy_slot`, `orin_opt_unwrap`, `orin_res_unwrap`, `orin_res_unwrap_err`, `orin_v_unwrap`.
+    Measured (valgrind, executed instructions, C / LLVM): bintrees 6,299,146,435 -> 5,591,750,641 (-11.2 %) / 6,029,451,956 -> 5,406,269,923
+    (-10.3 %); mutres, pqueue, sortedmap, strings unchanged to 30 instructions; selfcompile (C) 24,781,316,263 -> 24,788,630,444 (+0.03 %).
+    `ORIN_STATS` counters identical (`orin_nullary` was never counted).
+
+  - **R3d.3 the object model in Orin (done, ADR-0052 Addendum A sections 3 and 5; three commits, each revertible alone).** (a) `runtime/core/object.or`
+    (`structNew`, `variant1`, `arrayNew`, free lists); (b) `runtime/core/rc.or` (`destroy` iterative with the work stack in the heap block and the
+    first dying child freed without a push, `makeUniqueSlow`); (c) `runtime/core/heap.or` (`sbAlloc`, `sbFree`, `sbRealloc`, the small-block cache),
+    `strAlloc`, `arrayPushGrow` (kept out of line in LLVM, `noinline`). All sit on the `OrinHeap` block at the offsets of R3d.1. Generated code calls
+    the entries directly (`newStruct`, array-new); the C shells of `orin_runtime.c` reach them through wrappers that the emitted code defines under the
+    old C names (`backends/{c,llvm}/rtwrap.or`), so the C runtime keeps its call sites. New pure core operations 24..26: `wadd`, `wsub`, `wmul`
+    (wrapping `usize` arithmetic; `wrappingAdd` is an out-of-line call and `+` adds trap paths). Census builds (`-DORIN_SITE_STATS`, `--stats-sites`)
+    keep the C definitions, because the census hooks are C: `rtIdsFor(prog, sites)` leaves the entries out and the C versions stay under
+    `#ifdef ORIN_SITE_STATS` until R3d.5; `sb_drain` stays C. `cfg(0)` is a constant 1 in LLVM, so LLVM builds under ASan keep the free lists
+    (ASan then does not see a recycled header). The C unit tests of the runtime link `tools/rt_stub.sh` (an empty program compiled to C with `main`
+    renamed), which carries the wrappers. `compiler/mir/rt.or` also holds `rtAlways` (the entries `opt/prune.or` always keeps).
+  - **R3d.4 strings and arrays in Orin (done, ADR-0052 Addendum A section 5).** `runtime/core/str.or` (`strConcat`, `strAppend`, `strAppendSub`,
+    `strAppendInt`, `strAppendUsize`, `strPrepend`) and `runtime/core/array.or` (`arraySlice`, `arrayConcat`, `arrayExtend`, `bytesToString`,
+    `stringToBytes`; the byte loops take eight elements per step) are entries 17..27 of `compiler/mir/rt.or`. The backends call them directly
+    (`rtCallC`, `rtCallL`; objects as address words); without `$rt` (`--c-builtins`) they emit the old C call, which the frozen snapshot defines.
+    Only `str_concat`, `str_append`, `array_slice`, `array_concat`, `array_extend`, `bytes_to_string` and `string_to_bytes` get a C-named wrapper
+    (`rtWraps`), because the C unit tests call them; the others (`rtPlain`) have none. Growth, fresh allocation and the copying path of
+    `arrayExtend` are separate `noinline` functions (`rtCold`). Counters are updated exactly as the C versions did. Census builds keep the C
+    versions under `#ifdef ORIN_SITE_STATS` (`rtIdsFor` leaves all of these entries out) until R3d.5. `rc.or` exports `retain` and `release`.
+  - **R3d.1 the per-thread heap block (done, ADR-0052 Addendum A section 5).** `g_live`, the free lists, the small-block cache, the
+    work stack of `orin_destroy` and `orin_stats` are fields of one exported `__thread OrinHeap orin_heap` (1024 bytes, zero-initialised,
+    the block `heapBase()` returns), so Orin code reaches each at a fixed offset. ADR-0017 behaviour is unchanged (per task, returned in
+    `orin_rt_heap_exit`).
+
+    | offset | size | field (`OrinHeap`) | was | note |
+    |---:|---:|---|---|---|
+    | 0 | 72 | `fl_struct[9]` | `fl_struct` | free struct objects by `nslots` 0..8 (next pointer in word 0) |
+    | 72 | 8 | `fl_array` | `fl_array` | free array headers |
+    | 80 | 80 | `fl_n[10]` (u64) | `fl_n` (u32) | list lengths, `[9]` the array headers; cap `FL_CAP` = 2^18 |
+    | 160 | 8 | `live` (i64) | `g_live` | signed: a task can free more than it allocated |
+    | 168 | 8 | `dstack` (`OrinObj **`) | `t_dstack` | work stack of `orin_destroy`, NULL until first use |
+    | 176 | 8 | `dcap` (u64) | `t_dcap` | its capacity in entries |
+    | 184 | 8 | reserved | | |
+    | 192 | 144 | `stats` (`OrinStats`, 18 u64) | `orin_stats` | `alloc_string` +0, `alloc_array` +8, `alloc_struct` +16, `frees` +24, `retains` +32, `releases` +40, `cow_copies` +48, `cow_inplace` +56, `array_grows` +64, `string_grows` +72, `peak_live_objs` +80, `peak_live_bytes` +88, `live_bytes` +96, `file_opens` +104, `file_closes` +112, `transfer_moves` +120, `transfer_copies` +128, `tasks_spawned` +136 |
+    | 336 | 168 | reserved | | task pointer, grant and file tables (R3e) |
+    | 504 | 8 | `probe` | | scratch word of `std:coreprobe` |
+    | 512 | 272 | `sb[17]` (`{head, n}` pairs, 16 bytes each) | `sb_list`, `sb_cnt` (u32) | small-block cache by 16-byte class 0..16 (`SB_MAX` 256): list head @+0, length @+8, cap `SB_CAP` = 2^15 |
+    | 784 | 240 | reserved | | up to 1024 bytes (128 words) |
+
+    **Not moved (they stay `static __thread` in C until R3e):** `t_sites`, `t_pairs`, `t_calls` (census), `g_grants`, `g_files`, `t_task`, `t_joined_msg`, `orin_site_cur`, `orin_site_par`.
+    Offsets do not depend on the build configuration (the lists and counters exist unused under `-DORIN_NO_FREELIST` or without `ORIN_STATS_ENABLED`) and are pinned by `_Static_assert`s in `runtime/core/orin_runtime.h`.
+    `orin_stats` is now `#define orin_stats (orin_heap.stats)`, so inline code and generated C are unchanged; the block is `extern __thread OrinHeap orin_heap` (local-exec as before), `heapBase()` is its address (the C backend emits `&orin_heap`, the LLVM declaration is `[128 x i64]`).
+
+
   - **R3b strings and numbers (partly done).** `parseI8` .. `parseUsize` moved (`strParseIntK`, one more slot in
     `compiler/lower/prelude.or`). The rest of the inventory above stays in C for the stated reasons; no core operation
     was needed (the port is plain safe Orin). **What still needs the C copies of the R1/R3b functions** (none is

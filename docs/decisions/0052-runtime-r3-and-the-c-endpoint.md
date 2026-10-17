@@ -83,7 +83,7 @@ Orin and still links libc. It becomes worth doing only when Orin's verifier cove
 
 ## Addendum A: R3d object model in Orin (design)
 
-Status: proposed (2026-10-16), design only, no code. Read against PR #141 (R3a `BCore`, R3b). *(inference)* marks a conclusion from the code,
+Status: proposed (2026-10-16). Step R3d.0 is implemented on the working assumptions of section 6 (spec 19 "R3d.0 preparation"); the rest is design only. Read against PR #141 (R3a `BCore`, R3b). *(inference)* marks a conclusion from the code,
 not something the code states. Open questions for the owner: section 6.
 
 ### 1. Where the L1 modules live, how they load, how the gate narrows
@@ -188,8 +188,8 @@ worse than the table "Backends: ADR-0038 §8 gate 1".
 | R3d.0 | `$rt` root, `std:core` gate and negative tests, ops of section 2, `addrOf` escape rule, `rt.or`, prune roots, seed bridge, one runtime source list, legacy flag. No emitted-code change | all; self-compile output byte-identical | low |
 | R3d.1 | runtime only: `g_live`, `fl_*`, `sb_*`, `t_dstack`, `orin_stats` into one exported `__thread orin_heap` with documented offsets and `_Static_assert`s | bintrees, mapfreq, wordfreq, strings, selfcompile; expect 0.00 % | low (TLS cost was 1.0197 in "Concurrency stage 0") |
 | R3d.2 | leaves without allocator state: unwraps, `trap_shape`, `assert_*`, `struct_copy_slot`; static `nullary` | **bintrees** (expect about -10 %), mutres, pqueue, sortedmap | low |
-| R3d.3 | on the shared block: (a) `struct_new/array_new/variant1` + free lists, (b) `destroy`, `make_unique_slow`, (c) small-block cache, string allocation, `array_push_grow` | **bintrees** (destroy 62, struct_new 42 per node), sortedmap, mapfreq, qsort_func; (c) appends, strings, wordfreq, bytesstr, http_parse, html, url, selfcompile | **highest**: hot path, checked arithmetic, aliasing, `-O1` inlining; a/b/c revert alone |
-| R3d.4 | strings and arrays (R3b leftovers): `str_concat/append/prepend/append_*`, `array_slice/concat/extend`, `bytes_to_string`, `string_to_bytes` | appends, mutres, strings, bytesstr, qsort_inplace, qsort_func, streams, url | medium: per-element retain by `is_ref` in a raw loop; appends/mutres are the in-place canaries |
+| R3d.3 | on the shared block: (a) `struct_new/array_new/variant1` + free lists, (b) `destroy`, `make_unique_slow`, (c) small-block cache, string allocation, `array_push_grow` | **bintrees** (destroy 62, struct_new 42 per node), sortedmap, mapfreq, qsort_func; (c) appends, strings, wordfreq, bytesstr, http_parse, html, url, selfcompile | **highest**: hot path, checked arithmetic, aliasing, `-O1` inlining; a/b/c revert alone. **Done**: bintrees -20.3 % (C and LLVM) against the pre-R3d.2 base, every other benchmark within +0.7 % (C) / +0.0 % (LLVM) of it; the commits are within budget one by one (LLVM bintrees (b) +0.35 % over (a)); wadd / wsub / wmul added to avoid checked arithmetic; census builds keep the C allocator until R3d.5 |
+| R3d.4 | strings and arrays (R3b leftovers): `str_concat/append/prepend/append_*`, `array_slice/concat/extend`, `bytes_to_string`, `string_to_bytes` | appends, mutres, strings, bytesstr, qsort_inplace, qsort_func, streams, url | medium: per-element retain by `is_ref` in a raw loop; appends/mutres are the in-place canaries**Done**: `runtime/core/{str,array}.or`; wrappers only for the 7 functions the C unit tests call; census builds keep the C versions under `#ifdef ORIN_SITE_STATS`. Executed instructions against the R3d.3 base, LLVM: appends -19.0 %, bytesstr -21.0 %, html -10.8 %, strings -4.4 %, qsort_func -9.8 %, url -1.8 %, http_parse -0.8 %, wordfreq +0.6 %, the others within +0.01 %; C: bytesstr -5.7 %, qsort_func -9.9 %, http_parse +1.1 %, wordfreq +0.9 %, selfcompile +0.4 %, the others within +-0.5 %; `ORIN_STATS` counters of every benchmark identical. The fresh-allocation paths are separate `noinline` functions (`rtCold`), so the in-place path of an append keeps its few registers |
 | R3d.5 | stats, `stats_report`, census prefix word, `live_count` | counters and `tools/alloc_census.py` output identical; `tools/test_resources.sh` | low |
 | R3d.6 | C preamble replaces the header inlines for generated code | all (C output changes textually) | medium |
 | R3d.7 | seed refresh | bootstrap from the new seed; selfcompile | low |
@@ -201,7 +201,34 @@ under the L0 runtime lock, for which no core op exists, and revokes grants and c
 `refmask`, `is_ref` and the pin bits), `task_main` (calls a closure through a raw function address; no core op). In R3d they stay C and read the
 shared block through the offsets of R3d.1. The porting table of ADR-0017 Addendum A is unchanged.
 
+**R3d.1 (done): the offsets of the shared block.** `heapBase()` is `&orin_heap`, `extern __thread OrinHeap orin_heap` in `runtime/core/orin_runtime.h`
+(1024 bytes, 128 words, replacing the 64-word placeholder of R3d.0; word 63 stays the scratch word of `std:coreprobe`). Every offset is pinned by a `_Static_assert`.
+
+| offset | size | field (`OrinHeap`) | was | note |
+|---:|---:|---|---|---|
+| 0 | 72 | `fl_struct[9]` | `fl_struct` | free struct objects by `nslots` 0..8 (next pointer in word 0) |
+| 72 | 8 | `fl_array` | `fl_array` | free array headers |
+| 80 | 80 | `fl_n[10]` (u64) | `fl_n` (u32) | list lengths, `[9]` the array headers; cap `FL_CAP` = 2^18 |
+| 160 | 8 | `live` (i64) | `g_live` | signed: a task can free more than it allocated |
+| 168 | 8 | `dstack` (`OrinObj **`) | `t_dstack` | work stack of `orin_destroy`, NULL until first use |
+| 176 | 8 | `dcap` (u64) | `t_dcap` | its capacity in entries |
+| 184 | 8 | reserved | | |
+| 192 | 144 | `stats` (`OrinStats`, 18 u64) | `orin_stats` | `alloc_string` +0, `alloc_array` +8, `alloc_struct` +16, `frees` +24, `retains` +32, `releases` +40, `cow_copies` +48, `cow_inplace` +56, `array_grows` +64, `string_grows` +72, `peak_live_objs` +80, `peak_live_bytes` +88, `live_bytes` +96, `file_opens` +104, `file_closes` +112, `transfer_moves` +120, `transfer_copies` +128, `tasks_spawned` +136 |
+| 336 | 168 | reserved | | task pointer, grant and file tables (R3e) |
+| 504 | 8 | `probe` | | scratch word of `std:coreprobe` |
+| 512 | 272 | `sb[17]` (`{head, n}` pairs, 16 bytes each) | `sb_list`, `sb_cnt` (u32) | small-block cache by 16-byte class 0..16 (`SB_MAX` 256): list head @+0, length @+8, cap `SB_CAP` = 2^15 |
+| 784 | 240 | reserved | | up to 1024 bytes (128 words) |
+
+**Not moved (they stay `static __thread` in C until R3e):** `t_sites`, `t_pairs`, `t_calls` (census), `g_grants`, `g_files`, `t_task`, `t_joined_msg`, `orin_site_cur`, `orin_site_par`.
+Offsets do not depend on the build configuration (the lists and counters exist unused under `-DORIN_NO_FREELIST` or without `ORIN_STATS_ENABLED`) and are pinned by `_Static_assert`s in `runtime/core/orin_runtime.h`.
+`orin_stats` is now `#define orin_stats (orin_heap.stats)`, so inline code and generated C are unchanged; the block is `extern __thread OrinHeap orin_heap` (local-exec as before), `heapBase()` is its address (the C backend emits `&orin_heap`, the LLVM declaration is `[128 x i64]`).
+
 ### 6. Open questions for the project owner
+
+**Working assumptions until the owner confirms (2026-10-17):** the work proceeds on the recommendations below, as the decision
+card in the project thread says it would. Budget rule as applied: per step at most +1 % executed instructions on the LLVM backend
+(the `--release` default), and below +2 % on the C backend. R3d.1 measured LLVM -0.9 to -1.6 %, C +0.55 to +1.62 % (bintrees).
+Each assumption is a separate commit (R3d.0) and can be reverted alone if the owner decides otherwise.
 
 1. **Marker of a core module.** Recommend virtual root `$rt/` plus internal module `std:core`, and amending spec 19 and this ADR from "manifest
    `core = true`" to "modules of the embedded runtime root"; add the key when a second runtime (WASI, freestanding) needs user-visible core packages.

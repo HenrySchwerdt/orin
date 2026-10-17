@@ -1,0 +1,170 @@
+// $rt/heap -- the per-thread heap block and the small-block cache, written in Orin (ADR-0052 Addendum A, step R3d.3).
+//
+// Every task / thread has one zero-initialised block (`OrinHeap`, 1024 bytes, `heapBase()`): the free lists of struct objects and
+// array headers, the live-object balance, the work stack of `destroy`, the counters (`OrinStats`) and the small-block cache. The
+// offsets are the ones pinned by the _Static_asserts of runtime/core/orin_runtime.h (spec 19 "R3d.1"). A block is plain malloc
+// memory, so a node that came from another thread's heap joins this one's list (capped by FL_CAP / SB_CAP).
+//
+// Address arithmetic uses the wrapping core operations `wadd`, `wsub`, `wmul` (hir/coreops.or): the checked `+` of the language
+// would add a trap path to every access. The free lists and the small-block cache exist only when `cfg(0) == 1` (off under
+// ASan / MSan and with -DORIN_NO_FREELIST: then every block goes straight to the allocator, as before), the counters only when
+// `cfg(1) == 1` (-DORIN_STATS_ENABLED). The configuration is a constant, so the dead code folds away.
+//
+// Object layout (frozen, spec 19): header rc@0 kind@8 tag@12 (16 bytes); string len@16 cap@24 data@32; array len@16 cap@24
+// is_ref@32 items@40; struct nslots@16 refmask@24 slots@32; kinds string 1, array 2, struct 3.
+
+import { load64, store64, memAlloc, memFree, memRealloc, memCopy, heapBase, cfg, wadd, wsub, shl, shr, xor } from "std:core";
+
+// ---------------------------------------------------------------- offsets in the heap block
+
+export const FL_STRUCT: usize = 0;   // free struct objects by nslots 0..8, 8 bytes each
+export const FL_ARRAY: usize = 72;   // free array headers
+export const FL_N: usize = 80;       // list lengths: [nslots] for structs, [9] (@152) for the array headers
+export const LIVE: usize = 160;      // live objects of this heap (signed)
+export const DSTACK: usize = 168;    // the work stack of destroy (0 until first use)
+export const DCAP: usize = 176;      // its capacity in entries
+export const S_ALLOC_STRING: usize = 192;
+export const S_ALLOC_ARRAY: usize = 200;
+export const S_ALLOC_STRUCT: usize = 208;
+export const S_FREES: usize = 216;
+export const S_RETAINS: usize = 224;
+export const S_RELEASES: usize = 232;
+export const S_COW_COPIES: usize = 240;
+export const S_COW_INPLACE: usize = 248;
+export const S_ARRAY_GROWS: usize = 256;
+export const S_STRING_GROWS: usize = 264;
+export const S_PEAK_LIVE_OBJS: usize = 272;
+export const S_PEAK_LIVE_BYTES: usize = 280;
+export const S_LIVE_BYTES: usize = 288;
+export const SB: usize = 512;        // small-block cache: 17 classes of {head, length}, 16 bytes each
+
+export const FL_CAP: usize = 262144;  // 2^18 objects per free list
+export const SB_CAP: usize = 32768;   // 2^15 blocks per small-block class
+export const SB_MAX: usize = 256;     // the largest cached block
+
+const SIGN: usize = 9223372036854775808;
+
+// ---------------------------------------------------------------- word helpers
+
+// word at `p` += d (wrapping)
+@Inline
+export function addAt(p: usize, d: usize): void {
+  store64(p, wadd(load64(p), d));
+}
+
+// word at `p` -= d (wrapping)
+@Inline
+export function subAt(p: usize, d: usize): void {
+  store64(p, wsub(load64(p), d));
+}
+
+// True when a reference count is positive as a signed 64-bit number: a live object (not immortal, not lend-pinned).
+@Inline
+export function isLive(rc: usize): bool {
+  return wsub(rc, 1) < 9223372036854775807;
+}
+
+// ---------------------------------------------------------------- accounting (the static counters, hot path under cfg(1))
+
+// One more object, `bytes` more live bytes, and the peaks. `counter` is the offset of the kind's allocation counter.
+@Inline
+export function statAlloc(counter: usize, bytes: usize): void {
+  if (cfg(1) == 1) {
+    const h = heapBase();
+    addAt(wadd(h, counter), 1);
+    const lb = wadd(load64(wadd(h, S_LIVE_BYTES)), bytes);
+    store64(wadd(h, S_LIVE_BYTES), lb);
+    if (xor(lb, SIGN) > xor(load64(wadd(h, S_PEAK_LIVE_BYTES)), SIGN)) {
+      store64(wadd(h, S_PEAK_LIVE_BYTES), lb);
+    }
+    const lv = load64(wadd(h, LIVE));
+    if (xor(lv, SIGN) > xor(load64(wadd(h, S_PEAK_LIVE_OBJS)), SIGN)) {
+      store64(wadd(h, S_PEAK_LIVE_OBJS), lv);
+    }
+  }
+}
+
+// `bytes` more live bytes (a buffer grew) and the peak.
+@Inline
+export function statGrow(bytes: usize): void {
+  if (cfg(1) == 1) {
+    const h = heapBase();
+    const lb = wadd(load64(wadd(h, S_LIVE_BYTES)), bytes);
+    store64(wadd(h, S_LIVE_BYTES), lb);
+    if (xor(lb, SIGN) > xor(load64(wadd(h, S_PEAK_LIVE_BYTES)), SIGN)) {
+      store64(wadd(h, S_PEAK_LIVE_BYTES), lb);
+    }
+  }
+}
+
+// One more live object (the balance may go negative on a task that frees what another allocated: it is signed).
+@Inline
+export function liveInc(): void {
+  addAt(wadd(heapBase(), LIVE), 1);
+}
+
+// One object freed: the live balance and the `frees` counter.
+@Inline
+export function liveDec(): void {
+  subAt(wadd(heapBase(), LIVE), 1);
+  if (cfg(1) == 1) {
+    addAt(wadd(heapBase(), S_FREES), 1);
+  }
+}
+
+// ---------------------------------------------------------------- small-block cache (variable-size buffers <= SB_MAX)
+
+// A buffer of `n` bytes: string objects (sizeof(OrinString) + cap + 1) and array item buffers (cap * 8). Blocks of at most
+// SB_MAX bytes are rounded up to a 16-byte class and taken from the class list when it has one; a block can sit on any thread's
+// list and needs no header, because its free passes the same size.
+@Inline
+export function sbAlloc(n: usize): usize {
+  if (cfg(0) == 1 && n <= 256) {
+    const c = shr(wadd(n, 15), 4);
+    const q = wadd(wadd(heapBase(), SB), shl(c, 4));
+    const f = load64(q);
+    if (f != 0) {
+      store64(q, load64(f));
+      subAt(wadd(q, 8), 1);
+      return f;
+    }
+    return memAlloc(shl(c, 4));
+  }
+  return memAlloc(n);
+}
+
+// Return the block `p` of `n` bytes to the cache, or to the allocator when the class is full or the block is large.
+@Inline
+export function sbFree(p: usize, n: usize): void {
+  if (cfg(0) == 1 && n <= 256) {
+    const c = shr(wadd(n, 15), 4);
+    const q = wadd(wadd(heapBase(), SB), shl(c, 4));
+    if (load64(wadd(q, 8)) < 32768) {
+      store64(p, load64(q));
+      store64(q, p);
+      addAt(wadd(q, 8), 1);
+      return;
+    }
+  }
+  memFree(p);
+}
+
+// Grow (or shrink) the buffer `p` (0 when `old` is 0) from `old` to `n` bytes. Large buffers keep the in-place growth of `realloc`; a
+// small one stays where it is while it fits its 16-byte class, else it moves to a block of the new class.
+export function sbRealloc(p: usize, old: usize, n: usize): usize {
+  if (cfg(0) == 0) {
+    return memRealloc(p, n);
+  }
+  if (old > 256 && n > 256) {
+    return memRealloc(p, n);
+  }
+  if (p != 0 && old <= 256 && n <= 256 && shr(wadd(old, 15), 4) == shr(wadd(n, 15), 4)) {
+    return p;
+  }
+  const q = sbAlloc(n);
+  if (p != 0) {
+    memCopy(q, p, old < n ? old : n);
+    sbFree(p, old);
+  }
+  return q;
+}

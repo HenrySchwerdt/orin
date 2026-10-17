@@ -1,4 +1,6 @@
 /* Runtime-only tests. Build: cc -I runtime/core runtime/core/tests/runtime_test.c runtime/core/orin_runtime.c runtime/platform/orin_platform.c
+ *     $(tools/rt_stub.sh build/rt_stub.o)
+ * (the object model is Orin code, ADR-0052 R3d.3; the stub object defines orin_struct_new, orin_destroy, ... for the C shells).
  * Optionally with -fsanitize=address,undefined. Exits 0 and prints "ok" on success. */
 #define _GNU_SOURCE
 #include "orin_runtime.h"
@@ -19,6 +21,10 @@ static int failures;
             failures++;                                                                         \
         }                                                                                       \
     } while (0)
+
+/* The unwrap helpers are Orin functions now ($rt/leaf.or, ADR-0052 R3d.2); these tests read the payload slot directly. */
+static uint64_t orin_res_unwrap(OrinObj *r) { return orin_tag(r) == 0 ? orin_struct_get(r, 0) : 0; }
+static uint64_t orin_res_unwrap_err(OrinObj *r) { return orin_struct_get(r, 0); }
 
 static OrinObj *S(const char *s) { return orin_str_new(s, strlen(s)); }
 static int streq(OrinObj *o, const char *s) {

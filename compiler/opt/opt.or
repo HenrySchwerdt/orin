@@ -27,6 +27,7 @@
 // function is optimised on its own (a `map` over the function indices, ready for ADR-0039 `.parallel()`).
 
 import { MProgram, MFunction } from "../mir";
+import { mapChunksLent } from "../util";
 import { PSites, scanSites, rewriteParam } from "./params";
 import { insertCallDups, peephole } from "./calls";
 import { inplaceSlots } from "./inplace";
@@ -256,12 +257,41 @@ export function sameFunctions(p: MProgram, r: MProgram): bool {
   return true;
 }
 
+// The inputs of step 2, lent to the pieces of `optimize`.
+type OptInputs = { q: MProgram; p: MProgram; };
+
+// `optimizeFunction` for the functions lo..hi-1, in order.
+@Requires(lo <= hi && hi <= inp.p.functions.length && inp.q.functions.length == inp.p.functions.length)
+function optimizeRange(inp: OptInputs, lo: usize, hi: usize): MFunction[] {
+  let out: MFunction[] = [];
+  let fi = lo;
+  while (fi < hi) {
+    out.push(optimizeFunction(inp.q, inp.p, fi));
+    fi += 1;
+  }
+  return out;
+}
+
 @Requires(progWellFormed(p) && allBorrowed(p))
 @Ensures(progWellFormed(result) && sameFunctions(p, result))
 export function optimize(p: MProgram): MProgram {
   const pinned = closureTargets(p);
   const q = withModes(p, inferModes(p, pinned));
-  const fns = indices(p.functions.length).map(fi => optimizeFunction(q, p, fi));
+  // Step 2 in pieces of 64 consecutive functions on the task pool, `lent` lent to the workers (ADR-0049 row 15a); the
+  // pieces come back in index order, so `fns` is the concatenation in function order, as the sequential map built it.
+  // `lent` is not used after the call.
+  // Only step 2 runs in pieces: the rewrites of 3 and 4 (`forwardProgram`, `dropUniqueProgram`, `uncheckProgram`) return
+  // nearly unchanged functions, so lending them copies almost the whole program back for little work (ADR-0049 row 15a:
+  // about +0.6 s of CPU for the three, +0.2 s for this step, in `orin compile compiler/main.or`); they stay sequential maps.
+  const lent = OptInputs { q: q, p: p };
+  const n = p.functions.length;
+  const pieces = mapChunksLent(lent, n, 64, (lo: usize, hi: usize) => optimizeRange(lent, lo, hi));
+  let fns: MFunction[] = [];
+  for (const part of pieces) {
+    for (const f of part) {
+      fns.push(f);
+    }
+  }
   const paired = pairReturns(
     MProgram {
       functions: fns,

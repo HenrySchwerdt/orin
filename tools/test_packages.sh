@@ -5,6 +5,7 @@
 # The multi-file run/error tests live in tests/next (run by tools/run_tests.py).
 set -eu
 cd "$(dirname "$0")/.."
+. tools/runtime_files.sh   # the runtime source list: tools/runtime-sources.txt
 ORIN2=${ORIN2:-build/bootstrap/orin2}
 SHOP=tests/next/packages/shop
 T=build/pkgtest
@@ -17,7 +18,7 @@ bad() { echo "FAIL $1"; fail=1; }
 # 1. package directory: check, compile, run
 $ORIN2 check "$SHOP" && ok "check <package-dir>" || bad "check <package-dir>"
 $ORIN2 compile "$SHOP" -o "$T/shop.c"
-cc -O1 -w -I runtime/core "$T/shop.c" runtime/core/orin_runtime.c runtime/platform/orin_platform.c -lm -o "$T/shop-exe"
+cc -O1 -w $(rt_inc) "$T/shop.c" $(rt_src) -lm -o "$T/shop-exe"
 got=$("$T/shop-exe")
 want=$(printf 'user 7 bob (internal)\n332')
 [ "$got" = "$want" ] && ok "compile+run <package-dir>" || bad "compile+run <package-dir> (got: $got)"

@@ -8,6 +8,7 @@
 #   4. both backends (C and, when clang is available, LLVM).
 set -eu
 cd "$(dirname "$0")/.."
+. tools/runtime_files.sh   # the runtime source list: tools/runtime-sources.txt
 ORIN2=${ORIN2:-build/bootstrap/orin2}
 CC=${CC:-cc}
 mkdir -p build/tests build/capabilities
@@ -18,10 +19,10 @@ build() { # backend name
   b=$1; n=$2
   if [ "$b" = llvm ]; then
     $ORIN2 compile tests/next/deny/$n.or --backend=llvm -o build/capabilities/$n.$b.ll
-    $CC -O1 -w -I runtime/core build/capabilities/$n.$b.ll runtime/core/orin_runtime.c runtime/core/orin_runtime_llvm.c runtime/platform/orin_platform.c -lm -o build/capabilities/$n.$b
+    $CC -O1 -w $(rt_inc) build/capabilities/$n.$b.ll $(rt_src) $(rt_llvm) -lm -o build/capabilities/$n.$b
   else
     $ORIN2 compile tests/next/deny/$n.or -o build/capabilities/$n.$b.c
-    $CC -O1 -w -I runtime/core build/capabilities/$n.$b.c runtime/core/orin_runtime.c runtime/platform/orin_platform.c -lm -o build/capabilities/$n.$b
+    $CC -O1 -w $(rt_inc) build/capabilities/$n.$b.c $(rt_src) -lm -o build/capabilities/$n.$b
   fi
 }
 

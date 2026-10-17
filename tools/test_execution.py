@@ -12,6 +12,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import time
+from runtime_files import rt_inc, rt_src, rt_llvm  # the runtime source list: tools/runtime-sources.txt
 
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "build/portable"
@@ -88,10 +89,9 @@ function main(host: Host): void {
         generated = OUT / ("bounded.c" if backend == "c" else "bounded.ll")
         exe = OUT / ("bounded_" + backend)
         run([orinc, "compile", source, "--backend=" + backend, "-o", generated])
-        cmd = ["clang", "-O2", "-w", "-I", "runtime/core", generated, "runtime/core/orin_runtime.c",
-               "runtime/platform/orin_platform.c", "-o", exe]
+        cmd = ["clang", "-O2", "-w", *rt_inc(), generated, *rt_src(), "-o", exe]
         if backend == "llvm":
-            cmd += ["runtime/core/orin_runtime_llvm.c"]
+            cmd += rt_llvm()
         run(cmd)
         result = run([exe], timeout=5)
         assert result.stdout == "hello\n7\n124\n-2\n-1\n", result

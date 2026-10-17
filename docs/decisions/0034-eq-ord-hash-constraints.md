@@ -67,3 +67,66 @@ get back equals the value you put in" in their contracts.
   work. It comes after rewrite step 2b, because it touches the checker's body rules, and before the
   std I/O freeze, because it changes the collection APIs. `std:net`/`std:http` do not depend on
   it: header maps use string keys.
+
+## Implementation status
+
+Slice 1 (language and compiler, 2026-10-17) delivers decisions 1, 2 (tiers 1 and 2), 4 and 5. Not part of the slice: tier 3
+(law obligations), the verifier axioms of decision 3, and the std collections (slice 2, below).
+
+**What is implemented.**
+- **Constraints.** `Eq`, `Ord` and `Hash` are built-in interfaces (no import, no declaration; a user-declared interface of the same
+  name wins). They are used with the existing bound syntax, `function max<T extends Ord>(a: T, b: T): T`,
+  `class Counter<K extends Hash>`, and in `implements` lists. `Ord` and `Hash` imply `Eq`. Like every bound there is one per type
+  parameter (ADR-0026), so a parameter cannot be `Ord` and `Hash` at once yet. The bounds are checked at every instantiation.
+- **Operations.** `==`, `!=` (`Eq`), `<`, `<=`, `>`, `>=` (`Ord`) and the methods `equals(other): bool`, `compare(other): int`
+  (-1, 0 or 1 for derived instances, any sign for an explicit one) and `hash(): usize` work on a bounded type parameter and, because
+  an instance is re-checked with the concrete type, on every type that has the instance, also without generics.
+- **Tier 1, derivation.** The integers, `usize`, `bool` and `string` are `Eq + Ord + Hash` (`false < true`, strings byte-wise);
+  records, unions, `Option`, `Result` and arrays are derived structurally. The order is lexicographic: fields in order, a union by
+  the position of its variant (`None` before `Some`, `Ok` before `Err`) and then its payload, an array element by element and then by
+  length. `float` / `f32` are none of the three as a *component or bound* (`==` on a bare `float` keeps working); function values,
+  interface values, resource handles and `Map` have no instance. The checker builds one HIR function per type
+  (`$derive.eq<T>`, `$derive.cmp<T>`, `$derive.hash<T>`, `compiler/check/derive.or`); scalar components call small prelude
+  functions (`cmpInt`, `hashStr`, `hashMix`, ... in `library/collections/map.or`). Existing programs are unaffected: no derived
+  function exists unless one is used, and the Map prelude keeps its scalar hash functions.
+- **Tier 2, classes.** A class declares `equals(other: C): bool`, `compare(other: C): int` and/or `hash(): usize` (public,
+  non-mutating) and then satisfies the bound; `==` and `<` call them. `implements Eq` / `Ord` / `Hash` without the method asks
+  for the structural instance of the class fields. An explicit `equals` next to `implements Hash` without `hash` (or `Ord` without
+  `compare`) is an error, because the derived hash could disagree with `equals`. Records and unions have no methods in the
+  language, so tier 2 is **limited to classes**; a record or union whose equality is not structural has to be wrapped in a class.
+  Generic classes work too (the signature is checked on each instance).
+- **Maps.** `Map<K, V>` takes any `Hash` key, including `K extends Hash` in a generic class. A key type that can never be
+  hashed (`float`, a function) is E0400 where the type is written, as before; a composite key that contains one, or a class without
+  `hash`, is E0475 when the map is created. The scalar key types use the same functions as before.
+- **Errors.** E0475 (a type does not satisfy `Eq`/`Ord`/`Hash`, with the reason: which field or component) and E0476 (an explicit
+  `equals`/`compare`/`hash` is unusable or inconsistent with the derivation). `==`/`<` on a type without the instance stays E0410,
+  now with the reason. See `docs/bootstrap-subset.md`.
+
+**Slice 2 (std collections, 2026-10-17).** `std:collections` has the generic containers, in addition to the specialised ones (nothing removed or renamed):
+- `Set<T extends Hash>`: the algorithm of `IntSet` / `StringSet` (a `Map<T, bool>`), same operations and contracts; `Set<int>` and `Set<string>`
+  are tested against `IntSet` / `StringSet` on random operation sequences.
+- `OrderedMap<K extends Ord, V>` (`OrderedEntry<K, V>`, `isStrictlyIncreasingOrd`): the B-tree. `tools/sorted_map.tmpl` is generated three times now
+  (int, string, `Ord`), so all three have the same code and invariants (`tools/gen_sorted_map.py`). `put` also states `floorKey(k) == k`, an
+  equality of keys that the specialised ones could state only through macros. Tested against `SortedMap` / `SortedStringMap`, including the tree
+  height, and with record, `Option`, array, `bool` and class keys.
+- `MinHeap<T extends Ord>`: the 4-ary heap of `PriorityQueue<T>` with the value as the key, FIFO among equal values; `pop` returns a value equal to
+  `old(peek())`. Tested against `PriorityQueue<int>` and with record and class elements.
+- `std:test` `assertEqual<T extends Eq>(actual, expected, msg)`. It shows no values (no generic `toString`); `assertEq` for `int` is unchanged.
+- Names: ADR-0034 wrote `SortedMap<K extends Ord, V>` and `PriorityQueue<T extends Ord>`, but those names are the specialised classes (`SortedMap<V>`,
+  `PriorityQueue<T>` with an explicit priority), and renaming them is a std-freeze decision (ADR-0048). The generic ones are `OrderedMap` and `MinHeap`
+  for now; `Set` was free.
+- Aliases: `IntSet` / `StringSet` could become `type IntSet = Set<int>` (identical algorithm, the `Map` key functions are the same scalar ones, so no
+  slowdown expected), `SortedMap<V>` / `SortedStringMap<V>` could become `OrderedMap<int, V>` / `OrderedMap<string, V>` only if `Ord` on a scalar
+  compiles to the direct comparison and not to the derived `compare` dispatch (to be measured before the freeze), and `PriorityQueue<T>` stays because
+  its `int` priority is separate from the value. Not done: removal or aliasing is a std-freeze decision.
+- The contract of the value type `V` (`get` after `put` returns the value) is still not stated, because `V` is unbounded and one bound per type parameter
+  is the ADR-0026 limit; keys, set elements and heap elements are covered.
+- Mutation check: 15 mutants of the generic code (`tools/mutation.sh std --module collections`), all killed.
+
+**What remains.**
+- Tier 3: the law proofs for explicit instances (strict mode, `NEEDS_DECISION`) and the generated `@Property` tests for normal
+  builds (ADR-0031 §17); the Z3 axioms for `Eq`/`Ord` on type parameters (decision 3).
+- Turning the int/string collections into aliases of the generic ones and the final names (`SortedMap`, `PriorityQueue`), before the std freeze; `V: Eq` in
+  `OrderedMap` contracts needs several bounds; `Array.indexOf/includes` for `T extends Eq` (ADR-0048).
+- Several bounds on one parameter (`T extends Ord & Hash`, ADR-0026 limit).
+- `Map` instances with a key class whose `hash` is slow or weak are the class author's responsibility (no law check yet).

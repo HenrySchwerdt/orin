@@ -248,3 +248,305 @@ export function rangesOk(lo: usize[], hi: usize[], chunks: usize): bool {
   }
   return true;
 }
+
+// ---- structured cancellation and outcomes (ADR-0017 Addendum B, Gate 1 / C0) -------------------------------------------------
+// Pure state machines, written against ADR-0048 naming. Nothing here blocks or reads a clock: std:task (C1+) loads a word from a
+// monitor, applies one of these functions and stores the result back inside one critical section. Instants are the `millis` of a
+// `MonotonicInstant` (std:time); NO_DEADLINE is -1. Everything is monotone: a cancellation cause, once set, never changes.
+
+// Cancellation causes (a token's state word). 0 = live. The first cause wins and is never replaced.
+export function causeLive(): usize { return 0; }
+export function causeCancelled(): usize { return 1; }  // cancel() on this token, on an ancestor, or a trapped sibling
+export function causeDeadline(): usize { return 2; }   // the absolute monotonic deadline passed
+
+// Task outcomes. 0 = still running. A settled outcome is the order of severity: Completed < Closed < Cancelled < Deadline < Error.
+export function outcomePending(): usize { return 0; }
+export function outcomeCompleted(): usize { return 1; }  // the task body returned
+export function outcomeClosed(): usize { return 2; }     // a channel end it waited on was closed and drained
+export function outcomeCancelled(): usize { return 3; }  // it stopped at a checkpoint because its token was cancelled
+export function outcomeDeadline(): usize { return 4; }   // it stopped because its deadline passed
+export function outcomeError(): usize { return 5; }      // it trapped
+
+export function isOutcome(o: usize): bool { return o <= 5; }
+export function isSettled(o: usize): bool { return o >= 1 && o <= 5; }
+
+// The cause that survives when `cur` is already set and `next` arrives (first cause wins).
+@Requires(cur <= 2 && next <= 2)
+@Ensures(result <= 2)
+@Ensures(cur != 0 ==> result == cur)
+@Ensures(cur == 0 ==> result == next)
+export function causeMerge(cur: usize, next: usize): usize {
+  return cur != 0 ? cur : next;
+}
+
+// A child token observes its parent: it keeps its own cause, else takes the parent's (cancellation flows down, never up).
+@Requires(child <= 2 && parent <= 2)
+@Ensures(child != 0 ==> result == child)
+@Ensures(child == 0 ==> result == parent)
+export function causeInherit(child: usize, parent: usize): usize {
+  return causeMerge(child, parent);
+}
+
+// The combined outcome of two settled outcomes (a scope's outcome over its children): the more severe one.
+@Requires(isSettled(a) && isSettled(b))
+@Ensures(isSettled(result))
+@Ensures(result == a || result == b)
+@Ensures(result >= a && result >= b)
+export function outcomeJoin(a: usize, b: usize): usize {
+  return a >= b ? a : b;
+}
+
+// The outcome a cancelled token imposes on a task that stops at a checkpoint (requires a set cause).
+@Requires(cause == 1 || cause == 2)
+@Ensures(result == 3 || result == 4)
+@Ensures((cause == 1) == (result == 3))
+export function outcomeOfCause(cause: usize): usize {
+  return cause == 2 ? 4 : 3;
+}
+
+// What a blocking call (recv, send, join, sleep ...) returns at a checkpoint, from what it can see under the lock:
+// `ready` = the operation can complete now, `closed` = the object it waits on is closed and drained, `cause` = the token's cause.
+// Precedence: completing beats closed beats cancelled, so a value that is already there is never dropped. 0 = keep waiting.
+@Requires(cause <= 2)
+@Ensures(ready ==> result == 1)
+@Ensures(!ready && closed ==> result == 2)
+@Ensures(!ready && !closed && cause == 0 ==> result == 0)
+@Ensures(!ready && !closed && cause != 0 ==> result == outcomeOfCause(cause))
+@Ensures(result <= 4)
+export function checkpointOutcome(ready: bool, closed: bool, cause: usize): usize {
+  if (ready) {
+    return 1;
+  }
+  if (closed) {
+    return 2;
+  }
+  if (cause == 0) {
+    return 0;
+  }
+  return outcomeOfCause(cause);
+}
+
+// ---- absolute monotonic deadlines (millis; -1 = none) ----
+
+export function noDeadline(): int { return -1; }
+
+export function deadlineOk(d: int): bool { return d >= -1; }
+
+// The tighter of two deadlines (a child never outlives its parent's deadline; none is the loosest).
+@Requires(deadlineOk(a) && deadlineOk(b))
+@Ensures(deadlineOk(result))
+@Ensures(a == -1 ==> result == b)
+@Ensures(b == -1 ==> result == a)
+@Ensures(a >= 0 && b >= 0 ==> result <= a && result <= b && (result == a || result == b))
+export function deadlineMin(a: int, b: int): int {
+  if (a < 0) {
+    return b;
+  }
+  if (b < 0) {
+    return a;
+  }
+  return a < b ? a : b;
+}
+
+// start + delay on millis, saturating at the largest i64 instead of overflowing (so a huge timeout means "practically never").
+@Requires(start >= 0 && delay >= 0)
+@Ensures(result >= start)
+@Ensures(delay <= 9223372036854775807 - start ==> result == start + delay)
+@Ensures(delay > 9223372036854775807 - start ==> result == 9223372036854775807)
+export function deadlineAfterMillis(start: int, delay: int): int {
+  if (delay > 9223372036854775807 - start) {
+    return 9223372036854775807;
+  }
+  return start + delay;
+}
+
+// The deadline has passed at `now` (equality counts as passed, as std:time `isExpired`).
+@Requires(deadlineOk(d) && now >= 0)
+@Ensures(d == -1 ==> !result)
+@Ensures(d >= 0 ==> result == (now >= d))
+export function deadlineExpired(d: int, now: int): bool {
+  return d >= 0 && now >= d;
+}
+
+// How long a timed wait may block at `now`: 0 when expired, the distance otherwise; -1 = no deadline, wait without a time limit.
+@Requires(deadlineOk(d) && now >= 0)
+@Ensures(d == -1 ==> result == -1)
+@Ensures(d >= 0 ==> result >= 0)
+@Ensures(d >= 0 && now >= d ==> result == 0)
+@Ensures(d >= 0 && now < d ==> result == d - now)
+export function waitBudget(d: int, now: int): int {
+  if (d < 0) {
+    return -1;
+  }
+  if (now >= d) {
+    return 0;
+  }
+  return d - now;
+}
+
+// The state of one cancellation token: its cause and its absolute monotonic deadline. Monotone: the cause is set once, the
+// deadline can only move earlier. Tokens form a tree; a child reads its parent's cause with `observe`.
+@Invariant(this.cause <= 2)
+@Invariant(deadlineOk(this.deadline))
+export class CancelState {
+  cause: usize;
+  deadline: int;
+
+  @Requires(cause <= 2 && deadlineOk(deadline))
+  constructor(cause: usize, deadline: int) {
+    this.cause = cause;
+    this.deadline = deadline;
+  }
+
+  // isCancelled(): some cause is set (a task must stop at its next checkpoint).
+  @Ensures(result == (this.cause != 0))
+  isCancelled(): bool {
+    return this.cause != 0;
+  }
+
+  // cancel(): explicit cancellation; has no effect when a cause is already set.
+  @Ensures(this.cause != 0)
+  @Ensures(old(this.cause) != 0 ==> this.cause == old(this.cause))
+  @Ensures(old(this.cause) == 0 ==> this.cause == 1)
+  @Ensures(this.deadline == old(this.deadline))
+  cancel(): void {
+    this.cause = causeMerge(this.cause, 1);
+  }
+
+  // limit(d): the token may not outlive deadline d (the tighter deadline wins).
+  @Requires(deadlineOk(d))
+  @Ensures(this.cause == old(this.cause))
+  @Ensures(this.deadline == deadlineMin(old(this.deadline), d))
+  limit(d: int): void {
+    this.deadline = deadlineMin(this.deadline, d);
+  }
+
+  // observe(parentCause, now): fold in the parent's cause and the clock; returns whether the token is cancelled afterwards.
+  // A parent cause wins over a deadline that expires at the same observation (the parent was cancelled first).
+  @Requires(parentCause <= 2 && now >= 0)
+  @Ensures(old(this.cause) != 0 ==> this.cause == old(this.cause))
+  @Ensures(old(this.cause) == 0 && parentCause != 0 ==> this.cause == parentCause)
+  @Ensures(old(this.cause) == 0 && parentCause == 0 && deadlineExpired(this.deadline, now) ==> this.cause == 2)
+  @Ensures(result == (this.cause != 0))
+  observe(parentCause: usize, now: int): bool {
+    this.cause = causeInherit(this.cause, parentCause);
+    if (this.cause == 0 && deadlineExpired(this.deadline, now)) {
+      this.cause = 2;
+    }
+    return this.cause != 0;
+  }
+
+  // budget(now): the time a timed wait may block; 0 when the token is already cancelled; -1 = unlimited.
+  @Requires(now >= 0)
+  @Ensures(this.cause != 0 ==> result == 0)
+  @Ensures(this.cause == 0 ==> result == waitBudget(this.deadline, now))
+  budget(now: int): int {
+    if (this.cause != 0) {
+      return 0;
+    }
+    return waitBudget(this.deadline, now);
+  }
+}
+
+// The exactly-once result slot of one task: it starts pending, `settle` records the outcome once, `take` hands the result token to
+// the joiner once (token ownership: the slot gives it up, the joiner owns it afterwards). Pure counterpart of the result monitor.
+@Invariant(isOutcome(this.outcome))
+@Invariant(!this.taken || this.outcome != 0)
+export class TaskCell {
+  outcome: usize;
+  taken: bool;
+
+  constructor() {
+    this.outcome = 0;
+    this.taken = false;
+  }
+
+  // isDone(): the outcome has been recorded.
+  @Ensures(result == (this.outcome != 0))
+  isDone(): bool {
+    return this.outcome != 0;
+  }
+
+  // settle(o): record the outcome; legal exactly once.
+  @Requires(this.outcome == 0 && isSettled(o))
+  @Ensures(this.outcome == o && !this.taken)
+  settle(o: usize): void {
+    this.outcome = o;
+  }
+
+  // canTake(): the joiner may take the result now.
+  @Ensures(result == (this.outcome != 0 && !this.taken))
+  canTake(): bool {
+    return this.outcome != 0 && !this.taken;
+  }
+
+  // take(): the outcome, handed over once (a second take is a bug and traps, as "join twice" does).
+  @Requires(this.outcome != 0 && !this.taken)
+  @Ensures(result == this.outcome && this.taken)
+  take(): usize {
+    this.taken = true;
+    return this.outcome;
+  }
+}
+
+// The cancellation bookkeeping of one scope: its token, how many tasks are still running, and the outcome over the finished ones.
+// A child that traps cancels the scope (siblings stop at their next checkpoint); the scope is done when no task is running.
+@Invariant(this.finished <= this.spawned)
+@Invariant(this.cause <= 2)
+@Invariant(this.worst <= 5)
+@Invariant(this.finished == 0 ==> this.worst == 0)
+@Invariant(this.finished > 0 ==> this.worst != 0)
+export class CancelScope {
+  spawned: usize;
+  finished: usize;
+  cause: usize;
+  worst: usize;
+
+  @Requires(cause <= 2)
+  constructor(cause: usize) {
+    this.spawned = 0;
+    this.finished = 0;
+    this.cause = cause;
+    this.worst = 0;
+  }
+
+  // spawn(): a new task; a cancelled scope still accepts it, and the task stops at its first checkpoint.
+  @Ensures(this.spawned == old(this.spawned) + 1)
+  @Ensures(this.cause == old(this.cause))
+  spawn(): void {
+    this.spawned += 1;
+  }
+
+  // cancel(): the scope token is cancelled by its owner or its parent (the first cause stays).
+  @Requires(cause == 1 || cause == 2)
+  @Ensures(this.cause == causeMerge(old(this.cause), cause))
+  cancel(cause: usize): void {
+    this.cause = causeMerge(this.cause, cause);
+  }
+
+  // settle(o): one task finished with outcome o. A trap cancels the rest of the scope.
+  @Requires(this.finished < this.spawned && isSettled(o))
+  @Ensures(this.finished == old(this.finished) + 1)
+  @Ensures(o == 5 ==> this.cause != 0)
+  @Ensures(o != 5 ==> this.cause == old(this.cause))
+  @Ensures(this.worst >= o)
+  settle(o: usize): void {
+    this.worst = this.finished == 0 ? o : outcomeJoin(this.worst, o);
+    this.finished += 1;
+    if (o == 5) {
+      this.cause = causeMerge(this.cause, 1);
+    }
+  }
+
+  // isDone(): no task is running any more, so the scope may return.
+  @Ensures(result == (this.finished == this.spawned))
+  isDone(): bool {
+    return this.finished == this.spawned;
+  }
+
+  // running(): tasks that have not finished.
+  @Ensures(result == this.spawned - this.finished)
+  running(): usize {
+    return this.spawned - this.finished;
+  }
+}

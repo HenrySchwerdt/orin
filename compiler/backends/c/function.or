@@ -7,7 +7,9 @@
 import { BinOp, UnOp, Builtin, taskOpC } from "../../hir";
 import {
   MType, MLocal, Operand, Instr, SwitchCase, Terminator, MBlock, MFunction, MProgram, aggWords,
-  isAggTy, slotWords,
+  isAggTy, slotWords, RT_OPT_UNWRAP, RT_RES_UNWRAP, RT_RES_UNWRAP_ERR, RT_V_UNWRAP, RT_ASSERT_FACT, RT_ASSERT_ARRAY,
+  RT_STRUCT_NEW, RT_ARRAY_NEW, RT_STR_APPEND, RT_STR_APPEND_SUB, RT_STR_APPEND_USIZE, RT_STR_APPEND_INT, RT_STR_PREPEND,
+  RT_ARRAY_SLICE, RT_ARRAY_CONCAT, RT_ARRAY_EXTEND, RT_BYTES_TO_STRING, RT_STRING_TO_BYTES, rtSig, l1Builtin,
 } from "../../mir";
 
 import {
@@ -160,11 +162,7 @@ function runtimeCall(op: Builtin): Option<RtCall> {
     BStrWithCapacity => c("orin_str_with_capacity", 1),
     BArrLength => c("orin_array_len", 1),
     BArrGet => c("orin_array_get", 2),
-    BArrSlice => c("orin_array_slice", 3),
-    BArrConcat => c("orin_array_concat", 2),
     BArrJoin => c("orin_array_join", 2),
-    BBytesToString => c("orin_bytes_to_string", 3),
-    BStringToBytes => c("orin_string_to_bytes", 1),
     BIntToString => c("orin_int_to_string", 1),
     BIntToUsize => c("orin_int_to_usize", 1),
     BUsizeToString => c("orin_usize_to_string", 1),
@@ -226,17 +224,63 @@ function coreC(k: usize, a: string[]): string {
     5 => storeC(a[0], "uint32_t", "4", a[1]),
     6 => storeC(a[0], "uint64_t", "8", a[1]),
     7 => storeC(a[0], "double", "8", a[1]),
-    8 => "((uint64_t)(uintptr_t)orin_platform_alloc((size_t)(" + a[0] + ")))",
+    8 => "({ void *m_ = orin_platform_alloc((size_t)(" + a[0] + ")); if (!m_) orin_trap(\"out of memory\"); (uint64_t)(uintptr_t)m_; })",
     9 => "orin_platform_free(" + addrC(a[0]) + ")",
     10 => "(void)orin_platform_mem_copy(" + addrC(a[0]) + ", " + addrC(a[1]) + ", (size_t)(" + a[2] + "))",
     11 => "(void)orin_platform_mem_set(" + addrC(a[0]) + ", (int)(uint8_t)(" + a[1] + "), (size_t)(" + a[2] + "))",
-    _ => "((uint64_t)(uintptr_t)(" + a[0] + "))",
+    12 => "((uint64_t)(uintptr_t)(" + a[0] + "))",
+    13 => "((uint64_t)(" + a[0] + ") & (uint64_t)(" + a[1] + "))",
+    14 => "((uint64_t)(" + a[0] + ") | (uint64_t)(" + a[1] + "))",
+    15 => "((uint64_t)(" + a[0] + ") ^ (uint64_t)(" + a[1] + "))",
+    16 => "({ uint64_t n_ = (uint64_t)(" + a[1] + "); n_ >= 64 ? (uint64_t)0 : (uint64_t)(" + a[0] + ") << n_; })",
+    17 => "({ uint64_t n_ = (uint64_t)(" + a[1] + "); n_ >= 64 ? (uint64_t)0 : (uint64_t)(" + a[0] + ") >> n_; })",
+    18 => "((int64_t)__builtin_expect((long)(" + a[0] + "), (long)(" + a[1] + ")))",
+    19 => "((uint64_t)((" + a[0] + ") == 0 ? ORIN_CFG_FREELIST : (" + a[0] + ") == 1 ? ORIN_CFG_STATS : (" + a[0]
+        + ") == 2 ? ORIN_CFG_SITES : 0))",
+    20 => "((uint64_t)(uintptr_t)&orin_heap)",
+    21 => "({ void *m_ = orin_platform_realloc(" + addrC(a[0]) + ", (size_t)(" + a[1]
+        + ")); if (!m_) orin_trap(\"out of memory\"); (uint64_t)(uintptr_t)m_; })",
+    22 => "(void)orin_platform_mem_move(" + addrC(a[0]) + ", " + addrC(a[1]) + ", (size_t)(" + a[2] + "))",
+    24 => "((uint64_t)(" + a[0] + ") + (uint64_t)(" + a[1] + "))",
+    25 => "((uint64_t)(" + a[0] + ") - (uint64_t)(" + a[1] + "))",
+    26 => "((uint64_t)(" + a[0] + ") * (uint64_t)(" + a[1] + "))",
+    _ => "({ int c_ = orin_platform_mem_cmp(" + addrC(a[0]) + ", " + addrC(a[1]) + ", (size_t)(" + a[2]
+        + ")); (int64_t)((c_ > 0) - (c_ < 0)); })",
   };
 }
 
+// The call of the L1 function `sym` (mir/rt.or) with the object `a` as an address word.
+function l1Obj(sym: string, a: string): string {
+  return sym + "((uint64_t)(uintptr_t)(" + a + "))";
+}
+
+// The call of the string / array function that the L1 entry `k` replaces, with the C arguments `a`: the Orin function of `$rt`
+// (objects as address words, the result cast back) when the program has it, else the C runtime function of the same signature.
+function rtCallC(syms: CSymbols, k: usize, a: string[]): string {
+  const sym = syms.l1(k);
+  const w = rtSig(k).unwrap();
+  if (sym == "") {
+    return callN(w.name, a, a.length);
+  }
+  let args = "";
+  let i: usize = 0;
+  while (i < w.params.length) {
+    args += (i > 0 ? ", " : "") + (w.params[i] == "o" ? "(uint64_t)(uintptr_t)(" + a[i] + ")" : a[i]);
+    i += 1;
+  }
+  return "((OrinObj *)(uintptr_t)" + sym + "(" + args + "))";
+}
+
 // C expression for a builtin whose result is a fresh Owned ref or a scalar. `rt` is the type of the destination (MVoid
-// when there is none).
-export function builtinC(op: Builtin, a: string[], rt: MType): string {
+// when there is none). `syms` holds the L1 entries (the unwrap builtins call the Orin functions of `$rt`; without them the
+// C runtime's).
+export function builtinC(op: Builtin, a: string[], rt: MType, syms: CSymbols): string {
+  match (l1Builtin(op)) {
+    Some(k) => {
+      return rtCallC(syms, k, a);
+    },
+    None => {},
+  }
   match (runtimeCall(op)) {
     Some(rc) => {
       return callN(rc.name, a, rc.n);
@@ -248,14 +292,26 @@ export function builtinC(op: Builtin, a: string[], rt: MType): string {
     BOptIsNone => "(orin_tag(" + a[0] + ") == 1)",
     BResIsOk => "(orin_tag(" + a[0] + ") == 0)",
     BResIsErr => "(orin_tag(" + a[0] + ") == 1)",
-    BOptUnwrap => dupIf(rt, fromSlot(rt, callN("orin_opt_unwrap", a, 1))),
+    BOptUnwrap => dupIf(
+      rt,
+      fromSlot(rt, syms.l1(RT_OPT_UNWRAP) != "" ? l1Obj(syms.l1(RT_OPT_UNWRAP), a[0]) : callN("orin_opt_unwrap", a, 1)),
+    ),
     BOptUnwrapOr => dupIf(
       rt,
       "(orin_tag(" + a[0] + ") == 0 ? " + fromSlot(rt, "orin_struct_get(" + a[0] + ", 0)") + " : "
           + a[1] + ")",
     ),
-    BResUnwrap => dupIf(rt, fromSlot(rt, callN("orin_res_unwrap", a, 1))),
-    BResUnwrapErr => dupIf(rt, fromSlot(rt, callN("orin_res_unwrap_err", a, 1))),
+    BResUnwrap => dupIf(
+      rt,
+      fromSlot(rt, syms.l1(RT_RES_UNWRAP) != "" ? l1Obj(syms.l1(RT_RES_UNWRAP), a[0]) : callN("orin_res_unwrap", a, 1)),
+    ),
+    BResUnwrapErr => dupIf(
+      rt,
+      fromSlot(
+        rt,
+        syms.l1(RT_RES_UNWRAP_ERR) != "" ? l1Obj(syms.l1(RT_RES_UNWRAP_ERR), a[0]) : callN("orin_res_unwrap_err", a, 1),
+      ),
+    ),
     BIntToFloat => "((double)(" + a[0] + "))",
     BUsizeToFloat => "((double)(" + a[0] + "))",
     BF32Round => "((double)(float)(" + a[0] + "))",
@@ -326,7 +382,7 @@ function unwrapWhat(b: Builtin): string {
 
 // C expression of an Option / Result builtin whose argument 0 is the aggregate local `l` (`a1` the C text of argument 1,
 // the default of `unwrapOr`); `rt` is the type of the destination (a plain scalar, or MVoid).
-export function aggBuiltinC(b: Builtin, l: usize, a1: string, rt: MType): string {
+export function aggBuiltinC(b: Builtin, l: usize, a1: string, rt: MType, syms: CSymbols): string {
   const tag = aggWordC(l, 0);
   return match (b) {
     BOptIsSome => "(" + tag + " == 0)",
@@ -334,7 +390,11 @@ export function aggBuiltinC(b: Builtin, l: usize, a1: string, rt: MType): string
     BOptIsNone => "(" + tag + " == 1)",
     BResIsErr => "(" + tag + " == 1)",
     BOptUnwrapOr => "(" + tag + " == 0 ? " + fromSlot(rt, aggWordC(l, 1)) + " : " + a1 + ")",
-    _ => fromSlot(rt, "orin_v_unwrap(" + tag + ", " + aggWordC(l, 1) + ", " + unwrapWhat(b) + ")"),
+    _ => fromSlot(
+      rt,
+      (syms.l1(RT_V_UNWRAP) != "" ? syms.l1(RT_V_UNWRAP) : "orin_v_unwrap") + "(" + tag + ", " + aggWordC(l, 1) + ", "
+          + unwrapWhat(b) + ")",
+    ),
   };
 }
 
@@ -391,7 +451,10 @@ export class CFunctionEmitter {
 
   // `--assert-facts`: the check an unchecked array access skips, run before it (exit 70 if it would have trapped).
   private assertArray(a: Operand, k: Operand): string {
-    return this.facts ? "orin_assert_array(" + opC(a) + ", " + opC(k) + "); " : "";
+    const sym = this.syms.l1(RT_ASSERT_ARRAY);
+    return this.facts
+        ? (sym != "" ? sym + "((uint64_t)(uintptr_t)(" + opC(a) + "), " : "orin_assert_array(" + opC(a) + ", ") + opC(k) + "); "
+        : "";
   }
 
   private slotOf(o: Operand): string {
@@ -455,8 +518,8 @@ export class CFunctionEmitter {
     };
     const agg: Option<usize> = args.length > 0 ? this.aggLocal(args[0]) : None;
     const code = match (agg) {
-      Some(l) => aggBuiltinC(b, l, args.length > 1 ? opC(args[1]) : "0", rt),
-      None => builtinC(b, args.map(opC), rt),
+      Some(l) => aggBuiltinC(b, l, args.length > 1 ? opC(args[1]) : "0", rt, this.syms),
+      None => builtinC(b, args.map(opC), rt, this.syms),
     };
     return assignOpt(d, code);
   }
@@ -491,17 +554,17 @@ export class CFunctionEmitter {
       ICall(d, g, args) => this.call(d, g, args),
       IBuiltin(d, b, args) => this.builtin(d, b, args),
 
-      IStrAppend(x, y) => lname(x) + " = orin_str_append(" + lname(x) + ", " + opC(y) + ");",
-      IStrAppendSub(x, y, a, b) => lname(x) + " = orin_str_append_sub(" + lname(x) + ", " + opC(y) + ", " + opC(a) + ", "
-          + opC(b) + ");",
-      IStrAppendNum(x, y, uns) => lname(x) + " = " + (uns ? "orin_str_append_usize(" : "orin_str_append_int(")
-          + lname(x) + ", " + opC(y) + ");",
-      IStrPrepend(x, y) => lname(x) + " = orin_str_prepend(" + lname(x) + ", " + opC(y) + ");",
-      IArrayExtend(x, y) => lname(x) + " = orin_array_extend(" + lname(x) + ", " + opC(y) + ");",
+      IStrAppend(x, y) => lname(x) + " = " + rtCallC(this.syms, RT_STR_APPEND, [lname(x), opC(y)]) + ";",
+      IStrAppendSub(x, y, a, b) => lname(x) + " = " + rtCallC(this.syms, RT_STR_APPEND_SUB, [lname(x), opC(y), opC(a), opC(b)])
+          + ";",
+      IStrAppendNum(x, y, uns) => lname(x) + " = "
+          + rtCallC(this.syms, uns ? RT_STR_APPEND_USIZE : RT_STR_APPEND_INT, [lname(x), opC(y)]) + ";",
+      IStrPrepend(x, y) => lname(x) + " = " + rtCallC(this.syms, RT_STR_PREPEND, [lname(x), opC(y)]) + ";",
+      IArrayExtend(x, y) => lname(x) + " = " + rtCallC(this.syms, RT_ARRAY_EXTEND, [lname(x), opC(y)]) + ";",
       IStructNew(d, tag, slots) => this.structNew(d, tag, slots),
       INullary(d, t) => isAggTy(this.ty(d))
           ? this.aggNew(d, t, [])
-          : lname(d) + " = orin_nullary(" + u(t) + ");",
+          : lname(d) + " = " + this.nullaryC(t) + ";",
       ITag(d, o) => match (this.aggLocal(o)) {
         Some(l) => lname(d) + " = (int64_t)" + aggWordC(l, 0) + ";",
         None => lname(d) + " = (int64_t)orin_tag(" + opC(o) + ");",
@@ -543,7 +606,9 @@ export class CFunctionEmitter {
 
       // Check the pre-instruction slot: d may also be the index local k.
       IForward(d, s, o, k) => (this.facts
-          ? "orin_assert_fact(" + opC(o) + ", " + opC(k) + ", " + this.slotOf(OLocal(s)) + "); "
+          ? (this.syms.l1(RT_ASSERT_FACT) != ""
+              ? this.syms.l1(RT_ASSERT_FACT) + "((uint64_t)(uintptr_t)(" + opC(o) + "), "
+              : "orin_assert_fact(" + opC(o) + ", ") + opC(k) + ", " + this.slotOf(OLocal(s)) + "); "
           : "")
           + lname(d) + " = " + lname(s) + ";",
       IClosure(d, g, caps) => this.closure(d, g, caps),
@@ -579,8 +644,7 @@ export class CFunctionEmitter {
     }
     const n = lname(d);
 
-    let s = n + " = orin_struct_new(" + u(tag) + ", " + u(slots.length) + ", "
-        + u(this.maskOf(slots)) + "ULL);";
+    let s = n + " = " + this.newStruct(u(tag), u(slots.length), u(this.maskOf(slots)) + "ULL") + ";";
     let k: usize = 0;
     for (const o of slots) {
       s += " orin_struct_init(" + n + ", " + u(k) + ", " + this.slotOf(o) + ");";
@@ -591,11 +655,26 @@ export class CFunctionEmitter {
 
   private arrayNew(d: usize, isRef: bool, es: Operand[]): string {
     const n = lname(d);
-    let s = n + " = orin_array_new(" + u(es.length) + ", " + (isRef ? "1" : "0") + ");";
+    const sym = this.syms.l1(RT_ARRAY_NEW);
+    let s = n + " = " + (sym != "" ? "(OrinObj *)(uintptr_t)" + sym : "orin_array_new") + "(" + u(es.length) + ", "
+        + (isRef ? "1" : "0") + ");";
     for (const o of es) {
       s += " orin_array_push(" + n + ", " + this.slotOf(o) + ");";
     }
     return s;
+  }
+
+  // The C expression of a new struct (`orin_struct_new`): the Orin function of `$rt` when the program has it (a `static inline`
+  // the C compiler can inline), else the C runtime's.
+  private newStruct(tag: string, nslots: string, mask: string): string {
+    const sym = this.syms.l1(RT_STRUCT_NEW);
+    return (sym != "" ? "(OrinObj *)(uintptr_t)" + sym : "orin_struct_new") + "(" + tag + ", " + nslots + ", " + mask + ")";
+  }
+
+  // The immortal payload-less variant with tag `t`: a static object of the unit when the program has the L1 entries
+  // (`nullaryDecls` in cemit.or: no table, no atomic load), else the C runtime's shared singleton.
+  private nullaryC(t: usize): string {
+    return this.syms.l1Loaded() ? "(OrinObj *)&orin_nz" + u(t) : "orin_nullary(" + u(t) + ")";
   }
 
   // A closure is a struct `{ code pointer (scalar slot 0), environment (reference slot 1) }`; the environment is a struct
@@ -605,10 +684,9 @@ export class CFunctionEmitter {
   private closure(d: usize, g: usize, caps: Operand[]): string {
     const n = lname(d);
     let s = "";
-    let env = "orin_nullary(0)";
+    let env = this.nullaryC(0);
     if (caps.length > 0) {
-      s += "{ OrinObj *env_ = orin_struct_new(0, " + u(caps.length) + ", " + u(this.maskOf(caps))
-          + "ULL);";
+      s += "{ OrinObj *env_ = " + this.newStruct("0", u(caps.length), u(this.maskOf(caps)) + "ULL") + ";";
       let k: usize = 0;
       for (const o of caps) {
         s += " orin_struct_init(env_, " + u(k) + ", " + this.slotOf(o) + ");";
@@ -617,7 +695,7 @@ export class CFunctionEmitter {
       s += " ";
       env = "env_";
     }
-    s += n + " = orin_struct_new(0, 2, 2ULL); orin_struct_init(" + n + ", 0, (uint64_t)(uintptr_t)&"
+    s += n + " = " + this.newStruct("0", "2", "2ULL") + "; orin_struct_init(" + n + ", 0, (uint64_t)(uintptr_t)&"
         + this.syms.name(g) + "); orin_struct_init(" + n + ", 1, ORIN_SLOT(" + env + "));";
     if (caps.length > 0) {
       s += " }";
@@ -648,7 +726,7 @@ export class CFunctionEmitter {
   @Requires(vt < this.syms.vtables())
   private iface(d: usize, vt: usize, v: Operand): string {
     const n = lname(d);
-    return n + " = orin_struct_new(0, 2, 2ULL); orin_struct_init(" + n
+    return n + " = " + this.newStruct("0", "2", "2ULL") + "; orin_struct_init(" + n
         + ", 0, (uint64_t)(uintptr_t)orin_vt" + u(vt) + "); orin_struct_init(" + n + ", 1, "
         + this.slotOf(v) + ");";
   }

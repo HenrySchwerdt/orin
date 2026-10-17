@@ -1,0 +1,176 @@
+// std:coreprobe -- self-test of the core operations (ADR-0052 step R3a, spec 19 section 4; hir/coreops.or).
+//
+// INTERNAL. The core operations (raw loads / stores at a usize address, platform memory functions, the object address of a
+// reference) are reachable only through the internal module std:core, which only the modules of the embedded `$rt` root
+// (runtime/core/) can import, so a test of them has to live here. It is reached as `std:coreprobe` (loader/resolve.or). `coreProbe()` runs every operation on memory it allocates itself and returns one line per
+// check; `tests/run/core_ops.or` prints it and the conformance suite compares the output on both backends (C and LLVM). It
+// touches no memory but its own allocations. Delete it when the runtime modules of R3b+ exercise the operations for real.
+
+import {
+  load8, load32, load64, loadF64, store8, store32, store64, storeF64, memAlloc, memFree, memCopy, memSet, addrOf,
+  and, or, xor, shl, shr, expect, cfg, heapBase, memRealloc, memMove, memCmp, wadd, wsub, wmul
+} from "std:core";
+
+type Pair = { x: int; y: int; };
+
+function line(name: string, ok: bool): string {
+  return name + (ok ? " ok" : " FAIL") + "\n";
+}
+
+// One line per operation: "<name> ok" or "<name> FAIL".
+export function coreProbe(): string {
+  let out = "";
+  const a = memAlloc(64);
+  out += line("memAlloc", a != 0);
+
+  // memSet / load8: every byte of the block, and only the low 8 bits of the value are used
+  memSet(a, 0, 64);
+  out += line("memSet zero", load64(a) == 0 && load64(a + 56) == 0);
+  memSet(a, 0x1AB, 16);
+  out += line("memSet byte", load8(a) == 0xAB && load8(a + 15) == 0xAB && load8(a + 16) == 0);
+  out += line("load8 zero-extends", load8(a) == 171);
+
+  // store8 / store32 / store64 and the loads, at unaligned addresses too
+  memSet(a, 0, 64);
+  store8(a, 0x1FF);
+  out += line("store8 low byte", load8(a) == 255 && load8(a + 1) == 0);
+  store32(a + 4, 0x1DEADBEEF);
+  out += line("store32 low word", load32(a + 4) == 0xDEADBEEF && load32(a + 8) == 0);
+  out += line("load32 zero-extends", load32(a + 4) == 3735928559);
+  store64(a + 8, 0x0123456789ABCDEF);
+  out += line("store64", load64(a + 8) == 0x0123456789ABCDEF);
+  store64(a + 17, 18446744073709551615);
+  out += line("load64 unaligned", load64(a + 17) == 18446744073709551615 && load8(a + 16) == 0 && load8(a + 25) == 0);
+  store32(a + 33, 1);
+  out += line("load32 unaligned", load32(a + 33) == 1);
+  out += line("native order", load8(a + 8) == load64(a + 8) - (load64(a + 8) / 256) * 256);
+
+  // floats
+  storeF64(a + 40, 1.5);
+  out += line("storeF64 / loadF64", loadF64(a + 40) == 1.5);
+  storeF64(a + 41, -0.25);
+  out += line("loadF64 unaligned", loadF64(a + 41) == -0.25);
+  store64(a + 48, 0x3FF0000000000000);
+  out += line("loadF64 bits", loadF64(a + 48) == 1.0);
+  storeF64(a + 48, 2.0);
+  out += line("storeF64 bits", load64(a + 48) == 0x4000000000000000);
+
+  // memCopy
+  const b = memAlloc(64);
+  memSet(b, 7, 64);
+  memCopy(b + 3, a + 8, 8);
+  out += line("memCopy", load64(b + 3) == 0x0123456789ABCDEF && load8(b + 2) == 7 && load8(b + 11) == 7);
+  memCopy(b, a, 0);
+  out += line("memCopy zero length", load8(b) == 7);
+
+  // memAlloc(0) is a valid block of one byte, never address 0
+  const z = memAlloc(0);
+  out += line("memAlloc zero", z != 0);
+  store8(z, 9);
+  out += line("memAlloc zero usable", load8(z) == 9);
+
+  // addrOf: the object address of a reference; stable, distinct per object, and it leaves the object alone
+  const s = "core";
+  const t = "dore";
+  const xs: int[] = [1, 2, 3];
+  out += line("addrOf string", addrOf(s) != 0 && addrOf(s) == addrOf(s) && addrOf(s) != addrOf(t));
+  out += line("addrOf array", addrOf(xs) != 0 && addrOf(xs) == addrOf(xs) && addrOf(xs) != addrOf(s));
+  out += line("addrOf aligned", addrOf(s) / 8 * 8 == addrOf(s) && addrOf(xs) / 8 * 8 == addrOf(xs));
+  out += line("addrOf leaves value", s == "core" && xs.length == 3 && xs[2] == 3);
+
+  // addrOf needs the real object (ADR-0052 Addendum A, rule 2): the optimiser must not unbox the record or scalar-replace the
+  // array, so the layout is there: string len@16 data@32, array len@16 items@40 (a pointer to the buffer), struct nslots@16 slots@32
+  const u = "wxyz";
+  const pr = Pair { x: 7, y: 9 };
+  const ys: int[] = [4, 5, 6];
+  out += line("addrOf string layout", load64(addrOf(u) + 16) == 4 && load8(addrOf(u) + 32) == 119 && load8(addrOf(u) + 35) == 122);
+  out += line("addrOf array layout", load64(addrOf(ys) + 16) == 3 && load64(load64(addrOf(ys) + 40)) == 4 && load64(load64(addrOf(ys) + 40) + 16) == 6);
+  out += line("addrOf record layout", load64(addrOf(pr) + 16) == 2 && load64(addrOf(pr) + 32) == 7 && load64(addrOf(pr) + 40) == 9);
+
+  // bit operations on usize
+  out += line("and", and(0xF0F0, 0xFF00) == 0xF000 && and(18446744073709551615, 5) == 5);
+  out += line("or", or(0xF0F0, 0x0F0F) == 0xFFFF && or(0, 0) == 0);
+  out += line("xor", xor(0xFF, 0x0F) == 0xF0 && xor(18446744073709551615, 18446744073709551615) == 0);
+  out += line("shl", shl(1, 3) == 8 && shl(1, 63) == 9223372036854775808 && shl(3, 63) == 9223372036854775808);
+  out += line("shl 64 or more", shl(1, 64) == 0 && shl(18446744073709551615, 200) == 0);
+  out += line("shr", shr(256, 4) == 16 && shr(18446744073709551615, 63) == 1 && shr(5, 0) == 5);
+  out += line("shr 64 or more", shr(18446744073709551615, 64) == 0 && shr(1, 1000) == 0);
+  out += line("shr is logical", shr(9223372036854775808, 62) == 2);
+  const refmask: usize = 5;
+  out += line("bit test", and(shr(refmask, 2), 1) == 1 && and(shr(refmask, 1), 1) == 0);
+
+  // wrapping arithmetic on usize: no overflow trap
+  out += line("wadd", wadd(1, 2) == 3 && wadd(18446744073709551615, 2) == 1 && wadd(18446744073709551615, 1) == 0);
+  out += line("wsub", wsub(5, 3) == 2 && wsub(0, 1) == 18446744073709551615 && wsub(3, 3) == 0);
+  out += line("wmul", wmul(6, 7) == 42 && wmul(9223372036854775808, 2) == 0 && wmul(4294967296, 4294967296) == 0);
+
+  // expect is the identity on its first argument
+  const yes = a != 0;
+  out += line("expect", expect(yes, true) && !expect(!yes, true) && expect(yes, false) && !expect(!yes, false));
+
+  // cfg: 0 or 1 for the three switches, 0 for an unknown number
+  out += line("cfg", cfg(0) <= 1 && cfg(1) <= 1 && cfg(2) <= 1 && cfg(3) == 0 && cfg(100) == 0);
+
+  // heapBase: a stable 8-aligned address; word 63 (byte 504) is ours (`probe` of OrinHeap) (zero at first, then what we store)
+  const h = heapBase();
+  out += line("heapBase", h != 0 && h == heapBase() && h / 8 * 8 == h);
+  out += line("heapBase zeroed", load64(h + 504) == 0);
+  store64(h + 504, 77);
+  out += line("heapBase usable", load64(h + 504) == 77 && load64(heapBase() + 504) == 77);
+  store64(h + 504, 0);
+
+  // memRealloc keeps the contents, grows and shrinks, and a size of 0 is one byte
+  const c = memAlloc(16);
+  store64(c, 0x1122334455667788);
+  store64(c + 8, 0x99AABBCCDDEEFF00);
+  const c2 = memRealloc(c, 4096);
+  out += line("memRealloc grow", c2 != 0 && load64(c2) == 0x1122334455667788 && load64(c2 + 8) == 0x99AABBCCDDEEFF00);
+  store8(c2 + 4095, 5);
+  out += line("memRealloc usable", load8(c2 + 4095) == 5);
+  const c3 = memRealloc(c2, 8);
+  out += line("memRealloc shrink", c3 != 0 && load64(c3) == 0x1122334455667788);
+  const c4 = memRealloc(c3, 0);
+  out += line("memRealloc zero", c4 != 0 && load8(c4) == 0x88);
+
+  // memMove: overlapping ranges in both directions
+  memSet(b, 0, 64);
+  store64(b, 0x0807060504030201);
+  memMove(b + 2, b, 8);
+  out += line("memMove up", load8(b) == 1 && load8(b + 1) == 2 && load8(b + 2) == 1 && load8(b + 9) == 8);
+  memMove(b, b + 2, 8);
+  out += line("memMove down", load8(b) == 1 && load8(b + 7) == 8);
+  memMove(b, a, 0);
+  out += line("memMove zero length", load8(b) == 1);
+
+  // memCmp: -1, 0, 1 by the first differing byte, bytes compare unsigned
+  const x = memAlloc(8);
+  const y = memAlloc(8);
+  memSet(x, 3, 8);
+  memSet(y, 3, 8);
+  out += line("memCmp equal", memCmp(x, y, 8) == 0 && memCmp(x, y, 0) == 0);
+  store8(y + 5, 4);
+  out += line("memCmp less", memCmp(x, y, 8) == -1 && memCmp(x, y, 5) == 0);
+  out += line("memCmp greater", memCmp(y, x, 8) == 1);
+  store8(y + 1, 200);
+  out += line("memCmp unsigned", memCmp(x, y, 8) == -1 && memCmp(y, x, 8) == 1);
+  memFree(y);
+  memFree(x);
+
+  memFree(c4);
+  memFree(z);
+  memFree(b);
+  memFree(a);
+  out += line("memFree", true);
+  return out;
+}
+
+// A failed allocation traps "out of memory" (exit 101) instead of returning 0: `tests/run/core_oom_trap.or`.
+export function coreOom(): usize {
+  return memAlloc(18446744073709551600);
+}
+
+// The same for memRealloc.
+export function coreOomRealloc(): usize {
+  const p = memAlloc(8);
+  return memRealloc(p, 18446744073709551600);
+}

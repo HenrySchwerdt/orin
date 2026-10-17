@@ -1,7 +1,8 @@
 import { assert, assertEq, assertEqUsize, assertEqString } from "std:test";
-import { Bytes, ByteBuilder, bytesFromString, bytesFromInts } from "std:bytes";
+import { Bytes, ByteBuilder, fromString, fromInts } from "std:bytes";
 import {
-  EncodingErrorKind, hexEncode, hexDecode, base64Encode, base64Decode, base64UrlEncode,
+  EncodingErrorKind, Padding, Padded, Unpadded, hexEncode, hexDecode, hexDecodeText, base64DecodeText, base64UrlDecodeText,
+  base64Encode, base64Decode, base64UrlEncode,
   base64UrlDecode, encodingErrorMessage,
 } from "std:encoding";
 
@@ -15,22 +16,22 @@ function kindName(k: EncodingErrorKind): string {
 }
 
 function vector(raw: string, encoded: string, unpadded: string): void {
-  const b = bytesFromString(raw);
-  assertEqString(base64Encode(b, true), encoded, "RFC padded encoding");
-  assertEqString(base64Encode(b, false), unpadded, "RFC unpadded encoding");
-  assert(base64Decode(bytesFromString(encoded), true).unwrap().equals(b), "RFC padded decoding");
+  const b = fromString(raw);
+  assertEqString(base64Encode(b, Padded), encoded, "RFC padded encoding");
+  assertEqString(base64Encode(b, Unpadded), unpadded, "RFC unpadded encoding");
+  assert(base64Decode(fromString(encoded), Padded).unwrap().equals(b), "RFC padded decoding");
   assert(
-    base64Decode(bytesFromString(unpadded), false).unwrap().equals(b),
+    base64Decode(fromString(unpadded), Unpadded).unwrap().equals(b),
     "RFC unpadded decoding",
   );
-  assertEqString(base64UrlEncode(b, true), encoded, "RFC URL padded encoding");
-  assertEqString(base64UrlEncode(b, false), unpadded, "RFC URL unpadded encoding");
+  assertEqString(base64UrlEncode(b, Padded), encoded, "RFC URL padded encoding");
+  assertEqString(base64UrlEncode(b, Unpadded), unpadded, "RFC URL unpadded encoding");
   assert(
-    base64UrlDecode(bytesFromString(encoded), true).unwrap().equals(b),
+    base64UrlDecode(fromString(encoded), Padded).unwrap().equals(b),
     "RFC URL padded decoding",
   );
   assert(
-    base64UrlDecode(bytesFromString(unpadded), false).unwrap().equals(b),
+    base64UrlDecode(fromString(unpadded), Unpadded).unwrap().equals(b),
     "RFC URL unpadded decoding",
   );
 }
@@ -44,100 +45,100 @@ function rfc4648Vectors(): void {
   vector("foob", "Zm9vYg==", "Zm9vYg");
   vector("fooba", "Zm9vYmE=", "Zm9vYmE");
   vector("foobar", "Zm9vYmFy", "Zm9vYmFy");
-  const b = bytesFromInts([251, 255, 255, 255]);
-  assertEqString(base64Encode(b, true), "+////w==", "standard alphabet");
-  assertEqString(base64UrlEncode(b, true), "-____w==", "URL alphabet");
-  assert(base64Decode(bytesFromString("+////w=="), true).unwrap().equals(b), "standard decode");
-  assert(base64UrlDecode(bytesFromString("-____w=="), true).unwrap().equals(b), "URL decode");
+  const b = fromInts([251, 255, 255, 255]);
+  assertEqString(base64Encode(b, Padded), "+////w==", "standard alphabet");
+  assertEqString(base64UrlEncode(b, Padded), "-____w==", "URL alphabet");
+  assert(base64Decode(fromString("+////w=="), Padded).unwrap().equals(b), "standard decode");
+  assert(base64UrlDecode(fromString("-____w=="), Padded).unwrap().equals(b), "URL decode");
 }
 
-function bad64(s: string, padded: bool, pos: usize, kind: EncodingErrorKind): void {
-  const r = base64Decode(bytesFromString(s), padded);
+function bad64(s: string, padding: Padding, pos: usize, kind: EncodingErrorKind): void {
+  const r = base64Decode(fromString(s), padding);
   assert(r.isErr(), "malformed Base64 rejected");
-  assertEqUsize(r.unwrapErr().position, pos, "error byte position");
+  assertEqUsize(r.unwrapErr().offset, pos, "error byte position");
   assert(kindName(r.unwrapErr().kind) == kindName(kind), "error kind");
   assert(encodingErrorMessage(r.unwrapErr()).length > 0, "error formatted");
 }
 
 @Test
 function malformedBase64(): void {
-  bad64("A", true, 1, InvalidLength);
-  bad64("A", false, 1, InvalidLength);
-  bad64("Zg", true, 2, InvalidLength);
-  bad64("Zg=", true, 3, InvalidLength);
-  bad64("Zg==", false, 2, InvalidPadding);
-  bad64("=AAA", true, 0, InvalidPadding);
-  bad64("A===", true, 1, InvalidPadding);
-  bad64("AA=A", true, 3, InvalidPadding);
-  bad64("AA==AAAA", true, 4, InvalidPadding);
-  bad64("AA===", true, 4, InvalidPadding);
-  bad64("AAAA=", true, 4, InvalidPadding);
-  bad64("AAA==", true, 4, InvalidPadding);
-  bad64("Zh==", true, 1, NonCanonical);
-  bad64("Zm9=", true, 2, NonCanonical);
-  bad64("Zh", false, 1, NonCanonical);
-  bad64("Zm9", false, 2, NonCanonical);
-  bad64("Zm9vZh==", true, 5, NonCanonical);
-  bad64("Z g=", true, 1, InvalidByte);
-  bad64("Zg==\n", true, 4, InvalidByte);
-  bad64("Zg\r\n", true, 2, InvalidByte);
-  bad64("Zg\0=", true, 2, InvalidByte);
-  bad64("Zg\xff=", true, 2, InvalidByte);
-  bad64("-___", true, 0, InvalidByte);
-  assert(base64UrlDecode(bytesFromString("+///"), true).isErr(), "URL rejects standard alphabet");
-  assert(base64UrlDecode(bytesFromString("-_/_"), false).isErr(), "URL rejects mixed alphabet");
+  bad64("A", Padded, 1, InvalidLength);
+  bad64("A", Unpadded, 1, InvalidLength);
+  bad64("Zg", Padded, 2, InvalidLength);
+  bad64("Zg=", Padded, 3, InvalidLength);
+  bad64("Zg==", Unpadded, 2, InvalidPadding);
+  bad64("=AAA", Padded, 0, InvalidPadding);
+  bad64("A===", Padded, 1, InvalidPadding);
+  bad64("AA=A", Padded, 3, InvalidPadding);
+  bad64("AA==AAAA", Padded, 4, InvalidPadding);
+  bad64("AA===", Padded, 4, InvalidPadding);
+  bad64("AAAA=", Padded, 4, InvalidPadding);
+  bad64("AAA==", Padded, 4, InvalidPadding);
+  bad64("Zh==", Padded, 1, NonCanonical);
+  bad64("Zm9=", Padded, 2, NonCanonical);
+  bad64("Zh", Unpadded, 1, NonCanonical);
+  bad64("Zm9", Unpadded, 2, NonCanonical);
+  bad64("Zm9vZh==", Padded, 5, NonCanonical);
+  bad64("Z g=", Padded, 1, InvalidByte);
+  bad64("Zg==\n", Padded, 4, InvalidByte);
+  bad64("Zg\r\n", Padded, 2, InvalidByte);
+  bad64("Zg\0=", Padded, 2, InvalidByte);
+  bad64("Zg\xff=", Padded, 2, InvalidByte);
+  bad64("-___", Padded, 0, InvalidByte);
+  assert(base64UrlDecode(fromString("+///"), Padded).isErr(), "URL rejects standard alphabet");
+  assert(base64UrlDecode(fromString("-_/_"), Unpadded).isErr(), "URL rejects mixed alphabet");
   assert(
-    kindName(base64UrlDecode(bytesFromString("_x=="), true).unwrapErr().kind) == "canonical",
+    kindName(base64UrlDecode(fromString("_x=="), Padded).unwrapErr().kind) == "canonical",
     "URL pad bits",
   );
 }
 
 @Test
 function hexVectorsAndErrors(): void {
-  assertEqString(hexEncode(bytesFromString("foobar")), "666f6f626172", "RFC hex");
-  assertEqString(hexEncode(bytesFromString("")), "", "empty hex");
-  assert(hexDecode(bytesFromString("")).unwrap().isEmpty(), "empty decode");
+  assertEqString(hexEncode(fromString("foobar")), "666f6f626172", "RFC hex");
+  assertEqString(hexEncode(fromString("")), "", "empty hex");
+  assert(hexDecode(fromString("")).unwrap().isEmpty(), "empty decode");
   assert(
-    hexDecode(bytesFromString("aAbBcCdDeEfF001122"))
+    hexDecode(fromString("aAbBcCdDeEfF001122"))
         .unwrap()
-        .equals(bytesFromInts([170, 187, 204, 221, 238, 255, 0, 17, 34])),
+        .equals(fromInts([170, 187, 204, 221, 238, 255, 0, 17, 34])),
     "both cases",
   );
   assertEqString(
-    encodingErrorMessage(hexDecode(bytesFromString("ab?")).unwrapErr()),
+    encodingErrorMessage(hexDecode(fromString("ab?")).unwrapErr()),
     "encoding error at byte 2: invalid alphabet byte",
     "error message and validation precedence",
   );
-  const odd = hexDecode(bytesFromString("abc"));
+  const odd = hexDecode(fromString("abc"));
   assert(kindName(odd.unwrapErr().kind) == "length", "odd length");
-  assertEqUsize(odd.unwrapErr().position, 3, "odd EOF offset");
+  assertEqUsize(odd.unwrapErr().offset, 3, "odd EOF offset");
   const invalid = ["0x", " 0", "0\n", "0\0", "0\xff", "0G"];
   let i: usize = 0;
   while (i < invalid.length) {
-    const r = hexDecode(bytesFromString(invalid[i]));
+    const r = hexDecode(fromString(invalid[i]));
     assert(r.isErr(), "invalid hex");
     assert(kindName(r.unwrapErr().kind) == "byte", "hex byte kind");
-    assertEqUsize(r.unwrapErr().position, i == 1 ? 0 : 1, "hex byte offset");
+    assertEqUsize(r.unwrapErr().offset, i == 1 ? 0 : 1, "hex byte offset");
     i += 1;
   }
 }
 
 function roundtrip(b: Bytes): void {
-  assert(hexDecode(bytesFromString(hexEncode(b))).unwrap().equals(b), "hex round trip");
+  assert(hexDecode(fromString(hexEncode(b))).unwrap().equals(b), "hex round trip");
   assert(
-    base64Decode(bytesFromString(base64Encode(b, true)), true).unwrap().equals(b),
+    base64Decode(fromString(base64Encode(b, Padded)), Padded).unwrap().equals(b),
     "base64 padded round trip",
   );
   assert(
-    base64Decode(bytesFromString(base64Encode(b, false)), false).unwrap().equals(b),
+    base64Decode(fromString(base64Encode(b, Unpadded)), Unpadded).unwrap().equals(b),
     "base64 raw round trip",
   );
   assert(
-    base64UrlDecode(bytesFromString(base64UrlEncode(b, true)), true).unwrap().equals(b),
+    base64UrlDecode(fromString(base64UrlEncode(b, Padded)), Padded).unwrap().equals(b),
     "URL padded round trip",
   );
   assert(
-    base64UrlDecode(bytesFromString(base64UrlEncode(b, false)), false).unwrap().equals(b),
+    base64UrlDecode(fromString(base64UrlEncode(b, Unpadded)), Unpadded).unwrap().equals(b),
     "URL raw round trip",
   );
 }
@@ -158,10 +159,10 @@ function everyByteAndViews(): void {
     roundtrip(all.slice(n, 256));
     n += 1;
   }
-  const view = bytesFromString("!Zh==!").slice(1, 5);
-  assertEqUsize(base64Decode(view, true).unwrapErr().position, 1, "error relative to view");
+  const view = fromString("!Zh==!").slice(1, 5);
+  assertEqUsize(base64Decode(view, Padded).unwrapErr().offset, 1, "error relative to view");
   assertEqUsize(
-    hexDecode(bytesFromString("!0g!").slice(1, 3)).unwrapErr().position,
+    hexDecode(fromString("!0g!").slice(1, 3)).unwrapErr().offset,
     1,
     "hex view offset",
   );
@@ -176,19 +177,19 @@ function exhaustiveTailBits(): void {
     const two = "A" + digits.charAt(i);
     const three = "AA" + digits.charAt(i);
     assert(
-      base64Decode(bytesFromString(two), false).isOk() == (i % 16 == 0),
+      base64Decode(fromString(two), Unpadded).isOk() == (i % 16 == 0),
       "two digit canonical bits",
     );
     assert(
-      base64Decode(bytesFromString(two + "=="), true).isOk() == (i % 16 == 0),
+      base64Decode(fromString(two + "=="), Padded).isOk() == (i % 16 == 0),
       "padded two canonical bits",
     );
     assert(
-      base64Decode(bytesFromString(three), false).isOk() == (i % 4 == 0),
+      base64Decode(fromString(three), Unpadded).isOk() == (i % 4 == 0),
       "three digit canonical bits",
     );
     assert(
-      base64Decode(bytesFromString(three + "="), true).isOk() == (i % 4 == 0),
+      base64Decode(fromString(three + "="), Padded).isOk() == (i % 4 == 0),
       "padded three canonical bits",
     );
     i += 1;
@@ -199,17 +200,17 @@ function exhaustiveTailBits(): void {
 function everyInputByte(): void {
   let i = 0;
   while (i < 256) {
-    const b = bytesFromInts([i]);
+    const b = fromInts([i]);
     const c = b.toRawString();
     const expectedHex = i >= 48 && i <= 57 || i >= 65 && i <= 70 || i >= 97 && i <= 102;
-    assert(hexDecode(bytesFromString(c + "0")).isOk() == expectedHex, "all hex input bytes");
+    assert(hexDecode(fromString(c + "0")).isOk() == expectedHex, "all hex input bytes");
     const alpha = i >= 65 && i <= 90 || i >= 97 && i <= 122 || i >= 48 && i <= 57;
     assert(
-      base64Decode(bytesFromString(c + "AAA"), true).isOk() == (alpha || i == 43 || i == 47),
+      base64Decode(fromString(c + "AAA"), Padded).isOk() == (alpha || i == 43 || i == 47),
       "all standard input bytes",
     );
     assert(
-      base64UrlDecode(bytesFromString(c + "AAA"), true).isOk() == (alpha || i == 45 || i == 95),
+      base64UrlDecode(fromString(c + "AAA"), Padded).isOk() == (alpha || i == 45 || i == 95),
       "all URL input bytes",
     );
     i += 1;
@@ -233,23 +234,42 @@ function deterministicMalformedAndRoundTrips(): void {
     }
     const b = out.build();
     const text = b.toRawString();
-    const a = base64Decode(b, true);
-    const c = base64Decode(b, false);
-    const d = base64UrlDecode(b, true);
-    const e = base64UrlDecode(b, false);
+    const a = base64Decode(b, Padded);
+    const c = base64Decode(b, Unpadded);
+    const d = base64UrlDecode(b, Padded);
+    const e = base64UrlDecode(b, Unpadded);
     if (a.isOk()) {
-      assertEqString(base64Encode(a.unwrap(), true), text, "canonical standard padded");
+      assertEqString(base64Encode(a.unwrap(), Padded), text, "canonical standard padded");
     }
     if (c.isOk()) {
-      assertEqString(base64Encode(c.unwrap(), false), text, "canonical standard raw");
+      assertEqString(base64Encode(c.unwrap(), Unpadded), text, "canonical standard raw");
     }
     if (d.isOk()) {
-      assertEqString(base64UrlEncode(d.unwrap(), true), text, "canonical URL padded");
+      assertEqString(base64UrlEncode(d.unwrap(), Padded), text, "canonical URL padded");
     }
     if (e.isOk()) {
-      assertEqString(base64UrlEncode(e.unwrap(), false), text, "canonical URL raw");
+      assertEqString(base64UrlEncode(e.unwrap(), Unpadded), text, "canonical URL raw");
     }
     roundtrip(b);
     trial += 1;
   }
+}
+
+// ---------------------------------------------------------------- ADR-0048: text overloads, Padding, error shape
+
+@Test
+function textDecodersMatchByteDecoders(): void {
+  const h = hexDecodeText("00ff7f").unwrap();
+  assert(h.equals(fromInts([0, 255, 127])), "hexDecodeText");
+  assertEqString(hexEncode(h), h.toHex(), "hexEncode is Bytes.toHex");
+  assertEqUsize(hexDecodeText("abc").unwrapErr().offset, 3, "odd length offset");
+  assertEqUsize(hexDecodeText("0g").unwrapErr().offset, 1, "bad digit offset");
+  assertEqString(encodingErrorMessage(hexDecodeText("0g").unwrapErr()), "encoding error at byte 1: invalid alphabet byte", "message");
+  assert(base64DecodeText("Zm9v", Padded).unwrap().equals(fromString("foo")), "base64DecodeText");
+  assert(base64DecodeText("Zg", Unpadded).unwrap().equals(fromString("f")), "base64DecodeText unpadded");
+  assert(base64DecodeText("Zg", Padded).isErr(), "padded required");
+  assert(base64DecodeText("Zg==", Unpadded).isErr(), "padding forbidden");
+  assert(base64UrlDecodeText("-_8", Unpadded).unwrap().equals(fromInts([251, 255])), "base64UrlDecodeText");
+  assert(base64UrlDecodeText("+/8", Unpadded).isErr(), "URL alphabet only");
+  assertEqUsize(base64DecodeText("Zm9v!", Padded).unwrapErr().offset, 4, "text error offset");
 }

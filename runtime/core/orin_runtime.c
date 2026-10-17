@@ -8,8 +8,15 @@
 /* Per-thread heap state (ADR-0017): every task allocates from, and counts in, its own thread-local state, so reference counts
  * and free lists need no atomics. Moving an object to another task's heap is safe because a block is just malloc memory
  * (freed on any thread). The process-wide totals of finished tasks are g_fold / g_fold_live. */
-static __thread int64_t g_live;
-__thread OrinStats orin_stats ORIN_TLS_MODEL;
+__thread OrinHeap orin_heap ORIN_TLS_MODEL; /* all of it, in one block: orin_runtime.h "The per-thread heap block" */
+/* The names the code below uses for the fields of the block. */
+#define g_live (orin_heap.live)
+#define fl_struct (orin_heap.fl_struct)
+#define fl_array (orin_heap.fl_array)
+#define fl_n (orin_heap.fl_n)
+#define sb_list(c) (orin_heap.sb[c].head)
+#define sb_cnt(c) (orin_heap.sb[c].n)
+#define t_dstack (orin_heap.dstack)
 static OrinStats g_fold;
 static int64_t g_fold_live;
 
@@ -356,15 +363,10 @@ void orin_trap(const char *msg) {
 #endif
 #endif
 #ifndef ORIN_NO_FREELIST
-enum { FL_STRUCT_CLASSES = 9 }; /* nslots 0..8 */
 /* A free list holds at most FL_CAP objects: a task that frees more than it allocates (the consumer of a channel) must not hoard
  * the memory of a producer that keeps allocating; beyond the cap an object goes back to the allocator. fl_n[FL_STRUCT_CLASSES]
  * counts the array headers. */
 enum { FL_CAP = 1 << 18 };
-typedef struct FreeNode { struct FreeNode *next; } FreeNode;
-static __thread FreeNode *fl_struct[FL_STRUCT_CLASSES];
-static __thread FreeNode *fl_array;
-static __thread uint32_t fl_n[FL_STRUCT_CLASSES + 1];
 #endif
 
 static void *xmalloc(size_t n) {
@@ -379,21 +381,19 @@ static void *xrealloc(void *q, size_t n) {
 }
 
 /* Small-block cache for the variable-size buffers: string objects and array item buffers of at most SB_MAX bytes (16-byte
- * size classes). Every such block is allocated with its size rounded up to the class, and its free passes the same size
- * (string: sizeof(OrinString) + cap + 1; items: cap * 8), so a block can sit on any thread's list and no header is needed.
- * Per thread like the object lists above (a block is plain malloc memory), capped per class, and compiled out with them
- * (ASan, -DORIN_NO_FREELIST). Larger buffers go to the allocator (realloc keeps its in-place growth for them). */
+ * size classes). It is Orin code now (sbAlloc, sbFree, sbRealloc of runtime/core/heap.or, ADR-0052 R3d.3 (c)) over the lists in the heap
+ * block (orin_runtime.h); the C below calls the Orin functions through the wrappers the emitted code defines. Only a census build
+ * (-DORIN_SITE_STATS) keeps the C versions. sb_drain, the return of the lists at the end of a task, stays C until R3e. */
+#ifdef ORIN_SITE_STATS
 #ifndef ORIN_NO_FREELIST
-enum { SB_MAX = 256, SB_CLASSES = SB_MAX / 16, SB_CAP = 1 << 15 };
-static __thread FreeNode *sb_list[SB_CLASSES + 1];
-static __thread uint32_t sb_cnt[SB_CLASSES + 1];
+enum { SB_CAP = 1 << 15 };
 static inline void *sb_alloc(size_t n) {
     if (n <= SB_MAX) {
         size_t c = (n + 15) >> 4;
-        FreeNode *f = sb_list[c];
+        FreeNode *f = sb_list(c);
         if (f) {
-            sb_list[c] = f->next;
-            sb_cnt[c]--;
+            sb_list(c) = f->next;
+            sb_cnt(c)--;
             return f;
         }
         return xmalloc(c << 4);
@@ -403,10 +403,10 @@ static inline void *sb_alloc(size_t n) {
 static inline void sb_free(void *p, size_t n) {
     if (n <= SB_MAX) {
         size_t c = (n + 15) >> 4;
-        if (sb_cnt[c] < SB_CAP) {
-            ((FreeNode *)p)->next = sb_list[c];
-            sb_list[c] = (FreeNode *)p;
-            sb_cnt[c]++;
+        if (sb_cnt(c) < SB_CAP) {
+            ((FreeNode *)p)->next = sb_list(c);
+            sb_list(c) = (FreeNode *)p;
+            sb_cnt(c)++;
             return;
         }
     }
@@ -423,31 +423,43 @@ static void *sb_realloc(void *p, size_t old, size_t n) {
     }
     return q;
 }
-static void sb_drain(void) {
-    for (int c = 0; c <= SB_CLASSES; c++)
-        while (sb_list[c]) {
-            FreeNode *n = sb_list[c];
-            sb_list[c] = n->next;
-            sb_cnt[c]--;
-            orin_platform_free(n);
-        }
-}
 #else
 #define sb_alloc(n) xmalloc(n)
 #define sb_free(p, n) orin_platform_free(p)
 #define sb_realloc(p, old, n) xrealloc((p), (n))
+#endif
+#else
+static inline void *sb_alloc(size_t n) { return orin_sb_alloc(n); }
+static inline void sb_free(void *p, size_t n) { orin_sb_free(p, n); }
+static inline void *sb_realloc(void *p, size_t old, size_t n) { return orin_sb_realloc(p, old, n); }
+#endif
+#ifndef ORIN_NO_FREELIST
+static void sb_drain(void) {
+    for (int c = 0; c <= SB_CLASSES; c++)
+        while (sb_list(c)) {
+            FreeNode *n = sb_list(c);
+            sb_list(c) = n->next;
+            sb_cnt(c)--;
+            orin_platform_free(n);
+        }
+}
+#else
 #define sb_drain() ((void)0)
 #endif
 
 /* ---------------------------------------------------------------- destroy */
 
-static __thread OrinObj **t_dstack; /* the work stack of orin_destroy: per task, freed when the task ends */
-static __thread size_t t_dcap;
+/* orin_destroy and orin_make_unique_slow are Orin functions of $rt/rc.or now (ADR-0052 R3d.3 (b)); the code the program is compiled to
+ * defines them under these names for the header inlines (orin_release, orin_make_unique) and the C shells. A census build
+ * (-DORIN_SITE_STATS) keeps the C versions (the census hooks are C; they go with the census in R3d.5). */
+#ifdef ORIN_SITE_STATS
+
+/* t_dstack / t_dcap: the work stack of orin_destroy: per task, freed when the task ends */
 
 void orin_destroy(OrinObj *o) {
     /* Iterative so that long chains (lists, deep trees) cannot overflow the C stack. */
     OrinObj **stack = t_dstack;
-    size_t scap = t_dcap, sp = 0;
+    size_t scap = (size_t)orin_heap.dcap, sp = 0;
 #define PUSH(x)                                                                                 \
     do {                                                                                        \
         if (sp == scap) {                                                                       \
@@ -517,13 +529,18 @@ void orin_destroy(OrinObj *o) {
         ORIN_STAT(orin_stats.frees++);
     }
     t_dstack = stack;
-    t_dcap = scap;
+    orin_heap.dcap = scap;
 #undef PUSH
 #undef DEC
 }
+#endif
 
 /* ---------------------------------------------------------------- structs */
 
+/* orin_struct_new, orin_variant1 and orin_array_new are Orin functions of $rt/object.or now (ADR-0052 R3d.3 (a)); the code the program is
+ * compiled to defines them under these names for the C shells below. A census build (-DORIN_SITE_STATS, `orin2 compile --stats-sites`)
+ * keeps the C versions, because the census hooks (SITE_ALLOC) are C: they go with the census in R3d.5. */
+#ifdef ORIN_SITE_STATS
 OrinObj *orin_struct_new(uint32_t tag, uint32_t nslots, uint64_t refmask) {
     if (nslots > 64) orin_trap("struct has more than 64 slots");
     OrinStruct *s;
@@ -556,103 +573,24 @@ OrinObj *orin_struct_new(uint32_t tag, uint32_t nslots, uint64_t refmask) {
     SITE_ALLOC(&s->h, 3, sizeof(OrinStruct) + (uint64_t)nslots * 8);
     return &s->h;
 }
+#endif
 
-/* The immortal singletons are shared by all tasks (never counted, never freed, never written after creation): created on
- * first use and published with a compare-and-swap, the loser frees its copy. */
-OrinObj *orin_nullary(uint32_t tag) {
-    enum { N = 1024 };
-    static OrinObj *tbl[N];
-    if (tag >= N) orin_trap("variant tag too large");
-    OrinObj *o = __atomic_load_n(&tbl[tag], __ATOMIC_ACQUIRE);
-    if (!o) {
-        OrinStruct *s = (OrinStruct *)xmalloc(sizeof(OrinStruct));
-        s->h.rc = -1;
-        s->h.kind = ORIN_K_STRUCT;
-        s->h.tag = tag;
-        s->nslots = 0;
-        s->pad = 0;
-        s->refmask = 0;
-        OrinObj *none = NULL;
-        if (__atomic_compare_exchange_n(&tbl[tag], &none, &s->h, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-            o = &s->h;
-        } else {
-            orin_platform_free(s);
-            o = none;
-        }
-    }
-    return o;
-}
-
+/* orin_nullary, orin_assert_fact, orin_assert_array, orin_struct_copy_slot, orin_opt_unwrap, orin_res_unwrap, orin_res_unwrap_err and
+ * orin_v_unwrap are written in Orin now ($rt/leaf.or, ADR-0052 R3d.2); the frozen runtime in bootstrap/seed/runtime/ keeps the C versions
+ * for the seed and --c-builtins. orin_trap_shape stays: the header inlines and the functions below call it. */
 void orin_trap_shape(void) { orin_trap("field access on a value of the wrong shape (compiler bug)"); }
 
-/* `orin2 compile --assert-facts` (docs/mir.md v2.4, ADR-0038 lever 2): the dynamic check of a forwarded load. `got` is the value
- * an IForward claimed for slot `key` of `o` (a field index or an array index); the slot itself is read here, as the original
- * getfield / arrayget would have. A difference is an optimiser or verifier bug, not a program error: exit 70 (internal error). */
-void orin_assert_fact(const OrinObj *o, uint64_t key, uint64_t got) {
-    const char *why = 0;
-    uint64_t want = 0;
-    if (o->kind == ORIN_K_STRUCT && key < ((const OrinStruct *)o)->nslots) want = ((const OrinStruct *)o)->slots[key];
-    else if (o->kind == ORIN_K_ARRAY && key < ((const OrinArray *)o)->len) want = ((const OrinArray *)o)->items[key];
-    else why = "internal error: --assert-facts: a forwarded load names a slot that does not exist";
-    if (!why && want != got) why = "internal error: --assert-facts: a forwarded load differs from the slot it was forwarded from";
-    if (!why) return;
-    size_t n = 0;
-    while (why[n]) n++;
-    orin_platform_write_line(ORIN_PLATFORM_STDERR, why, n);
-    orin_platform_exit(70);
-}
-
-/* `orin2 compile --assert-facts` (docs/mir.md v2.6, rule U1): the kind check and the bounds check that an IArrayGetU / IArraySetU
- * leaves out, executed before it. A failure is a verifier or optimiser bug, not a program error: exit 70 (internal error). */
-void orin_assert_array(const OrinObj *o, uint64_t i) {
-    const char *why = 0;
-    if (o->kind != ORIN_K_ARRAY) why = "internal error: --assert-facts: an unchecked array access on an object that is not an array";
-    else if (i >= ((const OrinArray *)o)->len) why = "internal error: --assert-facts: an unchecked array access is out of bounds";
-    if (!why) return;
-    size_t n = 0;
-    while (why[n]) n++;
-    orin_platform_write_line(ORIN_PLATFORM_STDERR, why, n);
-    orin_platform_exit(70);
-}
-
+#ifdef ORIN_SITE_STATS
 OrinObj *orin_variant1(uint32_t tag, uint64_t refmask, uint64_t slot) {
     OrinObj *o = orin_struct_new(tag, 1, refmask & 1);
     ((OrinStruct *)o)->slots[0] = slot;
     return o;
 }
-
-void orin_struct_copy_slot(OrinObj *dst, uint32_t i, OrinObj *src, uint32_t j) {
-    orin_chk_slot(dst, i);
-    orin_chk_slot(src, j);
-    OrinStruct *d = (OrinStruct *)dst;
-    uint64_t v = ((OrinStruct *)src)->slots[j];
-    if ((d->refmask >> i) & 1) orin_retain(ORIN_REF(v));
-    d->slots[i] = v;
-}
-
-uint64_t orin_opt_unwrap(OrinObj *o) {
-    if (o->tag != 0) orin_trap("unwrap on None");
-    return orin_struct_get(o, 0);
-}
-uint64_t orin_res_unwrap(OrinObj *o) {
-    if (o->tag != 0) orin_trap("unwrap on Err");
-    return ((OrinStruct *)o)->nslots ? orin_struct_get(o, 0) : 0;
-}
-uint64_t orin_res_unwrap_err(OrinObj *o) {
-    if (o->tag != 1) orin_trap("unwrapErr on Ok");
-    return orin_struct_get(o, 0);
-}
-
-uint64_t orin_v_unwrap(uint64_t tag, uint64_t word, int64_t what) {
-    if (what == 0 && tag != 0) orin_trap("unwrap on None");
-    if (what == 1 && tag != 0) orin_trap("unwrap on Err");
-    if (what == 2 && tag != 1) orin_trap("unwrapErr on Ok");
-    return word;
-}
-
+#endif
 
 /* ---------------------------------------------------------------- make_unique */
 
+#ifdef ORIN_SITE_STATS
 OrinObj *orin_make_unique_slow(OrinObj *o) {
     ORIN_STAT(orin_stats.cow_copies++);
     ORIN_SITE_RC(o, ORIN_SITE_COW_COPY);
@@ -684,9 +622,12 @@ OrinObj *orin_make_unique_slow(OrinObj *o) {
     orin_release(o);
     return r;
 }
+#endif
 
 /* ---------------------------------------------------------------- strings */
 
+/* str_alloc is the Orin function strAlloc of runtime/core/object.or (R3d.3 (c)); a census build keeps the C version. */
+#ifdef ORIN_SITE_STATS
 static OrinString *str_alloc(uint64_t len, uint64_t cap) {
     if (cap < len) cap = len;
     if (cap > ((uint64_t)1 << 48)) orin_trap("string too large");
@@ -702,6 +643,9 @@ static OrinString *str_alloc(uint64_t len, uint64_t cap) {
     SITE_ALLOC(&s->h, 0, sizeof(OrinString) + cap + 1);
     return s;
 }
+#else
+static inline OrinString *str_alloc(uint64_t len, uint64_t cap) { return (OrinString *)orin_str_alloc(len, cap); }
+#endif
 
 OrinObj *orin_str_new(const char *p, uint64_t n) {
     OrinString *s = str_alloc(n, n);
@@ -714,6 +658,9 @@ OrinObj *orin_str_with_capacity(uint64_t cap) {
     return &str_alloc(0, cap)->h;
 }
 
+/* The string append family (concat, append, append_sub / _int / _usize, prepend) is the Orin functions of runtime/core/str.or (R3d.4);
+   the unit tests reach concat and append through the wrappers orin_str_concat / orin_str_append. A census build keeps the C versions. */
+#ifdef ORIN_SITE_STATS
 OrinObj *orin_str_concat(OrinObj *a, OrinObj *b) {
     OrinString *x = (OrinString *)a, *y = (OrinString *)b;
     if (y->len == 0) return orin_dup(a);
@@ -850,6 +797,8 @@ OrinObj *orin_str_prepend(OrinObj *a, OrinObj *b) {
     orin_release(a);
     return &r->h;
 }
+
+#endif
 
 int64_t orin_str_eq(OrinObj *a, OrinObj *b) {
     if (a == b) return 1;
@@ -1169,6 +1118,7 @@ OrinObj *orin_parse_float(OrinObj *s) {
 
 /* ---------------------------------------------------------------- arrays */
 
+#ifdef ORIN_SITE_STATS
 OrinObj *orin_array_new(uint64_t cap, int64_t is_ref) {
     if (cap > ((uint64_t)1 << 40)) orin_trap("array too large");
     OrinArray *a;
@@ -1192,7 +1142,10 @@ OrinObj *orin_array_new(uint64_t cap, int64_t is_ref) {
     SITE_ALLOC(&a->h, is_ref ? 2 : 1, sizeof(OrinArray) + cap * 8);
     return &a->h;
 }
+#endif
 
+/* orin_array_push_grow is the Orin function arrayPushGrow of runtime/core/object.or (R3d.3 (c)); a census build keeps the C version. */
+#ifdef ORIN_SITE_STATS
 void orin_array_push_grow(OrinObj *o, uint64_t slot) {
     OrinArray *a = (OrinArray *)o;
     uint64_t cap = a->cap ? a->cap * 2 : 4;
@@ -1204,6 +1157,7 @@ void orin_array_push_grow(OrinObj *o, uint64_t slot) {
     a->cap = cap;
     a->items[a->len++] = slot;
 }
+#endif
 
 OrinObj *orin_array_pop(OrinObj *o) {
     OrinArray *a = (OrinArray *)o;
@@ -1236,6 +1190,9 @@ OrinObj *orin_array_get(OrinObj *o, uint64_t i) {
     return orin_variant1(0, a->is_ref, v);
 }
 
+/* slice, concat, extend and the byte conversions are the Orin functions of runtime/core/array.or (R3d.4), reached by the unit tests through the
+   wrappers of the same names; a census build keeps the C versions. */
+#ifdef ORIN_SITE_STATS
 OrinObj *orin_array_slice(OrinObj *o, uint64_t from, uint64_t to) {
     OrinArray *a = (OrinArray *)o;
     if (from > to || to > a->len) orin_trap("slice out of range");
@@ -1347,6 +1304,8 @@ OrinObj *orin_string_to_bytes(OrinObj *o) {
     a->len = s->len;
     return r;
 }
+
+#endif
 
 OrinObj *orin_array_join(OrinObj *o, OrinObj *sep) {
     OrinArray *a = (OrinArray *)o;
@@ -2426,6 +2385,7 @@ enum { TASK_MSG = 480 };
 typedef struct {
     uint64_t tok;       /* the transfer token of the task body (a closure) */
     int trapped;        /* written by the task thread, read after the join */
+    uint64_t done_mon;  /* monitor whose word 1 becomes 1 when the task ends, by return or trap (orin_rt_task_watch); 0 = none */
     char msg[TASK_MSG]; /* the trap message */
 } RtTask;
 static __thread RtTask *t_task;                        /* the task this thread runs, NULL on the main thread */
@@ -2438,7 +2398,7 @@ void orin_rt_heap_exit(void) {
     files_at_exit();
     orin_platform_free(t_dstack);
     t_dstack = NULL;
-    t_dcap = 0;
+    orin_heap.dcap = 0;
 #ifndef ORIN_NO_FREELIST
     for (int c = 0; c < FL_STRUCT_CLASSES; c++)
         while (fl_struct[c]) {
@@ -2466,6 +2426,16 @@ void orin_rt_heap_exit(void) {
 
 static int task_active(void) { return t_task != NULL; }
 
+/* The task is over (its heap is gone): publish it for a timed join. Only L0 calls; the joiner frees the monitor after the join. */
+static void task_signal_done(void) {
+    uint64_t m = t_task->done_mon;
+    if (!m) return;
+    orin_platform_monitor_lock((int64_t)m);
+    orin_platform_monitor_set((int64_t)m, 1, 1);
+    orin_platform_monitor_notify((int64_t)m, 0, 1);
+    orin_platform_monitor_unlock((int64_t)m);
+}
+
 /* Called by orin_trap on a task thread: record the message, end the task, never return. */
 static void task_trap(const char *msg) {
     size_t n = 0;
@@ -2474,6 +2444,7 @@ static void task_trap(const char *msg) {
     t_task->msg[n] = 0;
     t_task->trapped = 1;
     orin_rt_heap_exit();
+    task_signal_done();
     orin_platform_thread_exit();
 }
 
@@ -2485,12 +2456,14 @@ static void task_main(void *p) {
     ((void (*)(OrinObj *))(uintptr_t)clo->slots[0])(ORIN_REF(clo->slots[1])); /* closure layout: docs/mir.md v1.3 */
     orin_release(box);
     orin_rt_heap_exit();
+    task_signal_done();
 }
 
 uint64_t orin_rt_task_spawn(uint64_t tok) {
     RtTask *t = (RtTask *)xmalloc(sizeof *t);
     t->tok = tok;
     t->trapped = 0;
+    t->done_mon = 0;
     t->msg[0] = 0;
     int64_t h = orin_platform_thread_create(task_main, t);
     if (!h) {
@@ -2512,6 +2485,11 @@ uint64_t orin_rt_task_join(uint64_t h) {
     t_joined_msg[TASK_MSG] = 0;
     orin_platform_free(t);
     return st;
+}
+
+/* Called by a task on its own thread (std:task `spawn`): word 1 of monitor m is set to 1 and queue 0 notified when the task ends. */
+void orin_rt_task_watch(uint64_t m) {
+    if (t_task) t_task->done_mon = m;
 }
 
 OrinObj *orin_rt_task_message(void) {
@@ -2538,6 +2516,14 @@ void orin_mon_lock(uint64_t m) { mon_check(orin_platform_monitor_lock((int64_t)m
 void orin_mon_unlock(uint64_t m) { mon_check(orin_platform_monitor_unlock((int64_t)m)); }
 void orin_mon_wait(uint64_t m, uint64_t c) { mon_check(orin_platform_monitor_wait((int64_t)m, (int)c)); }
 void orin_mon_notify_all(uint64_t m, uint64_t c) { mon_check(orin_platform_monitor_notify((int64_t)m, (int)c, 1)); }
+/* Timed wait on an absolute CLOCK_MONOTONIC deadline in milliseconds: 1 when it passed, 0 when notified (or spurious). */
+uint64_t orin_mon_wait_until(uint64_t m, uint64_t c, uint64_t deadline) {
+    if (deadline > (uint64_t)INT64_MAX) deadline = (uint64_t)INT64_MAX;
+    int rc = orin_platform_monitor_wait_until((int64_t)m, (int)c, (int64_t)deadline);
+    if (rc == ORIN_PLATFORM_WAIT_TIMEOUT) return 1;
+    mon_check(rc);
+    return 0;
+}
 void orin_mon_notify_one(uint64_t m, uint64_t c) { mon_check(orin_platform_monitor_notify((int64_t)m, (int)c, 0)); }
 uint64_t orin_mon_get(uint64_t m, uint64_t i) {
     uint64_t v = 0;

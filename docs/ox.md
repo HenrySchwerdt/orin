@@ -9,7 +9,7 @@ lowering). Libraries: [`std:html`](std.md#stdhtml), [`std:ox`](std.md#stdox).
 
 ```tsx
 import ox from "std:html";
-import { Html, render, document } from "std:html";
+import { Html, render, renderDocument } from "std:html";
 
 type Product = { id: int; name: string; price: int; url: string; };
 
@@ -33,7 +33,7 @@ function main(): void {
   const page = <Layout title="Catalog">
     <table>{products.map(p => <Row p={p} />)}</table>
   </Layout>;
-  console.log(document(page));   // "<!DOCTYPE html>" + the page
+  console.log(renderDocument(page));   // "<!DOCTYPE html>" + the page
 }
 ```
 
@@ -81,7 +81,7 @@ Everything HTML-specific is data in the literal:
 ```ts
 export function ox(): Markup<Html> {
   return Markup<Html> {
-    wrap: trustHtml, embed: render, embedAll: joinAll, text: escape, attr: escape,
+    wrap: trustHtml, embed: render, embedAll: renderAll, text: escape, attr: escape,
     rules: [AttrRule { names: ["href", "src", ...], prefix: "", convert: Some(escapeUrl) },
             AttrRule { names: [], prefix: "on", convert: None }],
     escapes: [Escape { char: "&", encoded: "&amp;" }, Escape { char: "<", encoded: "&lt;" }, ...],

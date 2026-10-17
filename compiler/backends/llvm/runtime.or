@@ -2,6 +2,7 @@
 // `alwaysinline` IR functions for the hot runtime operations, written against the object layout asserted in
 // runtime/core/orin_runtime_llvm.c) and the declarations of the C runtime functions the IR calls by symbol.
 
+import { MProgram } from "../../mir";
 import { u } from "./text";
 
 // ---------------------------------------------------------------- trap messages
@@ -140,6 +141,63 @@ export function factsDeclare(): string {
   return "declare void @orin_assert_fact(ptr, i64, i64)\ndeclare void @orin_assert_array(ptr, i64)\n";
 }
 
+// The core operations (hir/coreops.or) the program uses, by number: a module declares what only they need (the realloc, memmove,
+// memcmp and expect intrinsics, the out-of-memory trap, the per-thread block) when one is present, so a program without core
+// operations has the same module as before.
+export function coreOpsUsed(prog: MProgram): bool[] {
+  let used: bool[] = [];
+  let k: usize = 0;
+  while (k < 27) {
+    used.push(false);
+    k += 1;
+  }
+  for (const f of prog.functions) {
+    for (const b of f.blocks) {
+      for (const ins of b.instrs) {
+        match (ins) {
+          IBuiltin(_, op, _) => {
+            match (op) {
+              BCore(n) => {
+                if (n < used.length) {
+                  used[n] = true;
+                }
+              },
+              _ => {},
+            }
+          },
+          _ => {},
+        }
+      }
+    }
+  }
+  return used;
+}
+
+// The extra declarations of `coreOpsUsed` (empty when the program uses none of the operations that need one).
+export function coreDeclares(prog: MProgram): string {
+  const used = coreOpsUsed(prog);
+  let d = "";
+  if (used[8] || used[21]) {
+    d += "declare void @orin_oom() noreturn cold nounwind\n";
+  }
+  if (used[18]) {
+    d += "declare i1 @llvm.expect.i1(i1, i1)\n";
+  }
+  if (used[20]) {
+    d += "@orin_heap = external thread_local(localexec) global [128 x i64]\n";
+  }
+  if (used[21]) {
+    d += "declare ptr @realloc(ptr, i64)\n";
+  }
+  if (used[22]) {
+    d += "declare void @llvm.memmove.p0.p0.i64(ptr, ptr, i64, i1)\n";
+  }
+  if (used[23]) {
+    d += "declare i32 @memcmp(ptr, ptr, i64)\n";
+  }
+  return d;
+}
+
 export function declares(): string {
   const d = [
     "declare void @orin_init(i32, ptr)",
@@ -209,6 +267,8 @@ export function declares(): string {
     "declare i64 @orin_rt_transfer_count(i64)",
     "declare i64 @orin_rt_lend(ptr)",
     "declare i64 @orin_rt_par_threads()",
+    "declare i64 @orin_mon_wait_until(i64, i64, i64)",
+    "declare void @orin_rt_task_watch(i64)",
     "declare i64 @orin_rt_task_spawn(i64)",
     "declare i64 @orin_rt_task_join(i64)",
     "declare ptr @orin_rt_task_message()",

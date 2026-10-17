@@ -9,7 +9,7 @@ import { Host, useFs } from "std:host";
 import { FsGrant } from "std:fs";
 import { assert, assertEqUsize, assertEqBool, assertEqString } from "std:test";
 import { SourceFile } from "../diag";
-import { BOptUnwrapOr, BOptIsSome, BArrLength, OpGt, OpAdd } from "../hir";
+import { Builtin, BOptUnwrapOr, BOptIsSome, BArrLength, BCore, OpGt, OpAdd } from "../hir";
 import {
   MType, MLocal, MBlock, Instr, Terminator, Operand, MFunction, MProgram, MVTable, SwitchCase,
   plainBlock, isAggTy, aggWords,
@@ -206,6 +206,49 @@ function aValueStoredOnTheHeapStaysBoxed(): void {
     },
     "the stored local stays boxed",
   );
+}
+
+// main takes `find(4)` and applies the builtin `b` to it (result in a scalar local), then releases it.
+function findThen(b: Builtin): MProgram {
+  const p0 = optionProgram();
+  const mainF = fnP(
+    "main",
+    0,
+    [lr("o"), MLocal { name: "r", ty: MInt }],
+    MVoid,
+    [bk([ICall(Some(0), 1, [OInt(4)]), IBuiltin(Some(1), b, [OLocal(0)]), IRelease(0)], TReturn(None))],
+  );
+  return prog([mainF, p0.functions[1]]);
+}
+
+@Test
+function theOperandOfAddrOfIsNeverUnboxed(): void {
+  // ADR-0052 Addendum A, rule 2: addrOf (core operation 12) needs the real object, so the web of its operand stays boxed
+  // although the same value, read by an Option builtin, is unboxed
+  const reads = findThen(BOptIsSome);
+  assertEqUsize(errorsOf(reads), 0, "the control program verifies");
+  const u0 = unboxValues(reads, noPins(reads));
+  assertEqUsize(aggW(u0.functions[1].ret), 1, "control: an Option read by isSome is unboxed");
+  const p = findThen(BCore(12));
+  assertEqUsize(errorsOf(p), 0, "the addrOf program verifies");
+  const q = unboxValues(p, noPins(p));
+  assert(unboxKept(p, q, noPins(p)), "unboxKept");
+  assert(
+    match (q.functions[1].ret) {
+      MRef => true,
+      _ => false,
+    },
+    "find keeps its reference result",
+  );
+  assert(
+    match (q.functions[0].locals[0].ty) {
+      MRef => true,
+      _ => false,
+    },
+    "the operand of addrOf stays a reference",
+  );
+  assertEqUsize(releases(q.functions[0]), 1, "and is released");
+  assertEqUsize(errorsOf(q), 0, "the result verifies");
 }
 
 @Test

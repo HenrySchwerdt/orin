@@ -17,16 +17,16 @@ import {
   SemanticIndex, SymbolDef, SkFunction, SkRecord, SkUnion, SkVariant, SkAlias, SkConst, SkLocal,
   SkParam, SkField, SkInterface,
 } from "../hir";
-import { ImportTarget, ImportUnit, ImportStd, StdFs, StdProcess, StdClock } from "../loader";
-import { Span } from "../diag";
-import { normalizePath, joinPath, dirname, loadAll } from "../loader";
+import { ImportTarget, ImportUnit, ImportStd, StdFs, StdProcess, StdClock, StdCore } from "../loader";
+import { Span, SourceFile } from "../diag";
+import { normalizePath, joinPath, dirname, loadAll, loadWithRoots, preludeRoots } from "../loader";
 import { check } from "../check";
 import { runTests, TestOpts, reportJson, hasTests, eraseTests } from "../testing";
 import { parseJson } from "../json";
 import { ruleIndex } from "../package";
 import { effectsContext, defEffectsJson, viewsJson, aggregateViews, moduleDefs } from "../analysis";
 import { lower } from "../lower";
-import { optimize } from "../opt";
+import { optimize, pruneProgram } from "../opt";
 import { fuseProgram } from "../fuse";
 import { verify } from "../verify";
 import { emitC } from "../backends/c";
@@ -612,6 +612,7 @@ function importName(a: Analysis, t: ImportTarget): string {
       StdFs => "std:fsraw",
       StdProcess => "std:process",
       StdClock => "std:clock",
+      StdCore => "std:core",
     },
   };
 }
@@ -1009,7 +1010,10 @@ type Compiled = { ok: bool; diags: DiagView[]; err: string; bytes: usize; };
 
 function compileEntry(fs: FsGrant, st: McpSession, entry: string, out: string): Compiled {
   const none: DiagView[] = [];
-  const loaded = loadAll(fs, entry);
+  // As `orin compile`: with the preludes, so that the Orin runtime ($rt) is part of the program (the C runtime no longer holds the
+  // allocator, ADR-0052 R3d.3).
+  const noOverlay: SourceFile[] = [];
+  const loaded = loadWithRoots(fs, entry, noOverlay, preludeRoots());
   for (const f of loaded.sm.files) {
     if (!f.path.startsWith("$") && resolvePath(st, f.path).isErr()) {
       return Compiled {
@@ -1060,7 +1064,7 @@ function compileEntry(fs: FsGrant, st: McpSession, entry: string, out: string): 
       bytes: 0,
     };
   }
-  const c = emitC(mir);
+  const c = emitC(pruneProgram(mir));
   const w = writeFile(fs, out, c);
   if (w.isErr()) {
     return Compiled {

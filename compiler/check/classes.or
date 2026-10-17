@@ -21,7 +21,7 @@ import { LoadedProgram, Unit } from "../loader";
 import { Type } from "../hir";
 import {
   Env, ClassInfo, FieldAcc, MethodInfo, EntRecord, EntGen, EntIface, VFunc, VGFunc, findType, findVal, originOf, boundOf, showType,
-  FmCtor, FmMethod, FmStatic, isRecordKind,
+  FmCtor, FmMethod, FmStatic, isRecordKind, cmpKindOfIface, builtinIface, isOpaqueRec, mapOrigin, parOrigin, typeEq, isVoid, isMapKeyType,
 } from "./env";
 
 export type Lowered = { prog: LoadedProgram; classes: ClassInfo[]; diags: Diagnostic[]; };
@@ -548,8 +548,278 @@ export function recordImplements(env: Env, r: usize, iface: usize): bool {
   return b.isSome() && b.unwrap() == iface;
 }
 
+// ---------------------------------------------------------------------------
+// The constraint interfaces Eq / Ord / Hash (ADR-0034)
+// ---------------------------------------------------------------------------
+
+// Why a type is not `Eq` / `Ord` / `Hash`: the error code (E0475: the type has no such instance, E0476: an explicit
+// `equals` / `compare` / `hash` of a class is unusable or inconsistent) and the message.
+export type CmpProb = { code: string; msg: string; };
+
+function cmpWord(kind: usize): string {
+  return kind == 1 ? "Eq" : (kind == 2 ? "Ord" : "Hash");
+}
+
+function prob(code: string, msg: string): Option<CmpProb> {
+  return Some(CmpProb { code: code, msg: msg });
+}
+
+function inside(p: Option<CmpProb>, ctx: string): Option<CmpProb> {
+  return match (p) {
+    Some(q) => Some(CmpProb { code: q.code, msg: ctx + ": " + q.msg }),
+    None => None,
+  };
+}
+
+// None when a value of type `t` is `Eq` (kind 1), `Ord` (2) or `Hash` (3), else the reason. Tier 1 (derivation): the
+// integers, `bool` and `string` are all three; `Option`, `Result`, arrays, records and unions are when all their
+// components are; floats, function values, interface values and resource handles never are. Tier 2: a class is `Eq`
+// when it declares `equals` (or `implements Eq`/`Ord`/`Hash`, which asks for the structural instance), `Ord` with
+// `compare` (or `implements Ord`), `Hash` with `hash` (or `implements Hash`). A parameter bounded by `Ord` or `Hash`
+// is `Eq` as well.
+export function cmpProblem(env: Env, t: Type, kind: usize): Option<CmpProb> {
+  const seen: string[] = [];
+  return cmpProb(env, t, kind, seen, true);
+}
+
+// Like `cmpProblem`, but a record, union or class is accepted without looking inside: for a place where those types are
+// still being declared (a `Map<K, V>` written in a declaration); the full check happens when a value is created.
+export function cmpShapeProblem(env: Env, t: Type, kind: usize): Option<CmpProb> {
+  const seen: string[] = [];
+  return cmpProb(env, t, kind, seen, false);
+}
+
+function cmpProb(env: Env, t: Type, kind: usize, seen: string[], deep: bool): Option<CmpProb> {
+  const w = cmpWord(kind);
+  match (t) {
+    TyFloat => {
+      return prob("E0475", "`float` is not `" + w + "` (NaN is not equal to itself); use an integer, or a wrapper with an explicit total order");
+    },
+    TyF32 => {
+      return prob("E0475", "`f32` is not `" + w + "` (NaN is not equal to itself); use an integer, or a wrapper with an explicit total order");
+    },
+    TyVoid => {
+      return prob("E0475", "`void` has no value to compare");
+    },
+    TyArray(e) => {
+      return inside(cmpProb(env, e, kind, seen, deep), "element type `" + showType(env, e) + "`");
+    },
+    TyOption(e) => {
+      return inside(cmpProb(env, e, kind, seen, deep), "type `" + showType(env, e) + "` inside `Option`");
+    },
+    TyResult(a, b) => {
+      if (!isVoid(a)) {
+        const pa = cmpProb(env, a, kind, seen, deep);
+        if (pa.isSome()) {
+          return inside(pa, "type `" + showType(env, a) + "` inside `Result`");
+        }
+      }
+      return inside(cmpProb(env, b, kind, seen, deep), "type `" + showType(env, b) + "` inside `Result`");
+    },
+    TyFn(_, _) => {
+      return prob("E0475", "function values are neither `Eq`, `Ord` nor `Hash`");
+    },
+    TyIface(_) => {
+      return prob("E0475", "interface values are neither `Eq`, `Ord` nor `Hash`");
+    },
+    TyFile => {
+      return prob("E0475", "resource handles are neither `Eq`, `Ord` nor `Hash`");
+    },
+    TyGrant(_) => {
+      return prob("E0475", "resource handles are neither `Eq`, `Ord` nor `Hash`");
+    },
+    TyUnion(u) => {
+      if (!deep) {
+        return None;
+      }
+      const key = "u" + u.toString();
+      if (seen.includes(key)) {
+        return None;
+      }
+      let seen2 = seen;
+      seen2.push(key);
+      for (const v of env.unions[u].variants) {
+        for (const pt of v.payload) {
+          const p = cmpProb(env, pt, kind, seen2, deep);
+          if (p.isSome()) {
+            return inside(p, "payload of variant `" + v.name + "` of `" + showType(env, t) + "`");
+          }
+        }
+      }
+      return None;
+    },
+    TyRecord(r) => {
+      return recProb(env, r, kind, seen, deep);
+    },
+    _ => {
+      return None;
+    },
+  }
+}
+
+function recProb(env: Env, r: usize, kind: usize, seen: string[], deep: bool): Option<CmpProb> {
+  const w = cmpWord(kind);
+  if (isOpaqueRec(env, r)) {
+    const b = boundOf(env, r);
+    if (b.isSome()) {
+      const bk = cmpKindOfIface(env, b.unwrap());
+      if (bk == kind || kind == 1 && bk > 0) {
+        return None;
+      }
+    }
+    const n = env.records[r].name;
+    return prob("E0475", "type parameter `" + n + "` is not `" + w + "`; declare `" + n + " extends " + w + "`");
+  }
+  const t = TyRecord(r);
+  if (mapOrigin(env, t).isSome() || parOrigin(env, t).isSome()) {
+    return prob("E0475", "`" + showType(env, t) + "` is not `" + w + "`");
+  }
+  if (!deep) {
+    return None;
+  }
+  const key = "r" + r.toString() + ":" + kind.toString();
+  if (seen.includes(key)) {
+    return None;
+  }
+  let seen2 = seen;
+  seen2.push(key);
+  const co = classOfRec(env, r);
+  if (co.isSome()) {
+    return classProb(env, co.unwrap(), r, kind, seen2);
+  }
+  return fieldsProb(env, r, kind, seen2);
+}
+
+function fieldsProb(env: Env, r: usize, kind: usize, seen: string[]): Option<CmpProb> {
+  for (const f of env.records[r].fields) {
+    const p = cmpProb(env, f.ty, kind, seen, true);
+    if (p.isSome()) {
+      return inside(p, "field `" + f.name + "` of `" + showType(env, TyRecord(r)) + "`");
+    }
+  }
+  return None;
+}
+
+// The explicit method of tier 2 for `kind` (1 equals, 2 compare, 3 hash) of class `c`.
+export function cmpMethodName(kind: usize): string {
+  return kind == 1 ? "equals" : (kind == 2 ? "compare" : "hash");
+}
+
+// The method of tier 2 that class `c` declares for `kind`, if any.
+export function cmpMethodOf(c: ClassInfo, kind: usize): Option<usize> {
+  return findMethod(c, cmpMethodName(kind));
+}
+
+// Does class `c` ask for derivation with `implements Eq` / `Ord` / `Hash`? (`kind` 0: any of them.)
+function implementsCmp(env: Env, c: ClassInfo, kind: usize): bool {
+  for (const i of c.impls) {
+    const k = cmpKindOfIface(env, i);
+    if (k > 0 && (kind == 0 || k == kind)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function classProb(env: Env, ci: usize, rec: usize, kind: usize, seen: string[]): Option<CmpProb> {
+  const c = env.classes[ci];
+  const w = cmpWord(kind);
+  const mEq = cmpMethodOf(c, 1);
+  const mine = cmpMethodOf(c, kind);
+  const sig = kind == 1 ? "equals(other: " + c.name + "): bool" : (kind == 2 ? "compare(other: " + c.name + "): int" : "hash(): usize");
+  if (kind > 1) {
+    const e = classProb(env, ci, rec, 1, seen);
+    if (e.isSome()) {
+      return e;
+    }
+  }
+  if (mine.isSome()) {
+    return methodProb(env, c, rec, mine.unwrap(), kind);
+  }
+  const wants = kind == 1 ? implementsCmp(env, c, 0) : implementsCmp(env, c, kind);
+  if (!wants) {
+    return prob("E0475", "class `" + c.name + "` is not `" + w + "`: declare `" + sig + "`, or `implements " + w + "` for the structural instance");
+  }
+  if (kind > 1 && mEq.isSome()) {
+    return prob("E0476", "class `" + c.name + "` has an explicit `equals`, so `implements " + w + "` cannot derive `" + cmpMethodName(kind) + "` structurally (it could disagree with `equals`); declare `" + sig + "`");
+  }
+  return fieldsProb(env, rec, kind, seen);
+}
+
+// A declared `equals` / `compare` / `hash` must be a public, non-static, non-mutating instance method with the
+// signature `equals(other: C): bool`, `compare(other: C): int`, `hash(): usize`. A generic class is checked on
+// the instance when it is created (derive.or), because its signature mentions the type parameters.
+function methodProb(env: Env, c: ClassInfo, rec: usize, m: usize, kind: usize): Option<CmpProb> {
+  const mi = c.methods[m];
+  const n = cmpMethodName(kind);
+  const sig = kind == 1 ? "equals(other: " + c.name + "): bool" : (kind == 2 ? "compare(other: " + c.name + "): int" : "hash(): usize");
+  if (mi.isStatic) {
+    return prob("E0476", "`" + n + "` of class `" + c.name + "` is static; it must be an instance method `" + sig + "`");
+  }
+  if (mi.priv) {
+    return prob("E0476", "`" + n + "` of class `" + c.name + "` is private; it must be public: `" + sig + "`");
+  }
+  if (mi.mutating) {
+    return prob("E0476", "`" + n + "` of class `" + c.name + "` mutates its receiver; it must not");
+  }
+  if (c.gid < 0 && env.funcs[mi.fid].params.length > 0) {
+    // (a method whose signature is not resolved yet, while declarations are resolved, is accepted here and checked on use)
+    const f = env.funcs[mi.fid];
+    const want = TyRecord(rec);
+    const okParams = kind == 3 ? f.params.length == 1 : (f.params.length == 2 && typeEq(f.params[1], want));
+    const wantRet: Type = kind == 1 ? TyBool : (kind == 2 ? TyInt : TyUsize);
+    if (!okParams || !typeEq(f.srcRet, wantRet)) {
+      return prob("E0476", "`" + n + "` of class `" + c.name + "` must have the signature `" + sig + "`");
+    }
+  }
+  return None;
+}
+
+// The message of a bound that a type does not satisfy (`kind` 1..3), for `T extends Eq` of a function or class.
+export function cmpBoundError(env: Env, t: Type, kind: usize, what: string, span: Span): Option<Diagnostic> {
+  const p = cmpProblem(env, t, kind);
+  if (p.isNone()) {
+    return None;
+  }
+  return Some(diag(p.unwrap().code, span, "type `" + showType(env, t) + "` does not satisfy the bound `" + cmpWord(kind) + "` of " + what + ": " + p.unwrap().msg));
+}
+
+// Is `t` a type that is built from other types (so that a `Map` key problem is about its components)?
+function isCompositeTy(env: Env, t: Type): bool {
+  return match (t) {
+    TyArray(_) => true,
+    TyOption(_) => true,
+    TyResult(_, _) => true,
+    TyUnion(_) => true,
+    TyRecord(r) => !isOpaqueRec(env, r),
+    _ => false,
+  };
+}
+
+// The error for a `Map` key type that is not `Hash` (E0400 for a type that can never be a key, such as `float`; E0475 when
+// a component is the problem). `deep` false: records, unions and classes are taken on trust (declaration time).
+export function mapKeyError(env: Env, t: Type, deep: bool, span: Span): Option<Diagnostic> {
+  if (isMapKeyType(t)) {
+    return None;
+  }
+  const p = deep ? cmpProblem(env, t, 3) : cmpShapeProblem(env, t, 3);
+  if (p.isNone()) {
+    return None;
+  }
+  return Some(diag(
+    isCompositeTy(env, t) ? p.unwrap().code : "E0400",
+    span,
+    "`Map` keys must be `Hash` (integers, `bool`, `string`, and records, unions, `Option`, `Result` and arrays of them, or a class with `hash`), found `"
+      + showType(env, t) + "`: " + p.unwrap().msg
+  ));
+}
+
 // Does a value of type `t` satisfy the bound / convert to interface `iface`?
 export function satisfies(env: Env, t: Type, iface: usize): bool {
+  const ck = cmpKindOfIface(env, iface);
+  if (ck > 0) {
+    return cmpProblem(env, t, ck).isNone();
+  }
   return match (t) {
     TyRecord(r) => recordImplements(env, r, iface),
     TyIface(j) => j == iface,
@@ -561,6 +831,10 @@ export function satisfies(env: Env, t: Type, iface: usize): bool {
 export function boundIface(env: Env, unit: usize, b: Ident): Result<usize, Diagnostic> {
   const found = findType(env.units[unit].scope, b.name);
   if (found.isNone()) {
+    const bi = builtinIface(env, b.name);
+    if (bi.isSome()) {
+      return Ok(bi.unwrap());
+    }
     return Err(diag("E0300", b.span, "unknown interface `" + b.name + "` in a type parameter bound"));
   }
   return match (found.unwrap()) {
@@ -579,7 +853,13 @@ export function checkClassBounds(env: Env, ci: usize, args: Type[], span: Span):
       Some(b) => {
         match (boundIface(env, c.unit, b)) {
           Ok(i) => {
-            if (!satisfies(env, args[k], i)) {
+            const ck = cmpKindOfIface(env, i);
+            if (ck > 0) {
+              const bad = cmpBoundError(env, args[k], ck, "class `" + c.name + "`", span);
+              if (bad.isSome()) {
+                return bad;
+              }
+            } else if (!satisfies(env, args[k], i)) {
               let why = "";
               match (args[k]) {
                 TyRecord(r) => {

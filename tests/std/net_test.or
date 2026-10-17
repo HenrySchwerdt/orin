@@ -2,46 +2,106 @@
 // with contract checking (every @Invariant / @Requires / @Ensures of std:net is a run-time trap) and without.
 import { assert, assertEq, assertEqUsize, assertEqString, assertEqBool, fail } from "std:test";
 import { Host, useNet } from "std:host";
-import { Bytes, bytesFromString, bytesFromInts } from "std:bytes";
+import { milliseconds } from "std:time";
+import { Bytes, fromString, fromInts } from "std:bytes";
 import {
-  NetGrant, Listener, Stream, Peer, parsePeer, findFrom, makeError, isDenied, isTimeout, isReset, useListenerNet, useConnectionBeside,
-  useAccepted, portOf, recv, send, sendAll, shutdownWrite, nowMillis, StreamReader, RecvResult, RecvData, RecvEof, RecvTimeout, RecvReset,
-  RecvError, Fill, Filled, FillClosed, FillLimit, FillTimeout, FillError
+  NetGrant, Listener, Stream, Peer, NetError, NetErrorKind, parsePeer, netErrorFromCode, netErrorMessage, isDenied, isTimeout, isReset,
+  useListenerNet, useConnectionBeside, useAccepted, portOf, recv, send, sendAll, shutdownWrite, monotonicMillis, StreamReader,
+  RecvResult, RecvData, RecvEof, RecvTimeout, RecvReset, RecvError, Fill, Filled, FillClosed, FillLimit, FillTimeout, FillError,
+  Denied, Closed, Timeout, Reset, InvalidArgument, InvalidPeer, Os
 } from "std:net";
+
+function kindName(k: NetErrorKind): string {
+  return match (k) {
+    Denied => "Denied",
+    Closed => "Closed",
+    Timeout => "Timeout",
+    Reset => "Reset",
+    InvalidArgument => "InvalidArgument",
+    InvalidPeer => "InvalidPeer",
+    Os => "Os"
+  };
+}
 
 @Test
 function peerParsing(): void {
-  const a = parsePeer("127.0.0.1:8080");
+  const a = parsePeer("127.0.0.1:8080").unwrap();
   assertEqString(a.host, "127.0.0.1", "ipv4 host");
   assertEq(a.port, 8080, "ipv4 port");
-  const b = parsePeer("[::1]:443");
+  const b = parsePeer("[::1]:443").unwrap();
   assertEqString(b.host, "::1", "ipv6 host");
   assertEq(b.port, 443, "ipv6 port");
-  assertEq(parsePeer("nonsense").port, 0, "no port");
-  assertEq(parsePeer("1.2.3.4:99x").port, 0, "bad port");
+  assertEq(parsePeer("localhost:0").unwrap().port, 0, "port 0 is a port");
+  assertEq(parsePeer("h:65535").unwrap().port, 65535, "the largest port");
+}
+
+@Test
+function peerParsingRejects(): void {
+  // no sentinel: every bad text is an Err(InvalidPeer) with the byte offset of the problem
+  const none = parsePeer("nonsense");
+  assert(none.isErr(), "no port");
+  assertEqString(kindName(none.unwrapErr().kind), "InvalidPeer", "kind");
+  assertEqUsize(none.unwrapErr().offset, 8, "offset: the end of the text");
+  const digits = parsePeer("1.2.3.4:99x");
+  assert(digits.isErr(), "bad port");
+  assertEqUsize(digits.unwrapErr().offset, 10, "offset: the first bad digit");
+  assert(parsePeer("1.2.3.4:").isErr(), "empty port");
+  assert(parsePeer("1.2.3.4:65536").isErr(), "port too large");
+  assert(parsePeer("1.2.3.4:999999999999999999999").isErr(), "port far too large");
+  assert(parsePeer(":80").isErr(), "empty host");
+  assert(parsePeer("::1:80").isErr(), "an IPv6 literal needs brackets");
+  assert(parsePeer("[::1:80").isErr(), "unbalanced bracket");
+  assert(parsePeer("").isErr(), "empty text");
+  assert(netErrorMessage(none.unwrapErr()).length > 0, "every error has text");
+  assertEqString(netErrorMessage(none.unwrapErr()), "invalid peer address at byte 8", "message");
 }
 
 @Test
 function errorClassification(): void {
-  assert(isDenied(makeError(1)), "EPERM is a denial");
-  assert(isTimeout(makeError(1002)), "timeout");
-  assert(isReset(makeError(1003)), "reset");
-  assert(!isDenied(makeError(1002)), "a timeout is not a denial");
-  assert(makeError(1002).message.length > 0, "every error has text");
-  assert(makeError(111).message.length > 0, "an errno has text");
+  assert(isDenied(netErrorFromCode(1)), "EPERM is a denial");
+  assert(isTimeout(netErrorFromCode(1002)), "timeout");
+  assert(isReset(netErrorFromCode(1003)), "reset");
+  assert(!isDenied(netErrorFromCode(1002)), "a timeout is not a denial");
+  assertEqString(kindName(netErrorFromCode(1).kind), "Denied", "kind of 1");
+  assertEqString(kindName(netErrorFromCode(1001).kind), "Closed", "kind of 1001");
+  assertEqString(kindName(netErrorFromCode(1002).kind), "Timeout", "kind of 1002");
+  assertEqString(kindName(netErrorFromCode(1003).kind), "Reset", "kind of 1003");
+  assertEqString(kindName(netErrorFromCode(22).kind), "InvalidArgument", "kind of EINVAL");
+  assertEqString(kindName(netErrorFromCode(111).kind), "Os", "any other errno");
+  assertEq(netErrorFromCode(111).code, 111, "the errno is kept");
+  assert(netErrorMessage(netErrorFromCode(1002)).length > 0, "every error has text");
+  assert(netErrorMessage(netErrorFromCode(111)).length > 0, "an errno has text");
 }
 
 @Test
-function delimiterSearch(): void {
-  const crlf = bytesFromString("\r\n");
-  const h = bytesFromString("GET / HTTP/1.1\r\nHost: x\r\n\r\n");
-  assertEqUsize(findFrom(h, crlf, 0, 100).unwrap(), 16, "first CRLF");
-  assertEqUsize(findFrom(h, crlf, 16, 100).unwrap(), 25, "second CRLF");
-  assert(findFrom(h, crlf, 0, 15).isNone(), "the delimiter would end past the limit");
-  assertEqUsize(findFrom(h, crlf, 0, 16).unwrap(), 16, "the delimiter ends exactly at the limit");
-  assert(findFrom(bytesFromString("ab\r"), crlf, 0, 100).isNone(), "half a delimiter");
-  assertEqUsize(findFrom(bytesFromString("aaab"), bytesFromString("aab"), 0, 10).unwrap(), 4, "overlapping prefix");
-  assert(findFrom(bytesFromString(""), crlf, 0, 10).isNone(), "empty haystack");
+function delimiterSearchThroughReadUntil(host: Host): void {
+  // The delimiter search is internal; its boundaries are observable through `readUntil` on bytes that are already buffered
+  // (no byte arrives, so every answer that does not need the network is immediate).
+  useNet(host, net => {
+    const l = useListenerNet(net, "127.0.0.1", 0, 8, (ln, n) => {
+      pair(ln, n, (c: Stream) => {}, (s: Stream) => {
+        const crlf = fromString("\r\n");
+        const h = fromString("GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+        let rd = new StreamReader(64);
+        rd.unread(h);
+        assertEqString(fillKind(rd.readUntil(s, crlf, 64, milliseconds(50))), "filled GET / HTTP/1.1\r\n", "first CRLF");
+        assertEqString(fillKind(rd.readUntil(s, crlf, 64, milliseconds(50))), "filled Host: x\r\n", "second CRLF");
+        rd = new StreamReader(64);
+        rd.unread(h);
+        assertEqString(fillKind(rd.readUntil(s, crlf, 15, milliseconds(50))), "limit", "the delimiter would end past the limit");
+        assertEqString(fillKind(rd.readUntil(s, crlf, 16, milliseconds(50))), "filled GET / HTTP/1.1\r\n", "the delimiter ends exactly at the limit");
+        rd = new StreamReader(64);
+        rd.unread(fromString("ab\r"));
+        assertEqString(fillKind(rd.readUntil(s, crlf, 64, milliseconds(30))), "timeout", "half a delimiter: wait for the rest");
+        rd = new StreamReader(64);
+        rd.unread(fromString("aaab"));
+        assertEqString(fillKind(rd.readUntil(s, fromString("aab"), 10, milliseconds(30))), "filled aaab", "overlapping prefix");
+        rd = new StreamReader(64);
+        assertEqString(fillKind(rd.readUntil(s, crlf, 10, milliseconds(30))), "timeout", "empty buffer, nothing arrives");
+      });
+    });
+    assert(l.isOk(), "listener");
+  });
 }
 
 function kind(r: RecvResult): string {
@@ -67,9 +127,9 @@ function fillKind(f: Fill): string {
 // client side: connect to the listener in the same process and run `body` with the accepted stream (the connect completes
 // before accept: the kernel queues it)
 function pair(ln: Listener, net: NetGrant, client: (c: Stream) => void, server: (s: Stream) => void): void {
-  const r = useConnectionBeside(net, "127.0.0.1", portOf(ln), 2000, ln, (c: Stream, ln2: Listener) => {
+  const r = useConnectionBeside(net, "127.0.0.1", portOf(ln), milliseconds(2000), ln, (c: Stream, ln2: Listener) => {
     client(c);
-    const a = useAccepted(ln2, 2000, (s: Stream, p: Peer) => { server(s); });
+    const a = useAccepted(ln2, milliseconds(2000), (s: Stream, p: Peer) => { server(s); });
     assert(a.isOk(), "accepted");
   });
   assert(r.isOk(), "connected");
@@ -81,16 +141,16 @@ function readUntilAndExact(host: Host): void {
     const l = useListenerNet(net, "127.0.0.1", 0, 8, (ln, n) => {
       pair(ln, n, (c: Stream) => {
         // a head that arrives as three separate sends, and a body behind it
-        sendAll(c, bytesFromString("GET / HT"), 1000);
-        sendAll(c, bytesFromString("TP/1.1\r"), 1000);
-        sendAll(c, bytesFromString("\nHost: x\r\n\r\nbody!"), 1000);
+        sendAll(c, fromString("GET / HT"), milliseconds(1000));
+        sendAll(c, fromString("TP/1.1\r"), milliseconds(1000));
+        sendAll(c, fromString("\nHost: x\r\n\r\nbody!"), milliseconds(1000));
         shutdownWrite(c);
       }, (s: Stream) => {
         let rd = new StreamReader(1024);
-        assertEqString(fillKind(rd.readUntil(s, bytesFromString("\r\n"), 100, 1000)), "filled GET / HTTP/1.1\r\n", "request line");
-        assertEqString(fillKind(rd.readUntil(s, bytesFromString("\r\n\r\n"), 100, 1000)), "filled Host: x\r\n\r\n", "rest of the head");
-        assertEqString(fillKind(rd.readExact(s, 3, 1000)), "filled bod", "exact");
-        assertEqString(fillKind(rd.readExact(s, 5, 1000)), "closed y!", "the peer closed before 5 bytes");
+        assertEqString(fillKind(rd.readUntil(s, fromString("\r\n"), 100, milliseconds(1000))), "filled GET / HTTP/1.1\r\n", "request line");
+        assertEqString(fillKind(rd.readUntil(s, fromString("\r\n\r\n"), 100, milliseconds(1000))), "filled Host: x\r\n\r\n", "rest of the head");
+        assertEqString(fillKind(rd.readExact(s, 3, milliseconds(1000))), "filled bod", "exact");
+        assertEqString(fillKind(rd.readExact(s, 5, milliseconds(1000))), "closed y!", "the peer closed before 5 bytes");
         assertEqUsize(rd.buffered().length(), 0, "nothing buffered at the end");
       });
     });
@@ -103,19 +163,19 @@ function limitsAndDeadlines(host: Host): void {
   useNet(host, net => {
     const l = useListenerNet(net, "127.0.0.1", 0, 8, (ln, n) => {
       pair(ln, n, (c: Stream) => {
-        sendAll(c, bytesFromString("0123456789"), 1000);
+        sendAll(c, fromString("0123456789"), milliseconds(1000));
       }, (s: Stream) => {
         let rd = new StreamReader(64);
-        assertEqString(fillKind(rd.readUntil(s, bytesFromString("\n"), 4, 500)), "limit", "no delimiter within 4 bytes");
+        assertEqString(fillKind(rd.readUntil(s, fromString("\n"), 4, milliseconds(500))), "limit", "no delimiter within 4 bytes");
         assert(rd.buffered().length() <= 4, "at most the limit was received");
         // the rest is still there for the next read: nothing was lost
-        assertEqString(fillKind(rd.readExact(s, 10, 500)), "filled 0123456789", "all ten bytes, nothing lost");
+        assertEqString(fillKind(rd.readExact(s, 10, milliseconds(500))), "filled 0123456789", "all ten bytes, nothing lost");
         // a deadline for the whole call: nothing more arrives
-        const t0 = nowMillis(s);
-        assertEqString(fillKind(rd.readExact(s, 1, 120)), "timeout", "deadline");
-        const dt = nowMillis(s) - t0;
+        const t0 = monotonicMillis(s);
+        assertEqString(fillKind(rd.readExact(s, 1, milliseconds(120))), "timeout", "deadline");
+        const dt = monotonicMillis(s) - t0;
         assert(dt >= 100 && dt < 2000, "the deadline is about 120 ms, not much less and not infinite: " + dt.toString());
-        assertEqString(kind(recv(s, 8, 20)), "timeout", "recv timeout");
+        assertEqString(kind(recv(s, 8, milliseconds(20))), "timeout", "recv timeout");
       });
     });
     assert(l.isOk(), "listener");
@@ -127,12 +187,12 @@ function recvAndSend(host: Host): void {
   useNet(host, net => {
     const l = useListenerNet(net, "127.0.0.1", 0, 8, (ln, n) => {
       pair(ln, n, (c: Stream) => {
-        const one = send(c, bytesFromInts([1, 2, 3, 250, 251]), 1000);
+        const one = send(c, fromInts([1, 2, 3, 250, 251]), milliseconds(1000));
         assertEqUsize(one.unwrap(), 5, "send reports what it handed over");
-        assert(send(c, bytesFromString(""), 1000).unwrap() == 0, "an empty send");
+        assert(send(c, fromString(""), milliseconds(1000)).unwrap() == 0, "an empty send");
       }, (s: Stream) => {
-        assertEqString(kind(recv(s, 2, 1000)), "data 2", "recv is capped by maxBytes");
-        const r = recv(s, 100, 1000);
+        assertEqString(kind(recv(s, 2, milliseconds(1000))), "data 2", "recv is capped by maxBytes");
+        const r = recv(s, 100, milliseconds(1000));
         match (r) {
           RecvData(b) => {
             assertEqUsize(b.length(), 3, "the rest");
@@ -141,8 +201,8 @@ function recvAndSend(host: Host): void {
           },
           _ => { fail("expected data"); }
         }
-        assertEqString(kind(recv(s, 0, 10)), "error", "maxBytes 0");
-        sendAll(s, bytesFromString("x"), 1000);
+        assertEqString(kind(recv(s, 0, milliseconds(10))), "error", "maxBytes 0");
+        sendAll(s, fromString("x"), milliseconds(1000));
       });
     });
     assert(l.isOk(), "listener");
@@ -155,14 +215,14 @@ function sendViewsOfALargerArray(host: Host): void {
     const l = useListenerNet(net, "127.0.0.1", 0, 8, (ln, n) => {
       pair(ln, n, (c: Stream) => {
         // views that start and end inside their storage: only their own bytes go out
-        const all = bytesFromString("xxHELLOyyWORLDzz");
-        assertEqUsize(send(c, all.slice(2, 7), 1000).unwrap(), 5, "send of a view");
-        assert(sendAll(c, all.slice(9, 14), 1000).isOk(), "sendAll of a view");
+        const all = fromString("xxHELLOyyWORLDzz");
+        assertEqUsize(send(c, all.slice(2, 7), milliseconds(1000)).unwrap(), 5, "send of a view");
+        assert(sendAll(c, all.slice(9, 14), milliseconds(1000)).isOk(), "sendAll of a view");
         shutdownWrite(c);
       }, (s: Stream) => {
         let rd = new StreamReader(64);
-        assertEqString(fillKind(rd.readExact(s, 10, 1000)), "filled HELLOWORLD", "only the bytes of the views");
-        assertEqString(fillKind(rd.readExact(s, 1, 1000)), "closed ", "nothing after them");
+        assertEqString(fillKind(rd.readExact(s, 10, milliseconds(1000))), "filled HELLOWORLD", "only the bytes of the views");
+        assertEqString(fillKind(rd.readExact(s, 1, milliseconds(1000))), "closed ", "nothing after them");
       });
     });
     assert(l.isOk(), "listener");
@@ -186,11 +246,11 @@ function readUntilNeverBuffersPastTheLimit(host: Host): void {
   useNet(host, net => {
     const l = useListenerNet(net, "127.0.0.1", 0, 8, (ln, n) => {
       pair(ln, n, (c: Stream) => {
-        sendAll(c, bytesFromString("0123456789"), 1000);
+        sendAll(c, fromString("0123456789"), milliseconds(1000));
       }, (s: Stream) => {
         let rd = new StreamReader(64);
-        rd.unread(bytesFromString("xx"));
-        assertEqString(fillKind(rd.readUntil(s, bytesFromString("\n"), 4, 500)), "limit", "no delimiter within 4 bytes");
+        rd.unread(fromString("xx"));
+        assertEqString(fillKind(rd.readUntil(s, fromString("\n"), 4, milliseconds(500))), "limit", "no delimiter within 4 bytes");
         assertEqUsize(rd.buffered().length(), 4, "two bytes were already buffered, so only two more were received");
       });
     });
@@ -203,12 +263,12 @@ function readUntilDeadline(host: Host): void {
   useNet(host, net => {
     const l = useListenerNet(net, "127.0.0.1", 0, 8, (ln, n) => {
       pair(ln, n, (c: Stream) => {
-        sendAll(c, bytesFromString("abc"), 1000);
+        sendAll(c, fromString("abc"), milliseconds(1000));
       }, (s: Stream) => {
         let rd = new StreamReader(64);
-        const t0 = nowMillis(s);
-        assertEqString(fillKind(rd.readUntil(s, bytesFromString("\n"), 64, 150)), "timeout", "the delimiter never comes");
-        const dt = nowMillis(s) - t0;
+        const t0 = monotonicMillis(s);
+        assertEqString(fillKind(rd.readUntil(s, fromString("\n"), 64, milliseconds(150))), "timeout", "the delimiter never comes");
+        const dt = monotonicMillis(s) - t0;
         assert(dt >= 120 && dt < 3000, "readUntil honours its deadline: " + dt.toString());
         assertEqUsize(rd.buffered().length(), 3, "the bytes that did arrive stay buffered");
       });
