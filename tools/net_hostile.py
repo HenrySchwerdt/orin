@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Hostile-peer checks of examples/http_server.or for tools/test_server_campaign.sh (ADR-0017, work package C5).
 
-  net_hostile.py PORT REQUEST_MS SEND_MS WORKERS CHECK...      CHECK is one of: slowloris nonreading abrupt
+  net_hostile.py PORT REQUEST_MS SEND_MS WORKERS CHECK...      CHECK is one of: slowloris nonreading abrupt shutdown
 The server runs with WORKERS workers, a request deadline of REQUEST_MS and a send deadline of SEND_MS.
   slowloris    2 * WORKERS clients drip a valid request one byte at a time, far slower than the deadline. Each must be cut off (408
                or a close) within REQUEST_MS plus slack of ITS first byte, so the server never waits longer than the deadline however
@@ -11,6 +11,9 @@ The server runs with WORKERS workers, a request deadline of REQUEST_MS and a sen
                SEND_MS plus slack) and afterwards at once
   abrupt       300 clients that connect and close, or reset, in the middle of a head, a body, or right after the request; the server
                still answers a healthy client afterwards
+  shutdown     (needs the server started with admin = 1; ends it) a half-sent request is open, POST /shutdown is answered 200, the held
+               request is still answered (408 at its deadline: served to the end, not dropped), a request on a connection opened
+               after the shutdown is never served, and the port is refused once the server has exited
 Exit status 0 when every check passed; one line per check, with the measured numbers."""
 import socket
 import struct
@@ -169,6 +172,48 @@ def abrupt():
           h is not None and h < 3.0)
 
 
+def shutdown():
+    held = connect()
+    held.sendall(b"GET /hea")
+    time.sleep(0.2)
+    s = connect()
+    s.sendall(b"POST /shutdown HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+    data = b""
+    while True:
+        c = s.recv(4096)
+        if not c:
+            break
+        data += c
+    check("shutdown: POST /shutdown answered 200", data.startswith(b"HTTP/1.1 200") and b"shutting down" in data)
+    late = None
+    try:
+        l = connect()
+        l.sendall(b"GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        l.settimeout(1.5)
+        late = l.recv(100)
+    except (socket.timeout, OSError):
+        late = b""
+    check("shutdown: a connection opened after the shutdown is not served", not late.startswith(b"HTTP/1.1 200"))
+    held.settimeout(request_ms / 1000.0 + SLACK)
+    try:
+        got = held.recv(100)
+    except OSError:
+        got = b""
+    check("shutdown: the request held open is served to the end (%s)" % got[:24].decode("latin1").strip(), got.startswith(b"HTTP/1.1 408"))
+    t = time.time()
+    refused = False
+    while time.time() - t < 10:
+        try:
+            socket.create_connection(("127.0.0.1", port), timeout=1).close()
+            time.sleep(0.1)
+        except ConnectionRefusedError:
+            refused = True
+            break
+        except OSError:
+            time.sleep(0.1)
+    check("shutdown: the port is refused once the server has exited (%.1f s)" % (time.time() - t), refused)
+
+
 for c in checks:
-    {"slowloris": slowloris, "nonreading": nonreading, "abrupt": abrupt}[c]()
+    {"shutdown": shutdown, "slowloris": slowloris, "nonreading": nonreading, "abrupt": abrupt}[c]()
 sys.exit(1 if failed else 0)
