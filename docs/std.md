@@ -2,7 +2,7 @@
 
 Status of the std modules of ADR-0016 (spec 08). Every public function has a doc comment in its
 source with signature, errors/absence, behaviour and complexity (the spec 08 validation rule); this
-page is the map. `orin mcp` `inspect` answers `std:path.join`, `std:json.parse`, ... from its built-in
+page is the map. `orin mcp` `inspect` answers `std:path.join`, `std:json/legacy.parse`, `std:json.parseDocument`, ... from its built-in
 API table (`compiler/mcp/apitable.or`).
 
 | Module | Implemented in | Status |
@@ -11,7 +11,7 @@ API table (`compiler/mcp/apitable.or`).
 | `std:fs` | Orin, `library/std/fs.or` (scope API) over C runtime primitives (`std:fsraw`, internal) | done; takes an `FsGrant` first (ADR-0027), **unstable** until the owner confirms the I/O freeze (ADR-0016); resources and streaming: ADR-0025 |
 | `std:process`, `std:io` | C runtime built-ins (`runtime/core/orin_runtime*.c/.h`) | done; `args`, `shell`, `readLine`, ... take a `ProcessGrant` / `StdioGrant` first (ADR-0027), **unstable** |
 | `std:path` | Orin, `library/std/path.or` | done (POSIX, lexical) |
-| `std:json` | Orin, `library/std/json.or` | done, **integers only** |
+| `std:json` | Orin, `library/std/json.or` (+ `json/number.or`, `json/decode.or`, `json/legacy.or`) | done (ADR-0048 section 7.1): exact bounded `JsonValue`, `std:json/number`, `std:json/decode`; the integer-only `Json` is `std:json/legacy` (deprecated) |
 | `std:time` | Orin, `library/std/time.or` + clock-read built-ins | wall/monotonic clocks, checked elapsed/deadline helpers, durations and UTC calendar; no `sleep`; **unstable** (ADR-0027); [monotonic API](std-time-monotonic.md) |
 | `std:graph` | Orin, `library/std/graph.or` | `class Graph<T>` with generational, tagged `GraphId<T>` (ADR-0026) |
 | `std:bytes` | Orin, `library/std/bytes.or` | `Bytes`, `ByteBuilder`, `ByteReader`; provable-std layer 1 (ADR-0030), contract standard |
@@ -38,7 +38,7 @@ API table (`compiler/mcp/apitable.or`).
 `compiler/loader/embedded_stdlib.or`; run it after editing `library/std/`, `tools/bootstrap.sh` checks it).
 It is a *library root* (`PreludeRoot` with an empty `entry`): its files are served from memory under
 `$stdlib/<name>.or` but, unlike `library/core/` and `library/collections/`, **not** imported implicitly. The loader maps
-`import ... from "std:path"` (also `std:json`, `std:time`, `std:graph`, `std:test`, `std:bytes`, `std:utf8`, `std:url`, `std:collections`, `std:http`, `std:seq`, `std:net`, `std:text`, `std:html`, `std:meta`) to the unit `$stdlib/path`.
+`import ... from "std:path"` (also `std:json` and its submodules `std:json/number`, `std:json/decode`, `std:json/legacy`, which live in `library/std/json/`; `std:time`, `std:graph`, `std:test`, `std:bytes`, `std:utf8`, `std:url`, `std:collections`, `std:http`, `std:seq`, `std:net`, `std:text`, `std:html`, `std:meta`) to the unit `$stdlib/path`.
 Programs that do not import a module pay nothing for it, and the leading `$` makes unused functions of
 imported modules disappear in `compiler/opt/prune.or`. The sources use the full language (generics,
 records, closures); only the compiler itself has to stay Orin-B. Type names in diagnostics show the
@@ -129,7 +129,9 @@ leading `..` of relative paths kept, trailing `/` kept), `dirname(p)`, `basename
 (`".txt"`; `""` for `.bashrc`, `..`, no dot), `stem(p)`, `withExtension(p, ext)`, `isAbsolute(p)`,
 `resolveAgainst(base, p)`.
 
-## std:json (integers only)
+## std:json/legacy (integers only, deprecated)
+
+The integer-only model, moved from `std:json` by ADR-0048 section 7.1. New code uses `std:json` (below); `toValue(j): JsonValue` and `fromValue(v): Result<Json, NumberError>` cross between the two.
 
 ```
 type Json = JNull | JBool(bool) | JNum(int) | JStr(string) | JArr(Json[]) | JObj(JField[])
@@ -138,9 +140,9 @@ type JsonError = { message: string; offset: usize; line: usize; column: usize } 
 ```
 
 `parse(text): Result<Json, JsonError>`, `stringify(j): string` (compact), `pretty(j, indent: usize): string`,
-`quote(s)`, `formatError(e)` ("line L, column C: message"); builders `field(key, value)`; accessors (all
-total, `None` on a wrong kind/missing key): `get`, `at`, `path`, `keys`, `asString`, `asInt`, `asBool`,
-`asArray`, `asObject`, `isNull`, `getString`, `getInt`, `getBool`, `getArray`.
+`quote(s)`, `jsonErrorMessage(e)` ("line L, column C: message"; `formatError` is a deprecated alias); builders `field(key, value)`; accessors (all
+total, `None` on a wrong kind/missing key): `get`, `getIndex`, `getPath`, `keys`, `asString`, `asInt`, `asBool`,
+`asArray`, `asObject`, `isNull`, `getString`, `getInt`, `getBool`, `getArray` (`at` and `path` are deprecated aliases of `getIndex` and `getPath`).
 
 Rules: integers in -(2^63-1)..2^63-1 only; `1.5` / `1e3` are errors ("floats are not supported yet") until
 floats exist; nesting > 200 is an error; `\uXXXX` and surrogate pairs decode to UTF-8 (lone surrogate ->
@@ -176,10 +178,11 @@ generic class (ADR-0026) and, like every class, a value: a copy is independent.
 
 ```
 type GraphId<T> = { tag: int; index: usize; gen: int }     // obtain only through add (T is phantom)
-type GraphError = StaleId | ForeignId
+type GraphErrorKind = StaleId | ForeignId
+type GraphError = { kind: GraphErrorKind }        // rule 3.1: every error record has a `kind`
 class Graph<T> {
   constructor(tag: int)
-  size(): usize                                   contains(id): bool
+  size(): usize    isEmpty(): bool                has(id): bool      // contains(id) is a deprecated wrapper of has
   add(value: T): GraphId<T>                       // mutating, never fails
   get(id): Result<T, GraphError>
   set(id, value): Result<void, GraphError>        // mutating
@@ -249,19 +252,23 @@ class Bytes                                           // new Bytes(data: u8[], s
   slice(lo, hi): Bytes       trySlice(lo, hi): Option<Bytes>   // O(1); slice: @Requires(lo <= hi && hi <= length())
   concat(o): Bytes           equals(o): bool          startsWith(p): bool     indexOf(b: u8): Option<usize>   // O(n)
   toArray(): u8[]            toRawString(): string    toHex(): string          // O(n)
-emptyBytes()  bytesFromArray(u8[])  bytesFromInts(int[]) @Requires(allBytes(xs))  bytesFromString(s)  bytesFromHex(s): Option<Bytes>
+  includes(b: u8): bool      indexOfBytes(needle: Bytes, begin: usize): Option<usize>   // O(n * needle.length()) worst case
+empty()  fromArray(u8[])  fromInts(int[]) @Requires(allBytes(xs))  fromString(s)       // ADR-0048: `import * as bytes`
 allBytes(xs: int[]): bool
+// hex has one home, std:encoding: hexEncode / hexDecode / hexDecodeText; Bytes.toHex() is what hexEncode calls.
+// Deprecated for one release: emptyBytes bytesFromArray bytesFromInts bytesFromString bytesFromHex(s): Option<Bytes>
 
 class ByteBuilder                                     // invariant: capacity >= length
-  length()  reserved()  byteAt(i)  reserve(extra)  clear()  build(): Bytes
-  appendU8(u8)  appendU16be/le(u16)  appendU32be/le(u32)  appendBytes(Bytes)  appendString(s)   // amortised O(1) per byte
+  length()  isEmpty()  capacity()  byteAt(i)  reserve(extra)  clear()  build(): Bytes      // reserved() is deprecated
+  appendU8(u8)  appendU16Be/Le(u16)  appendU32Be/Le(u32)  appendBytes(Bytes)  appendString(s)   // amortised O(1) per byte
+                                                      // appendU16be/le, appendU32be/le are deprecated spellings
 
-type ReadError = { position: usize; needed: usize; remaining: usize }
+type BytesError = { offset: usize; needed: usize; remaining: usize }    // alias ReadError; no `kind`: one cause only
 class ByteReader                                      // invariant: pos <= src.length(): the cursor never passes the end
   position()  remaining()  isAtEnd()  peekAt(offset): Option<u8>
-  readU8(): Result<u8, ReadError>      readU16be/le(): Result<u16, ReadError>     readU32be/le(): Result<u32, ReadError>
-  readExact(n): Result<Bytes, ReadError>   skip(n): Result<void, ReadError>   rest(): Bytes
-readErrorMessage(e)
+  readU8(): Result<u8, BytesError>      readU16Be/Le(): Result<u16, BytesError>     readU32Be/Le(): Result<u32, BytesError>
+  readExact(n): Result<Bytes, BytesError>   skip(n): Result<void, BytesError>   takeRest(): Bytes   // moves the cursor
+bytesErrorMessage(e)                                  // readErrorMessage, rest(), readU16be/le, readU32be/le: deprecated
 ```
 
 Contracts that matter: every `read*` is `Ok` **iff** at least that many bytes remain (`result.isOk() ==
@@ -271,7 +278,7 @@ grow the length by exactly the bytes appended and put the right bytes at the end
 byte; `concat` states length and both seams. There are no bitwise operators in Orin, so multi-byte values use `*`,
 `/` and `%` on `int`. `reserve` is bookkeeping (`capacity`): the runtime has no array reserve, arrays still grow
 geometrically on `push`. A `u8` array element costs 8 bytes at run time (ADR-0022); strings are the compact form
-(`toRawString` / `bytesFromString` are O(n) conversions, byte for byte, no validation).
+(`toRawString` / `fromString` are O(n) conversions, byte for byte, no validation).
 
 ### std:utf8
 
@@ -279,13 +286,15 @@ Orin strings are byte strings that are only *expected* to hold UTF-8; `Utf8Strin
 
 ```
 type Utf8ErrorKind = InvalidLead | TruncatedSequence | InvalidContinuation | Overlong | Surrogate | TooLarge
-type Utf8Error = { position: usize; length: usize; kind: Utf8ErrorKind }
-validate(b: Bytes): Result<Utf8String, Utf8Error>        validateString(s: string): Result<Utf8String, Utf8Error>   // O(n)
-checkUtf8(s): Result<void, Utf8Error>   isValidUtf8(s): bool   utf8ErrorMessage(e)  encode(s: Utf8String): Bytes
-isScalarValue(cp: int): bool   utf8Len(cp): int  @Requires(isScalarValue(cp))   encodeCodePoint(cp): Option<string>
+type Utf8Error = { kind: Utf8ErrorKind; offset: usize; length: usize }
+decode(b: Bytes): Result<Utf8String, Utf8Error>          Utf8String.tryFrom(s: string): Result<Utf8String, Utf8Error>   // O(n)
+validate(s): Result<void, Utf8Error>   isValid(s): bool   utf8ErrorMessage(e)  encode(s: Utf8String): Bytes
+isScalarValue(cp: int): bool   encodedLength(cp): int  @Requires(isScalarValue(cp))   encodeCodePoint(cp): Option<string>
 fromCodePoints(cps: int[]): Option<Utf8String>
+// deprecated for one release: checkUtf8 -> validate, isValidUtf8 -> isValid, validateString -> Utf8String.tryFrom, utf8Len -> encodedLength
+// (the old `validate(b: Bytes)` is now `decode(b)`: the same name with another parameter type has no wrapper)
 
-@Invariant(isValidUtf8(this.text))
+@Invariant(isValid(this.text))
 class Utf8String                                          // new Utf8String(text) validates and traps on invalid input
   asString()  byteLength()  isEmpty()  toBytes()  codePointCount()  codePoints(): int[]  codePointAt(i): Option<int>
   isCharBoundary(i)  concat(o): Utf8String  trySlice(lo, hi): Option<Utf8String>   // slices only at boundaries
@@ -342,14 +351,15 @@ class Deque<T>                    // ring buffer, doubling from 4 slots, wrap by
   size() isEmpty() capacity() pushBack(x) pushFront(x) popFront() popBack() front() back() get(i) clear() toArray()   // amortised O(1)
 class SortedMap<V>                // int keys: a B-tree in an arena; new SortedMap<V>(minDegree) with minDegree >= 2, use 16
 class SortedStringMap<V>          // the same with string keys in compareStrings order (byte-wise lexicographic)
-  size() isEmpty() height() has(k) get(k): Option<V> put(k, v): bool remove(k): Option<V>   // all O(t log_t n) = O(log n)
-  firstKey() lastKey() floorKey(k) ceilKey(k)   popFirst() popLast(): Option<SortedEntry<V>>  keyArray() valueArray() clear()
+  size() isEmpty() height() has(k) get(k): Option<V> set(k, v): bool remove(k): Option<V>   // all O(t log_t n) = O(log n)
+  firstKey() lastKey() floorKey(k) ceilKey(k)   first() last() popFirst() popLast(): Option<SortedEntry<V>>
+  keys() values() entries(): SortedEntry<V>[]  clear()   // O(n); put -> set, keyArray -> keys, valueArray -> values are deprecated wrappers
 class PriorityQueue<T>            // 4-ary min-heap in three parallel arrays; invariants: equal lengths, heap property (strict,
                                   // on (priority, insertion number)), every insertion number < the counter, which never decreases
-  size() isEmpty() minPriority() peek() push(priority: int, value: T) pop(): Option<PQEntry<T>> allAtLeast(p) clear()   // push/pop O(log n)
+  size() isEmpty() minPriority() peek() push(priority: int, value: T) pop(): Option<PqEntry<T>> allAtLeast(p) clear()   // push/pop O(log n)
 ```
 
-Contracts: `add`/`put` return whether the key was new and the size grows by exactly 1 in that case (`result ==>
+Contracts: `add`/`set` return whether the key was new and the size grows by exactly 1 in that case (`result ==>
 size == old(size) + 1`, `!result ==> size == old(size)`), `has(k)` holds afterwards; `remove` makes `has(k)` false and
 shrinks the size by exactly 1 iff the key was present; `get` is `Some` iff `has`; `floorKey`/`ceilKey` return a present
 key on the right side of `k` and, on `None`, the first/last key proves there is none; `popFirst`/`popLast` return
@@ -368,8 +378,8 @@ other and sizes add up).
 | `PriorityQueue` | 4-ary implicit heap, struct of arrays (priorities, insertion numbers, values), hole-based sifting (one write per level), FIFO among equal priorities through the insertion number | equal array lengths; every entry leaves strictly before its up to four children (`isMinHeap4`); insertion numbers below a monotone counter | 200,000 random pushes + pops: boxed binary heap with swaps 300 ms, binary SoA hole 164 ms, **4-ary SoA hole 122 ms**, 8-ary 137 ms |
 | `Deque` | ring buffer with doubling growth, wrap by conditional subtraction, no per-element allocation | `len <= capacity`, head in range, filler exists iff there is storage | 500,000 push/pop rounds: `Option<T>` slots with `%` 128 ms, **plain slots 84 ms** (see the gap below) |
 | `IntSet`, `StringSet` | the prelude's open-addressing hash map (`Map<K, bool>`, expected O(1)); `union` copies the larger set and inserts the smaller, `intersection` walks the smaller and probes the larger | map size == key count, every flag true | reviewed: a hash set is the best known structure and the prelude map is already open addressing with an index table; no change |
-| `Bytes`, `ByteBuilder`, `ByteReader` | views over one shared `u8[]` (O(1) slices, cursor reads without copying), geometric `push` growth | `start + len <= data.length`; `pos <= length`; `capacity >= length` | reviewed: `concat` by `push` loop 108 ms vs built-in `slice` + `concat` 104 ms for 20 x 1 MB (no gain), `equals` 1.9 ms/MB, `bytesFromString` 1.2 ms/MB, `toRawString` 6 ms/MB (one 1-byte string per byte: see the gap below); no change |
-| `std:utf8` | Hoehrmann DFA + ASCII runs (see above) | `Utf8String`: `isValidUtf8(text)`; cursor: position on a code point boundary | 1 MB: DFA 0.6 / 1.0 / 1.2 ms (ASCII / mixed / CJK) vs decoder 22 / 16 / 9 ms |
+| `Bytes`, `ByteBuilder`, `ByteReader` | views over one shared `u8[]` (O(1) slices, cursor reads without copying), geometric `push` growth | `start + len <= data.length`; `pos <= length`; `capacity >= length` | reviewed: `concat` by `push` loop 108 ms vs built-in `slice` + `concat` 104 ms for 20 x 1 MB (no gain), `equals` 1.9 ms/MB, `fromString` 1.2 ms/MB, `toRawString` 6 ms/MB (one 1-byte string per byte: see the gap below); no change |
+| `std:utf8` | Hoehrmann DFA + ASCII runs (see above) | `Utf8String`: `isValid(text)`; cursor: position on a code point boundary | 1 MB: DFA 0.6 / 1.0 / 1.2 ms (ASCII / mixed / CJK) vs decoder 22 / 16 / 9 ms |
 
 ### Limitations of this layer (language friction, honest list)
 
@@ -476,8 +486,8 @@ makeStatus  makeRequest  makeResponse  headersFromLists  reasonName  reasonText 
 ```ts
 import { RequestParser, Done, NeedMore, Failed, defaultLimits, methodName } from "std:http";
 let p = new RequestParser(defaultLimits());
-match (p.feed(bytesFromString("GET /a HTT"))) { NeedMore => ..., Done(q, used) => ..., Failed(e) => ... }  // NeedMore
-match (p.feed(bytesFromString("P/1.1\r\nHost: h\r\n\r\nGET /b"))) {
+match (p.feed(fromString("GET /a HTT"))) { NeedMore => ..., Done(q, used) => ..., Failed(e) => ... }  // NeedMore
+match (p.feed(fromString("P/1.1\r\nHost: h\r\n\r\nGET /b"))) {
   Done(q, used) => { /* q is GET /a; the chunk's remaining bytes (from `used`) start the next message */ p.reset(); }
   ...
 }
@@ -893,6 +903,7 @@ above; a pool lives for one call (worker threads are started per operation, abou
 * Generic methods do not exist (E0460); `Graph<T>` has no edge weights and needs a caller-supplied tag.
 * Diagnostics print std types with their unit name (`$stdlib/graph.GraphId<int>`).
 * `std:clock` is importable but internal; so is `std:fsraw` (the raw open/close and grant primitives behind `std:fs` and `std:host`; only library code may import it).
+* `std:collections/internal` and `std:bytes/internal` (files `collections_internal.or`, `bytes_internal.or`) hold the contract helpers (`allTrue`, `isStrictlyIncreasing`, `isMinHeap4`, the B-tree shape and order checks, `allBytes`, ...) and the generated B-tree node types behind the public modules (ADR-0048 rule 7.3). They are not API and can change in any release; user code does not import them.
 * `std:fs` streaming: text/byte-string API without seek, no directory operations, at most 256 open files.
 
 ## Bounded shell execution (unstable)
@@ -926,21 +937,19 @@ function main(host: Host): void {
 Strict byte-based Hex, Base64 and Base64URL codecs with explicit padding policy
 and structured errors containing byte offsets. See [API, errors and complexity](std-encoding.md).
 
-## std:jsonnumber
+## std:json
 
-Exact validated JSON numeric tokens and checked decimal/exponent-to-int conversion,
-with full i64 preservation and structured errors. Separate from legacy std:json;
-see [API, bounds and validation](std-jsonnumber.md).
+Bounded JSON documents (`JsonValue`, `parseDocument`, `writeDocument`, `defaultLimits`, `defaultReadOptions`,
+`jsonParseErrorMessage`, `jsonWriteErrorMessage`) with exact numbers, ordered members, an explicit duplicate
+policy, strict Unicode and per-call budgets. See [API, limits and errors](std-json.md).
 
-## std:jsonvalue
+## std:json/number
 
-Opt-in bounded JSON document parser and compact writer, with exact std:jsonnumber
-tokens, ordered members, explicit duplicate policy, strict Unicode and per-call
-budgets. Legacy std:json is unchanged. See [API, limits and errors](std-jsonvalue.md).
+Exact validated JSON numeric tokens and checked decimal/exponent-to-int conversion, with full i64
+preservation and structured errors. See [API, bounds and validation](std-json-number.md).
 
-## std:jsondecode
+## std:json/decode
 
-Pure field-path validation over bounded JsonValue trees: sealed cursors, exact
-integer ranges, absent/null distinction, explicit unknown-field policy, and
-structural JSON Pointer errors. See [API, ordering and complexity](std-jsondecode.md)
-and the [config example](../examples/json_config.or).
+Pure field-path validation over bounded `JsonValue` trees: sealed cursors, exact integer ranges, absent/null
+distinction, explicit unknown-field policy, structural JSON Pointer errors and `decodeErrorMessage`. See
+[API, ordering and complexity](std-json-decode.md) and the [config example](../examples/json_config.or).
