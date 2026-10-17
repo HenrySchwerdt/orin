@@ -8,6 +8,8 @@
 A TypeScript-familiar, natively compiled language for verifiable software engineering:<br>
 value semantics, ownership checking, contracts, and semantic change analysis.</p>
 
+Documentation: <https://orin-lang.github.io/orin-lang/> (built from [`docs/`](docs/website.md)).
+
 > ⚠️ **Experimental alpha.** Orin is a research-driven language in early development. Expect
 > missing features and breaking changes. Orin is **not a drop-in TypeScript replacement** and does not
 > run arbitrary JavaScript or npm packages. See [what works today](#status) and the
