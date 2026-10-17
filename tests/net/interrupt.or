@@ -29,6 +29,7 @@ const LONG: int = 30000;   // every blocking call below is given 30 s: only a ca
 const WAKE_SLACK: int = 1500;
 
 type Probe = { what: string; t0: int; t1: int; };
+type Outcome = { p: Probe; changed: bool; };
 
 function kindName(k: NetErrorKind): string {
   return match (k) {
@@ -137,31 +138,33 @@ function blockedRecv(net: NetGrant, starts: Sender<int>): Probe {
   return probeOf(r, "listen");
 }
 
-function megabytes(n: usize): Bytes {
-  let block = "0123456789abcdef";
-  while (block.length < 65536) {
-    block = block + block;
+// 1 MiB of text (a u8 array element takes 8 bytes of memory, so the tests send this block repeatedly instead of building one huge array)
+function megabyte(): Bytes {
+  let b = fromString("0123456789abcdef");
+  while (b.length() < 1048576) {
+    b = b.concat(b);
   }
-  const b = fromString(block);
-  let total = b;
-  let i: usize = 1;
-  while (i < n * 16) {
-    total = total.concat(b);
-    i += 1;
-  }
-  return total;
+  return b;
 }
 
-// send: the server side writes 64 MB to a client that never reads.
+// send: the server side writes 1 MiB blocks (up to 200) to a client that never reads: the socket buffers fill after a few.
 function blockedSend(net: NetGrant, starts: Sender<int>): Probe {
   const r = withListenerNet(net, "127.0.0.1", 0, 4, (ln: Listener, n: NetGrant) => {
     const q = withConnectionBeside(n, "127.0.0.1", portOf(ln), milliseconds(2000), ln, (c: Stream, l2: Listener) => {
       const a = withAccepted(l2, milliseconds(2000), (s: Stream, p: Peer) => {
         const t0 = monotonicMillis(s);
         starts.send(t0);
-        const sent = sendAll(s, megabytes(64), milliseconds(LONG));
-        const t1 = monotonicMillis(s);
-        return Probe { what: sent.isOk() ? "sent" : kindName(sent.unwrapErr().kind), t0: t0, t1: t1 };
+        const block = megabyte();
+        let what = "sent";
+        let i: int = 0;
+        while (i < 200 && what == "sent") {
+          const sent = sendAll(s, block, milliseconds(LONG));
+          if (sent.isErr()) {
+            what = kindName(sent.unwrapErr().kind);
+          }
+          i += 1;
+        }
+        return Probe { what: what, t0: t0, t1: monotonicMillis(s) };
       });
       return probeOf(a, "accept");
     });
@@ -194,8 +197,7 @@ function blockedConnect(net: NetGrant, starts: Sender<int>): Probe {
     const t0 = nowMs(n);
     starts.send(t0);
     const c = withConnection(n, "127.0.0.1", port, milliseconds(LONG), (s: Stream) => 0);
-    const t1 = nowMs(n);
-    return Probe { what: c.isOk() ? "connected" : kindName(c.unwrapErr().kind), t0: t0, t1: t1 };
+    return Probe { what: c.isOk() ? "connected" : kindName(c.unwrapErr().kind), t0: t0, t1: 0 }; // t1: set by the caller
   });
   return probeOf(r, "listen");
 }
@@ -203,9 +205,11 @@ function blockedConnect(net: NetGrant, starts: Sender<int>): Probe {
 // ---------------------------------------------------------------------------------------------------- cases
 
 // One probe task and one canceller in a scope; the canceller sleeps DELAY ms after the probe's start and cancels the scope.
+// A cancelled task cannot read the clock through the network any more, so the connect probe (which holds no stream) is timed by the
+// caller right after the scope ended.
 function cancelCase(net: NetGrant, name: string, which: int): string {
   const ch = channel<int>(2);
-  return scopeNet(net, (sc: Scope, g: NetGrant) => {
+  const out = scopeNet(net, (sc: Scope, g: NetGrant) => {
     const tok = sc.token();
     const rx = ch.rx;
     const tx = ch.tx;
@@ -218,12 +222,16 @@ function cancelCase(net: NetGrant, name: string, which: int): string {
       return tok.cancel();
     });
     const p = probe.join();
-    const cancelled = stopper.join();
-    if (p.what == "skipped") {
-      return name + ": skipped (this OS does not drop a SYN for a full accept queue)";
-    }
-    return verdict(name, p, "Cancelled") + (cancelled ? "" : " (the token was already cancelled)");
+    return Outcome { p: p, changed: stopper.join() };
   });
+  let p = out.p;
+  if (which == 3 && p.what != "skipped") {
+    p = Probe { what: p.what, t0: p.t0, t1: nowMs(net) };
+  }
+  if (p.what == "skipped") {
+    return name + ": skipped (this OS does not drop a SYN for a full accept queue)";
+  }
+  return verdict(name, p, "Cancelled") + (out.changed ? "" : " (the token was already cancelled)");
 }
 
 // A task spawned into a cancelled scope fails at once, also against a listener that has a connection waiting.
@@ -347,16 +355,26 @@ function trickle(net: NetGrant): string {
   });
 }
 
-// senddeadline: a peer that reads nothing; sendAllUntil of 64 MB with one 300 ms deadline.
+// senddeadline: a peer that reads nothing; sendAllUntil of 1 MiB blocks with one 300 ms deadline.
 function sendDeadline(net: NetGrant): string {
   const r = withListenerNet(net, "127.0.0.1", 0, 4, (ln: Listener, n: NetGrant) => {
     const q = withConnectionBeside(n, "127.0.0.1", portOf(ln), milliseconds(2000), ln, (c: Stream, l2: Listener) => {
       const a = withAccepted(l2, milliseconds(2000), (s: Stream, p: Peer) => {
         const t0 = monotonicMillis(s);
-        const sent = sendAllUntil(s, megabytes(64), at(t0 + 300));
+        const block = megabyte();
+        const end = at(t0 + 300);
+        let what = "sent everything";
+        let i: int = 0;
+        while (i < 200 && what == "sent everything") {
+          const sent = sendAllUntil(s, block, end);
+          if (sent.isErr()) {
+            what = kindName(sent.unwrapErr().kind);
+          }
+          i += 1;
+        }
         const dt = monotonicMillis(s) - t0;
-        if (sent.isOk() || sent.unwrapErr().kind != Timeout) {
-          return "senddeadline: FAIL " + (sent.isOk() ? "sent everything" : kindName(sent.unwrapErr().kind));
+        if (what != "Timeout") {
+          return "senddeadline: FAIL " + what;
         }
         if (dt < 280 || dt > 300 + WAKE_SLACK) {
           return "senddeadline: FAIL ended after " + dt.toString() + " ms (deadline 300)";
@@ -391,25 +409,23 @@ function connectDeadline(net: NetGrant): string {
   return r.isOk() ? r.unwrap() : "connectdeadline: FAIL listen";
 }
 
+function report(line: string): int {
+  console.log(line);
+  return line.includes("FAIL") ? 1 : 0;
+}
+
 function main(host: Host): void {
   useNet(host, net => {
-    let lines: string[] = [];
-    lines.push(cancelCase(net, "accept", 0));
-    lines.push(cancelCase(net, "recv", 1));
-    lines.push(cancelCase(net, "send", 2));
-    lines.push(cancelCase(net, "connect", 3));
-    lines.push(precancelled(net));
-    lines.push(nested(net));
-    lines.push(trickle(net));
-    lines.push(sendDeadline(net));
-    lines.push(connectDeadline(net));
     let bad: int = 0;
-    for (const l of lines) {
-      console.log(l);
-      if (l.includes("FAIL")) {
-        bad += 1;
-      }
-    }
+    bad += report(cancelCase(net, "accept", 0));
+    bad += report(cancelCase(net, "recv", 1));
+    bad += report(cancelCase(net, "send", 2));
+    bad += report(cancelCase(net, "connect", 3));
+    bad += report(precancelled(net));
+    bad += report(nested(net));
+    bad += report(trickle(net));
+    bad += report(sendDeadline(net));
+    bad += report(connectDeadline(net));
     console.log(bad == 0 ? "interrupt: ok" : "interrupt: FAIL");
   });
 }
