@@ -40,6 +40,7 @@ export type Token = { kind: TokKind; text: string; span: Span; value: int; };
 
 const INT_MAX: int = 9223372036854775807;
 
+@Ensures(result == match (t.kind) { KEof => true, _ => false })
 export function isEofTok(t: Token): bool {
   return match (t.kind) {
     KEof => true,
@@ -627,6 +628,7 @@ export class Lexer {
   // The whole token stream: lexes to the end, checks that every template interpolation was closed and appends KEof.
   @Requires(this.pos == 0 && this.toks.length == 0 && !this.done)
   @Ensures(result.isOk() ==> tokensWellFormed(result.unwrap(), this.file, this.src.length))
+  @Ensures(result.isOk() ==> result.unwrap().length > 0 && isEofTok(result.unwrap()[result.unwrap().length - 1]))
   @Ensures(result.isErr()
       ==> result.unwrapErr().code == "E0100" && result.unwrapErr().span.end <= this.src.length)
   run(): Result<Token[], Diagnostic> {
@@ -726,6 +728,7 @@ export class Lexer {
   // `=`, a string value, the `{` of an expression value, or the `>` / `/>` that ends the tag.
   @Requires(!this.done && this.pos < this.src.length)
   @Requires(this.err.isNone())
+  @Requires(this.ctx.length > 0)
   private oxTag(mode: int): void {
     const src = this.src;
     const n = src.length;
@@ -747,6 +750,7 @@ export class Lexer {
     }
     if (isAlpha(c)) {
       let j = i + 1;
+      @Invariant(i < j && j <= n)
       while (j < n && (isAlpha(src.charCodeAt(j)) || isDigit(src.charCodeAt(j)) || src.charCodeAt(j) == 45)) {
         j += 1;
       }
@@ -864,6 +868,7 @@ export class Lexer {
   // Appends a token for src[start..end) and moves the cursor to its end.
   @Requires(start >= this.pos && start <= end && end <= this.src.length)
   @Ensures(this.pos == end && this.toks.length == old(this.toks.length) + 1)
+  @Ensures(isEofTok(this.toks[this.toks.length - 1]) == match (kind) { KEof => true, _ => false })
   private emit(kind: TokKind, text: string, start: usize, end: usize, value: int): void {
     this.toks.push(Token {
       kind: kind,
@@ -892,6 +897,7 @@ export class Lexer {
   }
 
   // Integer literal at the cursor (decimal or `0x` hexadecimal).
+  @Requires(this.err.isNone() && this.pos < this.src.length)
   private number(): void {
     const src = this.src;
     const file = this.file;
@@ -907,10 +913,12 @@ export class Lexer {
     }
     const dstart = i;
     if (base == 16) {
+      @Invariant(start <= dstart && dstart <= i && i <= n)
       while (i < n && hexVal(src.charCodeAt(i)) >= 0) {
         i += 1;
       }
     } else {
+      @Invariant(start <= dstart && dstart <= i && i <= n)
       while (i < n && isDigit(src.charCodeAt(i))) {
         i += 1;
       }
@@ -954,6 +962,7 @@ export class Lexer {
 
   // Float literal (ADR-0018) at the cursor (a digit): `D+ . D+ [exp]` or `D+ exp` with exp = `(e|E) [+-]? D+`.
   // No token and nothing consumed when the text is not a float literal (so it is an integer).
+  @Requires(this.err.isNone() && this.pos < this.src.length)
   @Ensures(!this.done && this.toks.length == old(this.toks.length) ==> this.pos == old(this.pos))
   @Ensures(this.toks.length > old(this.toks.length) ==> this.pos > old(this.pos))
   private float(): void {
@@ -962,6 +971,7 @@ export class Lexer {
     const n = src.length;
     const start = this.pos;
     let i = start;
+    @Invariant(start <= i && i <= n)
     while (i < n && isDigit(src.charCodeAt(i))) {
       i += 1;
     }
@@ -973,6 +983,7 @@ export class Lexer {
       hasFrac = true;
       fracStart = i + 1;
       i += 1;
+      @Invariant(start <= intEnd && intEnd < fracStart && fracStart <= i && i <= n)
       while (i < n && isDigit(src.charCodeAt(i))) {
         i += 1;
       }
@@ -993,6 +1004,7 @@ export class Lexer {
         hasExp = true;
         expSign = sg;
         expStart = j;
+        @Invariant(i < expStart && expStart <= j && j <= n)
         while (j < n && isDigit(src.charCodeAt(j))) {
           j += 1;
         }
@@ -1012,6 +1024,7 @@ export class Lexer {
     let intDigits: usize = 0;
     let seenNonZero = false;
     let k = start;
+    @Invariant(start <= k && k <= intEnd && intEnd <= i && i <= n)
     while (k < intEnd) {
       if (src.charCodeAt(k) != 48) {
         seenNonZero = true;
@@ -1114,6 +1127,7 @@ export class Lexer {
   }
 
   // Punctuation at the cursor (longest match), or the lexical error for a character that starts no token.
+  @Requires(this.err.isNone() && this.pos < this.src.length)
   private punct(): void {
     const src = this.src;
     const file = this.file;
@@ -1171,6 +1185,7 @@ export class Lexer {
 
 // The tokens of `src` (file `file`), ending with KEof; or the first lexical error (E0100), whose span lies in the source.
 @Ensures(result.isOk() ==> tokensWellFormed(result.unwrap(), file, src.length))
+@Ensures(result.isOk() ==> result.unwrap().length > 0 && isEofTok(result.unwrap()[result.unwrap().length - 1]))
 @Ensures(result.isErr()
     ==> result.unwrapErr().code == "E0100"
         && result.unwrapErr().span.file == file

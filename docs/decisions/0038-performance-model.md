@@ -950,3 +950,27 @@ An SSE2 version (16 per iteration) reached bytesstr -58.9 %, but `<emmintrin.h>`
 compiles them worse than the plain loop (bytesstr 444 M, http_parse +5 %). The plain loop is kept; an intrinsics path would need
 its own place in the platform layer. The rest of bytesstr is the 8-byte slot traffic (2 x 8 MB per round trip); only packed
 storage removes it. http_parse gains little because its strings are short.
+
+## Addendum (2026-10-17): U6 unchecked struct slots
+Every `getfield` / `setfield` of a heap struct executes the check `kind == 3 && nslots > k` in both backends (`slotInline` in the LLVM backend,
+`orinc_chk_slot` in C). Removing every one of them by hand from the LLVM IR of `bench/mutres` halved its executed instructions (2.03G to 1.02G) and
+cut `pqueue` by 13%. This change removes the ones a verifier can justify: MIR v2.8 adds `IGetFieldU` / `ISetFieldU` (docs/mir.md), accepted by rule
+**U6** (`compiler/verify/fieldcheck.or`) when an earlier access (`getfield`, `setfield`, `takefield`, `putfield`, checked or unchecked) of the same struct
+local in the same block, within 64 instructions, checked slot `k' >= k` and nothing in between defines the local. Unlike the array rule U1, `makeunique`
+and every other use of the local leave the fact intact, because a struct's kind and slot count never change and the copy `makeunique` makes has the
+same header. The optimiser pass `compiler/opt/fieldcheck.or` asks the same predicate. `--assert-facts` does not re-check these (it needs a new runtime
+symbol; runtime/ and the seed are frozen here).
+
+A second step makes the first access of a block benefit as well. The new instruction `IShapeCheck(o, k)` is exactly the check of a field access,
+alone; rule U6 also accepts it, and the `IStructNew` that builds the local (slot count known statically), as sources. The optimiser puts one
+`IShapeCheck(o, K)` in front of the first checked access of a struct local in a block when later accesses of the same block (within the window, before the
+local is redefined) use higher slots (K the highest), so the whole group executes one check instead of several, and the first access is unchecked too.
+Insertion happens only where it removes at least one check. A struct too small for K now traps at the first access instead of the later one, with the same
+message (a compiler bug either way).
+
+Measured (executed instructions, cachegrind, LLVM backend / C backend, main vs this change): mutres 2,030M / 2,542M to 1,757M / 2,407M; pqueue 1,344M /
+1,411M to 1,350M / 1,384M; bintrees 4,320M / 4,457M to 4,219M / 4,324M; nbody, qsort_inplace, html, mapfreq unchanged within 0.02%. In the self-compile
+8,440 of 27,210 field accesses (31%) become unchecked, behind 2,646 shape checks. The remaining distance to the hand-removal (mutres 1.02G) is the
+first access of each function on a parameter, which needs a fact across calls (a typed-parameter shape invariant) or a rule across blocks: follow-ups.
+Mutation classes `field-*` and `shape-*` in `tools/mutate_mir.py` (2,556 unchecked accesses and 507 shape checks of the corpus) are all rejected, and the
+positive control is accepted.
