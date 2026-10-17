@@ -1,0 +1,107 @@
+// A parallel HTTP client for tools/test_net.sh (ADR-0017 Addendum C): N tasks, each owning a NetGrant narrowed to the server's
+// port (spawnNet), each sends one POST /echo with its own body over its own connection and checks the answer.
+// Usage: parallel_clients <port> <N> <bodyBytes>
+// Prints "parallel: N ok" when every task got status 200 with exactly its own body, else a line per failure and "parallel: FAIL".
+import { Host, withProcess, useNet } from "std:host";
+import { milliseconds } from "std:time";
+import { args } from "std:process";
+import { Bytes, bytesFromString } from "std:bytes";
+import { ResponseParser, NeedMore, Done, Failed, ToOther, defaultLimits } from "std:http";
+import { Scope, TaskHandle, scopeNetDo, spawnNet } from "std:task";
+import { NetGrant, Stream, Reset, useConnect, withConnection, sendAll, recv, RecvData, netErrorMessage } from "std:net";
+
+function body(i: int, n: int): string {
+  let s = "client " + i.toString() + ":";
+  while (s.length < n.toUsize()) {
+    s = s + "0123456789abcdef";
+  }
+  return s.substring(0, n.toUsize());
+}
+
+// "" if the exchange succeeded, else what went wrong.
+function exchange(s: Stream, i: int, n: int): string {
+  const payload = body(i, n);
+  const req = "POST /echo HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Type: text/plain\r\nContent-Length: " + payload.length.toString() + "\r\n\r\n" + payload;
+  const sent = sendAll(s, bytesFromString(req), milliseconds(5000));
+  if (sent.isErr()) {
+    return "send: " + netErrorMessage(sent.unwrapErr());
+  }
+  let p = new ResponseParser(defaultLimits(), ToOther);
+  let out = "no response";
+  let going = true;
+  while (going) {
+    const r = recv(s, 16384, milliseconds(5000));
+    match (r) {
+      RecvData(b) => {
+        const pr = p.feed(b);
+        match (pr) {
+          NeedMore => {},
+          Done(resp, used) => {
+            if (resp.status().code() != 200) {
+              out = "status " + resp.status().code().toString();
+            } else if (resp.body().toRawString() != payload) {
+              out = "wrong body";
+            } else {
+              out = "";
+            }
+            going = false;
+          },
+          Failed(e) => { out = "parse error"; going = false; }
+        }
+      },
+      _ => { going = false; }
+    }
+  }
+  return out;
+}
+
+// A connect refused by a full accept backlog is retried: macOS answers a SYN beyond kern.ipc.somaxconn (128) with a reset
+// where Linux drops it and the client's own SYN retry covers it. Only the connect is retried; an exchange that has started
+// is never repeated.
+const CONNECT_TRIES: int = 2000;
+
+function one(net: NetGrant, port: int, i: int, n: int): string {
+  let tries: int = 0;
+  while (true) {
+    const r = withConnection(net, "127.0.0.1", port, milliseconds(5000), (s: Stream) => exchange(s, i, n));
+    if (r.isOk()) {
+      return r.unwrap();
+    }
+    const e = r.unwrapErr();
+    tries += 1;
+    if (e.kind != Reset || tries >= CONNECT_TRIES) {
+      return "connect: " + netErrorMessage(e);
+    }
+  }
+}
+
+function main(host: Host): void {
+  const argv = withProcess(host, p => args(p));
+  const port = parseInt(argv[0]).unwrapOr(0);
+  const count = parseInt(argv[1]).unwrapOr(1);
+  const size = parseInt(argv[2]).unwrapOr(100);
+  useNet(host, net => {
+    useConnect(net, "127.0.0.1", port, port, c => {
+      scopeNetDo(c, (sc: Scope, g: NetGrant) => {
+        let hs: TaskHandle<string>[] = [];
+        let i: int = 0;
+        while (i < count) {
+          const k = i;
+          hs.push(spawnNet(sc, g, (t: NetGrant) => one(t, port, k, size)));
+          i += 1;
+        }
+        let bad: int = 0;
+        i = 0;
+        for (const h of hs) {
+          const e = h.join();
+          if (e != "") {
+            bad += 1;
+            console.log("client " + i.toString() + ": " + e);
+          }
+          i += 1;
+        }
+        console.log(bad == 0 ? "parallel: " + count.toString() + " ok" : "parallel: FAIL");
+      });
+    });
+  });
+}
