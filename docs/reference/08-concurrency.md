@@ -22,8 +22,7 @@ Tests: tests/next/run/task_scope_exit_join.or, tests/next/run/task_spawn_join.or
 **TSK-2. Spawn and join.** `spawn(s, f: () => T): TaskHandle<T>` starts `f` as a task; `spawnDo` takes a `void` closure and
 returns `TaskHandle<bool>`. `h.join()` waits and returns the result. These are free functions because generic methods do not
 exist yet (E0460).
-Tests: tests/next/run/task_spawn_join.or, tests/next/run/task_many.or, tests/next/errors/e0460_class_generic_method.or,
-tests/next/errors/e0460_genclass_generic_method.or.
+Tests: tests/next/run/task_spawn_join.or, tests/next/run/task_many.or, tests/next/errors/e0460_interface_generic_method.or.
 
 **TSK-3. Join once.** A second `join` of one handle, a `spawn` on a scope that has ended, and any use of a released channel
 trap at run time.

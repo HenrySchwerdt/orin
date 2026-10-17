@@ -590,14 +590,55 @@ function cStmt(j: Json, path: string, sp: Span): Result<Stmt, string> {
 
 // ---- declarations ---------------------------------------------------------------------------------------------------
 
-function noBounds(n: usize): Option<Ident>[] {
-  let out: Option<Ident>[] = [];
+function noBounds(n: usize): Ident[][] {
+  let out: Ident[][] = [];
   let i: usize = 0;
   while (i < n) {
-    out.push(None);
+    out.push([]);
     i += 1;
   }
   return out;
+}
+
+// The optional `"bounds"` key of a generic declaration: one array of interface names per type parameter, parallel to
+// `typeParams` (`[["Ord", "Hash"], []]` is `<T extends Ord & Hash, U>`). Absent: no bounds.
+function cBounds(j: Json, tps: Ident[], path: string, sp: Span): Result<Ident[][], string> {
+  if (getField(j, "bounds").isNone()) {
+    return Ok(noBounds(tps.length));
+  }
+  const xs = dArr(j, "bounds", path)?;
+  if (xs.length != tps.length) {
+    return Err(at(path + ".bounds", "expected one array of bounds per type parameter"));
+  }
+  let out: Ident[][] = [];
+  let i: usize = 0;
+  while (i < xs.length) {
+    const p = idx(path, "bounds", i);
+    const names = dStrsOf(xs[i], p)?;
+    out.push(idents(names, p, sp)?);
+    i += 1;
+  }
+  return Ok(out);
+}
+
+function dStrsOf(j: Json, path: string): Result<string[], string> {
+  return match (j) {
+    JArr(ys) => {
+      let out: string[] = [];
+      for (const y of ys) {
+        match (y) {
+          JStr(s) => {
+            out.push(s);
+          },
+          _ => {
+            return Err(at(path, "expected an array of strings"));
+          },
+        }
+      }
+      return Ok(out);
+    },
+    _ => Err(at(path, "expected an array of strings")),
+  };
 }
 
 function noContracts(): ContractClause[] {
@@ -619,7 +660,7 @@ function cFn(j: Json, path: string, sp: Span): Result<FunctionDecl, string> {
     exported: e,
     name: n,
     typeParams: tps,
-    bounds: noBounds(tps.length),
+    bounds: cBounds(j, tps, path, sp)?,
     params: ps,
     ret: Some(r),
     body: body,
@@ -723,7 +764,7 @@ function cClass(j: Json, path: string, sp: Span): Result<ClassDecl, string> {
     exported: e,
     name: n,
     typeParams: tps,
-    bounds: noBounds(tps.length),
+    bounds: cBounds(j, tps, path, sp)?,
     ext: None,
     impls: [],
     members: members,

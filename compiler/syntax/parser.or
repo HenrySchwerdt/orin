@@ -38,7 +38,7 @@ import {
 } from "./wellformed";
 
 // Type parameters with their optional bounds (parallel); `any`: some parameter has a bound.
-type Bounds = { ids: Ident[]; bounds: Option<Ident>[]; any: bool; };
+type Bounds = { ids: Ident[]; bounds: Ident[][]; any: bool; };
 
 // Contract clauses and annotations before a declaration; `first` is the span of the first one.
 type Decos = { clauses: ContractClause[]; annos: Annotation[]; first: Span; };
@@ -702,13 +702,14 @@ export class Parser {
   }
 
   // Optional `<T, U>` list of generic parameter names, each with an optional bound `T extends Shape`
-  // (interfaces, ADR-0019). More than one bound (`A & B`) is E0408. Consumes nothing when there is no `<`.
+  // (interfaces, ADR-0019), or a list of bounds `T extends Ord & Hash` (ADR-0034 limit lifted). `bounds` is parallel to `ids`; an empty
+  // list means no bound. Consumes nothing when there is no `<`.
   @Ensures(result.isOk() ==> result.unwrap().ids.length == result.unwrap().bounds.length)
   @Ensures(result.isOk() ==> result.unwrap().ids.length == 0 == (this.pos == old(this.pos)))
-  @Ensures(result.isOk() ==> result.unwrap().any == result.unwrap().bounds.some(b => b.isSome()))
+  @Ensures(result.isOk() ==> result.unwrap().any == result.unwrap().bounds.some(b => b.length > 0))
   private parseTypeParamsB(): Result<Bounds, Diagnostic> {
     let ids: Ident[] = [];
-    let bounds: Option<Ident>[] = [];
+    let bounds: Ident[][] = [];
     let any = false;
     if (!this.isP("<")) {
       return Ok(Bounds { ids: ids, bounds: bounds, any: any });
@@ -717,20 +718,14 @@ export class Parser {
     while (true) {
       const id = this.parseIdent()?;
       ids.push(id);
-      let b: Option<Ident> = None;
+      let b: Ident[] = [];
       if (this.isIdentText(0, "extends")) {
         this.pos += 1;
-        const bi = this.parseIdent()?;
-        b = Some(bi);
+        b.push(this.parseIdent()?);
         any = true;
-        if (this.isP("&")) {
-          return Err(
-            diag(
-              "E0408",
-              this.toks[this.pos].span,
-              "a type parameter can have only one bound in Orin 1.0 (`T extends A & B` is not supported, ADR-0019)",
-            ),
-          );
+        while (this.isP("&")) {
+          this.pos += 1;
+          b.push(this.parseIdent()?);
         }
       }
       bounds.push(b);

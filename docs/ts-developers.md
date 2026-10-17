@@ -204,7 +204,7 @@ The same is true of records: `type A = { x: int }` and `type B = { x: int }` are
 - No `instanceof`, no downcasts. Dispatch is a vtable call, and an interface value holds a
   *snapshot* of the class value.
 - Generic bound: `function total<T extends Shape>(xs: T[]): int` is monomorphised (zero cost);
-  one bound per parameter.
+  a parameter may have several bounds (`T extends Ord & Hash`).
 
 Tests: `ts_dev_interface.or`, `ts_dev_e0417_structural.or`.
 

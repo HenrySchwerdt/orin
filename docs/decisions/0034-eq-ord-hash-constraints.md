@@ -76,8 +76,7 @@ Slice 1 (language and compiler, 2026-10-17) delivers decisions 1, 2 (tiers 1 and
 **What is implemented.**
 - **Constraints.** `Eq`, `Ord` and `Hash` are built-in interfaces (no import, no declaration; a user-declared interface of the same
   name wins). They are used with the existing bound syntax, `function max<T extends Ord>(a: T, b: T): T`,
-  `class Counter<K extends Hash>`, and in `implements` lists. `Ord` and `Hash` imply `Eq`. Like every bound there is one per type
-  parameter (ADR-0026), so a parameter cannot be `Ord` and `Hash` at once yet. The bounds are checked at every instantiation.
+  `class Counter<K extends Hash>`, and in `implements` lists. `Ord` and `Hash` imply `Eq`. A parameter can have several bounds, `T extends Ord & Hash` (see "Multiple bounds" below). The bounds are checked at every instantiation.
 - **Operations.** `==`, `!=` (`Eq`), `<`, `<=`, `>`, `>=` (`Ord`) and the methods `equals(other): bool`, `compare(other): int`
   (-1, 0 or 1 for derived instances, any sign for an explicit one) and `hash(): usize` work on a bounded type parameter and, because
   an instance is re-checked with the concrete type, on every type that has the instance, also without generics.
@@ -127,6 +126,7 @@ Slice 1 (language and compiler, 2026-10-17) delivers decisions 1, 2 (tiers 1 and
 - Tier 3: the law proofs for explicit instances (strict mode, `NEEDS_DECISION`) and the generated `@Property` tests for normal
   builds (ADR-0031 §17); the Z3 axioms for `Eq`/`Ord` on type parameters (decision 3).
 - Turning the int/string collections into aliases of the generic ones and the final names (`SortedMap`, `PriorityQueue`), before the std freeze; `V: Eq` in
-  `OrderedMap` contracts needs several bounds; `Array.indexOf/includes` for `T extends Eq` (ADR-0048).
-- Several bounds on one parameter (`T extends Ord & Hash`, ADR-0026 limit).
+  `OrderedMap` contracts can now use several bounds (not done yet); `Array.indexOf/includes` for `T extends Eq` (ADR-0048).
+- **Multiple bounds (implemented with ADR-0040).** `T extends Ord & Hash` works on functions, classes and methods; the
+  derivation and the explicit instances are unchanged (each bound is tested on its own). See ADR-0040, "Multiple bounds".
 - `Map` instances with a key class whose `hash` is slow or weak are the class author's responsibility (no law check yet).
