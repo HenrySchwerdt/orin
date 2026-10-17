@@ -15,21 +15,21 @@ variable {ext : List Val} {np : Nat} {sh : Shapes} {Γ : List Ty} {hty : HTy} {a
   {s : St}
 
 /-- result shape of every per-instruction lemma -/
-def TOp (sh : Shapes) (Γ : List Ty) (hty : HTy) (a1 : AState) (r : Res St) : Prop :=
-  r ≠ .ill ∧ ∀ s', r = .ok s' → ∃ hty', TInv sh Γ hty' a1 s'
+def TOp (sh : Shapes) (Γ : List Ty) (hty : HTy) (a1 : AState) (s : St) (r : Res St) : Prop :=
+  r ≠ .ill ∧ ∀ s', r = .ok s' → ∃ hty', HyExt hty hty' s.heap s'.heap ∧ TInv sh Γ hty' a1 s'
 
 theorem TOp.ok {r : Res St} {s0 : St} (hop : r = .ok s0)
-    (h : ∃ hty', TInv sh Γ hty' a1 s0) : TOp sh Γ hty a1 r := by
+    (h : ∃ hty', HyExt hty hty' s.heap s0.heap ∧ TInv sh Γ hty' a1 s0) : TOp sh Γ hty a1 s r := by
   subst hop
   refine ⟨(fun e => by cases e), fun s' hs => ?_⟩
   cases hs
   exact h
 
-theorem TOp.trap {r : Res St} (hop : r = .trap) : TOp sh Γ hty a1 r := by
+theorem TOp.trap {r : Res St} (hop : r = .trap) : TOp sh Γ hty a1 s r := by
   subst hop
   exact ⟨(fun e => by cases e), (fun s' hs => by cases hs)⟩
 
-theorem TOp.bad {r : Res St} {k : BadKind} (hop : r = .bad k) : TOp sh Γ hty a1 r := by
+theorem TOp.bad {r : Res St} {k : BadKind} (hop : r = .bad k) : TOp sh Γ hty a1 s r := by
   subst hop
   exact ⟨(fun e => by cases e), (fun s' hs => by cases hs)⟩
 
@@ -43,7 +43,7 @@ theorem noHole1 {hs : List (Nat × Nat)} {d : Nat} (h : ¬ hasHole hs d = true) 
 
 theorem top_const {d : Nat} {n : Int} (hI : Inv ext a.ls s) (hT : TInv sh Γ hty a s)
     (ht : tcheckI sh Γ (.const d n) = true) (h : stepA np a (.const d n) = some a1) :
-    TOp sh Γ hty a1 (opConst s d n) := by
+    TOp sh Γ hty a1 s (opConst s d n) := by
   obtain ⟨ls', h', hL, hH, rfl⟩ := stepA_split h
   simp only [stepL] at hL
   split at hL
@@ -58,13 +58,13 @@ theorem top_const {d : Nat} {n : Int} (hI : Inv ext a.ls s) (hT : TInv sh Γ hty
       have hdl : d < s.locals.length := hI.len ▸ hc.1
       have hop : opConst s d n = .ok (s.setL d (.int n)) := by simp [opConst, hdl]
       refine TOp.ok hop ?_
-      exact ⟨hty, (hT.setL hΓ ⟨n, rfl⟩ (noHole1 hnh)).abs (fun p hp => hp)
+      exact ⟨hty, HyExt.keep (by first | exact Nat.le_refl _ | simp), (hT.setL hΓ ⟨n, rfl⟩ (noHole1 hnh)).abs (fun p hp => hp)
         (KT_defK hc.1 hT.kt (fun _ => hΓ))⟩
   · cases hL
 
 theorem top_move {d x : Nat} (hI : Inv ext a.ls s) (hT : TInv sh Γ hty a s)
     (ht : tcheckI sh Γ (.move d x) = true) (h : stepA np a (.move d x) = some a1) :
-    TOp sh Γ hty a1 (opMove s d x) := by
+    TOp sh Γ hty a1 s (opMove s d x) := by
   obtain ⟨ls', h', hL, hH, rfl⟩ := stepA_split h
   simp only [stepL] at hL
   split at hL
@@ -87,7 +87,7 @@ theorem top_move {d x : Nat} (hI : Inv ext a.ls s) (hT : TInv sh Γ hty a s)
       have hop : opMove s d x = .ok ((s.setL d (s.get x)).setL x (.int 0)) := by
         simp [opMove, hdl, hxl, St.setL]
       refine TOp.ok hop ?_
-      refine ⟨hty, ?_⟩
+      refine ⟨hty, HyExt.keep (by first | exact Nat.le_refl _ | simp), ?_⟩
       have h1 := hT.setL hτ (hT.loc x τ hτx) hnd
       have h2 := h1.setL hτx (VT_zero _ _ _) hnx
       refine h2.abs (fun p hp => hp) ?_
@@ -110,7 +110,7 @@ theorem tchk_copy {d x : Nat} (hΓ : Γ[d]? = Γ[x]? ∧ (Γ[d]?).isSome = true)
 
 theorem top_borrow {d x : Nat} (hI : Inv ext a.ls s) (hT : TInv sh Γ hty a s)
     (ht : tcheckI sh Γ (.borrow d x) = true) (h : stepA np a (.borrow d x) = some a1) :
-    TOp sh Γ hty a1 (opBorrow s d x) := by
+    TOp sh Γ hty a1 s (opBorrow s d x) := by
   obtain ⟨ls', h', hL, hH, rfl⟩ := stepA_split h
   simp only [stepL] at hL
   split at hL
@@ -127,13 +127,13 @@ theorem top_borrow {d x : Nat} (hI : Inv ext a.ls s) (hT : TInv sh Γ hty a s)
       have hxl : x < s.locals.length := hI.len ▸ hc.2.1
       have hop : opBorrow s d x = .ok (s.setL d (s.get x)) := by simp [opBorrow, hdl, hxl]
       refine TOp.ok hop ?_
-      refine ⟨hty, (hT.setL hτ (hT.loc x τ hτx) hnd).abs (fun p hp => hp) ?_⟩
+      refine ⟨hty, HyExt.keep (by first | exact Nat.le_refl _ | simp), (hT.setL hτ (hT.loc x τ hτx) hnd).abs (fun p hp => hp) ?_⟩
       exact KT_defK (by rw [length_demote]; exact hc.1) (KT_demote hc.2.1 hT.kt) (fun e => by cases e)
   · cases hL
 
 theorem top_dup {d x : Nat} (hI : Inv ext a.ls s) (hT : TInv sh Γ hty a s)
     (ht : tcheckI sh Γ (.dup d x) = true) (h : stepA np a (.dup d x) = some a1) :
-    TOp sh Γ hty a1 (opCopy s d x) := by
+    TOp sh Γ hty a1 s (opCopy s d x) := by
   obtain ⟨ls', h', hL, hH, rfl⟩ := stepA_split h
   simp only [stepL] at hL
   split at hL
@@ -152,7 +152,7 @@ theorem top_dup {d x : Nat} (hI : Inv ext a.ls s) (hT : TInv sh Γ hty a s)
       · have hop : opCopy s d x = .ok { s.setL d (s.get x) with heap := s.heap.bump [s.get x] } := by
           simp [opCopy, hdl, hxl, hl]
         refine TOp.ok hop ?_
-        refine ⟨hty, ?_⟩
+        refine ⟨hty, HyExt.keep (by first | exact Nat.le_refl _ | simp), ?_⟩
         have h1 := hT.setL hτ (hT.loc x τ hτx) hnd
         have h2 : TInv sh Γ hty a { s.setL d (s.get x) with heap := s.heap.bump [s.get x] } := by
           refine h1.heap rfl ⟨rfl, fun l o' ho' => ?_⟩
@@ -166,7 +166,7 @@ theorem top_dup {d x : Nat} (hI : Inv ext a.ls s) (hT : TInv sh Γ hty a s)
 
 theorem top_release {x : Nat} (hI : Inv ext a.ls s) (hT : TInv sh Γ hty a s)
     (ht : tcheckI sh Γ (.release x) = true) (h : stepA np a (.release x) = some a1) :
-    TOp sh Γ hty a1 (opRelease s x) := by
+    TOp sh Γ hty a1 s (opRelease s x) := by
   obtain ⟨ls', h', hL, hH, rfl⟩ := stepA_split h
   simp only [stepL] at hL
   split at hL
@@ -183,7 +183,7 @@ theorem top_release {x : Nat} (hI : Inv ext a.ls s) (hT : TInv sh Γ hty a s)
       have hop : opRelease s x = .ok { s.setL x (.int 0) with pending := s.get x :: s.pending } := by
         simp [opRelease, hxl, St.setL]
       refine TOp.ok hop ?_
-      refine ⟨hty, ?_⟩
+      refine ⟨hty, HyExt.keep (by first | exact Nat.le_refl _ | simp), ?_⟩
       have h1 := hT.setL hτ (VT_zero _ _ _) (noHole1 hnh)
       have h2 := TInv.abs (a1 := ⟨killK a.ls x, a.holes⟩) h1 (fun p hp => hp) (KT_killK hc.1 hT.kt)
       exact h2.same rfl rfl
@@ -283,7 +283,7 @@ theorem tchk_get {d o i : Nat} {r : Bool}
 theorem top_getField {d o i : Nat} {r : Bool} (hI : Inv ext a.ls s) (hT : TInv sh Γ hty a s)
     (hu : HU a) (ht : tcheckI sh Γ (.getField d o i r) = true)
     (h : stepA np a (.getField d o i r) = some a1) :
-    TOp sh Γ hty a1 (opGetField s d o i r) := by
+    TOp sh Γ hty a1 s (opGetField s d o i r) := by
   obtain ⟨t, ts, τ', hΓo, hts, hi, hΓd, hr⟩ := tchk_get ht
   obtain ⟨ls', h', hL, hH, rfl⟩ := stepA_split h
   simp only [stepH] at hH
@@ -319,7 +319,7 @@ theorem top_getField {d o i : Nat} {r : Bool} (hI : Inv ext a.ls s) (hT : TInv s
         refine TOp.ok hop ?_
         rw [if_neg Bool.false_ne_true] at hL'
         cases hL'
-        refine ⟨hty, (hT.setL hΓd ⟨n, rfl⟩ hnd).abs (fun p hp => hp) ?_⟩
+        refine ⟨hty, HyExt.keep (by first | exact Nat.le_refl _ | simp), (hT.setL hΓd ⟨n, rfl⟩ hnd).abs (fun p hp => hp) ?_⟩
         exact KT_defK hd hT.kt (fun _ => hΓd)
       · simp [hint] at hr
         subst hr
@@ -338,7 +338,7 @@ theorem top_getField {d o i : Nat} {r : Bool} (hI : Inv ext a.ls s) (hT : TInv s
             simp only [ite_true] at hL'
             split at hL'
             · cases hL'
-              refine ⟨hty, (hT.setL hΓd (by simp only [VT]; exact Or.inr ⟨m, rfl, hm1, hm2⟩) hnd).abs
+              refine ⟨hty, HyExt.keep (by first | exact Nat.le_refl _ | simp), (hT.setL hΓd (by simp only [VT]; exact Or.inr ⟨m, rfl, hm1, hm2⟩) hnd).abs
                 (fun p hp => hp) ?_⟩
               exact KT_defK hd hT.kt (fun e => by cases e)
             · cases hL'
@@ -353,7 +353,7 @@ theorem top_getField {d o i : Nat} {r : Bool} (hI : Inv ext a.ls s) (hT : TInv s
             simp only [ite_true] at hL'
             split at hL'
             · cases hL'
-              refine ⟨hty, (hT.setL hΓd (by simp only [VT]; exact Or.inr ⟨m, rfl, hm1, hm2⟩) hnd).abs
+              refine ⟨hty, HyExt.keep (by first | exact Nat.le_refl _ | simp), (hT.setL hΓd (by simp only [VT]; exact Or.inr ⟨m, rfl, hm1, hm2⟩) hnd).abs
                 (fun p hp => hp) ?_⟩
               exact KT_defK hd hT.kt (fun e => by cases e)
             · cases hL'
@@ -389,7 +389,7 @@ theorem tchk_alloc {d n : Nat} (ht : tcheckI sh Γ (.alloc d n) = true) :
 
 theorem top_alloc {d n : Nat} (hI : Inv ext a.ls s) (hT : TInv sh Γ hty a s)
     (ht : tcheckI sh Γ (.alloc d n) = true) (h : stepA np a (.alloc d n) = some a1) :
-    TOp sh Γ hty a1 (opAllocN s d n) := by
+    TOp sh Γ hty a1 s (opAllocN s d n) := by
   obtain ⟨t, ts, hΓ, hts, hlen⟩ := tchk_alloc ht
   obtain ⟨ls', h', hL, hH, rfl⟩ := stepA_split h
   simp only [stepL, stepAlloc] at hL
@@ -410,7 +410,7 @@ theorem top_alloc {d n : Nat} (hI : Inv ext a.ls s) (hT : TInv sh Γ hty a s)
       have hfok : FOK sh hty s.heap (.st t) (List.replicate n (.int 0)) :=
         ⟨ts, hts, by rw [← hlen]; exact AllT_replicate hty s.heap ts⟩
       have hG := hT.tlo.grow (d := d) hn hnew hold hΓ (by intro e; cases e) hfok
-      refine ⟨extHty hty s.heap.next (.st t), hG.loc, hG.obj, ?_, ?_⟩
+      refine ⟨extHty hty s.heap.next (.st t), ⟨fun l hl => by simp [extHty, Nat.ne_of_lt hl], by rw [hn]; omega⟩, hG.loc, hG.obj, ?_, ?_⟩
       · intro l o t' ts' i ho ht' hts' hτ hf
         by_cases hl : l = s.heap.next
         · subst hl
@@ -443,7 +443,7 @@ theorem top_alloc {d n : Nat} (hI : Inv ext a.ls s) (hT : TInv sh Γ hty a s)
 
 theorem top_arrayNew {d nl : Nat} (hI : Inv ext a.ls s) (hT : TInv sh Γ hty a s)
     (ht : tcheckI sh Γ (.arrayNew d nl) = true) (h : stepA np a (.arrayNew d nl) = some a1) :
-    TOp sh Γ hty a1 (opArrayNew s d nl) := by
+    TOp sh Γ hty a1 s (opArrayNew s d nl) := by
   have hΓ : Γ[d]? = some .arr ∧ Γ[nl]? = some .int := by simpa [tcheckI] using ht
   obtain ⟨ls', h', hL, hH, rfl⟩ := stepA_split h
   simp only [stepL] at hL
@@ -477,7 +477,7 @@ theorem top_arrayNew {d nl : Nat} (hI : Inv ext a.ls s) (hT : TInv sh Γ hty a s
             have := List.eq_of_mem_replicate hv
             exact ⟨0, this⟩
           have hG := hT.tlo.grow (d := d) hn' hnew hold hΓ.1 (by intro e; cases e) hfok
-          refine ⟨extHty hty s.heap.next .arr, hG.loc, hG.obj, ?_, ?_⟩
+          refine ⟨extHty hty s.heap.next .arr, ⟨fun l hl => by simp [extHty, Nat.ne_of_lt hl], by rw [hn']; omega⟩, hG.loc, hG.obj, ?_, ?_⟩
           · intro l o t' ts' i ho ht' hts' hτ hf
             by_cases hl : l = s.heap.next
             · subst hl
@@ -502,7 +502,7 @@ theorem top_arrayNew {d nl : Nat} (hI : Inv ext a.ls s) (hT : TInv sh Γ hty a s
 
 theorem top_arrayLen {d x : Nat} (hI : Inv ext a.ls s) (hT : TInv sh Γ hty a s)
     (ht : tcheckI sh Γ (.arrayLen d x) = true) (h : stepA np a (.arrayLen d x) = some a1) :
-    TOp sh Γ hty a1 (opArrayLen s d x) := by
+    TOp sh Γ hty a1 s (opArrayLen s d x) := by
   have hΓ : Γ[x]? = some .arr ∧ Γ[d]? = some .int := by simpa [tcheckI] using ht
   obtain ⟨ls', h', hL, hH, rfl⟩ := stepA_split h
   simp only [stepL] at hL
@@ -527,13 +527,13 @@ theorem top_arrayLen {d x : Nat} (hI : Inv ext a.ls s) (hT : TInv sh Γ hty a s)
         have hop : opArrayLen s d x = .ok (s.setL d (.int (ob.fields.length : Int))) := by
           simp [opArrayLen, hdl, hxl, hlo, hob]
         refine TOp.ok hop ?_
-        exact ⟨hty, (hT.setL hΓ.2 ⟨_, rfl⟩ hnd).abs (fun p hp => hp)
+        exact ⟨hty, HyExt.keep (by first | exact Nat.le_refl _ | simp), (hT.setL hΓ.2 ⟨_, rfl⟩ hnd).abs (fun p hp => hp)
           (KT_defK hd hT.kt (fun _ => hΓ.2))⟩
   · cases hL
 
 theorem top_arrayGet {d x i : Nat} {r : Bool} (hI : Inv ext a.ls s) (hT : TInv sh Γ hty a s)
     (ht : tcheckI sh Γ (.arrayGet d x i r) = true) (h : stepA np a (.arrayGet d x i r) = some a1) :
-    TOp sh Γ hty a1 (opArrayGet s d x i r) := by
+    TOp sh Γ hty a1 s (opArrayGet s d x i r) := by
   have hΓ : Γ[x]? = some .arr ∧ Γ[i]? = some .int ∧ Γ[d]? = some .int ∧ r = false := by
     simpa [tcheckI] using ht
   obtain ⟨hΓx, hΓi, hΓd, hr⟩ := hΓ
@@ -585,7 +585,7 @@ theorem top_arrayGet {d x i : Nat} {r : Bool} (hI : Inv ext a.ls s) (hT : TInv s
               have hop : opArrayGet s d x i false = .ok (s.setL d (.int m)) := by
                 simp [opArrayGet, hil, hn, h0, opGetFieldE, hdl, hxl, hlo, hob, hw]
               refine TOp.ok hop ?_
-              exact ⟨hty, (hT.setL hΓd ⟨m, rfl⟩ hnd).abs (fun p hp => hp) hkt⟩
+              exact ⟨hty, HyExt.keep (by first | exact Nat.le_refl _ | simp), (hT.setL hΓd ⟨m, rfl⟩ hnd).abs (fun p hp => hp) hkt⟩
           · have hop : opArrayGet s d x i false = .trap := by
               simp [opArrayGet, hil, hn, h0, hdl, hxl, hlo, hob]
             exact TOp.trap hop
@@ -646,7 +646,7 @@ theorem store_core {x i v : Nat} (hI : Inv ext a.ls s) (hT : TInv sh Γ hty a s)
     (hkeep : ∀ p ∈ a.holes, p ≠ (x, i) → p ∈ a1.holes)
     (hsh : ∃ t ts τ', Γ[x]? = some (.st t) ∧ sh[t]? = some ts ∧ ts[i]? = some τ' ∧
       Γ[v]? = some τ') (hkt : KT Γ a1.ls) :
-    TOp sh Γ hty a1 (opSetField s x i v) := by
+    TOp sh Γ hty a1 s (opSetField s x i v) := by
   obtain ⟨t, ts, τ', hΓx, hts, hi, hΓv⟩ := hsh
   have hset' := hset
   unfold stepSet at hset'
@@ -697,7 +697,7 @@ theorem store_core {x i v : Nat} (hI : Inv ext a.ls s) (hT : TInv sh Γ hty a s)
       refine ⟨o', ?_, rfl⟩
       rw [hother k hk] at ho'
       rw [hclr]; exact ho'
-    refine ⟨hty, hlo.loc, hlo.obj, ?_, hkt⟩
+    refine ⟨hty, HyExt.keep (by first | exact Nat.le_refl _ | simp), hlo.loc, hlo.obj, ?_, hkt⟩
     intro l' o' t' ts'' i' ho' ht' hts'' hτ hf
     have hgv : ∀ x', (x', i') ∈ a.holes → x' ≠ v := by
       intro x' hx' e; subst e
@@ -757,7 +757,7 @@ theorem KT_stepSet {a : List AS} {x v : Nat} {a1 : List AS} (hk : KT Γ a)
 
 theorem top_setField {x i v : Nat} (hI : Inv ext a.ls s) (hT : TInv sh Γ hty a s) (hu : HU a)
     (ht : tcheckI sh Γ (.setField x i v) = true) (h : stepA np a (.setField x i v) = some a1) :
-    TOp sh Γ hty a1 (opSetField s x i v) := by
+    TOp sh Γ hty a1 s (opSetField s x i v) := by
   obtain ⟨ls', h', hL, hH, rfl⟩ := stepA_split h
   simp only [stepL] at hL
   simp only [stepH] at hH
@@ -771,7 +771,7 @@ theorem top_setField {x i v : Nat} (hI : Inv ext a.ls s) (hT : TInv sh Γ hty a 
 
 theorem top_putField {x i v : Nat} (hI : Inv ext a.ls s) (hT : TInv sh Γ hty a s) (hu : HU a)
     (ht : tcheckI sh Γ (.putField x i v) = true) (h : stepA np a (.putField x i v) = some a1) :
-    TOp sh Γ hty a1 (opSetField s x i v) := by
+    TOp sh Γ hty a1 s (opSetField s x i v) := by
   obtain ⟨ls', h', hL, hH, rfl⟩ := stepA_split h
   simp only [stepL] at hL
   simp only [stepH] at hH
@@ -787,7 +787,7 @@ theorem top_putField {x i v : Nat} (hI : Inv ext a.ls s) (hT : TInv sh Γ hty a 
 
 theorem top_arraySet {x i v : Nat} (hI : Inv ext a.ls s) (hT : TInv sh Γ hty a s)
     (ht : tcheckI sh Γ (.arraySet x i v) = true) (h : stepA np a (.arraySet x i v) = some a1) :
-    TOp sh Γ hty a1 (opArraySet s x i v) := by
+    TOp sh Γ hty a1 s (opArraySet s x i v) := by
   have hΓ : Γ[x]? = some .arr ∧ Γ[i]? = some .int ∧ Γ[v]? = some .int := by
     simpa [tcheckI] using ht
   obtain ⟨hΓx, hΓi, hΓv⟩ := hΓ
@@ -850,7 +850,7 @@ theorem top_arraySet {x i v : Nat} (hI : Inv ext a.ls s) (hT : TInv sh Γ hty a 
                 rcases List.mem_or_eq_of_mem_set hw with h1 | h1
                 · exact hints w h1
                 · exact ⟨m, by rw [h1, hm]⟩
-            refine ⟨hty, hlo.loc, hlo.obj, ?_, KT_stepSet hT.kt hset⟩
+            refine ⟨hty, HyExt.keep (by first | exact Nat.le_refl _ | simp), hlo.loc, hlo.obj, ?_, KT_stepSet hT.kt hset⟩
             intro l' o' t' ts'' i' ho' ht' hts'' hτ hf
             have hll : l' ≠ l := by
               intro e; subst e; rw [hlty] at ht'; cases ht'
@@ -892,7 +892,7 @@ theorem tchk_take {d x i : Nat} (ht : tcheckI sh Γ (.takeField d x i) = true) :
 
 theorem top_takeField {d x i : Nat} (hI : Inv ext a.ls s) (hT : TInv sh Γ hty a s) (hu : HU a)
     (ht : tcheckI sh Γ (.takeField d x i) = true) (h : stepA np a (.takeField d x i) = some a1) :
-    TOp sh Γ hty a1 (opTakeField s d x i) := by
+    TOp sh Γ hty a1 s (opTakeField s d x i) := by
   obtain ⟨t, ts, τ', hΓx, hts, hi, hΓd, hne⟩ := tchk_take ht
   obtain ⟨ls', h', hL, hH, rfl⟩ := stepA_split h
   simp only [stepL] at hL
@@ -940,7 +940,7 @@ theorem top_takeField {d x i : Nat} (hI : Inv ext a.ls s) (hT : TInv sh Γ hty a
             hlty rfl rfl ⟨_, hat, rfl⟩ ?_ ⟨ts, hts, AllT_set hA hi (VT_zero _ _ _)⟩
           intro k o' hk ho'
           exact ⟨o', by rw [hother k hk] at ho'; exact ho', rfl⟩
-        refine ⟨hty, hlo.loc, hlo.obj, ?_, ?_⟩
+        refine ⟨hty, HyExt.keep (by first | exact Nat.le_refl _ | simp), hlo.loc, hlo.obj, ?_, ?_⟩
         · intro l' o' t' ts'' i' ho' ht' hts'' hτ hf
           have hgetc : ∀ x', x' ≠ d → (takeSt s d l ob i (.ref lw)).get x' = s.get x' := by
             intro x' hx'
@@ -976,7 +976,7 @@ theorem top_takeField {d x i : Nat} (hI : Inv ext a.ls s) (hT : TInv sh Γ hty a
 
 theorem top_makeUnique {x : Nat} (hI : Inv ext a.ls s) (hT : TInv sh Γ hty a s) (hu : HU a)
     (ht : tcheckI sh Γ (.makeUnique x) = true) (h : stepA np a (.makeUnique x) = some a1) :
-    TOp sh Γ hty a1 (opMakeUnique s x) := by
+    TOp sh Γ hty a1 s (opMakeUnique s x) := by
   have hxG : x < Γ.length := by simpa [tcheckI] using ht
   obtain ⟨τ0, hτ0⟩ : ∃ τ, Γ[x]? = some τ := ⟨Γ[x], List.getElem?_eq_getElem hxG⟩
   obtain ⟨ls', h', hL, hH, rfl⟩ := stepA_split h
@@ -1005,7 +1005,7 @@ theorem top_makeUnique {x : Nat} (hI : Inv ext a.ls s) (hT : TInv sh Γ hty a s)
       by_cases hrc : ob.rc = 1
       · have hop : opMakeUnique s x = .ok s := by simp [opMakeUnique, hxl, hl, hob, hrc]
         refine TOp.ok hop ?_
-        exact ⟨hty, hT.abs (fun p hp => hp) hkt⟩
+        exact ⟨hty, HyExt.keep (by first | exact Nat.le_refl _ | simp), hT.abs (fun p hp => hp) hkt⟩
       · have hfl : ob.fields.all s.heap.liveb = true := by
           rw [List.all_eq_true]
           intro v hv
@@ -1038,7 +1038,7 @@ theorem top_makeUnique {x : Nat} (hI : Inv ext a.ls s) (hT : TInv sh Γ hty a s)
             · exact absurd hk1 hk
             · exact ⟨oH, hoH, hf⟩) hτ0 hne hok
         unfold muSt
-        refine ⟨extHty hty s.heap.next τ0, hG.loc, hG.obj, ?_, hkt⟩
+        refine ⟨extHty hty s.heap.next τ0, ⟨fun l hl => by simp [extHty, Nat.ne_of_lt hl], by rw [hnext]; omega⟩, hG.loc, hG.obj, ?_, hkt⟩
         intro l' o' t' ts'' i ho' ht' hts'' hτ hf
         by_cases hll : l' = s.heap.next
         · subst hll

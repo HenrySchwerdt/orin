@@ -13,6 +13,12 @@
 //     was put in" (that needs equality on `V` / `T`). The tests check values with `int` instances and against a
 //     naive reference model.
 //
+// Names (ADR-0048 section 1.1): `size()` / `isEmpty()` / `clear()` on every class; `has(k)` membership; `get(k)` the
+// checked read (`Option`); `set(k, v)` associates (sorted maps; `put` is a deprecated wrapper); `add(x)` for sets;
+// `remove(k)` returns `Option<V>` on maps and `bool` (was it present) on sets; `keys()` / `values()` / `entries()` copy
+// a keyed container out, `toArray()` a linear one; `first()` / `last()` the ends of an ordered map (`front` / `back` on
+// the `Deque`, whose two ends are both mutable). Import as a namespace: `import * as collections from "std:collections"`.
+//
 // Contract standard (ADR-0030 §3): every class has `@Invariant`s that `--check-contracts` / `orin test` verify
 // after every public method, and every public method states `@Requires` / `@Ensures`. Helpers that contracts call
 // are loops (no closures, no recursion). All classes are values with copy-on-write storage like every class.
@@ -21,8 +27,8 @@
 //   IntSet / StringSet        has, add, remove expected O(1) (the prelude's open-addressing hash map); union O(n + m),
 //                             intersection O(min(n, m)), difference and isSubsetOf O(n)
 //   Deque<T>                  pushFront/pushBack/popFront/popBack/get/front/back amortised O(1); toArray O(n)
-//   SortedMap / SortedStringMap  B-tree in an arena: has/get/put/remove/floorKey/ceilKey/firstKey/lastKey/popFirst/
-//                             popLast all O(t log_t n) = O(log n); keyArray/valueArray O(n); size O(1)
+//   SortedMap / SortedStringMap  B-tree in an arena: has/get/set/remove/floorKey/ceilKey/firstKey/lastKey/first/last/
+//                             popFirst/popLast all O(t log_t n) = O(log n); keys/values/entries O(n); size O(1)
 //   PriorityQueue<T>          4-ary heap: push, pop O(log n); peek, minPriority, size O(1)
 // Each choice was compared with the simpler alternative it replaces (numbers in docs/std.md): B-tree vs sorted
 // array 31 ms vs 1782 ms for 20,000 random inserts + lookups + removals; 4-ary struct-of-arrays heap vs boxed binary
@@ -31,80 +37,21 @@
 
 // ---------------------------------------------------------------------------------------------- helpers
 
-// allTrue(xs): every element is true. Loop-based (contracts cannot use `every`).
-export function allTrue(xs: bool[]): bool {
-  let i: usize = 0;
-  while (i < xs.length) {
-    if (!xs[i]) {
-      return false;
-    }
-    i += 1;
-  }
-  return true;
-}
+// The helpers that exist only to state contracts (`allTrue`, `isStrictlyIncreasing*`, the B-tree shape and order checks,
+// `isMinHeap4`, ...) live in `std:collections/internal` (ADR-0048 rule 7.3). They are not API.
+import {
+  allTrue, isStrictlyIncreasing, isStrictlyIncreasingStrings, compareBytewise, leavesBefore, isMinHeap4, seqsBelow,
+  IntNode, StringNode, lowerBoundInt, lowerBoundString, btreeIntShapeOk, btreeIntOrderOk, btreeIntKeyCount, btreeIntHeight,
+  btreeMinKeysInt, btreeIntKeys, btreeIntVals, btreeStringShapeOk, btreeStringOrderOk, btreeStringKeyCount,
+  btreeStringHeight, btreeMinKeysString, btreeStringKeys, btreeStringVals,
+} from "std:collections/internal";
 
-// isStrictlyIncreasing(xs): xs[0] < xs[1] < ... (so sorted and without duplicates).
-export function isStrictlyIncreasing(xs: int[]): bool {
-  let i: usize = 1;
-  while (i < xs.length) {
-    if (xs[i - 1] >= xs[i]) {
-      return false;
-    }
-    i += 1;
-  }
-  return true;
-}
-
-// compareStrings(a, b): -1, 0 or 1; byte-wise lexicographic order (shorter prefix first), the order of
-// `SortedStringMap`. O(min(a.length, b.length)).
+// compareStrings(a, b): int -- -1, 0 or 1; byte-wise lexicographic order (shorter prefix first), the order of
+// `SortedStringMap`. Never fails. O(min(a.length, b.length)).
 @Ensures(result >= -1 && result <= 1)
-@Ensures((result == 0) == (a.length == b.length && !differsAt(a, b)))
+@Ensures((result == 0) == (a == b))
 export function compareStrings(a: string, b: string): int {
-  const n = a.length < b.length ? a.length : b.length;
-  let i: usize = 0;
-  while (i < n) {
-    const x = a.charCodeAt(i);
-    const y = b.charCodeAt(i);
-    if (x < y) {
-      return -1;
-    }
-    if (x > y) {
-      return 1;
-    }
-    i += 1;
-  }
-  if (a.length < b.length) {
-    return -1;
-  }
-  if (a.length > b.length) {
-    return 1;
-  }
-  return 0;
-}
-
-// Does some byte inside the common length differ?
-function differsAt(a: string, b: string): bool {
-  const n = a.length < b.length ? a.length : b.length;
-  let i: usize = 0;
-  while (i < n) {
-    if (a.charCodeAt(i) != b.charCodeAt(i)) {
-      return true;
-    }
-    i += 1;
-  }
-  return false;
-}
-
-// isStrictlyIncreasingStrings(xs): compareStrings(xs[i-1], xs[i]) < 0 for all i.
-export function isStrictlyIncreasingStrings(xs: string[]): bool {
-  let i: usize = 1;
-  while (i < xs.length) {
-    if (compareStrings(xs[i - 1], xs[i]) >= 0) {
-      return false;
-    }
-    i += 1;
-  }
-  return true;
+  return compareBytewise(a, b);
 }
 
 // ------------------------------------------------------------------------------------------ IntSet
@@ -116,25 +63,25 @@ export function isStrictlyIncreasingStrings(xs: string[]): bool {
 export class IntSet {
   private items: Map<int, bool> = new Map<int, bool>();
 
-  // size(): number of members. O(1).
+  // size(): usize -- number of members. O(1).
   @Ensures(result == this.items.keys().length)
   size(): usize {
     return this.items.size;
   }
 
-  // isEmpty(): no members. O(1).
+  // isEmpty(): bool -- no members. O(1).
   @Ensures(result == (this.size() == 0))
   isEmpty(): bool {
     return this.items.size == 0;
   }
 
-  // has(x): is x a member? Expected O(1).
+  // has(x): bool -- is x a member? Expected O(1).
   @Ensures(result ==> this.size() > 0)
   has(x: int): bool {
     return this.items.has(x);
   }
 
-  // add(x): insert x; true when it was not a member (the size grows by 1), false when it already was. Expected O(1).
+  // add(x): bool -- insert x; true when it was not a member (the size grows by 1), false when it already was. Expected O(1).
   @Ensures(this.has(x))
   @Ensures(result == !old(this.has(x)))
   @Ensures(result ==> this.size() == old(this.size()) + 1)
@@ -147,7 +94,7 @@ export class IntSet {
     return true;
   }
 
-  // remove(x): delete x; true when it was a member (the size shrinks by 1). Expected O(1).
+  // remove(x): bool -- delete x; true when it was a member (the size shrinks by 1). Expected O(1).
   @Ensures(!this.has(x))
   @Ensures(result == old(this.has(x)))
   @Ensures(result ==> this.size() == old(this.size()) - 1)
@@ -160,19 +107,19 @@ export class IntSet {
     return true;
   }
 
-  // clear(): remove all members. O(1).
+  // clear(): void -- remove all members. O(1).
   @Ensures(this.size() == 0)
   clear(): void {
     this.items = new Map<int, bool>();
   }
 
-  // toArray(): the members in insertion order (not sorted). O(n).
+  // toArray(): int[] -- the members in insertion order (not sorted). O(n).
   @Ensures(result.length == this.size())
   toArray(): int[] {
     return this.items.keys();
   }
 
-  // isSubsetOf(other): every member of this is a member of other. O(n).
+  // isSubsetOf(other): bool -- every member of this is a member of other. O(n).
   @Ensures(result ==> this.size() <= other.size())
   @Ensures(this.size() == 0 ==> result)
   isSubsetOf(other: IntSet): bool {
@@ -190,7 +137,7 @@ export class IntSet {
     return true;
   }
 
-  // union(other): the members of either. O(n + m).
+  // union(other): IntSet -- the members of either. O(n + m).
   @Ensures(this.isSubsetOf(result) && other.isSubsetOf(result))
   @Ensures(result.size() >= this.size() && result.size() <= this.size() + other.size())
   union(other: IntSet): IntSet {
@@ -210,7 +157,7 @@ export class IntSet {
     return out;
   }
 
-  // intersection(other): the members of both. O(n).
+  // intersection(other): IntSet -- the members of both. O(n).
   @Ensures(result.isSubsetOf(this) && result.isSubsetOf(other))
   @Ensures(result.size() <= this.size() && result.size() <= other.size())
   intersection(other: IntSet): IntSet {
@@ -229,7 +176,7 @@ export class IntSet {
     return out;
   }
 
-  // difference(other): the members of this that are not in other. O(n).
+  // difference(other): IntSet -- the members of this that are not in other. O(n).
   @Ensures(result.isSubsetOf(this))
   @Ensures(result.intersection(other).isEmpty())
   @Ensures(result.size() + this.intersection(other).size() == this.size())
@@ -255,25 +202,25 @@ export class IntSet {
 export class StringSet {
   private items: Map<string, bool> = new Map<string, bool>();
 
-  // size(): number of members. O(1).
+  // size(): usize -- number of members. O(1).
   @Ensures(result == this.items.keys().length)
   size(): usize {
     return this.items.size;
   }
 
-  // isEmpty(): no members. O(1).
+  // isEmpty(): bool -- no members. O(1).
   @Ensures(result == (this.size() == 0))
   isEmpty(): bool {
     return this.items.size == 0;
   }
 
-  // has(x): is x a member? Expected O(1 + |x|).
+  // has(x): bool -- is x a member? Expected O(1 + |x|).
   @Ensures(result ==> this.size() > 0)
   has(x: string): bool {
     return this.items.has(x);
   }
 
-  // add(x): insert x; true when it was not a member (the size grows by 1). Expected O(1 + |x|).
+  // add(x): bool -- insert x; true when it was not a member (the size grows by 1). Expected O(1 + |x|).
   @Ensures(this.has(x))
   @Ensures(result == !old(this.has(x)))
   @Ensures(result ==> this.size() == old(this.size()) + 1)
@@ -286,7 +233,7 @@ export class StringSet {
     return true;
   }
 
-  // remove(x): delete x; true when it was a member (the size shrinks by 1). Expected O(1 + |x|).
+  // remove(x): bool -- delete x; true when it was a member (the size shrinks by 1). Expected O(1 + |x|).
   @Ensures(!this.has(x))
   @Ensures(result == old(this.has(x)))
   @Ensures(result ==> this.size() == old(this.size()) - 1)
@@ -299,19 +246,19 @@ export class StringSet {
     return true;
   }
 
-  // clear(): remove all members. O(1).
+  // clear(): void -- remove all members. O(1).
   @Ensures(this.size() == 0)
   clear(): void {
     this.items = new Map<string, bool>();
   }
 
-  // toArray(): the members in insertion order (not sorted). O(n).
+  // toArray(): string[] -- the members in insertion order (not sorted). O(n).
   @Ensures(result.length == this.size())
   toArray(): string[] {
     return this.items.keys();
   }
 
-  // isSubsetOf(other): every member of this is a member of other. O(n).
+  // isSubsetOf(other): bool -- every member of this is a member of other. O(n).
   @Ensures(result ==> this.size() <= other.size())
   @Ensures(this.size() == 0 ==> result)
   isSubsetOf(other: StringSet): bool {
@@ -329,7 +276,7 @@ export class StringSet {
     return true;
   }
 
-  // union(other): the members of either. O(n + m).
+  // union(other): StringSet -- the members of either. O(n + m).
   @Ensures(this.isSubsetOf(result) && other.isSubsetOf(result))
   @Ensures(result.size() >= this.size() && result.size() <= this.size() + other.size())
   union(other: StringSet): StringSet {
@@ -349,7 +296,7 @@ export class StringSet {
     return out;
   }
 
-  // intersection(other): the members of both. O(n).
+  // intersection(other): StringSet -- the members of both. O(n).
   @Ensures(result.isSubsetOf(this) && result.isSubsetOf(other))
   @Ensures(result.size() <= this.size() && result.size() <= other.size())
   intersection(other: StringSet): StringSet {
@@ -368,7 +315,7 @@ export class StringSet {
     return out;
   }
 
-  // difference(other): the members of this that are not in other. O(n).
+  // difference(other): StringSet -- the members of this that are not in other. O(n).
   @Ensures(result.isSubsetOf(this))
   @Ensures(result.intersection(other).isEmpty())
   @Ensures(result.size() + this.intersection(other).size() == this.size())
@@ -406,19 +353,19 @@ export class Deque<T> {
   private len: usize = 0;
   private filler: Option<T> = None;
 
-  // size(): number of elements. O(1).
+  // size(): usize -- number of elements. O(1).
   @Ensures(result == this.len)
   size(): usize {
     return this.len;
   }
 
-  // isEmpty(): no elements. O(1).
+  // isEmpty(): bool -- no elements. O(1).
   @Ensures(result == (this.size() == 0))
   isEmpty(): bool {
     return this.len == 0;
   }
 
-  // capacity(): number of slots of the ring (0 until the first push; then 4, 8, 16, ...). O(1).
+  // capacity(): usize -- number of slots of the ring (0 until the first push; then 4, 8, 16, ...). O(1).
   @Ensures(result == this.buf.length)
   capacity(): usize {
     return this.buf.length;
@@ -461,7 +408,7 @@ export class Deque<T> {
     this.head = 0;
   }
 
-  // pushBack(x): append x. Amortised O(1).
+  // pushBack(x): void -- append x. Amortised O(1).
   @Ensures(this.size() == old(this.size()) + 1)
   @Ensures(this.back().isSome() && this.get(this.size() - 1).isSome())
   @Ensures(old(this.isEmpty()) ==> this.front().isSome())
@@ -472,7 +419,7 @@ export class Deque<T> {
     this.len += 1;
   }
 
-  // pushFront(x): prepend x. Amortised O(1).
+  // pushFront(x): void -- prepend x. Amortised O(1).
   @Ensures(this.size() == old(this.size()) + 1)
   @Ensures(this.front().isSome() && this.get(0).isSome())
   @Ensures(old(this.isEmpty()) ==> this.back().isSome())
@@ -488,7 +435,7 @@ export class Deque<T> {
     this.len += 1;
   }
 
-  // popFront(): remove and return the first element, None when empty. O(1).
+  // popFront(): Option<T> -- remove and return the first element, None when empty. O(1).
   @Ensures(result.isSome() == (old(this.size()) > 0))
   @Ensures(result.isSome() ==> this.size() == old(this.size()) - 1)
   @Ensures(result.isNone() ==> this.size() == 0)
@@ -506,7 +453,7 @@ export class Deque<T> {
     return Some(v);
   }
 
-  // popBack(): remove and return the last element, None when empty. O(1).
+  // popBack(): Option<T> -- remove and return the last element, None when empty. O(1).
   @Ensures(result.isSome() == (old(this.size()) > 0))
   @Ensures(result.isSome() ==> this.size() == old(this.size()) - 1)
   @Ensures(result.isNone() ==> this.size() == 0)
@@ -521,7 +468,7 @@ export class Deque<T> {
     return Some(v);
   }
 
-  // front(): the first element without removing it, None when empty. O(1).
+  // front(): Option<T> -- the first element without removing it, None when empty. O(1).
   @Ensures(result.isSome() == (this.size() > 0))
   front(): Option<T> {
     if (this.len == 0) {
@@ -530,7 +477,7 @@ export class Deque<T> {
     return Some(this.buf[this.head]);
   }
 
-  // back(): the last element without removing it, None when empty. O(1).
+  // back(): Option<T> -- the last element without removing it, None when empty. O(1).
   @Ensures(result.isSome() == (this.size() > 0))
   back(): Option<T> {
     if (this.len == 0) {
@@ -539,7 +486,7 @@ export class Deque<T> {
     return Some(this.buf[this.slot(this.len - 1)]);
   }
 
-  // get(i): the i-th element from the front, None when i >= size(). O(1).
+  // get(i): Option<T> -- the i-th element from the front, None when i >= size(). O(1).
   @Ensures(result.isSome() == (i < this.size()))
   get(i: usize): Option<T> {
     if (i >= this.len) {
@@ -548,7 +495,7 @@ export class Deque<T> {
     return Some(this.buf[this.slot(i)]);
   }
 
-  // clear(): remove all elements and release the storage. O(1).
+  // clear(): void -- remove all elements and release the storage. O(1).
   @Ensures(this.size() == 0 && this.capacity() == 0)
   clear(): void {
     this.buf = [];
@@ -557,7 +504,7 @@ export class Deque<T> {
     this.filler = None;
   }
 
-  // toArray(): the elements front to back. O(n).
+  // toArray(): T[] -- the elements front to back. O(n).
   @Ensures(result.length == this.size())
   toArray(): T[] {
     let out: T[] = [];
@@ -573,290 +520,8 @@ export class Deque<T> {
 // BEGIN GENERATED by tools/gen_sorted_map.py from tools/sorted_map.tmpl: do not edit, run the script
 // ------------------------------------------------------------------------------------------ SortedMap
 
-// One node of the B-tree: `keys` sorted, `vals` parallel to them, `kids` empty for a leaf, else keys.length + 1
-// child ids (indices into the arena `nodes` of the map).
-export type IntNode<V> = { keys: int[]; vals: V[]; kids: usize[]; };
-
-// An entry returned by `SortedMap.popFirst` / `popLast`.
+// An entry of `SortedMap`: what `first`, `last`, `popFirst`, `popLast` return and `entries` lists.
 export type SortedEntry<V> = { key: int; value: V; };
-
-// The first index whose key is >= k (keys.length when there is none). Binary search, O(log keys.length).
-@Ensures(result <= keys.length)
-@Ensures(result < keys.length ==> (keys[result] >= k))
-@Ensures(result > 0 ==> (keys[result - 1] < k))
-export function lowerBoundInt(keys: int[], k: int): usize {
-  let lo: usize = 0;
-  let hi: usize = keys.length;
-  while (lo < hi) {
-    const mid = lo + (hi - lo) / 2;
-    if ((keys[mid] < k)) {
-      lo = mid + 1;
-    } else {
-      hi = mid;
-    }
-  }
-  return lo;
-}
-
-// Is `nodes` a well-formed B-tree arena of minimum degree t rooted at `root`, with free list `free`? Checked
-// iteratively with an explicit stack: every node id is in range and reached exactly once (no dangling or shared
-// ids, no cycles), keys and values have the same length, a leaf has no children and an inner node has one more
-// child than keys (and at least one key), every non-root node holds t-1 .. 2t-1 keys and the root at most 2t-1,
-// all leaves have the same depth, the free list holds distinct ids of unreachable nodes, and every arena slot is
-// either reachable or free.
-export function btreeIntShapeOk<V>(nodes: IntNode<V>[], root: usize, t: usize, free: usize[]): bool {
-  const n = nodes.length;
-  if (t < 2 || root >= n) {
-    return false;
-  }
-  let seen: bool[] = [];
-  let i: usize = 0;
-  while (i < n) {
-    seen.push(false);
-    i += 1;
-  }
-  i = 0;
-  while (i < free.length) {
-    if (free[i] >= n || seen[free[i]]) {
-      return false;
-    }
-    seen[free[i]] = true;
-    i += 1;
-  }
-  let ids: usize[] = [root];
-  let depths: usize[] = [0];
-  let leafDepth: int = -1;
-  let reachable: usize = 0;
-  while (ids.length > 0) {
-    const id = ids.pop().unwrap();
-    const d = depths.pop().unwrap();
-    if (seen[id]) {
-      return false;
-    }
-    seen[id] = true;
-    reachable += 1;
-    const kc = nodes[id].keys.length;
-    if (nodes[id].vals.length != kc || kc > 2 * t - 1) {
-      return false;
-    }
-    if (id != root && kc < t - 1) {
-      return false;
-    }
-    const kk = nodes[id].kids.length;
-    if (kk == 0) {
-      if (leafDepth < 0) {
-        leafDepth = d.toInt();
-      } else if (leafDepth != d.toInt()) {
-        return false;
-      }
-    } else {
-      if (kk != kc + 1 || kc == 0) {
-        return false;
-      }
-      let c: usize = 0;
-      while (c < kk) {
-        if (nodes[id].kids[c] >= n) {
-          return false;
-        }
-        ids.push(nodes[id].kids[c]);
-        depths.push(d + 1);
-        c += 1;
-      }
-    }
-  }
-  return reachable + free.length == n;
-}
-
-// Are the keys ordered? Inside every node strictly increasing, and every key of a child lies strictly between the
-// separator keys around it in the parent (inherited bounds), which together say the in-order sequence is strictly
-// increasing. Iterative; tolerates a broken shape (out-of-range ids, revisits) by answering false.
-export function btreeIntOrderOk<V>(nodes: IntNode<V>[], root: usize): bool {
-  if (root >= nodes.length) {
-    return false;
-  }
-  let ids: usize[] = [root];
-  let loFlags: bool[] = [false];
-  let los: int[] = [0];
-  let hiFlags: bool[] = [false];
-  let his: int[] = [0];
-  let visited: usize = 0;
-  while (ids.length > 0) {
-    visited += 1;
-    if (visited > nodes.length) {
-      return false;
-    }
-    const id = ids.pop().unwrap();
-    const hasLo = loFlags.pop().unwrap();
-    const lo = los.pop().unwrap();
-    const hasHi = hiFlags.pop().unwrap();
-    const hi = his.pop().unwrap();
-    const kc = nodes[id].keys.length;
-    let j: usize = 0;
-    while (j < kc) {
-      if (j > 0 && (nodes[id].keys[j - 1] >= nodes[id].keys[j])) {
-        return false;
-      }
-      j += 1;
-    }
-    if (kc > 0) {
-      if (hasLo && (nodes[id].keys[0] <= lo)) {
-        return false;
-      }
-      if (hasHi && (nodes[id].keys[kc - 1] >= hi)) {
-        return false;
-      }
-    }
-    const kk = nodes[id].kids.length;
-    if (kk > 0 && kk != kc + 1) {
-      return false;
-    }
-    let c: usize = 0;
-    while (c < kk) {
-      if (nodes[id].kids[c] >= nodes.length) {
-        return false;
-      }
-      ids.push(nodes[id].kids[c]);
-      if (c == 0) {
-        loFlags.push(hasLo);
-        los.push(lo);
-      } else {
-        loFlags.push(true);
-        los.push(nodes[id].keys[c - 1]);
-      }
-      if (c == kc) {
-        hiFlags.push(hasHi);
-        his.push(hi);
-      } else {
-        hiFlags.push(true);
-        his.push(nodes[id].keys[c]);
-      }
-      c += 1;
-    }
-  }
-  return true;
-}
-
-// The number of keys stored in the tree below `root` (iterative; a revisit or bad id stops the walk early).
-export function btreeIntKeyCount<V>(nodes: IntNode<V>[], root: usize): usize {
-  if (root >= nodes.length) {
-    return 0;
-  }
-  let ids: usize[] = [root];
-  let total: usize = 0;
-  let visited: usize = 0;
-  while (ids.length > 0) {
-    visited += 1;
-    if (visited > nodes.length) {
-      return total;
-    }
-    const id = ids.pop().unwrap();
-    total += nodes[id].keys.length;
-    let c: usize = 0;
-    while (c < nodes[id].kids.length) {
-      if (nodes[id].kids[c] < nodes.length) {
-        ids.push(nodes[id].kids[c]);
-      }
-      c += 1;
-    }
-  }
-  return total;
-}
-
-// Height of the tree: the number of levels (1 for a single leaf root). Follows the first child down. O(height).
-export function btreeIntHeight<V>(nodes: IntNode<V>[], root: usize): usize {
-  let h: usize = 1;
-  let id = root;
-  while (id < nodes.length && nodes[id].kids.length > 0 && h <= nodes.length) {
-    id = nodes[id].kids[0];
-    h += 1;
-  }
-  return h;
-}
-
-// The fewest keys a tree of minimum degree t and the given height can hold: the root has 1 key, every other node
-// at least t-1, so level d >= 1 has >= 2 t^(d-1) nodes and the total is 2 t^(h-1) - 1 (height 1: 1 key, but the
-// root leaf may also be empty, so 0 is returned for an empty tree by the caller). This is why height is O(log_t n).
-@Requires(t >= 2 && h >= 1)
-export function btreeMinKeysInt(h: usize, t: usize): usize {
-  let p: usize = 1;
-  let d: usize = 1;
-  while (d < h) {
-    p *= t;
-    d += 1;
-  }
-  return 2 * p - 1;
-}
-
-// All keys in order, by an explicit-stack in-order walk (the stack holds a node id and how many of its children
-// were visited). O(n).
-export function btreeIntKeys<V>(nodes: IntNode<V>[], root: usize): int[] {
-  let out: int[] = [];
-  let ids: usize[] = [root];
-  let js: usize[] = [0];
-  while (ids.length > 0) {
-    const top = ids.length - 1;
-    const id = ids[top];
-    const j = js[top];
-    const kc = nodes[id].keys.length;
-    if (nodes[id].kids.length == 0) {
-      let a: usize = 0;
-      while (a < kc) {
-        out.push(nodes[id].keys[a]);
-        a += 1;
-      }
-      ids.pop();
-      js.pop();
-    } else {
-      if (j > 0 && j - 1 < kc) {
-        out.push(nodes[id].keys[j - 1]);
-      }
-      if (j <= kc) {
-        js[top] = j + 1;
-        ids.push(nodes[id].kids[j]);
-        js.push(0);
-      } else {
-        ids.pop();
-        js.pop();
-      }
-    }
-  }
-  return out;
-}
-
-// All values in key order (same walk as `btreeIntKeys`). O(n).
-export function btreeIntVals<V>(nodes: IntNode<V>[], root: usize): V[] {
-  let out: V[] = [];
-  let ids: usize[] = [root];
-  let js: usize[] = [0];
-  while (ids.length > 0) {
-    const top = ids.length - 1;
-    const id = ids[top];
-    const j = js[top];
-    const kc = nodes[id].keys.length;
-    if (nodes[id].kids.length == 0) {
-      let a: usize = 0;
-      while (a < kc) {
-        out.push(nodes[id].vals[a]);
-        a += 1;
-      }
-      ids.pop();
-      js.pop();
-    } else {
-      if (j > 0 && j - 1 < kc) {
-        out.push(nodes[id].vals[j - 1]);
-      }
-      if (j <= kc) {
-        js[top] = j + 1;
-        ids.push(nodes[id].kids[j]);
-        js.push(0);
-      } else {
-        ids.pop();
-        js.pop();
-      }
-    }
-  }
-  return out;
-}
 
 // An ordered map from int keys to values of type V: a B-tree of minimum degree t (every node but the root holds
 // t-1 .. 2t-1 keys, all leaves at the same depth) whose nodes live in an arena (`nodes`) and refer to each other
@@ -867,9 +532,9 @@ export function btreeIntVals<V>(nodes: IntNode<V>[], root: usize): V[] {
 // Invariants (`@Invariant`, checked after every public method by `orin test` / `--check-contracts`): the arena is a
 // valid B-tree of degree t (shape, occupancy, equal leaf depth, no dangling or shared ids, consistent free list),
 // keys are ordered (sorted within nodes and bounded by the separators above them) and the stored count equals the
-// number of keys. Complexity: has/get/put/remove/floorKey/ceilKey/firstKey/lastKey/popFirst/popLast O(t log_t n)
+// number of keys. Complexity: has/get/set/remove/floorKey/ceilKey/firstKey/lastKey/first/last/popFirst/popLast O(t log_t n)
 // (a binary search of O(log t) in each of O(log_t n) nodes, plus O(t) to shift keys inside one node per level on
-// updates); size/isEmpty O(1); keyArray/valueArray O(n); `height()` <= 1 + log_t((n+1)/2). Use t = 16 unless you
+// updates); size/isEmpty O(1); keys/values/entries O(n); `height()` <= 1 + log_t((n+1)/2). Use t = 16 unless you
 // have measured otherwise; `minDegree` 2 gives the smallest nodes and deepest trees (useful for tests).
 @Invariant(this.t >= 2)
 @Invariant(btreeIntShapeOk(this.nodes, this.root, this.t, this.free))
@@ -888,19 +553,19 @@ export class SortedMap<V> {
     this.t = minDegree;
   }
 
-  // size(): number of entries. O(1).
+  // size(): usize -- number of entries. O(1).
   @Ensures(result == this.count)
   size(): usize {
     return this.count;
   }
 
-  // isEmpty(): no entries. O(1).
+  // isEmpty(): bool -- no entries. O(1).
   @Ensures(result == (this.size() == 0))
   isEmpty(): bool {
     return this.count == 0;
   }
 
-  // height(): number of levels of the tree (1 for the root leaf). It is logarithmic: a tree with this many levels
+  // height(): usize -- number of levels of the tree (1 for the root leaf). It is logarithmic: a tree with this many levels
   // holds at least 2 t^(h-1) - 1 keys, so n keys need at most about log_t(n/2) + 1 levels. O(height).
   @Ensures(result >= 1)
   @Ensures(this.count > 0 ==> btreeMinKeysInt(result, this.t) <= this.count)
@@ -908,7 +573,7 @@ export class SortedMap<V> {
     return btreeIntHeight(this.nodes, this.root);
   }
 
-  // has(k): is there an entry for k? O(t log_t n).
+  // has(k): bool -- is there an entry for k? O(t log_t n).
   @Ensures(result ==> this.size() > 0)
   has(k: int): bool {
     let x = this.root;
@@ -925,7 +590,7 @@ export class SortedMap<V> {
     return false;
   }
 
-  // get(k): the value for k, None when absent. O(t log_t n).
+  // get(k): Option<V> -- the value for k, None when absent. O(t log_t n).
   @Ensures(result.isSome() == this.has(k))
   get(k: int): Option<V> {
     let x = this.root;
@@ -1023,13 +688,13 @@ export class SortedMap<V> {
     this.insertKid(x, i + 1, z);
   }
 
-  // put(k, v): set the value for k; true when k was new (the size grows by 1), false when an existing value was
-  // replaced. One root-to-leaf pass that splits full nodes on the way down. O(t log_t n).
+  // set(k, v): bool -- associate k with v; true when k was new (the size grows by 1), false when an existing value was
+  // replaced. Never traps. One root-to-leaf pass that splits full nodes on the way down. O(t log_t n).
   @Ensures(this.has(k) && this.get(k).isSome())
   @Ensures(result == !old(this.has(k)))
   @Ensures(result ==> this.size() == old(this.size()) + 1)
   @Ensures(!result ==> this.size() == old(this.size()))
-  put(k: int, v: V): bool {
+  set(k: int, v: V): bool {
     const maxKeys = 2 * this.t - 1;
     if (this.nodes[this.root].keys.length == maxKeys) {
       const nr = this.alloc([], [], [this.root]);
@@ -1067,6 +732,13 @@ export class SortedMap<V> {
 
   // Child number ci of x has t-1 keys: give it one more from a sibling (rotation through x) or merge it with a
   // sibling. Returns the id of the child to descend into afterwards. May shrink the root.
+  @Deprecated("use set(k, v) (ADR-0048)")
+  @Ensures(this.has(k) && this.get(k).isSome())
+  @Ensures(result == !old(this.has(k)))
+  put(k: int, v: V): bool {
+    return this.set(k, v);
+  }
+
   private fill(x: usize, ci: usize): usize {
     const t = this.t;
     const len = this.nodes[x].keys.length;
@@ -1133,7 +805,7 @@ export class SortedMap<V> {
     }
   }
 
-  // remove(k): delete the entry for k and return its value, None when absent. One root-to-leaf pass (CLRS
+  // remove(k): Option<V> -- delete the entry for k and return its value, None when absent. One root-to-leaf pass (CLRS
   // top-down deletion): a node is only entered when it has at least t keys, so removing from a leaf never
   // underflows. A key in an inner node is replaced by its predecessor or successor (or the children are merged) and
   // that key is deleted further down. O(t log_t n).
@@ -1204,7 +876,7 @@ export class SortedMap<V> {
     return removed;
   }
 
-  // firstKey(): the smallest key, None when empty. O(height).
+  // firstKey(): Option<int> -- the smallest key, None when empty. O(height).
   @Ensures(result.isSome() == (this.size() > 0))
   @Ensures(result.isSome() ==> this.has(result.unwrap()))
   firstKey(): Option<int> {
@@ -1218,7 +890,7 @@ export class SortedMap<V> {
     return Some(this.nodes[x].keys[0]);
   }
 
-  // lastKey(): the largest key, None when empty. O(height).
+  // lastKey(): Option<int> -- the largest key, None when empty. O(height).
   @Ensures(result.isSome() == (this.size() > 0))
   @Ensures(result.isSome() ==> this.has(result.unwrap()))
   lastKey(): Option<int> {
@@ -1232,7 +904,7 @@ export class SortedMap<V> {
     return Some(this.nodes[x].keys[this.nodes[x].keys.length - 1]);
   }
 
-  // floorKey(k): the greatest key <= k, None when there is none. One descent. O(t log_t n).
+  // floorKey(k): Option<int> -- the greatest key <= k, None when there is none. One descent. O(t log_t n).
   @Ensures(result.isSome() ==> (result.unwrap() <= k) && this.has(result.unwrap()))
   @Ensures(result.isNone() ==> this.firstKey().isNone() || (this.firstKey().unwrap() > k))
   floorKey(k: int): Option<int> {
@@ -1254,7 +926,7 @@ export class SortedMap<V> {
     return best;
   }
 
-  // ceilKey(k): the smallest key >= k, None when there is none. One descent. O(t log_t n).
+  // ceilKey(k): Option<int> -- the smallest key >= k, None when there is none. One descent. O(t log_t n).
   @Ensures(result.isSome() ==> (result.unwrap() >= k) && this.has(result.unwrap()))
   @Ensures(result.isNone() ==> this.lastKey().isNone() || (this.lastKey().unwrap() < k))
   ceilKey(k: int): Option<int> {
@@ -1276,7 +948,29 @@ export class SortedMap<V> {
     return best;
   }
 
-  // popFirst(): remove the entry with the smallest key and return it, None when empty. O(t log_t n).
+  // first(): Option<SortedEntry<V>> -- the entry with the smallest key, None when empty; nothing is removed. O(height).
+  @Ensures(result.isSome() == (this.size() > 0))
+  @Ensures(result.isSome() ==> (result.unwrap().key == this.firstKey().unwrapOr(0)))
+  first(): Option<SortedEntry<V>> {
+    const f = this.firstKey();
+    if (f.isNone()) {
+      return None;
+    }
+    return Some(SortedEntry<V> { key: f.unwrap(), value: this.get(f.unwrap()).unwrap() });
+  }
+
+  // last(): Option<SortedEntry<V>> -- the entry with the largest key, None when empty; nothing is removed. O(height).
+  @Ensures(result.isSome() == (this.size() > 0))
+  @Ensures(result.isSome() ==> (result.unwrap().key == this.lastKey().unwrapOr(0)))
+  last(): Option<SortedEntry<V>> {
+    const l = this.lastKey();
+    if (l.isNone()) {
+      return None;
+    }
+    return Some(SortedEntry<V> { key: l.unwrap(), value: this.get(l.unwrap()).unwrap() });
+  }
+
+  // popFirst(): Option<SortedEntry<V>> -- remove the entry with the smallest key and return it, None when empty. O(t log_t n).
   @Ensures(result.isSome() == (old(this.size()) > 0))
   @Ensures(result.isSome() ==> this.size() == old(this.size()) - 1 && !this.has(result.unwrap().key))
   @Ensures(result.isSome() ==> (result.unwrap().key == old(this.firstKey().unwrapOr(0))))
@@ -1290,7 +984,7 @@ export class SortedMap<V> {
     return Some(SortedEntry<V> { key: f.unwrap(), value: v });
   }
 
-  // popLast(): remove the entry with the largest key and return it, None when empty. O(t log_t n).
+  // popLast(): Option<SortedEntry<V>> -- remove the entry with the largest key and return it, None when empty. O(t log_t n).
   @Ensures(result.isSome() == (old(this.size()) > 0))
   @Ensures(result.isSome() ==> this.size() == old(this.size()) - 1 && !this.has(result.unwrap().key))
   @Ensures(result.isSome() ==> (result.unwrap().key == old(this.lastKey().unwrapOr(0))))
@@ -1304,19 +998,45 @@ export class SortedMap<V> {
     return Some(SortedEntry<V> { key: l.unwrap(), value: v });
   }
 
-  // keyArray(): all keys in increasing order. O(n).
+  // keys(): int[] -- all keys in increasing order. Never fails. O(n).
   @Ensures(result.length == this.size() && isStrictlyIncreasing(result))
-  keyArray(): int[] {
+  keys(): int[] {
     return btreeIntKeys(this.nodes, this.root);
   }
 
-  // valueArray(): all values in key order. O(n).
+  // values(): V[] -- all values in key order. Never fails. O(n).
   @Ensures(result.length == this.size())
-  valueArray(): V[] {
+  values(): V[] {
     return btreeIntVals(this.nodes, this.root);
   }
 
-  // clear(): remove all entries. O(1).
+  // entries(): SortedEntry<V>[] -- all entries in increasing key order. Never fails. O(n).
+  @Ensures(result.length == this.size())
+  entries(): SortedEntry<V>[] {
+    const ks = btreeIntKeys(this.nodes, this.root);
+    const vs = btreeIntVals(this.nodes, this.root);
+    let out: SortedEntry<V>[] = [];
+    let i: usize = 0;
+    while (i < ks.length) {
+      out.push(SortedEntry<V> { key: ks[i], value: vs[i] });
+      i += 1;
+    }
+    return out;
+  }
+
+  @Deprecated("use keys() (ADR-0048)")
+  @Ensures(result.length == this.size() && isStrictlyIncreasing(result))
+  keyArray(): int[] {
+    return this.keys();
+  }
+
+  @Deprecated("use values() (ADR-0048)")
+  @Ensures(result.length == this.size())
+  valueArray(): V[] {
+    return this.values();
+  }
+
+  // clear(): void -- remove all entries. O(1).
   @Ensures(this.size() == 0)
   clear(): void {
     this.nodes = [IntNode<V> { keys: [], vals: [], kids: [] }];
@@ -1328,290 +1048,8 @@ export class SortedMap<V> {
 
 // ------------------------------------------------------------------------------------------ SortedStringMap
 
-// One node of the B-tree: `keys` sorted, `vals` parallel to them, `kids` empty for a leaf, else keys.length + 1
-// child ids (indices into the arena `nodes` of the map).
-export type StrNode<V> = { keys: string[]; vals: V[]; kids: usize[]; };
-
-// An entry returned by `SortedStringMap.popFirst` / `popLast`.
+// An entry of `SortedStringMap`: what `first`, `last`, `popFirst`, `popLast` return and `entries` lists.
 export type SortedStringEntry<V> = { key: string; value: V; };
-
-// The first index whose key is >= k (keys.length when there is none). Binary search, O(log keys.length).
-@Ensures(result <= keys.length)
-@Ensures(result < keys.length ==> (compareStrings(keys[result], k) >= 0))
-@Ensures(result > 0 ==> (compareStrings(keys[result - 1], k) < 0))
-export function lowerBoundStr(keys: string[], k: string): usize {
-  let lo: usize = 0;
-  let hi: usize = keys.length;
-  while (lo < hi) {
-    const mid = lo + (hi - lo) / 2;
-    if ((compareStrings(keys[mid], k) < 0)) {
-      lo = mid + 1;
-    } else {
-      hi = mid;
-    }
-  }
-  return lo;
-}
-
-// Is `nodes` a well-formed B-tree arena of minimum degree t rooted at `root`, with free list `free`? Checked
-// iteratively with an explicit stack: every node id is in range and reached exactly once (no dangling or shared
-// ids, no cycles), keys and values have the same length, a leaf has no children and an inner node has one more
-// child than keys (and at least one key), every non-root node holds t-1 .. 2t-1 keys and the root at most 2t-1,
-// all leaves have the same depth, the free list holds distinct ids of unreachable nodes, and every arena slot is
-// either reachable or free.
-export function btreeStrShapeOk<V>(nodes: StrNode<V>[], root: usize, t: usize, free: usize[]): bool {
-  const n = nodes.length;
-  if (t < 2 || root >= n) {
-    return false;
-  }
-  let seen: bool[] = [];
-  let i: usize = 0;
-  while (i < n) {
-    seen.push(false);
-    i += 1;
-  }
-  i = 0;
-  while (i < free.length) {
-    if (free[i] >= n || seen[free[i]]) {
-      return false;
-    }
-    seen[free[i]] = true;
-    i += 1;
-  }
-  let ids: usize[] = [root];
-  let depths: usize[] = [0];
-  let leafDepth: int = -1;
-  let reachable: usize = 0;
-  while (ids.length > 0) {
-    const id = ids.pop().unwrap();
-    const d = depths.pop().unwrap();
-    if (seen[id]) {
-      return false;
-    }
-    seen[id] = true;
-    reachable += 1;
-    const kc = nodes[id].keys.length;
-    if (nodes[id].vals.length != kc || kc > 2 * t - 1) {
-      return false;
-    }
-    if (id != root && kc < t - 1) {
-      return false;
-    }
-    const kk = nodes[id].kids.length;
-    if (kk == 0) {
-      if (leafDepth < 0) {
-        leafDepth = d.toInt();
-      } else if (leafDepth != d.toInt()) {
-        return false;
-      }
-    } else {
-      if (kk != kc + 1 || kc == 0) {
-        return false;
-      }
-      let c: usize = 0;
-      while (c < kk) {
-        if (nodes[id].kids[c] >= n) {
-          return false;
-        }
-        ids.push(nodes[id].kids[c]);
-        depths.push(d + 1);
-        c += 1;
-      }
-    }
-  }
-  return reachable + free.length == n;
-}
-
-// Are the keys ordered? Inside every node strictly increasing, and every key of a child lies strictly between the
-// separator keys around it in the parent (inherited bounds), which together say the in-order sequence is strictly
-// increasing. Iterative; tolerates a broken shape (out-of-range ids, revisits) by answering false.
-export function btreeStrOrderOk<V>(nodes: StrNode<V>[], root: usize): bool {
-  if (root >= nodes.length) {
-    return false;
-  }
-  let ids: usize[] = [root];
-  let loFlags: bool[] = [false];
-  let los: string[] = [""];
-  let hiFlags: bool[] = [false];
-  let his: string[] = [""];
-  let visited: usize = 0;
-  while (ids.length > 0) {
-    visited += 1;
-    if (visited > nodes.length) {
-      return false;
-    }
-    const id = ids.pop().unwrap();
-    const hasLo = loFlags.pop().unwrap();
-    const lo = los.pop().unwrap();
-    const hasHi = hiFlags.pop().unwrap();
-    const hi = his.pop().unwrap();
-    const kc = nodes[id].keys.length;
-    let j: usize = 0;
-    while (j < kc) {
-      if (j > 0 && (compareStrings(nodes[id].keys[j - 1], nodes[id].keys[j]) >= 0)) {
-        return false;
-      }
-      j += 1;
-    }
-    if (kc > 0) {
-      if (hasLo && (compareStrings(nodes[id].keys[0], lo) <= 0)) {
-        return false;
-      }
-      if (hasHi && (compareStrings(nodes[id].keys[kc - 1], hi) >= 0)) {
-        return false;
-      }
-    }
-    const kk = nodes[id].kids.length;
-    if (kk > 0 && kk != kc + 1) {
-      return false;
-    }
-    let c: usize = 0;
-    while (c < kk) {
-      if (nodes[id].kids[c] >= nodes.length) {
-        return false;
-      }
-      ids.push(nodes[id].kids[c]);
-      if (c == 0) {
-        loFlags.push(hasLo);
-        los.push(lo);
-      } else {
-        loFlags.push(true);
-        los.push(nodes[id].keys[c - 1]);
-      }
-      if (c == kc) {
-        hiFlags.push(hasHi);
-        his.push(hi);
-      } else {
-        hiFlags.push(true);
-        his.push(nodes[id].keys[c]);
-      }
-      c += 1;
-    }
-  }
-  return true;
-}
-
-// The number of keys stored in the tree below `root` (iterative; a revisit or bad id stops the walk early).
-export function btreeStrKeyCount<V>(nodes: StrNode<V>[], root: usize): usize {
-  if (root >= nodes.length) {
-    return 0;
-  }
-  let ids: usize[] = [root];
-  let total: usize = 0;
-  let visited: usize = 0;
-  while (ids.length > 0) {
-    visited += 1;
-    if (visited > nodes.length) {
-      return total;
-    }
-    const id = ids.pop().unwrap();
-    total += nodes[id].keys.length;
-    let c: usize = 0;
-    while (c < nodes[id].kids.length) {
-      if (nodes[id].kids[c] < nodes.length) {
-        ids.push(nodes[id].kids[c]);
-      }
-      c += 1;
-    }
-  }
-  return total;
-}
-
-// Height of the tree: the number of levels (1 for a single leaf root). Follows the first child down. O(height).
-export function btreeStrHeight<V>(nodes: StrNode<V>[], root: usize): usize {
-  let h: usize = 1;
-  let id = root;
-  while (id < nodes.length && nodes[id].kids.length > 0 && h <= nodes.length) {
-    id = nodes[id].kids[0];
-    h += 1;
-  }
-  return h;
-}
-
-// The fewest keys a tree of minimum degree t and the given height can hold: the root has 1 key, every other node
-// at least t-1, so level d >= 1 has >= 2 t^(d-1) nodes and the total is 2 t^(h-1) - 1 (height 1: 1 key, but the
-// root leaf may also be empty, so 0 is returned for an empty tree by the caller). This is why height is O(log_t n).
-@Requires(t >= 2 && h >= 1)
-export function btreeMinKeysStr(h: usize, t: usize): usize {
-  let p: usize = 1;
-  let d: usize = 1;
-  while (d < h) {
-    p *= t;
-    d += 1;
-  }
-  return 2 * p - 1;
-}
-
-// All keys in order, by an explicit-stack in-order walk (the stack holds a node id and how many of its children
-// were visited). O(n).
-export function btreeStrKeys<V>(nodes: StrNode<V>[], root: usize): string[] {
-  let out: string[] = [];
-  let ids: usize[] = [root];
-  let js: usize[] = [0];
-  while (ids.length > 0) {
-    const top = ids.length - 1;
-    const id = ids[top];
-    const j = js[top];
-    const kc = nodes[id].keys.length;
-    if (nodes[id].kids.length == 0) {
-      let a: usize = 0;
-      while (a < kc) {
-        out.push(nodes[id].keys[a]);
-        a += 1;
-      }
-      ids.pop();
-      js.pop();
-    } else {
-      if (j > 0 && j - 1 < kc) {
-        out.push(nodes[id].keys[j - 1]);
-      }
-      if (j <= kc) {
-        js[top] = j + 1;
-        ids.push(nodes[id].kids[j]);
-        js.push(0);
-      } else {
-        ids.pop();
-        js.pop();
-      }
-    }
-  }
-  return out;
-}
-
-// All values in key order (same walk as `btreeStrKeys`). O(n).
-export function btreeStrVals<V>(nodes: StrNode<V>[], root: usize): V[] {
-  let out: V[] = [];
-  let ids: usize[] = [root];
-  let js: usize[] = [0];
-  while (ids.length > 0) {
-    const top = ids.length - 1;
-    const id = ids[top];
-    const j = js[top];
-    const kc = nodes[id].keys.length;
-    if (nodes[id].kids.length == 0) {
-      let a: usize = 0;
-      while (a < kc) {
-        out.push(nodes[id].vals[a]);
-        a += 1;
-      }
-      ids.pop();
-      js.pop();
-    } else {
-      if (j > 0 && j - 1 < kc) {
-        out.push(nodes[id].vals[j - 1]);
-      }
-      if (j <= kc) {
-        js[top] = j + 1;
-        ids.push(nodes[id].kids[j]);
-        js.push(0);
-      } else {
-        ids.pop();
-        js.pop();
-      }
-    }
-  }
-  return out;
-}
 
 // An ordered map from string keys to values of type V: a B-tree of minimum degree t (every node but the root holds
 // t-1 .. 2t-1 keys, all leaves at the same depth) whose nodes live in an arena (`nodes`) and refer to each other
@@ -1622,17 +1060,17 @@ export function btreeStrVals<V>(nodes: StrNode<V>[], root: usize): V[] {
 // Invariants (`@Invariant`, checked after every public method by `orin test` / `--check-contracts`): the arena is a
 // valid B-tree of degree t (shape, occupancy, equal leaf depth, no dangling or shared ids, consistent free list),
 // keys are ordered (sorted within nodes and bounded by the separators above them) and the stored count equals the
-// number of keys. Complexity: has/get/put/remove/floorKey/ceilKey/firstKey/lastKey/popFirst/popLast O(t log_t n)
+// number of keys. Complexity: has/get/set/remove/floorKey/ceilKey/firstKey/lastKey/first/last/popFirst/popLast O(t log_t n)
 // (a binary search of O(log t) in each of O(log_t n) nodes, plus O(t) to shift keys inside one node per level on
-// updates); size/isEmpty O(1); keyArray/valueArray O(n); `height()` <= 1 + log_t((n+1)/2). Use t = 16 unless you
+// updates); size/isEmpty O(1); keys/values/entries O(n); `height()` <= 1 + log_t((n+1)/2). Use t = 16 unless you
 // have measured otherwise; `minDegree` 2 gives the smallest nodes and deepest trees (useful for tests).
 @Invariant(this.t >= 2)
-@Invariant(btreeStrShapeOk(this.nodes, this.root, this.t, this.free))
-@Invariant(btreeStrOrderOk(this.nodes, this.root))
-@Invariant(btreeStrKeyCount(this.nodes, this.root) == this.count)
+@Invariant(btreeStringShapeOk(this.nodes, this.root, this.t, this.free))
+@Invariant(btreeStringOrderOk(this.nodes, this.root))
+@Invariant(btreeStringKeyCount(this.nodes, this.root) == this.count)
 export class SortedStringMap<V> {
   private t: usize;
-  private nodes: StrNode<V>[] = [StrNode<V> { keys: [], vals: [], kids: [] }];
+  private nodes: StringNode<V>[] = [StringNode<V> { keys: [], vals: [], kids: [] }];
   private root: usize = 0;
   private free: usize[] = [];
   private count: usize = 0;
@@ -1643,33 +1081,33 @@ export class SortedStringMap<V> {
     this.t = minDegree;
   }
 
-  // size(): number of entries. O(1).
+  // size(): usize -- number of entries. O(1).
   @Ensures(result == this.count)
   size(): usize {
     return this.count;
   }
 
-  // isEmpty(): no entries. O(1).
+  // isEmpty(): bool -- no entries. O(1).
   @Ensures(result == (this.size() == 0))
   isEmpty(): bool {
     return this.count == 0;
   }
 
-  // height(): number of levels of the tree (1 for the root leaf). It is logarithmic: a tree with this many levels
+  // height(): usize -- number of levels of the tree (1 for the root leaf). It is logarithmic: a tree with this many levels
   // holds at least 2 t^(h-1) - 1 keys, so n keys need at most about log_t(n/2) + 1 levels. O(height).
   @Ensures(result >= 1)
-  @Ensures(this.count > 0 ==> btreeMinKeysStr(result, this.t) <= this.count)
+  @Ensures(this.count > 0 ==> btreeMinKeysString(result, this.t) <= this.count)
   height(): usize {
-    return btreeStrHeight(this.nodes, this.root);
+    return btreeStringHeight(this.nodes, this.root);
   }
 
-  // has(k): is there an entry for k? O(t log_t n).
+  // has(k): bool -- is there an entry for k? O(t log_t n).
   @Ensures(result ==> this.size() > 0)
   has(k: string): bool {
     let x = this.root;
     while (true) {
-      const i = lowerBoundStr(this.nodes[x].keys, k);
-      if (i < this.nodes[x].keys.length && (compareStrings(this.nodes[x].keys[i], k) == 0)) {
+      const i = lowerBoundString(this.nodes[x].keys, k);
+      if (i < this.nodes[x].keys.length && (compareBytewise(this.nodes[x].keys[i], k) == 0)) {
         return true;
       }
       if (this.nodes[x].kids.length == 0) {
@@ -1680,13 +1118,13 @@ export class SortedStringMap<V> {
     return false;
   }
 
-  // get(k): the value for k, None when absent. O(t log_t n).
+  // get(k): Option<V> -- the value for k, None when absent. O(t log_t n).
   @Ensures(result.isSome() == this.has(k))
   get(k: string): Option<V> {
     let x = this.root;
     while (true) {
-      const i = lowerBoundStr(this.nodes[x].keys, k);
-      if (i < this.nodes[x].keys.length && (compareStrings(this.nodes[x].keys[i], k) == 0)) {
+      const i = lowerBoundString(this.nodes[x].keys, k);
+      if (i < this.nodes[x].keys.length && (compareBytewise(this.nodes[x].keys[i], k) == 0)) {
         return Some(this.nodes[x].vals[i]);
       }
       if (this.nodes[x].kids.length == 0) {
@@ -1701,16 +1139,16 @@ export class SortedStringMap<V> {
   private alloc(keys: string[], vals: V[], kids: usize[]): usize {
     if (this.free.length > 0) {
       const id = this.free.pop().unwrap();
-      this.nodes[id] = StrNode<V> { keys: keys, vals: vals, kids: kids };
+      this.nodes[id] = StringNode<V> { keys: keys, vals: vals, kids: kids };
       return id;
     }
-    this.nodes.push(StrNode<V> { keys: keys, vals: vals, kids: kids });
+    this.nodes.push(StringNode<V> { keys: keys, vals: vals, kids: kids });
     return this.nodes.length - 1;
   }
 
   // Empties an arena slot and puts it on the free list.
   private release(id: usize): void {
-    this.nodes[id] = StrNode<V> { keys: [], vals: [], kids: [] };
+    this.nodes[id] = StringNode<V> { keys: [], vals: [], kids: [] };
     this.free.push(id);
   }
 
@@ -1778,13 +1216,13 @@ export class SortedStringMap<V> {
     this.insertKid(x, i + 1, z);
   }
 
-  // put(k, v): set the value for k; true when k was new (the size grows by 1), false when an existing value was
-  // replaced. One root-to-leaf pass that splits full nodes on the way down. O(t log_t n).
+  // set(k, v): bool -- associate k with v; true when k was new (the size grows by 1), false when an existing value was
+  // replaced. Never traps. One root-to-leaf pass that splits full nodes on the way down. O(t log_t n).
   @Ensures(this.has(k) && this.get(k).isSome())
   @Ensures(result == !old(this.has(k)))
   @Ensures(result ==> this.size() == old(this.size()) + 1)
   @Ensures(!result ==> this.size() == old(this.size()))
-  put(k: string, v: V): bool {
+  set(k: string, v: V): bool {
     const maxKeys = 2 * this.t - 1;
     if (this.nodes[this.root].keys.length == maxKeys) {
       const nr = this.alloc([], [], [this.root]);
@@ -1793,8 +1231,8 @@ export class SortedStringMap<V> {
     }
     let x = this.root;
     while (true) {
-      const i = lowerBoundStr(this.nodes[x].keys, k);
-      if (i < this.nodes[x].keys.length && (compareStrings(this.nodes[x].keys[i], k) == 0)) {
+      const i = lowerBoundString(this.nodes[x].keys, k);
+      if (i < this.nodes[x].keys.length && (compareBytewise(this.nodes[x].keys[i], k) == 0)) {
         this.nodes[x].vals[i] = v;
         return false;
       }
@@ -1807,11 +1245,11 @@ export class SortedStringMap<V> {
       if (this.nodes[this.nodes[x].kids[i]].keys.length == maxKeys) {
         this.splitChild(x, i);
         const m = this.nodes[x].keys[i];
-        if ((compareStrings(k, m) == 0)) {
+        if ((compareBytewise(k, m) == 0)) {
           this.nodes[x].vals[i] = v;
           return false;
         }
-        if ((compareStrings(k, m) > 0)) {
+        if ((compareBytewise(k, m) > 0)) {
           ci = i + 1;
         }
       }
@@ -1822,6 +1260,13 @@ export class SortedStringMap<V> {
 
   // Child number ci of x has t-1 keys: give it one more from a sibling (rotation through x) or merge it with a
   // sibling. Returns the id of the child to descend into afterwards. May shrink the root.
+  @Deprecated("use set(k, v) (ADR-0048)")
+  @Ensures(this.has(k) && this.get(k).isSome())
+  @Ensures(result == !old(this.has(k)))
+  put(k: string, v: V): bool {
+    return this.set(k, v);
+  }
+
   private fill(x: usize, ci: usize): usize {
     const t = this.t;
     const len = this.nodes[x].keys.length;
@@ -1888,7 +1333,7 @@ export class SortedStringMap<V> {
     }
   }
 
-  // remove(k): delete the entry for k and return its value, None when absent. One root-to-leaf pass (CLRS
+  // remove(k): Option<V> -- delete the entry for k and return its value, None when absent. One root-to-leaf pass (CLRS
   // top-down deletion): a node is only entered when it has at least t keys, so removing from a leaf never
   // underflows. A key in an inner node is replaced by its predecessor or successor (or the children are merged) and
   // that key is deleted further down. O(t log_t n).
@@ -1904,9 +1349,9 @@ export class SortedStringMap<V> {
     let saved = false;
     while (true) {
       const len = this.nodes[x].keys.length;
-      const i = lowerBoundStr(this.nodes[x].keys, target);
+      const i = lowerBoundString(this.nodes[x].keys, target);
       const isLeaf = this.nodes[x].kids.length == 0;
-      if (i < len && (compareStrings(this.nodes[x].keys[i], target) == 0)) {
+      if (i < len && (compareBytewise(this.nodes[x].keys[i], target) == 0)) {
         if (isLeaf) {
           if (!saved) {
             removed = Some(this.nodes[x].vals[i]);
@@ -1959,7 +1404,7 @@ export class SortedStringMap<V> {
     return removed;
   }
 
-  // firstKey(): the smallest key, None when empty. O(height).
+  // firstKey(): Option<string> -- the smallest key, None when empty. O(height).
   @Ensures(result.isSome() == (this.size() > 0))
   @Ensures(result.isSome() ==> this.has(result.unwrap()))
   firstKey(): Option<string> {
@@ -1973,7 +1418,7 @@ export class SortedStringMap<V> {
     return Some(this.nodes[x].keys[0]);
   }
 
-  // lastKey(): the largest key, None when empty. O(height).
+  // lastKey(): Option<string> -- the largest key, None when empty. O(height).
   @Ensures(result.isSome() == (this.size() > 0))
   @Ensures(result.isSome() ==> this.has(result.unwrap()))
   lastKey(): Option<string> {
@@ -1987,15 +1432,15 @@ export class SortedStringMap<V> {
     return Some(this.nodes[x].keys[this.nodes[x].keys.length - 1]);
   }
 
-  // floorKey(k): the greatest key <= k, None when there is none. One descent. O(t log_t n).
-  @Ensures(result.isSome() ==> (compareStrings(result.unwrap(), k) <= 0) && this.has(result.unwrap()))
-  @Ensures(result.isNone() ==> this.firstKey().isNone() || (compareStrings(this.firstKey().unwrap(), k) > 0))
+  // floorKey(k): Option<string> -- the greatest key <= k, None when there is none. One descent. O(t log_t n).
+  @Ensures(result.isSome() ==> (compareBytewise(result.unwrap(), k) <= 0) && this.has(result.unwrap()))
+  @Ensures(result.isNone() ==> this.firstKey().isNone() || (compareBytewise(this.firstKey().unwrap(), k) > 0))
   floorKey(k: string): Option<string> {
     let best: Option<string> = None;
     let x = this.root;
     while (true) {
-      const i = lowerBoundStr(this.nodes[x].keys, k);
-      if (i < this.nodes[x].keys.length && (compareStrings(this.nodes[x].keys[i], k) == 0)) {
+      const i = lowerBoundString(this.nodes[x].keys, k);
+      if (i < this.nodes[x].keys.length && (compareBytewise(this.nodes[x].keys[i], k) == 0)) {
         return Some(k);
       }
       if (i > 0) {
@@ -2009,16 +1454,16 @@ export class SortedStringMap<V> {
     return best;
   }
 
-  // ceilKey(k): the smallest key >= k, None when there is none. One descent. O(t log_t n).
-  @Ensures(result.isSome() ==> (compareStrings(result.unwrap(), k) >= 0) && this.has(result.unwrap()))
-  @Ensures(result.isNone() ==> this.lastKey().isNone() || (compareStrings(this.lastKey().unwrap(), k) < 0))
+  // ceilKey(k): Option<string> -- the smallest key >= k, None when there is none. One descent. O(t log_t n).
+  @Ensures(result.isSome() ==> (compareBytewise(result.unwrap(), k) >= 0) && this.has(result.unwrap()))
+  @Ensures(result.isNone() ==> this.lastKey().isNone() || (compareBytewise(this.lastKey().unwrap(), k) < 0))
   ceilKey(k: string): Option<string> {
     let best: Option<string> = None;
     let x = this.root;
     while (true) {
-      const i = lowerBoundStr(this.nodes[x].keys, k);
+      const i = lowerBoundString(this.nodes[x].keys, k);
       if (i < this.nodes[x].keys.length) {
-        if ((compareStrings(this.nodes[x].keys[i], k) == 0)) {
+        if ((compareBytewise(this.nodes[x].keys[i], k) == 0)) {
           return Some(k);
         }
         best = Some(this.nodes[x].keys[i]);
@@ -2031,11 +1476,33 @@ export class SortedStringMap<V> {
     return best;
   }
 
-  // popFirst(): remove the entry with the smallest key and return it, None when empty. O(t log_t n).
+  // first(): Option<SortedStringEntry<V>> -- the entry with the smallest key, None when empty; nothing is removed. O(height).
+  @Ensures(result.isSome() == (this.size() > 0))
+  @Ensures(result.isSome() ==> (compareBytewise(result.unwrap().key, this.firstKey().unwrapOr("")) == 0))
+  first(): Option<SortedStringEntry<V>> {
+    const f = this.firstKey();
+    if (f.isNone()) {
+      return None;
+    }
+    return Some(SortedStringEntry<V> { key: f.unwrap(), value: this.get(f.unwrap()).unwrap() });
+  }
+
+  // last(): Option<SortedStringEntry<V>> -- the entry with the largest key, None when empty; nothing is removed. O(height).
+  @Ensures(result.isSome() == (this.size() > 0))
+  @Ensures(result.isSome() ==> (compareBytewise(result.unwrap().key, this.lastKey().unwrapOr("")) == 0))
+  last(): Option<SortedStringEntry<V>> {
+    const l = this.lastKey();
+    if (l.isNone()) {
+      return None;
+    }
+    return Some(SortedStringEntry<V> { key: l.unwrap(), value: this.get(l.unwrap()).unwrap() });
+  }
+
+  // popFirst(): Option<SortedStringEntry<V>> -- remove the entry with the smallest key and return it, None when empty. O(t log_t n).
   @Ensures(result.isSome() == (old(this.size()) > 0))
   @Ensures(result.isSome() ==> this.size() == old(this.size()) - 1 && !this.has(result.unwrap().key))
-  @Ensures(result.isSome() ==> (compareStrings(result.unwrap().key, old(this.firstKey().unwrapOr(""))) == 0))
-  @Ensures(result.isSome() && this.size() > 0 ==> (compareStrings(this.firstKey().unwrap(), result.unwrap().key) > 0))
+  @Ensures(result.isSome() ==> (compareBytewise(result.unwrap().key, old(this.firstKey().unwrapOr(""))) == 0))
+  @Ensures(result.isSome() && this.size() > 0 ==> (compareBytewise(this.firstKey().unwrap(), result.unwrap().key) > 0))
   popFirst(): Option<SortedStringEntry<V>> {
     const f = this.firstKey();
     if (f.isNone()) {
@@ -2045,11 +1512,11 @@ export class SortedStringMap<V> {
     return Some(SortedStringEntry<V> { key: f.unwrap(), value: v });
   }
 
-  // popLast(): remove the entry with the largest key and return it, None when empty. O(t log_t n).
+  // popLast(): Option<SortedStringEntry<V>> -- remove the entry with the largest key and return it, None when empty. O(t log_t n).
   @Ensures(result.isSome() == (old(this.size()) > 0))
   @Ensures(result.isSome() ==> this.size() == old(this.size()) - 1 && !this.has(result.unwrap().key))
-  @Ensures(result.isSome() ==> (compareStrings(result.unwrap().key, old(this.lastKey().unwrapOr(""))) == 0))
-  @Ensures(result.isSome() && this.size() > 0 ==> (compareStrings(this.lastKey().unwrap(), result.unwrap().key) < 0))
+  @Ensures(result.isSome() ==> (compareBytewise(result.unwrap().key, old(this.lastKey().unwrapOr(""))) == 0))
+  @Ensures(result.isSome() && this.size() > 0 ==> (compareBytewise(this.lastKey().unwrap(), result.unwrap().key) < 0))
   popLast(): Option<SortedStringEntry<V>> {
     const l = this.lastKey();
     if (l.isNone()) {
@@ -2059,22 +1526,48 @@ export class SortedStringMap<V> {
     return Some(SortedStringEntry<V> { key: l.unwrap(), value: v });
   }
 
-  // keyArray(): all keys in increasing order. O(n).
+  // keys(): string[] -- all keys in increasing order. Never fails. O(n).
+  @Ensures(result.length == this.size() && isStrictlyIncreasingStrings(result))
+  keys(): string[] {
+    return btreeStringKeys(this.nodes, this.root);
+  }
+
+  // values(): V[] -- all values in key order. Never fails. O(n).
+  @Ensures(result.length == this.size())
+  values(): V[] {
+    return btreeStringVals(this.nodes, this.root);
+  }
+
+  // entries(): SortedStringEntry<V>[] -- all entries in increasing key order. Never fails. O(n).
+  @Ensures(result.length == this.size())
+  entries(): SortedStringEntry<V>[] {
+    const ks = btreeStringKeys(this.nodes, this.root);
+    const vs = btreeStringVals(this.nodes, this.root);
+    let out: SortedStringEntry<V>[] = [];
+    let i: usize = 0;
+    while (i < ks.length) {
+      out.push(SortedStringEntry<V> { key: ks[i], value: vs[i] });
+      i += 1;
+    }
+    return out;
+  }
+
+  @Deprecated("use keys() (ADR-0048)")
   @Ensures(result.length == this.size() && isStrictlyIncreasingStrings(result))
   keyArray(): string[] {
-    return btreeStrKeys(this.nodes, this.root);
+    return this.keys();
   }
 
-  // valueArray(): all values in key order. O(n).
+  @Deprecated("use values() (ADR-0048)")
   @Ensures(result.length == this.size())
   valueArray(): V[] {
-    return btreeStrVals(this.nodes, this.root);
+    return this.values();
   }
 
-  // clear(): remove all entries. O(1).
+  // clear(): void -- remove all entries. O(1).
   @Ensures(this.size() == 0)
   clear(): void {
-    this.nodes = [StrNode<V> { keys: [], vals: [], kids: [] }];
+    this.nodes = [StringNode<V> { keys: [], vals: [], kids: [] }];
     this.root = 0;
     this.free = [];
     this.count = 0;
@@ -2086,41 +1579,10 @@ export class SortedStringMap<V> {
 // ------------------------------------------------------------------------------------- PriorityQueue
 
 // What `pop` and `peek` return.
-export type PQEntry<T> = { priority: int; value: T; };
+export type PqEntry<T> = { priority: int; value: T; };
 
-// Does the entry (p1, s1) leave before (p2, s2)? Lower priority first; equal priorities by insertion number.
-function leavesBefore(p1: int, s1: int, p2: int, s2: int): bool {
-  return p1 < p2 || (p1 == p2 && s1 < s2);
-}
-
-// isMinHeap4(prios, seqs): every entry leaves strictly before its up to four children (children of i are
-// 4i+1 .. 4i+4, parent of i is (i-1)/4). Loop-based.
-export function isMinHeap4(prios: int[], seqs: int[]): bool {
-  if (prios.length != seqs.length) {
-    return false;
-  }
-  let i: usize = 1;
-  while (i < prios.length) {
-    const p = (i - 1) / 4;
-    if (!leavesBefore(prios[p], seqs[p], prios[i], seqs[i])) {
-      return false;
-    }
-    i += 1;
-  }
-  return true;
-}
-
-// Are all insertion numbers in 0..bound-1?
-export function seqsBelow(seqs: int[], bound: int): bool {
-  let i: usize = 0;
-  while (i < seqs.length) {
-    if (seqs[i] < 0 || seqs[i] >= bound) {
-      return false;
-    }
-    i += 1;
-  }
-  return true;
-}
+// PQEntry: the old spelling of `PqEntry` (ADR-0048 rule 1.1: acronyms are written as words); remove next release.
+export type PQEntry<T> = PqEntry<T>;
 
 function minInt(a: int, b: int): int {
   return a < b ? a : b;
@@ -2144,19 +1606,19 @@ export class PriorityQueue<T> {
   private vals: T[] = [];
   private nextSeq: int = 0;
 
-  // size(): number of queued entries. O(1).
+  // size(): usize -- number of queued entries. O(1).
   @Ensures(result == this.prios.length)
   size(): usize {
     return this.prios.length;
   }
 
-  // isEmpty(): nothing queued. O(1).
+  // isEmpty(): bool -- nothing queued. O(1).
   @Ensures(result == (this.size() == 0))
   isEmpty(): bool {
     return this.prios.length == 0;
   }
 
-  // minPriority(): the smallest priority queued, None when empty. O(1).
+  // minPriority(): Option<int> -- the smallest priority queued, None when empty. O(1).
   @Ensures(result.isSome() == (this.size() > 0))
   minPriority(): Option<int> {
     if (this.prios.length == 0) {
@@ -2165,7 +1627,7 @@ export class PriorityQueue<T> {
     return Some(this.prios[0]);
   }
 
-  // allAtLeast(p): every queued priority is >= p. O(n).
+  // allAtLeast(p): bool -- every queued priority is >= p. O(n).
   @Ensures(this.size() == 0 ==> result)
   @Ensures(result && this.size() > 0 ==> this.minPriority().unwrap() >= p)
   allAtLeast(p: int): bool {
@@ -2179,17 +1641,17 @@ export class PriorityQueue<T> {
     return true;
   }
 
-  // peek(): the entry `pop` would return, without removing it; None when empty. O(1).
+  // peek(): Option<PqEntry<T>> -- the entry `pop` would return, without removing it; None when empty. O(1).
   @Ensures(result.isSome() == (this.size() > 0))
   @Ensures(result.isSome() ==> result.unwrap().priority == this.minPriority().unwrap())
-  peek(): Option<PQEntry<T>> {
+  peek(): Option<PqEntry<T>> {
     if (this.prios.length == 0) {
       return None;
     }
-    return Some(PQEntry<T> { priority: this.prios[0], value: this.vals[0] });
+    return Some(PqEntry<T> { priority: this.prios[0], value: this.vals[0] });
   }
 
-  // push(priority, value): queue a value. O(log_4 n) comparisons, no allocation besides array growth.
+  // push(priority, value): void -- queue a value. O(log_4 n) comparisons, no allocation besides array growth.
   @Ensures(this.size() == old(this.size()) + 1)
   @Ensures(this.minPriority().unwrap() == minInt(priority, old(this.minPriority().unwrapOr(priority))))
   @Ensures(this.allAtLeast(minInt(priority, old(this.minPriority().unwrapOr(priority)))))
@@ -2215,18 +1677,18 @@ export class PriorityQueue<T> {
     this.vals[i] = value;
   }
 
-  // pop(): remove and return the entry with the smallest priority (the earliest pushed among equals); None when
+  // pop(): Option<PqEntry<T>> -- remove and return the entry with the smallest priority (the earliest pushed among equals); None when
   // empty. The returned priority is <= every priority still queued. O(log_4 n) levels, up to 4 comparisons each.
   @Ensures(result.isSome() == (old(this.size()) > 0))
   @Ensures(result.isSome() ==> this.size() == old(this.size()) - 1)
   @Ensures(result.isSome() ==> result.unwrap().priority == old(this.minPriority().unwrapOr(0)))
   @Ensures(result.isSome() ==> this.allAtLeast(result.unwrap().priority))
   @Ensures(result.isNone() ==> this.size() == 0)
-  pop(): Option<PQEntry<T>> {
+  pop(): Option<PqEntry<T>> {
     if (this.prios.length == 0) {
       return None;
     }
-    const top = PQEntry<T> { priority: this.prios[0], value: this.vals[0] };
+    const top = PqEntry<T> { priority: this.prios[0], value: this.vals[0] };
     const lp = this.prios.pop().unwrap();
     const ls = this.seqs.pop().unwrap();
     const lv = this.vals.pop().unwrap();
@@ -2262,7 +1724,7 @@ export class PriorityQueue<T> {
     return Some(top);
   }
 
-  // clear(): drop all entries. O(1).
+  // clear(): void -- drop all entries. O(1).
   @Ensures(this.size() == 0)
   clear(): void {
     this.prios = [];

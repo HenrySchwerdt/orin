@@ -38,7 +38,7 @@ UTF-8 and NUL; a Bytes view encodes only its selected bytes.
 Decoding accepts either hex case, performs one decoding pass, and leaves other raw bytes unchanged.
 `PercentSpace` preserves a raw `+`; `PlusAsSpace` changes it to space, while `%2B` still becomes literal
 plus. `percentDecode("a+%2B%2520", PlusAsSpace)` yields `a +%20`. The Bytes decoder permits every decoded byte.
-The text decoder validates the complete decoded component using `std:utf8.checkUtf8`, rejecting
+The text decoder validates the complete decoded component using `std:utf8.validate`, rejecting
 invalid leading/continuation bytes, overlong forms, surrogates, truncated sequences and values above
 U+10FFFF. Raw invalid UTF-8 is rejected too. Neither decoder strips whitespace or replaces bad bytes.
 

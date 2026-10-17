@@ -1,21 +1,21 @@
 import { assert, assertEq, assertEqBool, assertEqString, assertEqUsize } from "std:test";
 import {
   JsonValue, JsonMember, JsonLimits, JsonReadOptions, JsonDuplicatePolicy, parseDocument,
-  defaultJsonOptions, defaultJsonLimits,
-} from "std:jsonvalue";
-import { jsonNumber, numberFromInt } from "std:jsonnumber";
+  defaultReadOptions, defaultLimits,
+} from "std:json";
+import { jsonNumber, numberFromInt } from "std:json/number";
 import {
   DecodeCursor, DecodeError, DecodeErrorKind, PathSegment, UnknownFieldPolicy, decodeRoot,
   cursorValue, cursorPath, formatPath, requiredField, optionalField, decodeString, decodeBool,
-  decodeNumber, decodeInt, decodeArray, checkFields,
-} from "std:jsondecode";
+  decodeNumber, decodeInt, decodeArray, checkFields, decodeErrorMessage,
+} from "std:json/decode";
 import { decodeConfig } from "../../examples/json_config";
 
 function root(v: JsonValue): DecodeCursor {
-  return decodeRoot(v, defaultJsonLimits()).unwrap();
+  return decodeRoot(v, defaultLimits()).unwrap();
 }
 function read(s: string): DecodeCursor {
-  return root(parseDocument(s, defaultJsonOptions()).unwrap());
+  return root(parseDocument(s, defaultReadOptions()).unwrap());
 }
 function kind(k: DecodeErrorKind): string {
   return match (k) {
@@ -155,27 +155,27 @@ function exactIntegersAndBounds(): void {
 function rootDuplicatesUtf8AndOrdering(): void {
   const preserved = parseDocument(
     "{\"a\":1,\"\\u0061\":2}",
-    JsonReadOptions { limits: defaultJsonLimits(), duplicates: PreserveDuplicates },
+    JsonReadOptions { limits: defaultLimits(), duplicates: PreserveDuplicates },
   ).unwrap();
-  error(decodeRoot(preserved, defaultJsonLimits()).unwrapErr(), "duplicate", "/a");
+  error(decodeRoot(preserved, defaultLimits()).unwrapErr(), "duplicate", "/a");
   const manual = ValueArray([
     ValueObject([
       JsonMember { key: "a/b", value: ValueNull },
       JsonMember { key: "a/b", value: ValueBool(true) },
     ]),
   ]);
-  error(decodeRoot(manual, defaultJsonLimits()).unwrapErr(), "duplicate", "/0/a~1b");
+  error(decodeRoot(manual, defaultLimits()).unwrapErr(), "duplicate", "/0/a~1b");
   const earlier = ValueObject([
     JsonMember { key: "a", value: ValueString(String.fromCharCode(255)) },
     JsonMember { key: "a", value: ValueNull },
   ]);
-  const e = decodeRoot(earlier, defaultJsonLimits()).unwrapErr();
+  const e = decodeRoot(earlier, defaultLimits()).unwrapErr();
   error(e, "type", "/a");
   assertEqString(e.actual, "invalid UTF-8", "depth first child error before later duplicate");
   const invalidKey = ValueObject([JsonMember { key: String.fromCharCode(255), value: ValueNull }]);
-  error(decodeRoot(invalidKey, defaultJsonLimits()).unwrapErr(), "type", "");
+  error(decodeRoot(invalidKey, defaultLimits()).unwrapErr(), "type", "");
   error(
-    decodeRoot(ValueString(String.fromCharCode(255)), defaultJsonLimits()).unwrapErr(),
+    decodeRoot(ValueString(String.fromCharCode(255)), defaultLimits()).unwrapErr(),
     "type",
     "",
   );
@@ -183,7 +183,7 @@ function rootDuplicatesUtf8AndOrdering(): void {
     JsonMember { key: "é", value: ValueNull },
     JsonMember { key: "é", value: ValueNull },
   ]);
-  assert(decodeRoot(distinct, defaultJsonLimits()).isOk(), "no Unicode normalization");
+  assert(decodeRoot(distinct, defaultLimits()).isOk(), "no Unicode normalization");
 }
 
 function limit(v: JsonValue, l: JsonLimits, path: string, name: string): void {
@@ -193,15 +193,15 @@ function limit(v: JsonValue, l: JsonLimits, path: string, name: string): void {
 }
 @Test
 function everyRootBudgetAndInvalidLimits(): void {
-  let l = defaultJsonLimits();
+  let l = defaultLimits();
   l.maxNodes = 2;
   assert(decodeRoot(ValueArray([ValueNull]), l).isOk(), "nodes N");
   limit(ValueArray([ValueNull, ValueNull]), l, "/1", "maxNodes");
-  l = defaultJsonLimits();
+  l = defaultLimits();
   l.maxDepth = 1;
   assert(decodeRoot(ValueArray([]), l).isOk(), "depth N");
   limit(ValueArray([ValueArray([])]), l, "/0", "maxDepth");
-  l = defaultJsonLimits();
+  l = defaultLimits();
   l.maxContainerItems = 1;
   assert(decodeRoot(ValueArray([ValueNull]), l).isOk(), "items N");
   limit(ValueArray([ValueNull, ValueNull]), l, "", "maxContainerItems");
@@ -210,12 +210,12 @@ function everyRootBudgetAndInvalidLimits(): void {
     JsonMember { key: "b", value: ValueNull },
   ]);
   limit(obj, l, "", "maxContainerItems");
-  l = defaultJsonLimits();
+  l = defaultLimits();
   l.maxStringBytes = 1;
   assert(decodeRoot(ValueString("a"), l).isOk(), "single bytes N");
   limit(ValueString("ab"), l, "", "maxStringBytes");
   limit(ValueObject([JsonMember { key: "ab", value: ValueNull }]), l, "", "maxStringBytes");
-  l = defaultJsonLimits();
+  l = defaultLimits();
   l.maxDecodedStringBytes = 2;
   assert(
     decodeRoot(ValueObject([JsonMember { key: "a", value: ValueString("b") }]), l).isOk(),
@@ -227,11 +227,11 @@ function everyRootBudgetAndInvalidLimits(): void {
     "/a",
     "maxDecodedStringBytes",
   );
-  l = defaultJsonLimits();
+  l = defaultLimits();
   l.maxNumberBytes = 3;
   assert(decodeRoot(ValueNumber(jsonNumber("1e2", 3).unwrap()), l).isOk(), "number bytes N");
   limit(ValueNumber(jsonNumber("1e23", 4).unwrap()), l, "", "maxNumberBytes");
-  const base = defaultJsonLimits();
+  const base = defaultLimits();
   const invalid = [
     JsonLimits { ...base, maxInputBytes: 0 },
     JsonLimits { ...base, maxOutputBytes: 0 },
@@ -263,14 +263,14 @@ function unknownFieldsAndSchemaErrors(): void {
     "",
   );
   error(requiredField(c, String.fromCharCode(255)).unwrapErr(), "schema", "");
-  let l = defaultJsonLimits();
+  let l = defaultLimits();
   l.maxContainerItems = 1;
   const empty = decodeRoot(ValueObject([]), l).unwrap();
   error(checkFields(empty, ["a", "b"], IgnoreUnknown).unwrapErr(), "limit", "");
-  l = defaultJsonLimits();
+  l = defaultLimits();
   l.maxStringBytes = 1;
   error(requiredField(decodeRoot(ValueObject([]), l).unwrap(), "ab").unwrapErr(), "limit", "");
-  l = defaultJsonLimits();
+  l = defaultLimits();
   l.maxDecodedStringBytes = 1;
   error(
     checkFields(decodeRoot(ValueObject([]), l).unwrap(), ["a", "b"], IgnoreUnknown).unwrapErr(),
@@ -294,7 +294,7 @@ function unknownFieldsAndSchemaErrors(): void {
 function cursorCopiesAndValidationSnapshot(): void {
   let fields: JsonMember[] = [JsonMember { key: "a", value: ValueString("original") }];
   let v = ValueObject(fields);
-  let l = defaultJsonLimits();
+  let l = defaultLimits();
   const c = decodeRoot(v, l).unwrap();
   fields[0].value = ValueString(String.fromCharCode(255));
   v = ValueString("changed");
@@ -325,7 +325,7 @@ function cursorCopiesAndValidationSnapshot(): void {
 function pureConfigAndDepth(): void {
   const v = parseDocument(
     "{\"endpoint\":\"localhost\",\"port\":8.080e3}",
-    defaultJsonOptions(),
+    defaultReadOptions(),
   ).unwrap();
   const cfg = decodeConfig(v).unwrap();
   assertEqString(cfg.endpoint, "localhost", "pure config endpoint");
@@ -333,7 +333,7 @@ function pureConfigAndDepth(): void {
   assert(cfg.enabled, "default optional enabled");
   error(
     decodeConfig(
-      parseDocument("{\"endpoint\":\"x\",\"port\":0}", defaultJsonOptions()).unwrap(),
+      parseDocument("{\"endpoint\":\"x\",\"port\":0}", defaultReadOptions()).unwrap(),
     ).unwrapErr(),
     "range",
     "/port",
@@ -342,7 +342,7 @@ function pureConfigAndDepth(): void {
     decodeConfig(
       parseDocument(
         "{\"endpoint\":\"x\",\"port\":80,\"enabled\":null}",
-        defaultJsonOptions(),
+        defaultReadOptions(),
       ).unwrap(),
     ).unwrapErr(),
     "type",
@@ -354,7 +354,7 @@ function pureConfigAndDepth(): void {
     deep = ValueArray([deep]);
     i += 1;
   }
-  let l = defaultJsonLimits();
+  let l = defaultLimits();
   l.maxDepth = 200;
   let c = decodeRoot(deep, l).unwrap();
   i = 0;
@@ -364,4 +364,25 @@ function pureConfigAndDepth(): void {
   }
   assertEqUsize(cursorPath(c).length, 200, "maximum path depth");
   error(decodeRoot(ValueArray([deep]), l).unwrapErr(), "limit", formatPath(cursorPath(c)));
+}
+
+@Test
+function errorRenderer(): void {
+  const c = root(ValueObject([JsonMember { key: "a/b", value: ValueArray([ValueBool(true)]) }]));
+  assertEqString(
+    decodeErrorMessage(requiredField(c, "x").unwrapErr()),
+    "/x: missing field: expected field present, found missing",
+    "missing",
+  );
+  const arr = decodeArray(requiredField(c, "a/b").unwrap()).unwrap();
+  assertEqString(
+    decodeErrorMessage(decodeString(arr[0]).unwrapErr()),
+    "/a~1b/0: wrong type: expected string, found boolean",
+    "wrong type with escaped path",
+  );
+  assertEqString(
+    decodeErrorMessage(decodeString(c).unwrapErr()),
+    "(root): wrong type: expected string, found object",
+    "root",
+  );
 }
