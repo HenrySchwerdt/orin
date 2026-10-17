@@ -14,18 +14,22 @@
 // cannot be stored, state that belongs to one connection (the bytes read ahead, a parser) lives in a normal value
 // next to it: a `StreamReader`, an `http.RequestParser`.
 //
-// Time. Every call that can wait takes a timeout in milliseconds (0 .. 3,600,000); there is no infinite wait. A timeout
-// of `readUntil` / `readExact` / `sendAll` is a DEADLINE for the whole operation (a client that sends one byte per
-// `timeout - 1` ms does not extend it); `recv` / `send` / `accept` time out per call.
+// Time. Every call that can wait takes a `timeout: Duration` of std:time (clamped to 0 .. 3,600,000 ms); there is no
+// infinite wait. A timeout of `readUntil` / `readExact` / `sendAll` is a DEADLINE for the whole operation (a client that
+// sends one byte per `timeout - 1` ms does not extend it); `recv` / `send` / `accept` time out per call. Deadlines of
+// your own are computed with `monotonicMillis(stream)`.
 //
 // Blocking and single threaded: one connection is served at a time until tasks exist (ADR-0017); a slow client holds
 // the server up to the deadlines you set.
 //
-// Errors never trap, except a forged / stale / wrong-kind handle (the runtime traps: it is a bug, not a condition).
+// Errors. Every failure is a `NetError { kind, code, offset }` (`NetErrorKind`: Denied, Closed, Timeout, Reset,
+// InvalidArgument, InvalidPeer, Os); `netErrorMessage(e)` is its text. Nothing here traps for an ordinary failure, except a
+// forged / stale / wrong-kind handle (the runtime traps: it is a bug, not a condition).
 //
 // Contract standard (ADR-0030): every class has an @Invariant, every public function states @Requires / @Ensures.
 
 import { Bytes, fromArray, empty } from "std:bytes";
+import { Duration } from "std:time";
 import {
   NetGrant, Listener, Stream, grantListen, grantConnect, grantRevoke, netListen, netAccept, netConnect, netStatus, netClose,
   netPort, netNow, netRecv, netSend, netShutdown, netPeer, netResolve, netErrorText
@@ -35,34 +39,77 @@ export { NetGrant, Listener, Stream } from "std:fsraw";
 
 // ------------------------------------------------------------------------------------------------ errors
 
-// An error of this module: the L0 code and a message. Codes: 1 permission denied (scope or ORIN_DENY), 1001 closed by the
-// peer, 1002 timeout, 1003 reset; others are the errno of the OS (ECONNREFUSED, EADDRINUSE, ENOENT for an unknown name ...).
-export type NetError = { code: int; message: string; };
+// Why an operation of this module failed (rule 3.1.4: bare words describing the cause).
+//   Denied           refused by the grant's scope or by the host policy (`ORIN_DENY=net`)
+//   Closed           the peer closed the connection (L0 code 1001)
+//   Timeout          nothing happened within the time given (1002)
+//   Reset            the connection was reset or broke (1003)
+//   InvalidArgument  an argument was refused (EINVAL: a backlog of 0, an address that is not numeric, a port out of range)
+//   InvalidPeer      `parsePeer` was given text that is not `host:port` or `[ipv6]:port`
+//   Os               any other error of the operating system (ECONNREFUSED, EADDRINUSE, ENOENT for an unknown name ...);
+//                    `NetError.code` holds the errno
+export type NetErrorKind = Denied | Closed | Timeout | Reset | InvalidArgument | InvalidPeer | Os;
+
+// An error of this module. `code` is the L0 code (1 permission denied, 1001 closed by the peer, 1002 timeout, 1003 reset,
+// otherwise the errno of the OS) and 0 for an error that did not come from L0 (`InvalidPeer`). `offset` is the byte offset
+// into the text for `InvalidPeer` and 0 for every other kind. The text is `netErrorMessage(e)`.
+export type NetError = { kind: NetErrorKind; code: int; offset: usize; };
 
 const CODE_DENIED: int = 1;
 const CODE_EOF: int = 1001;
 const CODE_TIMEOUT: int = 1002;
 const CODE_RESET: int = 1003;
+const CODE_INVALID: int = 22;
 const MAX_MS: int = 3600000;
 const CHUNK: usize = 65536;
 
-// makeError(code): the NetError of an L0 code. O(1).
-@Ensures(result.code == code)
-export function makeError(code: int): NetError {
-  return NetError { code: code, message: netErrorText(code) };
+// kindOfCode(code): the kind of an L0 code. O(1).
+function kindOfCode(code: int): NetErrorKind {
+  if (code == CODE_DENIED) {
+    return Denied;
+  }
+  if (code == CODE_EOF) {
+    return Closed;
+  }
+  if (code == CODE_TIMEOUT) {
+    return Timeout;
+  }
+  if (code == CODE_RESET) {
+    return Reset;
+  }
+  if (code == CODE_INVALID) {
+    return InvalidArgument;
+  }
+  return Os;
 }
 
-// isDenied(e): refused by the grant's scope or by the host policy. O(1).
+// netErrorFromCode(code): NetError -- the error of an L0 code, with its kind. O(1).
+@Ensures(result.code == code && result.offset == 0)
+export function netErrorFromCode(code: int): NetError {
+  return NetError { kind: kindOfCode(code), code: code, offset: 0 };
+}
+
+// netErrorMessage(e): string -- a sentence for the error (the operating system's text for an L0 code). Never empty. O(1).
+@Ensures(result.length > 0)
+export function netErrorMessage(e: NetError): string {
+  const text = match (e.kind) {
+    InvalidPeer => `invalid peer address at byte ${e.offset.toString()}`,
+    _ => netErrorText(e.code)
+  };
+  return text.length > 0 ? text : `network error ${e.code.toString()}`;
+}
+
+// isDenied(e): bool -- refused by the grant's scope or by the host policy (`e.kind` is Denied). O(1).
 export function isDenied(e: NetError): bool {
   return e.code == CODE_DENIED;
 }
 
-// isTimeout(e): nothing happened within the time given. O(1).
+// isTimeout(e): bool -- nothing happened within the time given (Timeout). O(1).
 export function isTimeout(e: NetError): bool {
   return e.code == CODE_TIMEOUT;
 }
 
-// isReset(e): the connection was reset or broke. O(1).
+// isReset(e): bool -- the connection was reset or broke (Reset). O(1).
 export function isReset(e: NetError): bool {
   return e.code == CODE_RESET;
 }
@@ -81,44 +128,73 @@ function clampMs(ms: int): int {
 // The address of the other end of a stream: `host` is the numeric address, `port` its port.
 export type Peer = { host: string; port: int; };
 
-// parsePeer(text): "1.2.3.4:5" or "[::1]:5" to a Peer; Peer { host: text, port: 0 } if the text has no port. O(n).
-@Ensures(result.port >= 0 && result.port <= 100001)
-export function parsePeer(text: string): Peer {
+function invalidPeer(offset: usize): NetError {
+  return NetError { kind: InvalidPeer, code: 0, offset: offset };
+}
+
+function isInvalidPeer(e: NetError): bool {
+  return match (e.kind) {
+    InvalidPeer => true,
+    _ => false
+  };
+}
+
+// The decimal port in text[start, end): 1 to 5 digits, 0 .. 65535. Err(InvalidPeer) at the offending byte.
+function parsePort(text: string, start: usize): Result<int, NetError> {
+  if (start >= text.length) {
+    return Err(invalidPeer(start));
+  }
+  let v: int = 0;
+  let i = start;
+  while (i < text.length) {
+    const c = text.charCodeAt(i);
+    if (c < 48 || c > 57) {
+      return Err(invalidPeer(i));
+    }
+    v = v * 10 + (c - 48);
+    if (v > 65535) {
+      return Err(invalidPeer(start));
+    }
+    i += 1;
+  }
+  return Ok(v);
+}
+
+// parsePeer(text): Result<Peer, NetError> -- "1.2.3.4:5" or "[::1]:5" to a Peer (the brackets of an IPv6 literal are
+// dropped). Err(InvalidPeer) with the byte offset of the problem when there is no port, the port is not 0 .. 65535, the
+// host is empty, or an IPv6 literal is not in brackets. O(n).
+@Ensures(result.isOk() ==> result.unwrap().port >= 0 && result.unwrap().port <= 65535 && result.unwrap().host.length > 0)
+@Ensures(result.isErr() ==> isInvalidPeer(result.unwrapErr()))
+export function parsePeer(text: string): Result<Peer, NetError> {
   let i = text.length;
   while (i > 0) {
     i -= 1;
     if (text.charCodeAt(i) == 58) {
-      const port = text.substring(i + 1, text.length);
-      const p = parseDigits(port);
+      const port = parsePort(text, i + 1);
+      if (port.isErr()) {
+        return Err(port.unwrapErr());
+      }
       let h = text.substring(0, i);
       if (h.length >= 2 && h.charCodeAt(0) == 91 && h.charCodeAt(h.length - 1) == 93) {
         h = h.substring(1, h.length - 1);
+      } else if (h.indexOf(":").isSome()) {
+        return Err(invalidPeer(i));
       }
-      return Peer { host: h, port: p };
+      if (h.length == 0) {
+        return Err(invalidPeer(0));
+      }
+      return Ok(Peer { host: h, port: port.unwrap() });
     }
   }
-  return Peer { host: text, port: 0 };
-}
-
-function parseDigits(s: string): int {
-  let v: int = 0;
-  let i: usize = 0;
-  while (i < s.length) {
-    const c = s.charCodeAt(i);
-    if (c < 48 || c > 57 || v > 100000) {
-      return 0;
-    }
-    v = v * 10 + (c - 48);
-    i += 1;
-  }
-  return v;
+  return Err(invalidPeer(text.length));
 }
 
 // ------------------------------------------------------------------------------------------------ narrowing
 
-// withListen(net, addr, port, body): runs body with a grant that can only listen on exactly `addr:port` (addr is an
-// address literal; "0.0.0.0", "127.0.0.1", "::1" ...; port 0 = any port the OS picks). If `net` does not allow that, the
-// grant reaches nothing (every listen is refused). The grant is revoked when body returns. O(1).
+// withListen<T>(net, addr, port, body): T -- runs body with a grant that can only listen on exactly `addr:port` (addr is
+// an address literal: "0.0.0.0", "127.0.0.1", "::1" ...; port 0 = any port the OS picks), and returns its result. If
+// `net` does not allow that, the grant reaches nothing (every listen is refused). The grant is revoked when body returns.
+// O(1).
 export function withListen<T>(net: NetGrant, addr: string, port: int, body: (l: NetGrant) => T): T {
   const g = grantListen(net, addr, port);
   const r = body(g);
@@ -126,15 +202,16 @@ export function withListen<T>(net: NetGrant, addr: string, port: int, body: (l: 
   return r;
 }
 
-// useListen: `withListen` for a body that returns nothing.
+// useListen(net, addr, port, body): void -- `withListen` for a body that returns nothing.
 export function useListen(net: NetGrant, addr: string, port: int, body: (l: NetGrant) => void): void {
   const g = grantListen(net, addr, port);
   body(g);
   grantRevoke(g);
 }
 
-// withConnect(net, hostPattern, portLo, portHi, body): a grant that can only connect to / resolve hosts matching
-// `hostPattern` on ports portLo..portHi. A pattern or range outside `net`'s scope yields a grant that reaches nothing. O(1).
+// withConnect<T>(net, hostPattern, portLo, portHi, body): T -- runs body with a grant that can only connect to / resolve
+// hosts matching `hostPattern` on ports portLo..portHi. A pattern or range outside `net`'s scope yields a grant that
+// reaches nothing. The grant is revoked when body returns. O(1).
 export function withConnect<T>(net: NetGrant, hostPattern: string, portLo: int, portHi: int, body: (c: NetGrant) => T): T {
   const g = grantConnect(net, hostPattern, portLo, portHi);
   const r = body(g);
@@ -142,7 +219,7 @@ export function withConnect<T>(net: NetGrant, hostPattern: string, portLo: int, 
   return r;
 }
 
-// useConnect: `withConnect` for a body that returns nothing.
+// useConnect(net, hostPattern, portLo, portHi, body): void -- `withConnect` for a body that returns nothing.
 export function useConnect(net: NetGrant, hostPattern: string, portLo: int, portHi: int, body: (c: NetGrant) => void): void {
   const g = grantConnect(net, hostPattern, portLo, portHi);
   body(g);
@@ -151,10 +228,10 @@ export function useConnect(net: NetGrant, hostPattern: string, portLo: int, port
 
 // ------------------------------------------------------------------------------------------------ listeners
 
-// withListener(net, addr, port, backlog, body): binds a listener on addr:port (SO_REUSEADDR), runs body(listener) and
-// closes it. `Err` if `net` does not allow it (isDenied), the port is in use or the arguments are invalid; body is not
-// called then. `port` 0 binds a free port, `portOf(listener)` tells which. backlog 1..4096. The listener is created
-// through a grant narrowed to exactly addr:port.
+// withListener<T>(net, addr, port, backlog, body): Result<T, NetError> -- binds a listener on addr:port (SO_REUSEADDR),
+// runs body(listener) and closes it. `Err` if `net` does not allow it (Denied), the port is in use (Os) or the arguments
+// are invalid (InvalidArgument); body is not called then. `port` 0 binds a free port, `portOf(listener)` tells which.
+// backlog 1..4096. The listener is created through a grant narrowed to exactly addr:port. O(1); one socket.
 export function withListener<T>(net: NetGrant, addr: string, port: int, backlog: int, body: (ln: Listener) => T): Result<T, NetError> {
   const g = grantListen(net, addr, port);
   const ln = netListen(g, addr, port, backlog, 1);
@@ -162,7 +239,7 @@ export function withListener<T>(net: NetGrant, addr: string, port: int, backlog:
   if (code != 0) {
     netClose(ln);
     grantRevoke(g);
-    return Err(makeError(code));
+    return Err(netErrorFromCode(code));
   }
   const r = body(ln);
   netClose(ln);
@@ -170,7 +247,7 @@ export function withListener<T>(net: NetGrant, addr: string, port: int, backlog:
   return Ok(r);
 }
 
-// useListener: `withListener` for a body that returns nothing.
+// useListener(net, addr, port, backlog, body): Result<void, NetError> -- `withListener` for a body that returns nothing.
 export function useListener(net: NetGrant, addr: string, port: int, backlog: int, body: (ln: Listener) => void): Result<void, NetError> {
   const g = grantListen(net, addr, port);
   const ln = netListen(g, addr, port, backlog, 1);
@@ -178,7 +255,7 @@ export function useListener(net: NetGrant, addr: string, port: int, backlog: int
   if (code != 0) {
     netClose(ln);
     grantRevoke(g);
-    return Err(makeError(code));
+    return Err(netErrorFromCode(code));
   }
   body(ln);
   netClose(ln);
@@ -186,8 +263,9 @@ export function useListener(net: NetGrant, addr: string, port: int, backlog: int
   return Ok();
 }
 
-// useListenerNet(net, addr, port, backlog, body): `useListener` whose body also receives `net` again as a parameter (a
-// closure cannot capture a grant, so a body that must also connect, for example a loopback test, gets it this way).
+// useListenerNet(net, addr, port, backlog, body): Result<void, NetError> -- `useListener` whose body also receives `net`
+// again as a parameter (a closure cannot capture a grant, so a body that must also connect, for example a loopback test,
+// gets it this way).
 export function useListenerNet(
   net: NetGrant, addr: string, port: int, backlog: int, body: (ln: Listener, net: NetGrant) => void
 ): Result<void, NetError> {
@@ -197,7 +275,7 @@ export function useListenerNet(
   if (code != 0) {
     netClose(ln);
     grantRevoke(g);
-    return Err(makeError(code));
+    return Err(netErrorFromCode(code));
   }
   body(ln, net);
   netClose(ln);
@@ -205,95 +283,106 @@ export function useListenerNet(
   return Ok();
 }
 
-// portOf(ln): the port the listener is bound to (the real one when it was asked for port 0). O(1).
+// portOf(ln): int -- the port the listener is bound to (the real one when it was asked for port 0). O(1).
 @Ensures(result >= 0 && result <= 65535)
 export function portOf(ln: Listener): int {
   return netPort(ln);
 }
 
-// withAccepted(ln, timeoutMs, body): waits up to timeoutMs for a connection, runs body(stream, peer) and closes the
-// stream (a graceful `close` after `shutdownWrite` is the body's business). `Err(timeout)` if none came (isTimeout:
-// normal in a server loop), another Err on failure. TCP_NODELAY is on.
-export function withAccepted<T>(ln: Listener, timeoutMs: int, body: (s: Stream, peer: Peer) => T): Result<T, NetError> {
-  const s = netAccept(ln, clampMs(timeoutMs), 1);
+// withAccepted<T>(ln, timeout, body): Result<T, NetError> -- waits up to `timeout` for a connection, runs
+// body(stream, peer) and closes the stream (a graceful `close` after `shutdownWrite` is the body's business).
+// `Err(Timeout)` if none came (isTimeout: normal in a server loop), another Err on failure; body is not called then.
+// TCP_NODELAY is on. Waits up to `timeout`; one socket.
+export function withAccepted<T>(ln: Listener, timeout: Duration, body: (s: Stream, peer: Peer) => T): Result<T, NetError> {
+  const s = netAccept(ln, clampMs(timeout.millis), 1);
   const code = netStatus(s);
   if (code != 0) {
     netClose(s);
-    return Err(makeError(code));
+    return Err(netErrorFromCode(code));
   }
   const peer = parsePeer(netPeer(s));
-  const r = body(s, peer);
+  if (peer.isErr()) {
+    netClose(s);
+    return Err(peer.unwrapErr());
+  }
+  const r = body(s, peer.unwrap());
   netClose(s);
   return Ok(r);
 }
 
-// useAccepted: `withAccepted` for a body that returns nothing.
-export function useAccepted(ln: Listener, timeoutMs: int, body: (s: Stream, peer: Peer) => void): Result<void, NetError> {
-  const s = netAccept(ln, clampMs(timeoutMs), 1);
+// useAccepted(ln, timeout, body): Result<void, NetError> -- `withAccepted` for a body that returns nothing.
+export function useAccepted(ln: Listener, timeout: Duration, body: (s: Stream, peer: Peer) => void): Result<void, NetError> {
+  const s = netAccept(ln, clampMs(timeout.millis), 1);
   const code = netStatus(s);
   if (code != 0) {
     netClose(s);
-    return Err(makeError(code));
+    return Err(netErrorFromCode(code));
   }
   const peer = parsePeer(netPeer(s));
-  body(s, peer);
+  if (peer.isErr()) {
+    netClose(s);
+    return Err(peer.unwrapErr());
+  }
+  body(s, peer.unwrap());
   netClose(s);
   return Ok();
 }
 
 // ------------------------------------------------------------------------------------------------ connections
 
-// withConnection(net, host, port, timeoutMs, body): connects (a name is resolved by the OS first: that lookup is not
-// bounded by timeoutMs), runs body(stream) and closes the stream. `Err` if refused (isDenied), unreachable or timed out.
-export function withConnection<T>(net: NetGrant, host: string, port: int, timeoutMs: int, body: (s: Stream) => T): Result<T, NetError> {
-  const s = netConnect(net, host, port, clampMs(timeoutMs), 1);
+// withConnection<T>(net, host, port, timeout, body): Result<T, NetError> -- connects (a name is resolved by the OS
+// first: that lookup is not bounded by `timeout`), runs body(stream) and closes the stream. `Err` if refused (Denied),
+// unreachable (Os) or timed out (Timeout); body is not called then. Waits up to `timeout`; one socket.
+export function withConnection<T>(net: NetGrant, host: string, port: int, timeout: Duration, body: (s: Stream) => T): Result<T, NetError> {
+  const s = netConnect(net, host, port, clampMs(timeout.millis), 1);
   const code = netStatus(s);
   if (code != 0) {
     netClose(s);
-    return Err(makeError(code));
+    return Err(netErrorFromCode(code));
   }
   const r = body(s);
   netClose(s);
   return Ok(r);
 }
 
-// useConnection: `withConnection` for a body that returns nothing.
-export function useConnection(net: NetGrant, host: string, port: int, timeoutMs: int, body: (s: Stream) => void): Result<void, NetError> {
-  const s = netConnect(net, host, port, clampMs(timeoutMs), 1);
+// useConnection(net, host, port, timeout, body): Result<void, NetError> -- `withConnection` for a body that returns nothing.
+export function useConnection(net: NetGrant, host: string, port: int, timeout: Duration, body: (s: Stream) => void): Result<void, NetError> {
+  const s = netConnect(net, host, port, clampMs(timeout.millis), 1);
   const code = netStatus(s);
   if (code != 0) {
     netClose(s);
-    return Err(makeError(code));
+    return Err(netErrorFromCode(code));
   }
   body(s);
   netClose(s);
   return Ok();
 }
 
-// useConnectionBeside(net, host, port, timeoutMs, ln, body): `useConnection` whose body also receives the listener `ln`
-// again (a closure cannot capture a handle): a client and the server side of the same process, for example a loopback test.
-// The connection completes before `accept` (the kernel queues it, backlog permitting).
+// useConnectionBeside(net, host, port, timeout, ln, body): Result<void, NetError> -- `useConnection` whose body also
+// receives the listener `ln` again (a closure cannot capture a handle): a client and the server side of the same process,
+// for example a loopback test. The connection completes before `accept` (the kernel queues it, backlog permitting).
 export function useConnectionBeside(
-  net: NetGrant, host: string, port: int, timeoutMs: int, ln: Listener, body: (s: Stream, ln: Listener) => void
+  net: NetGrant, host: string, port: int, timeout: Duration, ln: Listener, body: (s: Stream, ln: Listener) => void
 ): Result<void, NetError> {
-  const s = netConnect(net, host, port, clampMs(timeoutMs), 1);
+  const s = netConnect(net, host, port, clampMs(timeout.millis), 1);
   const code = netStatus(s);
   if (code != 0) {
     netClose(s);
-    return Err(makeError(code));
+    return Err(netErrorFromCode(code));
   }
   body(s, ln);
   netClose(s);
   return Ok();
 }
 
-// resolve(net, name): the numeric addresses of `name` (IPv4 and IPv6, no duplicates), or Err. The grant's scope must
-// cover `name` (any port). Not bounded by a timeout (the OS resolver's own).
+// resolve(net, name): Result<string[], NetError> -- the numeric addresses of `name` (IPv4 and IPv6, no duplicates), or
+// Err (Denied when the grant's scope does not cover `name`, Os for an unknown name). Not bounded by a timeout (the OS
+// resolver's own). O(addresses).
 export function resolve(net: NetGrant, name: string): Result<string[], NetError> {
   const r = netResolve(net, name);
   return match (r) {
     Ok(text) => Ok(splitLines(text)),
-    Err(code) => Err(makeError(code))
+    Err(code) => Err(netErrorFromCode(code))
   };
 }
 
@@ -320,7 +409,7 @@ export type RecvResult = RecvData(Bytes) | RecvEof | RecvTimeout | RecvReset | R
 
 // recvWithin(r, max): a RecvData holds between 1 and `max` bytes (a recv never returns more than it was asked for, and
 // never an empty chunk: that is RecvEof). Other results hold no bytes. Used in contracts.
-export function recvWithin(r: RecvResult, max: usize): bool {
+function recvWithin(r: RecvResult, max: usize): bool {
   return match (r) {
     RecvData(b) => b.length() >= 1 && b.length() <= max,
     _ => true
@@ -328,23 +417,32 @@ export function recvWithin(r: RecvResult, max: usize): bool {
 }
 
 // recvIsError(r): the result is RecvError. Used in contracts.
-export function recvIsError(r: RecvResult): bool {
+function recvIsError(r: RecvResult): bool {
   return match (r) {
     RecvError(e) => true,
     _ => false
   };
 }
 
-// recv(s, maxBytes, timeoutMs): waits up to timeoutMs for bytes and returns 1..min(maxBytes, 65536) of them
+// recv(s, maxBytes, timeout): RecvResult -- waits up to `timeout` for bytes and returns 1..min(maxBytes, 65536) of them
 // (RecvData), or RecvEof (the peer closed: no more data ever), RecvTimeout (nothing arrived), RecvReset, or RecvError.
-// maxBytes 0 is an error. One system call; the bytes are copied once from the L0 buffer into the result.
+// maxBytes 0 is a RecvError(InvalidArgument). Never traps. One system call; the bytes are copied once from the L0
+// buffer into the result.
 @Ensures(recvWithin(result, maxBytes))
 @Ensures(maxBytes == 0 ==> recvIsError(result))
-export function recv(s: Stream, maxBytes: usize, timeoutMs: int): RecvResult {
+export function recv(s: Stream, maxBytes: usize, timeout: Duration): RecvResult {
+  return recvMs(s, maxBytes, clampMs(timeout.millis));
+}
+
+// recv with the wait in milliseconds, already clamped.
+@Requires(ms >= 0 && ms <= MAX_MS)
+@Ensures(recvWithin(result, maxBytes))
+@Ensures(maxBytes == 0 ==> recvIsError(result))
+function recvMs(s: Stream, maxBytes: usize, ms: int): RecvResult {
   if (maxBytes == 0) {
-    return RecvError(makeError(22));
+    return RecvError(netErrorFromCode(CODE_INVALID));
   }
-  const r = netRecv(s, maxBytes, clampMs(timeoutMs));
+  const r = netRecv(s, maxBytes, ms);
   return match (r) {
     Ok(arr) => RecvData(fromArray(arr)),
     Err(code) => recvFailure(code)
@@ -361,45 +459,45 @@ function recvFailure(code: int): RecvResult {
   if (code == CODE_RESET) {
     return RecvReset;
   }
-  return RecvError(makeError(code));
+  return RecvError(netErrorFromCode(code));
 }
 
-// send(s, data, timeoutMs): one attempt: waits up to timeoutMs until the socket is writable and hands the OS at most
-// 65536 bytes of `data`; Ok(n) with 0 <= n <= min(length, 65536) (a partial write is normal), Err otherwise (isTimeout,
-// isReset: the peer is gone). `sendAll` loops.
-export function send(s: Stream, data: Bytes, timeoutMs: int): Result<usize, NetError> {
+// send(s, data, timeout): Result<usize, NetError> -- one attempt: waits up to `timeout` until the socket is writable and
+// hands the OS at most 65536 bytes of `data`; Ok(n) with 0 <= n <= min(length, 65536) (a partial write is normal), Err
+// otherwise (Timeout, Reset: the peer is gone). `sendAll` loops. Does not copy `data`.
+export function send(s: Stream, data: Bytes, timeout: Duration): Result<usize, NetError> {
   const start = data.storageStart();
-  return sendFrom(s, data.storage(), start, start + data.length(), timeoutMs);
+  return sendFrom(s, data.storage(), start, start + data.length(), clampMs(timeout.millis));
 }
 
-// One attempt to send arr[off, end) (the bytes of a `Bytes` read from its storage, without a copy).
+// One attempt to send arr[off, end) (the bytes of a `Bytes` read from its storage, without a copy); `ms` is already clamped.
 @Requires(off <= end && end <= arr.length)
-function sendFrom(s: Stream, arr: u8[], off: usize, end: usize, timeoutMs: int): Result<usize, NetError> {
-  const r = netSend(s, arr, off, end - off, clampMs(timeoutMs));
+function sendFrom(s: Stream, arr: u8[], off: usize, end: usize, ms: int): Result<usize, NetError> {
+  const r = netSend(s, arr, off, end - off, ms);
   return match (r) {
     Ok(n) => Ok(n),
-    Err(code) => Err(makeError(code))
+    Err(code) => Err(netErrorFromCode(code))
   };
 }
 
-// sendAll(s, data, timeoutMs): sends all of `data`, resending the tail after partial writes; timeoutMs is a deadline for
-// the whole call. Err(timeout) if the peer does not read fast enough, Err(reset) if it is gone. O(length); `data` itself
-// is not copied.
-export function sendAll(s: Stream, data: Bytes, timeoutMs: int): Result<void, NetError> {
+// sendAll(s, data, timeout): Result<void, NetError> -- sends all of `data`, resending the tail after partial writes;
+// `timeout` is a deadline for the whole call. Err(Timeout) if the peer does not read fast enough, Err(Reset) if it is
+// gone. O(length); `data` itself is not copied.
+export function sendAll(s: Stream, data: Bytes, timeout: Duration): Result<void, NetError> {
   const arr = data.storage();
   const end = data.storageStart() + data.length();
-  const deadline = netNow(s) + clampMs(timeoutMs);
+  const deadline = netNow(s) + clampMs(timeout.millis);
   let off = data.storageStart();
   while (off < end) {
     const left = deadline - netNow(s);
     if (left <= 0) {
-      return Err(makeError(CODE_TIMEOUT));
+      return Err(netErrorFromCode(CODE_TIMEOUT));
     }
     const r = sendFrom(s, arr, off, end, left > MAX_MS ? MAX_MS : left);
     match (r) {
       Ok(n) => {
         if (n == 0) {
-          return Err(makeError(CODE_RESET));
+          return Err(netErrorFromCode(CODE_RESET));
         }
         off += n;
       },
@@ -411,21 +509,22 @@ export function sendAll(s: Stream, data: Bytes, timeoutMs: int): Result<void, Ne
   return Ok();
 }
 
-// shutdownWrite(s): half-close: sends FIN so the peer reads EOF while this side can still read. The first step of a
-// graceful close (then drain with `recv` for a bounded time, then let the scope close the stream); a bare close with
-// unread input makes the OS send RST, which can discard the response just written.
+// shutdownWrite(s): Result<void, NetError> -- half-close: sends FIN so the peer reads EOF while this side can still read.
+// The first step of a graceful close (then drain with `recv` for a bounded time, then let the scope close the stream); a
+// bare close with unread input makes the OS send RST, which can discard the response just written. O(1).
 export function shutdownWrite(s: Stream): Result<void, NetError> {
   const code = netShutdown(s, 1);
   if (code != 0) {
-    return Err(makeError(code));
+    return Err(netErrorFromCode(code));
   }
   return Ok();
 }
 
-// nowMillis(s): a monotonic clock in milliseconds (arbitrary origin) for deadlines; it needs a live stream, so a function
-// that has no clock grant can still enforce a deadline on the connection it was given. O(1).
+// monotonicMillis(s): int -- a monotonic clock in milliseconds (arbitrary origin) for deadlines; it needs a live stream,
+// so a function that has no clock grant can still enforce a deadline on the connection it was given. Not the wall clock
+// of `time.nowMillis`. O(1).
 // Traps if the underlying monotonic clock fails: it never substitutes a timestamp or disables a deadline.
-export function nowMillis(s: Stream): int {
+export function monotonicMillis(s: Stream): int {
   return netNow(s);
 }
 
@@ -443,33 +542,34 @@ export class StreamReader {
   private pending: Bytes;
   private cap: usize;
 
-  // new StreamReader(cap): an empty buffer that holds at most `cap` bytes (1 .. 268435456).
+  // new StreamReader(cap) -- an empty buffer that holds at most `cap` bytes (1 .. 268435456). Traps otherwise.
   @Requires(cap >= 1 && cap <= 268435456)
   constructor(cap: usize) {
     this.pending = empty();
     this.cap = cap;
   }
 
-  // buffered(): the bytes read ahead and not yet consumed. O(1).
+  // buffered(): Bytes -- the bytes read ahead and not yet consumed. O(1).
   @Ensures(result.length() <= this.cap)
   buffered(): Bytes {
     return this.pending;
   }
 
-  // capacity(): the most bytes the buffer holds. O(1).
+  // capacity(): usize -- the most bytes the buffer holds. O(1).
   @Ensures(result == this.cap)
   capacity(): usize {
     return this.cap;
   }
 
-  // unread(data): puts `data` back in front of the buffered bytes (for example the rest of a chunk a parser did not use).
+  // unread(data): void -- puts `data` back in front of the buffered bytes (for example the rest of a chunk a parser did
+  // not use). Traps if the buffer would exceed its capacity. O(length).
   @Requires(data.length() + this.pending.length() <= this.cap)
   @Ensures(this.buffered().length() == old(this.buffered().length()) + data.length())
   unread(data: Bytes): void {
     this.pending = data.concat(this.pending);
   }
 
-  // take(n): removes and returns the first n buffered bytes.
+  // take(n): Bytes -- removes and returns the first n buffered bytes. Traps if fewer than n are buffered. O(length).
   @Requires(n <= this.pending.length())
   @Ensures(result.length() == n)
   @Ensures(this.pending.length() == old(this.pending.length()) - n)
@@ -479,31 +579,32 @@ export class StreamReader {
     return head;
   }
 
-  // readSome(s, maxBytes, timeoutMs): buffered bytes if there are any (at most maxBytes, no system call), else one `recv`.
+  // readSome(s, maxBytes, timeout): RecvResult -- buffered bytes if there are any (at most maxBytes, no system call),
+  // else one `recv`. Traps if maxBytes is 0.
   @Requires(maxBytes >= 1)
-  readSome(s: Stream, maxBytes: usize, timeoutMs: int): RecvResult {
+  readSome(s: Stream, maxBytes: usize, timeout: Duration): RecvResult {
     if (this.pending.length() > 0) {
       const n = this.pending.length() < maxBytes ? this.pending.length() : maxBytes;
       return RecvData(this.take(n));
     }
-    return recv(s, maxBytes < this.cap ? maxBytes : this.cap, timeoutMs);
+    return recv(s, maxBytes < this.cap ? maxBytes : this.cap, timeout);
   }
 
-  // readExact(s, n, timeoutMs): exactly n bytes (Filled), or what arrived before the peer closed (FillClosed), or
-  // FillTimeout when the DEADLINE timeoutMs (for the whole call) passed. Never reads past n bytes: further bytes stay in
-  // the stream.
+  // readExact(s, n, timeout): Fill -- exactly n bytes (Filled), or what arrived before the peer closed (FillClosed), or
+  // FillTimeout when the DEADLINE `timeout` (for the whole call) passed, or FillError. Never reads past n bytes: further
+  // bytes stay in the stream. Traps if n exceeds the capacity.
   @Requires(n <= this.cap)
   @Ensures(match (result) { Filled(b) => b.length() == n, _ => true })
   @Ensures(this.pending.length() <= this.cap)
-  readExact(s: Stream, n: usize, timeoutMs: int): Fill {
-    const deadline = netNow(s) + clampMs(timeoutMs);
+  readExact(s: Stream, n: usize, timeout: Duration): Fill {
+    const deadline = netNow(s) + clampMs(timeout.millis);
     while (this.pending.length() < n) {
       const left = deadline - netNow(s);
       if (left < 0) {
         return FillTimeout;
       }
       const want = n - this.pending.length();
-      const r = recv(s, want, left);
+      const r = recvMs(s, want, clampMs(left));
       match (r) {
         RecvData(b) => {
           this.pending = this.pending.concat(b);
@@ -515,7 +616,7 @@ export class StreamReader {
           return FillTimeout;
         },
         RecvReset => {
-          return FillError(makeError(CODE_RESET));
+          return FillError(netErrorFromCode(CODE_RESET));
         },
         RecvError(e) => {
           return FillError(e);
@@ -525,18 +626,19 @@ export class StreamReader {
     return Filled(this.take(n));
   }
 
-  // readUntil(s, delim, limit, timeoutMs): the bytes up to and including the first occurrence of `delim` (Filled), with
-  // at most `limit` bytes examined: FillLimit if `limit` bytes contain no delimiter (the buffer then keeps them), FillClosed
-  // (the bytes so far) if the peer closed first, FillTimeout at the DEADLINE timeoutMs for the whole call. Receives at
-  // most limit - buffered bytes each time, so at most `limit` bytes are buffered by the call.
+  // readUntil(s, delim, limit, timeout): Fill -- the bytes up to and including the first occurrence of `delim` (Filled),
+  // with at most `limit` bytes examined: FillLimit if `limit` bytes contain no delimiter (the buffer then keeps them),
+  // FillClosed (the bytes so far) if the peer closed first, FillTimeout at the DEADLINE `timeout` for the whole call,
+  // FillError. Receives at most limit - buffered bytes each time, so at most `limit` bytes are buffered by the call.
+  // Traps if delim is empty, limit is shorter than delim or limit exceeds the capacity.
   @Requires(delim.length() >= 1 && limit >= delim.length() && limit <= this.cap)
   @Ensures(match (result) { Filled(b) => b.length() <= limit && b.length() >= delim.length(), _ => true })
   @Ensures(this.pending.length() <= this.cap)
-  readUntil(s: Stream, delim: Bytes, limit: usize, timeoutMs: int): Fill {
-    const deadline = netNow(s) + clampMs(timeoutMs);
+  readUntil(s: Stream, delim: Bytes, limit: usize, timeout: Duration): Fill {
+    const deadline = netNow(s) + clampMs(timeout.millis);
     let begin: usize = 0;
     while (true) {
-      const at = findFrom(this.pending, delim, begin, limit);
+      const at = delimiterEnd(this.pending, delim, begin, limit);
       match (at) {
         Some(end) => {
           return Filled(this.take(end));
@@ -551,7 +653,7 @@ export class StreamReader {
       if (left < 0) {
         return FillTimeout;
       }
-      const r = recv(s, limit - this.pending.length(), left);
+      const r = recvMs(s, limit - this.pending.length(), clampMs(left));
       match (r) {
         RecvData(b) => {
           this.pending = this.pending.concat(b);
@@ -563,7 +665,7 @@ export class StreamReader {
           return FillTimeout;
         },
         RecvReset => {
-          return FillError(makeError(CODE_RESET));
+          return FillError(netErrorFromCode(CODE_RESET));
         },
         RecvError(e) => {
           return FillError(e);
@@ -574,10 +676,12 @@ export class StreamReader {
   }
 }
 
-// findFrom(hay, delim, begin, limit): the end index (exclusive) of the first occurrence of `delim` in hay that starts at an
-// index >= begin and ends at <= limit, or None. O(length * delim) worst case, O(length) typical.
+// delimiterEnd(hay, delim, begin, limit): Option<usize> -- the end index (exclusive) of the first occurrence of `delim` in
+// hay that starts at an index >= begin and ends at <= limit, or None. O(length * delim) worst case, O(length) typical.
+// Internal (ADR-0048 7.4): this is a Bytes search, which will become `Bytes.indexOfBytes(needle, from)` in std:bytes; this
+// local copy goes away then.
 @Ensures(result.isSome() ==> result.unwrap() >= delim.length() && result.unwrap() <= limit && result.unwrap() <= hay.length())
-export function findFrom(hay: Bytes, delim: Bytes, begin: usize, limit: usize): Option<usize> {
+function delimiterEnd(hay: Bytes, delim: Bytes, begin: usize, limit: usize): Option<usize> {
   const n = hay.length() < limit ? hay.length() : limit;
   const m = delim.length();
   if (m == 0 || n < m) {

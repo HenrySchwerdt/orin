@@ -76,7 +76,7 @@ def allocSt (s : St) (d n : Nat) : St :=
 
 theorem op_alloc {d n : Nat} (hI : Inv ext a s)
     (h : stepL np a (.alloc d n) = some a') : OpSafe ext a' (opAllocN s d n) := by
-  simp only [stepL] at h
+  simp only [stepL, stepAlloc] at h
   split at h
   · rename_i hc
     obtain ⟨hd, _⟩ := hc
@@ -163,7 +163,7 @@ theorem def_uncounted {d : Nat} (hI : Inv ext a s) (hd : d < a.length) (k : AS)
 
 theorem op_getField {d o i : Nat} {r : Bool} (hI : Inv ext a s)
     (h : stepL np a (.getField d o i r) = some a') : OpSafe ext a' (opGetField s d o i r) := by
-  simp only [stepL] at h
+  simp only [stepL, stepGet] at h
   split at h
   · rename_i hc
     obtain ⟨hd, ho, _, hrefo⟩ := hc

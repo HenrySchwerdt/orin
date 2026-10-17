@@ -24,6 +24,8 @@ import subprocess
 import sys
 import tempfile
 import time
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from runtime_files import rt_inc, rt_src, rt_llvm  # the runtime source list: tools/runtime-sources.txt
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 failures = []
@@ -63,7 +65,7 @@ def main():
     cache = os.path.join(out, "cache")
     P = os.path.join(ROOT, "tests", "processors")
     describe = os.path.join(ROOT, "tests", "next", "run", "processor_describe")
-    rt = ["runtime/core/orin_runtime.c", "runtime/platform/orin_platform.c"]
+    rt = rt_src()
 
     def compile_(entry, outfile, *extra, cache_dir=None):
         return run([orin, "compile", entry, "-o", outfile, "--processor-cache", cache_dir or cache] + list(extra))
@@ -75,7 +77,7 @@ def main():
     check("describe: compiles", rc == 0, se)
     check("describe: the helper is built and run", "built the helper of `describeProc`" in se and "running `describeProc` for module `./models`" in se, se)
     exe = os.path.join(out, "describe")
-    rc, so, se2 = run([a.cc, "-O1", "-w", "-I", "runtime/core", c_file] + rt + ["-lm", "-o", exe])
+    rc, so, se2 = run([a.cc, "-O1", "-w", *rt_inc(), c_file] + rt + ["-lm", "-o", exe])
     check("describe: C build", rc == 0, se2)
     rc, so, se2 = run([exe])
     check("describe: runs (C)", rc == 0 and so == want, so + se2)
@@ -86,7 +88,7 @@ def main():
         rc, so, se = compile_(os.path.relpath(os.path.join(describe, "main.or"), ROOT), ll_file, "--backend=llvm")
         check("describe: compiles (llvm)", rc == 0, se)
         lexe = os.path.join(out, "describe_llvm")
-        rc, so, se2 = run([a.clang, "-O2", "-w", "-I", "runtime/core", ll_file] + rt + ["runtime/core/orin_runtime_llvm.c", "-lm", "-o", lexe])
+        rc, so, se2 = run([a.clang, "-O2", "-w", *rt_inc(), ll_file] + rt + [*rt_llvm(), "-lm", "-o", lexe])
         check("describe: LLVM build", rc == 0, se2)
         rc, so, se2 = run([lexe])
         check("describe: runs (LLVM)", rc == 0 and so == want, so + se2)
@@ -140,7 +142,7 @@ def main():
     rc, so, se = compile_(os.path.relpath(os.path.join(side, "main.or"), ROOT), os.path.join(out, "side.c"), "--verbose")
     check("sidecar: compiles", rc == 0, se)
     check("sidecar: no processor is run", "running" not in se and "built" not in se, se)
-    run([a.cc, "-O1", "-w", "-I", "runtime/core", os.path.join(out, "side.c")] + rt + ["-lm", "-o", sexe])
+    run([a.cc, "-O1", "-w", *rt_inc(), os.path.join(out, "side.c")] + rt + ["-lm", "-o", sexe])
     rc, so, se = run([sexe])
     check("sidecar: its output is used", so.startswith("RECORDED\n"), so)
 
@@ -188,7 +190,7 @@ def main():
         rc, so, se = run([orin, "compile", "tests/processors/" + d, "-o", dc, "--processor-cache", cache])
         check("dependency processor listed (%s): compiles" % d, rc == 0 and "W0492" not in se, se)
         dexe = os.path.join(out, d)
-        run([a.cc, "-O1", "-w", "-I", "runtime/core", dc] + rt + ["-lm", "-o", dexe])
+        run([a.cc, "-O1", "-w", *rt_inc(), dc] + rt + ["-lm", "-o", dexe])
         rc, so, se = run([dexe])
         check("dependency processor listed (%s): runs" % d, rc == 0 and so == "generated for Thing\n", so + se)
 
@@ -202,7 +204,7 @@ def main():
         rc, so, se = run([orin, "compile", d, "-o", cf, "--processor-cache", cache])
         check(label + ": compiles (C)", rc == 0, se)
         cexe = os.path.join(out, label + "_c")
-        rc, so, se = run([a.cc, "-O1", "-w", "-I", "runtime/core", cf] + rt + ["-lm", "-o", cexe])
+        rc, so, se = run([a.cc, "-O1", "-w", *rt_inc(), cf] + rt + ["-lm", "-o", cexe])
         rc, so, se2 = run([cexe])
         check(label + ": runs (C) with the expected output", rc == 0 and so == want, so + se2)
         if shutil.which(a.clang):
@@ -210,7 +212,7 @@ def main():
             rc, so, se = run([orin, "compile", d, "-o", lf, "--backend=llvm", "--processor-cache", cache])
             check(label + ": compiles (llvm)", rc == 0, se)
             lexe = os.path.join(out, label + "_llvm")
-            run([a.clang, "-O2", "-w", "-I", "runtime/core", lf] + rt + ["runtime/core/orin_runtime_llvm.c", "-lm", "-o", lexe])
+            run([a.clang, "-O2", "-w", *rt_inc(), lf] + rt + [*rt_llvm(), "-lm", "-o", lexe])
             rc, so, se2 = run([lexe])
             check(label + ": runs (LLVM), same output as C", rc == 0 and so == want, so + se2)
     rc, so, se = run([orin, "check", "tests/processors/json_bad", "--processor-cache", cache])

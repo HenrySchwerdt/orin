@@ -22,6 +22,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from runtime_files import rt_inc, rt_src  # the runtime source list: tools/runtime-sources.txt
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 failures = []
@@ -74,8 +76,7 @@ def main():
     rc, so, se = run([orin, "compile", "tests/expand/codec_check.or", "-o", codec_c])
     check("codec_check compiles", rc == 0, se)
     if rc == 0:
-        rc, so, se = run([a.cc, "-O1", "-w", "-I", "runtime/core", codec_c, "runtime/core/orin_runtime.c",
-                          "runtime/platform/orin_platform.c", "-lm", "-o", codec])
+        rc, so, se = run([a.cc, "-O1", "-w", *rt_inc(), codec_c, *rt_src(), "-lm", "-o", codec])
         check("codec_check builds", rc == 0, se)
     have_codec = os.path.exists(codec)
 

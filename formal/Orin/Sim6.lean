@@ -212,7 +212,7 @@ theorem consume_spec {a : List AS} {v : Nat} {a1 : List AS} (h : consume a v = s
 
 theorem op_setField {x i v : Nat} (hI : Inv ext a s)
     (h : stepL np a (.setField x i v) = some a') : OpSafe ext a' (opSetField s x i v) := by
-  simp only [stepL] at h
+  simp only [stepL, stepSet] at h
   split at h
   · rename_i hc
     obtain ⟨hx, hxv, hu⟩ := hc
@@ -224,7 +224,7 @@ theorem op_setField {x i v : Nat} (hI : Inv ext a s)
 
 theorem op_putField {x i v : Nat} (hI : Inv ext a s)
     (h : stepL np a (.putField x i v) = some a') : OpSafe ext a' (opSetField s x i v) := by
-  simp only [stepL] at h
+  simp only [stepL, stepSet] at h
   split at h
   · rename_i hc
     obtain ⟨hx, hxv, hu⟩ := hc

@@ -4,7 +4,7 @@
 // starts with `cd <root>`, like the Python runner's `cwd=ROOT`.
 
 import { FsGrant, exists, listDir, readFile } from "std:fs";
-import { shq, sortedStrings } from "./text";
+import { shq, sortedStrings, splitWords, strip } from "./text";
 import { Options } from "./cli";
 import { Spec, parseSpec } from "./headers";
 
@@ -94,13 +94,30 @@ export function discover(fs: FsGrant, root: string, base: string, kind: string):
   return out;
 }
 
-// The C compiler command and flags a test executable is built with (words, without the inputs).
+// The words of `key` (`<world>.<kind>`) in the runtime source list `text` (tools/runtime-sources.txt, the one place that names
+// the runtime files; tools/runtime_files.sh reads it too). Lines are `key = word ...`, `#` starts a comment line.
+export function listWords(text: string, key: string): string[] {
+  for (const line of text.split("\n")) {
+    const eq = line.indexOf("=");
+    if (!line.startsWith("#") && eq.isSome() && strip(line.substring(0, eq.unwrap())) == key) {
+      return splitWords(line.substring(eq.unwrap() + 1, line.length));
+    }
+  }
+  return [];
+}
+
+// The C compiler command and flags a test executable is built with (words, without the inputs). Tests are linked with the
+// live runtime (world `core`).
 export function ccBase(o: Options): string[] {
   let cc: string[] = [];
   if (o.backend == "llvm") {
-    cc = [o.cc != "cc" ? o.cc : "clang", "-O2", "-w", "-I", "runtime/core"];
+    cc = [o.cc != "cc" ? o.cc : "clang", "-O2", "-w"];
   } else {
-    cc = [o.cc, "-O1", "-w", "-I", "runtime/core"];
+    cc = [o.cc, "-O1", "-w"];
+  }
+  for (const d of listWords(o.rtList, "core.include")) {
+    cc.push("-I");
+    cc.push(d);
   }
   if (o.sanitize) {
     cc = cc.concat(["-fsanitize=address,undefined", "-fno-omit-frame-pointer"]);
@@ -109,10 +126,10 @@ export function ccBase(o: Options): string[] {
 }
 
 // C runtime sources to link; the LLVM backend also needs the out-of-line shim.
-export function runtimeSources(backend: string): string[] {
-  let srcs = ["runtime/core/orin_runtime.c", "runtime/platform/orin_platform.c"];
-  if (backend == "llvm") {
-    srcs.push("runtime/core/orin_runtime_llvm.c");
+export function runtimeSources(o: Options): string[] {
+  let srcs = listWords(o.rtList, "core.sources");
+  if (o.backend == "llvm") {
+    srcs = srcs.concat(listWords(o.rtList, "core.llvm"));
   }
   return srcs;
 }
@@ -181,7 +198,7 @@ export function makeCase(fs: FsGrant, o: Options, root: string, label: string, f
   if (kind == "errors") {
     return c;
   }
-  const inputs = rtObjs.length > 0 ? rtObjs : runtimeSources(o.backend);
+  const inputs = rtObjs.length > 0 ? rtObjs : runtimeSources(o);
   c = Case {
     ...c,
     ccCmd: cd + words(ccBase(o).concat([cOut]).concat(inputs).concat(["-lm", "-o", exe])) + " >/dev/null 2>" + shq(c.ccerr) + " </dev/null"
@@ -191,7 +208,7 @@ export function makeCase(fs: FsGrant, o: Options, root: string, label: string, f
   const stdin = exists(fs, root + "/" + inPath) ? shq(inPath) : "/dev/null";
   c = Case {
     ...c,
-    runCmd: cd + (o.sanitize ? "ASAN_OPTIONS=detect_leaks=0 " : "") + shq("./" + exe) + " >" + shq(c.rout)
+    runCmd: cd + (o.sanitize ? "ASAN_OPTIONS=detect_leaks=0:allocator_may_return_null=1 " : "") + shq("./" + exe) + " >" + shq(c.rout)
       + " 2>" + shq(c.rerr) + " <" + stdin
   };
   return c;

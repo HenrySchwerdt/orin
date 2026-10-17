@@ -31,6 +31,7 @@ import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from runtime_files import rt_inc, rt_src, rt_llvm  # the runtime source list: tools/runtime-sources.txt
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CC = os.environ.get("CC", "cc")
@@ -53,9 +54,9 @@ def sh(cmd, **kw):
 
 def build_runtime(out):
     objs = []
-    for src in ("runtime/core/orin_runtime.c", "runtime/platform/orin_platform.c"):
+    for src in rt_src():
         o = os.path.join(out, os.path.basename(src)[:-2] + ".sites.o")
-        sh([CC] + CFLAGS + ["-DORIN_SITE_STATS", "-I", "runtime/core", "-c", src, "-o", o])
+        sh([CC] + CFLAGS + ["-DORIN_SITE_STATS", *rt_inc(), "-c", src, "-o", o])
         objs.append(o)
     return objs
 
@@ -64,7 +65,7 @@ def build(orinc, src, out, name, rt):
     c = os.path.join(out, name + ".c")
     exe = os.path.join(out, name)
     sh([orinc, "compile", "--stats-sites", src, "-o", c], timeout=1800)
-    sh([CC] + CFLAGS + ["-I", "runtime/core", c] + rt + ["-lm", "-lpthread", "-o", exe], timeout=1800)
+    sh([CC] + CFLAGS + [*rt_inc(), c] + rt + ["-lm", "-lpthread", "-o", exe], timeout=1800)
     save_mir(orinc, src, out, name)
     return exe
 

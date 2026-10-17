@@ -15,6 +15,7 @@ import re
 import statistics
 import subprocess
 import time
+from runtime_files import rt_inc, rt_src, rt_llvm  # the runtime source list: tools/runtime-sources.txt
 
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "build/encoding"
@@ -38,10 +39,10 @@ def compile_orin(orinc, source, backend, contracts=False, sanitize=False):
         cmd += ["--check-contracts"]
     run(cmd)
     binary = OUT / stem
-    cmd = ["clang", "-O2", "-w", "-I", ROOT / "runtime" / "core", generated,
-           ROOT / "runtime/core/orin_runtime.c", ROOT / "runtime/platform/orin_platform.c", "-lm", "-o", binary]
+    cmd = ["clang", "-O2", "-w", *[ROOT / w if w != "-I" else w for w in rt_inc()], generated,
+           *[ROOT / f for f in rt_src()], "-lm", "-o", binary]
     if backend == "llvm":
-        cmd += [ROOT / "runtime/core/orin_runtime_llvm.c"]
+        cmd += [ROOT / f for f in rt_llvm()]
     if sanitize:
         cmd += ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"]
     run(cmd)

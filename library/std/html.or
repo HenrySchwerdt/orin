@@ -11,10 +11,14 @@
 // literal (the HTML rules: escape table, void and raw-text elements, URL and event attributes).
 // No platform calls, no additional trusted code, no runtime reflection.
 // Every function is total (never traps) and O(n) in the size of its input and output.
+//
+// Names (ADR-0048). The documentation writes `import * as html from "std:html"`: `empty`, `document`, `escape`, `fragment`
+// are generic words that collide with other imports; the module exports `fromText` (not `text`, a module name) and
+// `renderAll` / `renderDocument` (markup to string is `render`). The old names stay as deprecated wrappers for one release.
 
 import { Markup, AttrRule, Escape } from "std:ox";
 
-// Rendered, trusted HTML.
+// Html -- rendered, trusted HTML (a record with the sealed field `html`; build it with `fromText`, `fragment`, `trustHtml` or OX).
 @Sealed
 export type Html = { html: string; };
 
@@ -46,8 +50,8 @@ function entityOf(c: int): string {
   return "";
 }
 
-// True when `s` contains one of & < > " ' (so `escape(s)` differs from `s`).
-export function needsEscape(s: string): bool {
+// hasSpecialChars(s): bool -- `s` contains one of & < > " ' (so `escape(s)` differs from `s`). O(n).
+export function hasSpecialChars(s: string): bool {
   let i: usize = 0;
   while (i < s.length) {
     if (isSpecial(s.charCodeAt(i))) {
@@ -58,15 +62,21 @@ export function needsEscape(s: string): bool {
   return false;
 }
 
-// HTML escaping for text and for (double- or single-quoted) attribute values: & < > " ' become
+// needsEscape(s): bool -- use `hasSpecialChars`.
+@Deprecated("use hasSpecialChars")
+export function needsEscape(s: string): bool {
+  return hasSpecialChars(s);
+}
+
+// escape(s): string -- HTML escaping for text and for (double- or single-quoted) attribute values: & < > " ' become
 // &amp; &lt; &gt; &quot; &#39;; every other byte is copied unchanged. A string without those characters is
 // returned as is (the hot path: one scan, no allocation); otherwise the result is built from the runs between
 // the special characters, not byte by byte.
 @Ensures(result.indexOf("<").isNone() && result.indexOf(">").isNone())
 @Ensures(result.indexOf("\"").isNone() && result.indexOf("'").isNone())
 @Ensures(result.length >= s.length)
-@Ensures(!needsEscape(s) ==> result == s)
-@Ensures(needsEscape(s) ==> result.length > s.length)
+@Ensures(!hasSpecialChars(s) ==> result == s)
+@Ensures(hasSpecialChars(s) ==> result.length > s.length)
 export function escape(s: string): string {
   const n = s.length;
   let i: usize = 0;
@@ -127,7 +137,7 @@ function schemeIs(u: string, end: usize, lit: string): bool {
   return true;
 }
 
-// The URL rule: true when `u` is relative (no ':' before the first '/', '?' or '#') or its scheme, compared
+// hasSafeScheme(u): bool -- the URL rule: true when `u` is relative (no ':' before the first '/', '?' or '#') or its scheme, compared
 // ASCII-case-insensitively, is exactly http, https, mailto or tel. A scheme with a leading space, a control
 // character or an embedded TAB is not one of those, so " javascript:" and "java\tscript:" are rejected.
 export function hasSafeScheme(u: string): bool {
@@ -139,13 +149,13 @@ export function hasSafeScheme(u: string): bool {
   return schemeIs(u, end, "http") || schemeIs(u, end, "https") || schemeIs(u, end, "mailto") || schemeIs(u, end, "tel");
 }
 
-// True when `u` may be put into a URL attribute: it passes the scheme rule or it is the constant `safeUrl`
+// isSafeUrl(u): bool -- `u` may be put into a URL attribute: it passes the scheme rule or it is the constant `safeUrl`
 // substitutes for a rejected URL.
 export function isSafeUrl(u: string): bool {
   return hasSafeScheme(u) || u == UNSAFE_URL;
 }
 
-// URL attribute sanitising (href, src, action, ...), the rule of Go's html/template: a URL whose scheme is not
+// safeUrl(s): string -- URL attribute sanitising (href, src, action, ...), the rule of Go's html/template: a URL whose scheme is not
 // http, https, mailto or tel (javascript:, vbscript:, data:, ...) becomes "about:invalid#orin-unsafe-url"; a
 // relative URL, and an allowed one, is returned unchanged (the same string, no allocation). The result is not
 // HTML-escaped: use `escapeUrl` for the attribute value.
@@ -160,7 +170,7 @@ export function safeUrl(s: string): string {
   return UNSAFE_URL;
 }
 
-// escape(safeUrl(s)): a URL as the value of a quoted attribute.
+// escapeUrl(s): string -- `escape(safeUrl(s))`: a URL as the value of a quoted attribute.
 @Ensures(result == escape(safeUrl(s)))
 @Ensures(result.indexOf("<").isNone() && result.indexOf(">").isNone())
 @Ensures(result.indexOf("\"").isNone() && result.indexOf("'").isNone())
@@ -168,12 +178,13 @@ export function escapeUrl(s: string): string {
   return escape(safeUrl(s));
 }
 
-// The concatenation of the rendered strings of `xs` (the children `{items.map(i => <li>..</li>)}` of OX).
+// renderAll(xs): string -- the concatenation of the rendered strings of `xs` (the children `{items.map(i => <li>..</li>)}`
+// of OX). O(total length).
 @Ensures(xs.length == 0 ==> result == "")
 @Ensures(xs.length == 1 ==> result == xs[0].html)
 @Ensures(xs.length >= 1 ==> result.startsWith(xs[0].html) && result.endsWith(xs[xs.length - 1].html))
 @Inline
-export function joinAll(xs: Html[]): string {
+export function renderAll(xs: Html[]): string {
   let out = "";
   for (const x of xs) {
     out += x.html;
@@ -181,53 +192,71 @@ export function joinAll(xs: Html[]): string {
   return out;
 }
 
-// The explicit, auditable escape hatch: `raw` is HTML and is NOT escaped. Every use is a place to review.
+// joinAll(xs): string -- use `renderAll`.
+@Deprecated("use renderAll")
+export function joinAll(xs: Html[]): string {
+  return renderAll(xs);
+}
+
+// trustHtml(raw): Html -- the explicit, auditable escape hatch: `raw` is HTML and is NOT escaped. Every use is a place to review.
 @Ensures(result.html == raw)
 @Inline
 export function trustHtml(raw: string): Html {
   return Html { html: raw };
 }
 
-// `s` as text: escaped.
+// fromText(s): Html -- `s` as text: escaped. O(n).
 @Ensures(result.html == escape(s))
-export function text(s: string): Html {
+export function fromText(s: string): Html {
   return Html { html: escape(s) };
 }
 
-// No markup.
+// text(s): Html -- use `fromText` (`text` is also the name of a std module).
+@Deprecated("use fromText")
+export function text(s: string): Html {
+  return fromText(s);
+}
+
+// empty(): Html -- no markup. O(1).
 @Ensures(result.html == "")
 export function empty(): Html {
   return Html { html: "" };
 }
 
-// Several elements, one after the other.
-@Ensures(result.html == joinAll(xs))
+// fragment(xs): Html -- several elements, one after the other. O(total length).
+@Ensures(result.html == renderAll(xs))
 export function fragment(xs: Html[]): Html {
-  return Html { html: joinAll(xs) };
+  return Html { html: renderAll(xs) };
 }
 
-// The markup as a string.
+// render(h): string -- the markup as a string. O(1).
 @Ensures(result == h.html)
 @Inline
 export function render(h: Html): string {
   return h.html;
 }
 
-// A whole page: the doctype, then `h`.
+// renderDocument(h): string -- a whole page: the doctype, then `h`. O(length).
 @Ensures(result.startsWith("<!DOCTYPE html>") && result.endsWith(h.html))
 @Ensures(result.length == 15 + h.html.length)
-export function document(h: Html): string {
+export function renderDocument(h: Html): string {
   return "<!DOCTYPE html>" + h.html;
 }
 
-// True when `h` renders to nothing.
+// document(h): string -- use `renderDocument`.
+@Deprecated("use renderDocument")
+export function document(h: Html): string {
+  return renderDocument(h);
+}
+
+// isEmpty(h): bool -- `h` renders to nothing. O(1).
 @Ensures(result == (h.html.length == 0))
 export function isEmpty(h: Html): bool {
   return h.html.length == 0;
 }
 
-// The OX provider of HTML (ADR-0044 §5): the compiler reads this literal and calls the named functions. A root of
-// markup is `trustHtml(buffer)`, an `Html` child is `render(h)`, an `Html[]` child is `joinAll(hs)`, a computed
+// ox(): Markup<Html> -- the OX provider of HTML (ADR-0044 §5): the compiler reads this literal and calls the named
+// functions. A root of markup is `trustHtml(buffer)`, an `Html` child is `render(h)`, an `Html[]` child is `renderAll(hs)`, a computed
 // string child or attribute value is `escape(s)`; the attributes of `names` take `escapeUrl` (an unsafe scheme such
 // as `javascript:` becomes a harmless constant), attributes starting with `on` are static only (their value is
 // JavaScript). `escapes` is the compile-time twin of `escape` (tests/next/run/ox_escape_diff.or compares them).
@@ -235,7 +264,7 @@ export function ox(): Markup<Html> {
   return Markup<Html> {
     wrap: trustHtml,
     embed: render,
-    embedAll: joinAll,
+    embedAll: renderAll,
     text: escape,
     attr: escape,
     rules: [

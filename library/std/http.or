@@ -16,14 +16,15 @@
 //   * HTTP/1.1 requests without exactly one valid `Host` field, framing fields (Content-Length, Transfer-Encoding,
 //     Trailer, Host) in trailers.
 //
-// Limits are part of the parser (`Limits`, invariants below): request/status line length, header line length,
+// Limits are part of the parser (`HttpLimits`, checked by `isValidLimits`): request/status line length, header line length,
 // total header section size, header count, chunk header line length and body size. A message that exceeds a limit
 // is an error at the first byte over the limit, never a truncated parse.
 //
 // Incremental parsing. `RequestParser.feed(chunk)` takes bytes in arbitrary chunks (as `recv` delivers them) and
 // answers `NeedMore` (every byte of the chunk was consumed into the parser state), `Done(message, used)` (the
 // message is complete; `used` bytes of THIS chunk belonged to it, the rest `chunk[used..]` is the start of the next
-// pipelined message) or `Failed(HttpError)` (position = byte offset from the start of the message, reason, text).
+// pipelined message) or `Failed(HttpError)` (`kind` = the violated rule, `offset` = byte offset from the start of the
+// message; the text is `httpErrorMessage(e)`).
 // A partial message is never returned as complete. The result for a message is independent of how the bytes are
 // split into chunks (tests: every split point, 1-byte chunks, random splits).
 //
@@ -62,6 +63,14 @@
 // Not covered: HTTP/2 and HTTP/3, TLS, sockets, content codings (gzip), `Expect: 100-continue` handling,
 // connection management, URI parsing beyond the shape checks of `isValidTarget`, cookies and any header semantics
 // other than the framing and `Host` rules above.
+//
+// Internal helpers (ADR-0048 section 7.3). The rule predicates and tables below the line "character classes" (`charClass`,
+// `isTokenChar`, `isFieldByte`, `isToken`, `isFieldValue`, `isReasonPhrase`, `isHostValue`, `parseContentLength`,
+// `toLowerAscii`, `standardReason`, `statusHasNoBody`, `isValidTarget`, `isValidMethod`, `edgeAllowed`, `stateName`,
+// `hexString`, `httpError`) are NOT API: they exist to state the contracts and to be tested. They belong in
+// `std:http/internal`; the loader has no library submodules yet (and no warning for importing `internal` ones), so they stay
+// exported from here, each marked "Internal" in its comment, until it has. `eqIgnoreCase` is a string utility waiting for
+// the string builtins (7.4).
 
 import { Bytes, ByteBuilder, fromString, empty } from "std:bytes";
 
@@ -85,20 +94,20 @@ const HTTP_CLASS: string = "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x03\x01\x00\x00
 const HTTP_HEXV: string = "\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x10\x10\x10\x10\x10\x10\x10\x0a\x0b\x0c\x0d\x0e\x0f\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x0a\x0b\x0c\x0d\x0e\x0f\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10";
 
 
-// charClass(c): the class code of byte value c (0..255). O(1).
+// charClass(c): int -- the class code of byte value c (0..255). O(1). Internal.
 @Requires(c >= 0 && c <= 255)
 @Ensures(result >= 0 && result <= 13)
 export function charClass(c: int): int {
   return HTTP_CLASS.charCodeAt(c.toUsize());
 }
 
-// isTokenChar(c): c is a `tchar` (RFC 9110 §5.6.2): ALPHA, DIGIT or one of !#$%&'*+-.^_`|~. O(1).
+// isTokenChar(c): bool -- c is a `tchar` (RFC 9110 §5.6.2): ALPHA, DIGIT or one of !#$%&'*+-.^_`|~. O(1). Internal.
 @Requires(c >= 0 && c <= 255)
 export function isTokenChar(c: int): bool {
   return HTTP_CLASS.charCodeAt(c.toUsize()) >= C_TOKEN;
 }
 
-// isFieldByte(c): c may occur inside a field value or a reason phrase: HTAB, SP, VCHAR or obs-text. O(1).
+// isFieldByte(c): bool -- c may occur inside a field value or a reason phrase: HTAB, SP, VCHAR or obs-text. O(1). Internal.
 @Requires(c >= 0 && c <= 255)
 export function isFieldByte(c: int): bool {
   return HTTP_CLASS.charCodeAt(c.toUsize()) >= C_HTAB;
@@ -117,7 +126,8 @@ function lowerAscii(c: int): int {
   return c;
 }
 
-// eqIgnoreCase(a, b): equal after ASCII lower-casing (header names, RFC 9110 §5.1). O(n).
+// eqIgnoreCase(a, b): bool -- equal after ASCII lower-casing (header names, RFC 9110 §5.1). O(n). A string utility;
+// it moves to the string builtins (ADR-0048 7.4).
 @Ensures(result ==> a.length == b.length)
 export function eqIgnoreCase(a: string, b: string): bool {
   if (a.length != b.length) {
@@ -133,7 +143,8 @@ export function eqIgnoreCase(a: string, b: string): bool {
   return true;
 }
 
-// toLowerAscii(s): s with ASCII letters lower-cased; other bytes (including obs-text) unchanged. O(n).
+// toLowerAscii(s): string -- s with ASCII letters lower-cased; other bytes (including obs-text) unchanged. O(n). Internal
+// (ADR-0048 7.4: becomes `std:http/internal`).
 @Ensures(result.length == s.length)
 @Ensures(s.length > 0 ==> result.charCodeAt(0) == lowerAscii(s.charCodeAt(0)))
 @Ensures(s.length > 0 ==> result.charCodeAt(s.length - 1) == lowerAscii(s.charCodeAt(s.length - 1)))
@@ -147,7 +158,7 @@ export function toLowerAscii(s: string): string {
   return out;
 }
 
-// isToken(s): a non-empty run of token characters (a method or a field name). O(n).
+// isToken(s): bool -- a non-empty run of token characters (a method or a field name). O(n). Internal.
 @Ensures(result ==> s.length > 0)
 export function isToken(s: string): bool {
   if (s.length == 0) {
@@ -163,9 +174,9 @@ export function isToken(s: string): bool {
   return true;
 }
 
-// isFieldValue(s): a valid field value: only HTAB, SP, VCHAR and obs-text (so no CR, LF, NUL or other control
+// isFieldValue(s): bool -- a valid field value: only HTAB, SP, VCHAR and obs-text (so no CR, LF, NUL or other control
 // character), no leading or trailing SP/HTAB (the parser strips optional whitespace, so a stored value is
-// canonical). The empty string is valid. O(n).
+// canonical). The empty string is valid. O(n). Internal.
 @Ensures(result ==> s.length == 0 || (!isOws(s.charCodeAt(0)) && !isOws(s.charCodeAt(s.length - 1))))
 export function isFieldValue(s: string): bool {
   if (s.length == 0) {
@@ -184,7 +195,7 @@ export function isFieldValue(s: string): bool {
   return true;
 }
 
-// isReasonPhrase(s): `*( HTAB / SP / VCHAR / obs-text )`; may be empty and may have leading or trailing blanks
+// isReasonPhrase(s): bool -- (internal) `*( HTAB / SP / VCHAR / obs-text )`; may be empty and may have leading or trailing blanks
 // (the status line keeps it byte for byte). O(n).
 export function isReasonPhrase(s: string): bool {
   let i: usize = 0;
@@ -207,7 +218,7 @@ function isHostChar(c: int): bool {
     || c == 40 || c == 41 || c == 42 || c == 43 || c == 44 || c == 59 || c == 61 || c == 58 || c == 91 || c == 93;
 }
 
-// isHostValue(s): a plausible `Host` field value or CONNECT authority: only host characters (no SP, `/`, `@`, `?`,
+// isHostValue(s): bool -- (internal) a plausible `Host` field value or CONNECT authority: only host characters (no SP, `/`, `@`, `?`,
 // `#`). The empty string is allowed here (an empty authority is legal in `Host`). O(n).
 export function isHostValue(s: string): bool {
   let i: usize = 0;
@@ -220,7 +231,7 @@ export function isHostValue(s: string): bool {
   return true;
 }
 
-// parseContentLength(v): the value of a `Content-Length` field: 1 to 18 decimal digits (so it fits every integer
+// parseContentLength(v): Option<usize> -- (internal) the value of a `Content-Length` field: 1 to 18 decimal digits (so it fits every integer
 // type; larger values are refused instead of overflowing). No sign, no blanks, no list. O(n).
 @Ensures(result.isSome() ==> v.length >= 1 && v.length <= 18)
 export function parseContentLength(v: string): Option<usize> {
@@ -282,7 +293,7 @@ function isAbsoluteForm(s: string): bool {
 // The protocol versions this module speaks. Other versions (`HTTP/0.9`, `HTTP/2.0`) are rejected by the parsers.
 export type HttpVersion = Http10 | Http11;
 
-// versionText(v): "HTTP/1.0" or "HTTP/1.1". O(1).
+// versionText(v): string -- "HTTP/1.0" or "HTTP/1.1". O(1).
 @Ensures(result.length == 8)
 export function versionText(v: HttpVersion): string {
   return match (v) {
@@ -291,7 +302,7 @@ export function versionText(v: HttpVersion): string {
   };
 }
 
-// versionMinor(v): 0 or 1. O(1).
+// versionMinor(v): int -- 0 or 1. O(1).
 @Ensures(result == 0 || result == 1)
 export function versionMinor(v: HttpVersion): int {
   return match (v) {
@@ -304,7 +315,7 @@ export function versionMinor(v: HttpVersion): int {
 // form (what the parser produces and the invariants of `Request` demand): a standard method is never an `Ext`.
 export type Method = Get | Head | Post | Put | Delete | Connect | Options | Trace | Patch | Ext(string);
 
-// methodName(m): the method token, e.g. "GET". O(1).
+// methodName(m): string -- the method token, e.g. "GET". O(1).
 @Ensures(result.length > 0 || !isValidMethod(m))
 export function methodName(m: Method): string {
   return match (m) {
@@ -327,7 +338,7 @@ function isStandardMethodName(t: string): bool {
     || t == "TRACE" || t == "PATCH";
 }
 
-// isValidMethod(m): canonical and well-formed: a standard method, or `Ext(t)` with a token `t` that is not a
+// isValidMethod(m): bool -- (internal) canonical and well-formed: a standard method, or `Ext(t)` with a token `t` that is not a
 // standard method name. O(n).
 export function isValidMethod(m: Method): bool {
   return match (m) {
@@ -336,7 +347,7 @@ export function isValidMethod(m: Method): bool {
   };
 }
 
-// methodFromToken(t): the method with name t; None when t is not a token. Method names are case-sensitive:
+// methodFromToken(t): Option<Method> -- the method with name t; None when t is not a token. Method names are case-sensitive:
 // "get" is `Ext("get")`. O(n).
 @Ensures(result.isSome() == isToken(t))
 @Ensures(result.isSome() ==> isValidMethod(result.unwrap()) && methodName(result.unwrap()) == t)
@@ -373,12 +384,12 @@ function isOptions(m: Method): bool {
   };
 }
 
-// methodEquals(a, b): the same method. O(n).
+// methodEquals(a, b): bool -- the same method. O(n).
 export function methodEquals(a: Method, b: Method): bool {
   return methodName(a) == methodName(b);
 }
 
-// isValidTarget(m, target): the request-target has a legal shape for the method (RFC 9112 §3.2): `CONNECT` takes an
+// isValidTarget(m, target): bool -- (internal) the request-target has a legal shape for the method (RFC 9112 §3.2): `CONNECT` takes an
 // authority (`host:port`); `OPTIONS` also takes `*`; every method takes origin-form (`/path?query`) or
 // absolute-form (`scheme://authority/path`). Only the characters 0x21..0x7E occur and there is no fragment. O(n).
 @Ensures(result ==> target.length > 0)
@@ -397,30 +408,37 @@ export function isValidTarget(m: Method, target: string): bool {
 
 // ----------------------------------------------------------------------------------------------- errors
 
-// Why a message was refused. One variant per rule, so that callers (and tests) can tell the cases apart.
-export type HttpReason =
-  BadMethod | BadTarget | BadVersion | UnsupportedVersion | BadStatusCode | BadStatusLine
-  | BadHeaderName | MissingColon | SpaceBeforeColon | BadHeaderValue | ObsFold | BareLf | BareCr
+// Why a message was refused or could not be built. One variant per rule, so that callers (and tests) can tell the cases
+// apart. The last four are only produced by the constructors (`Status.tryNew`, `Request.tryNew`, `Response.tryNew`); the
+// parsers produce the others.
+export type HttpErrorKind =
+  InvalidMethod | InvalidTarget | InvalidVersion | UnsupportedVersion | InvalidStatusCode | InvalidStatusLine
+  | InvalidFieldName | MissingColon | SpaceBeforeColon | InvalidFieldValue | ObsFold | BareLf | BareCr
   | StartLineTooLong | HeaderLineTooLong | HeadersTooLarge | TooManyHeaders | BodyTooLarge | ChunkLineTooLong
-  | BadContentLength | DuplicateContentLength | ContentLengthWithTransferEncoding | DuplicateTransferEncoding
-  | UnsupportedTransferEncoding | ForbiddenFraming | MissingHost | DuplicateHost | BadHost
-  | BadChunkSize | BadChunkExtension | BadChunkTerminator | ForbiddenTrailer
-  | UnexpectedEof | ParserFinished;
+  | InvalidContentLength | DuplicateContentLength | ContentLengthWithTransferEncoding | DuplicateTransferEncoding
+  | UnsupportedTransferEncoding | ForbiddenFraming | MissingHost | DuplicateHost | InvalidHost
+  | InvalidChunkSize | InvalidChunkExtension | InvalidChunkTerminator | ForbiddenTrailer
+  | UnexpectedEof | ParserFinished
+  | InvalidStatusReason | UnexpectedBody | BodyLengthMismatch | MissingFraming;
 
-// reasonName(r): the variant name, stable (for logs and tests). O(1).
+// HttpReason -- the former name of `HttpErrorKind` (the variants `Bad*` are now `Invalid*`).
+@Deprecated("use HttpErrorKind; the variants Bad* are now Invalid* (BadHeaderName is InvalidFieldName, BadHeaderValue is InvalidFieldValue)")
+export type HttpReason = HttpErrorKind;
+
+// httpErrorKindName(k): string -- the variant name, stable (for logs and tests). Never empty. O(1).
 @Ensures(result.length > 0)
-export function reasonName(r: HttpReason): string {
-  return match (r) {
-    BadMethod => "BadMethod",
-    BadTarget => "BadTarget",
-    BadVersion => "BadVersion",
+export function httpErrorKindName(k: HttpErrorKind): string {
+  return match (k) {
+    InvalidMethod => "InvalidMethod",
+    InvalidTarget => "InvalidTarget",
+    InvalidVersion => "InvalidVersion",
     UnsupportedVersion => "UnsupportedVersion",
-    BadStatusCode => "BadStatusCode",
-    BadStatusLine => "BadStatusLine",
-    BadHeaderName => "BadHeaderName",
+    InvalidStatusCode => "InvalidStatusCode",
+    InvalidStatusLine => "InvalidStatusLine",
+    InvalidFieldName => "InvalidFieldName",
     MissingColon => "MissingColon",
     SpaceBeforeColon => "SpaceBeforeColon",
-    BadHeaderValue => "BadHeaderValue",
+    InvalidFieldValue => "InvalidFieldValue",
     ObsFold => "ObsFold",
     BareLf => "BareLf",
     BareCr => "BareCr",
@@ -430,7 +448,7 @@ export function reasonName(r: HttpReason): string {
     TooManyHeaders => "TooManyHeaders",
     BodyTooLarge => "BodyTooLarge",
     ChunkLineTooLong => "ChunkLineTooLong",
-    BadContentLength => "BadContentLength",
+    InvalidContentLength => "InvalidContentLength",
     DuplicateContentLength => "DuplicateContentLength",
     ContentLengthWithTransferEncoding => "ContentLengthWithTransferEncoding",
     DuplicateTransferEncoding => "DuplicateTransferEncoding",
@@ -438,30 +456,34 @@ export function reasonName(r: HttpReason): string {
     ForbiddenFraming => "ForbiddenFraming",
     MissingHost => "MissingHost",
     DuplicateHost => "DuplicateHost",
-    BadHost => "BadHost",
-    BadChunkSize => "BadChunkSize",
-    BadChunkExtension => "BadChunkExtension",
-    BadChunkTerminator => "BadChunkTerminator",
+    InvalidHost => "InvalidHost",
+    InvalidChunkSize => "InvalidChunkSize",
+    InvalidChunkExtension => "InvalidChunkExtension",
+    InvalidChunkTerminator => "InvalidChunkTerminator",
     ForbiddenTrailer => "ForbiddenTrailer",
     UnexpectedEof => "UnexpectedEof",
-    ParserFinished => "ParserFinished"
+    ParserFinished => "ParserFinished",
+    InvalidStatusReason => "InvalidStatusReason",
+    UnexpectedBody => "UnexpectedBody",
+    BodyLengthMismatch => "BodyLengthMismatch",
+    MissingFraming => "MissingFraming"
   };
 }
 
-// reasonText(r): a sentence naming the violated rule. O(1).
+// httpErrorKindText(k): string -- a sentence naming the violated rule. Never empty. O(1).
 @Ensures(result.length > 0)
-export function reasonText(r: HttpReason): string {
-  return match (r) {
-    BadMethod => "invalid character in the method (not a token)",
-    BadTarget => "invalid request-target",
-    BadVersion => "malformed HTTP version",
+export function httpErrorKindText(k: HttpErrorKind): string {
+  return match (k) {
+    InvalidMethod => "invalid character in the method (not a token)",
+    InvalidTarget => "invalid request-target",
+    InvalidVersion => "malformed HTTP version",
     UnsupportedVersion => "unsupported HTTP version (only HTTP/1.0 and HTTP/1.1)",
-    BadStatusCode => "the status code must be three digits in 100..599",
-    BadStatusLine => "malformed status line",
-    BadHeaderName => "invalid character in a field name (not a token)",
+    InvalidStatusCode => "the status code must be three digits in 100..599",
+    InvalidStatusLine => "malformed status line",
+    InvalidFieldName => "invalid character in a field name (not a token)",
     MissingColon => "a header line without a colon",
     SpaceBeforeColon => "whitespace between the field name and the colon",
-    BadHeaderValue => "control character in a field value",
+    InvalidFieldValue => "control character in a field value",
     ObsFold => "obsolete line folding (a header line that starts with SP or HTAB)",
     BareLf => "bare LF: a line must end with CRLF",
     BareCr => "bare CR: a CR must be followed by LF",
@@ -471,7 +493,7 @@ export function reasonText(r: HttpReason): string {
     TooManyHeaders => "too many header fields",
     BodyTooLarge => "the body exceeds the limit",
     ChunkLineTooLong => "a chunk header line exceeds the limit",
-    BadContentLength => "invalid Content-Length (1 to 18 digits expected)",
+    InvalidContentLength => "invalid Content-Length (1 to 18 digits expected)",
     DuplicateContentLength => "duplicate Content-Length",
     ContentLengthWithTransferEncoding => "both Content-Length and Transfer-Encoding (request smuggling)",
     DuplicateTransferEncoding => "duplicate Transfer-Encoding",
@@ -479,26 +501,51 @@ export function reasonText(r: HttpReason): string {
     ForbiddenFraming => "Content-Length or Transfer-Encoding is not allowed in this message",
     MissingHost => "an HTTP/1.1 request needs a Host field",
     DuplicateHost => "duplicate Host field",
-    BadHost => "invalid Host field value",
-    BadChunkSize => "invalid chunk size (hexadecimal digits expected)",
-    BadChunkExtension => "control character in a chunk extension",
-    BadChunkTerminator => "chunk data is not followed by CRLF",
+    InvalidHost => "invalid Host field value",
+    InvalidChunkSize => "invalid chunk size (hexadecimal digits expected)",
+    InvalidChunkExtension => "control character in a chunk extension",
+    InvalidChunkTerminator => "chunk data is not followed by CRLF",
     ForbiddenTrailer => "a framing field is not allowed in the trailer section",
     UnexpectedEof => "the input ended before the message was complete",
-    ParserFinished => "the parser already finished its message (call reset())"
+    ParserFinished => "the parser already finished its message (call reset())",
+    InvalidStatusReason => "invalid character in the reason phrase",
+    UnexpectedBody => "a message that never has a body has a body or trailers",
+    BodyLengthMismatch => "Content-Length does not match the length of the body",
+    MissingFraming => "a body needs Content-Length or Transfer-Encoding"
   };
 }
 
-// The error of a parser: `position` is the 0-based byte offset (from the first byte of the message) of the byte
-// that violates the rule (for limits: the first byte over the limit; for end-of-headers rules such as
-// Content-Length + Transfer-Encoding: the CR of the empty line; for a duplicate field: the first byte of the
-// offending line; for `UnexpectedEof`: the number of bytes received).
-export type HttpError = { position: usize; reason: HttpReason; message: string; };
 
-// httpError(position, reason): the error with its message "<reason text> at byte <position>". O(1).
-@Ensures(result.position == position && result.message.length > 0)
-export function httpError(position: usize, reason: HttpReason): HttpError {
-  return HttpError { position: position, reason: reason, message: `${reasonText(reason)} at byte ${position.toString()}` };
+// reasonName(k): string -- use `httpErrorKindName`.
+@Deprecated("use httpErrorKindName")
+export function reasonName(k: HttpErrorKind): string {
+  return httpErrorKindName(k);
+}
+
+// reasonText(k): string -- use `httpErrorKindText`.
+@Deprecated("use httpErrorKindText")
+export function reasonText(k: HttpErrorKind): string {
+  return httpErrorKindText(k);
+}
+
+// The error of a parser or of a message constructor. `offset` is the 0-based byte offset (from the first byte of the
+// message) of the byte that violates the rule (for limits: the first byte over the limit; for end-of-headers rules such
+// as Content-Length + Transfer-Encoding: the CR of the empty line; for a duplicate field: the first byte of the offending
+// line; for `UnexpectedEof`: the number of bytes received). Errors of the constructors have no input: their offset is 0,
+// except `InvalidStatusReason`, whose offset is the index of the offending byte of the phrase. The text is
+// `httpErrorMessage(e)`.
+export type HttpError = { kind: HttpErrorKind; offset: usize; };
+
+// httpError(offset, kind): HttpError -- the error with this kind at this byte offset. O(1).
+@Ensures(result.offset == offset)
+export function httpError(offset: usize, kind: HttpErrorKind): HttpError {
+  return HttpError { kind: kind, offset: offset };
+}
+
+// httpErrorMessage(e): string -- "<sentence for the kind> at byte <offset>". Never empty. O(1).
+@Ensures(result.length > 0)
+export function httpErrorMessage(e: HttpError): string {
+  return `${httpErrorKindText(e.kind)} at byte ${e.offset.toString()}`;
 }
 
 // The answer of a parser: the message is incomplete, complete, or refused. `Done(message, used)`: `used` is the
@@ -508,15 +555,20 @@ export type ParseResult<T> = NeedMore | Done(T, usize) | Failed(HttpError);
 
 // ---------------------------------------------------------------------------------------------- Headers
 
-// Why `Headers.add` refused a field.
-export type HeaderError = InvalidHeaderName | InvalidHeaderValue;
+// Why a header field was refused: `InvalidHeaderName` (not a non-empty token), `InvalidHeaderValue` (a control character
+// or a leading or trailing blank), `MismatchedLists` (`tryHeaders` got lists of different lengths).
+export type HeaderErrorKind = InvalidHeaderName | InvalidHeaderValue | MismatchedLists;
 
-// headerErrorMessage(e): a sentence. O(1).
+// The error of `Headers.add`, `Headers.set` and `tryHeaders`. The text is `headerErrorMessage(e)`.
+export type HeaderError = { kind: HeaderErrorKind; };
+
+// headerErrorMessage(e): string -- a sentence. Never empty. O(1).
 @Ensures(result.length > 0)
 export function headerErrorMessage(e: HeaderError): string {
-  return match (e) {
+  return match (e.kind) {
     InvalidHeaderName => "invalid field name: a non-empty token is required",
-    InvalidHeaderValue => "invalid field value: no control characters (CR, LF, NUL, ...) and no leading or trailing blanks"
+    InvalidHeaderValue => "invalid field value: no control characters (CR, LF, NUL, ...) and no leading or trailing blanks",
+    MismatchedLists => "the lists of field names and field values differ in length"
   };
 }
 
@@ -530,8 +582,8 @@ function enforce(ok: bool, what: string): void {
   }
 }
 
-// allTokens(xs): every element is a token. Loop-based so that contracts can use it.
-export function allTokens(xs: string[]): bool {
+// allTokens(xs): every element is a token. Loop-based so that contracts can use it. Internal.
+function allTokens(xs: string[]): bool {
   let i: usize = 0;
   while (i < xs.length) {
     if (!isToken(xs[i])) {
@@ -542,8 +594,8 @@ export function allTokens(xs: string[]): bool {
   return true;
 }
 
-// allFieldValues(xs): every element is a valid field value.
-export function allFieldValues(xs: string[]): bool {
+// allFieldValues(xs): every element is a valid field value. Internal.
+function allFieldValues(xs: string[]): bool {
   let i: usize = 0;
   while (i < xs.length) {
     if (!isFieldValue(xs[i])) {
@@ -552,6 +604,10 @@ export function allFieldValues(xs: string[]): bool {
     i += 1;
   }
   return true;
+}
+
+function headerError(kind: HeaderErrorKind): HeaderError {
+  return HeaderError { kind: kind };
 }
 
 // An ordered list of header fields (also used for trailers). Names are case-insensitive for every lookup and are
@@ -567,8 +623,8 @@ export class Headers {
   private names: string[];
   private values: string[];
 
-  // new Headers(names, values): the fields (names[i], values[i]) in order. Traps (in every build) when the lists
-  // differ in length or an element is not a token / valid value; `headersFromLists` answers a Result instead.
+  // new Headers(names, values) -- the fields (names[i], values[i]) in order. Traps (in every build) when the lists
+  // differ in length or an element is not a token / valid value; `tryHeaders` answers a Result instead.
   @Requires(names.length == values.length && allTokens(names) && allFieldValues(values))
   constructor(names: string[], values: string[]) {
     this.names = names;
@@ -576,27 +632,39 @@ export class Headers {
     enforce(names.length == values.length && allTokens(names) && allFieldValues(values), "invalid Headers");
   }
 
-  // count(): number of fields. O(1).
+  // size(): usize -- number of fields. O(1).
   @Ensures(result == this.names.length)
+  size(): usize {
+    return this.names.length;
+  }
+
+  // count(): usize -- use `size()`.
+  @Deprecated("use size()")
   count(): usize {
     return this.names.length;
   }
 
-  // nameAt(i): the name of the i-th field, as written. O(1).
+  // isEmpty(): bool -- there are no fields. O(1).
+  @Ensures(result == (this.size() == 0))
+  isEmpty(): bool {
+    return this.names.length == 0;
+  }
+
+  // nameAt(i): string -- the name of the i-th field, as written. Traps unless i < size(). O(1).
   @Requires(i < this.names.length)
   @Ensures(isToken(result))
   nameAt(i: usize): string {
     return this.names[i];
   }
 
-  // valueAt(i): the value of the i-th field. O(1).
+  // valueAt(i): string -- the value of the i-th field. Traps unless i < size(). O(1).
   @Requires(i < this.names.length)
   @Ensures(isFieldValue(result))
   valueAt(i: usize): string {
     return this.values[i];
   }
 
-  // countOf(name): number of fields called `name` (case-insensitive). O(count).
+  // countOf(name): usize -- number of fields called `name` (case-insensitive). O(size).
   @Ensures(result <= this.names.length)
   @Ensures(result == this.names.filter(n => eqIgnoreCase(n, name)).length)
   countOf(name: string): usize {
@@ -611,7 +679,7 @@ export class Headers {
     return n;
   }
 
-  // has(name): some field is called `name` (case-insensitive). O(count).
+  // has(name): bool -- some field is called `name` (case-insensitive). O(size).
   @Ensures(result == (this.countOf(name) > 0))
   @Ensures(result == this.names.some(n => eqIgnoreCase(n, name)))
   has(name: string): bool {
@@ -625,7 +693,7 @@ export class Headers {
     return false;
   }
 
-  // get(name): the value of the first field called `name`, or None. O(count).
+  // get(name): Option<string> -- the value of the first field called `name`, or None. O(size).
   @Ensures(result.isSome() == this.has(name))
   @Ensures(result.isSome() ==> isFieldValue(result.unwrap()))
   get(name: string): Option<string> {
@@ -639,7 +707,7 @@ export class Headers {
     return None;
   }
 
-  // getAll(name): the values of all fields called `name`, in order. O(count).
+  // getAll(name): string[] -- the values of all fields called `name`, in order. O(size).
   @Ensures(result.length == this.countOf(name))
   @Ensures(result.every(v => isFieldValue(v)))
   getAll(name: string): string[] {
@@ -654,27 +722,27 @@ export class Headers {
     return out;
   }
 
-  // add(name, value): appends a field. Err (and no change) when `name` is not a token or `value` is not a valid
-  // field value. O(name + value).
+  // add(name, value): Result<void, HeaderError> -- appends a field. Err (and no change) when `name` is not a token
+  // (InvalidHeaderName) or `value` is not a valid field value (InvalidHeaderValue). O(name + value).
   @Ensures(result.isOk() == (isToken(name) && isFieldValue(value)))
-  @Ensures(result.isOk() ==> this.count() == old(this.count()) + 1)
-  @Ensures(result.isOk() ==> this.nameAt(this.count() - 1) == name && this.valueAt(this.count() - 1) == value)
-  @Ensures(result.isErr() ==> this.count() == old(this.count()))
+  @Ensures(result.isOk() ==> this.size() == old(this.size()) + 1)
+  @Ensures(result.isOk() ==> this.nameAt(this.size() - 1) == name && this.valueAt(this.size() - 1) == value)
+  @Ensures(result.isErr() ==> this.size() == old(this.size()))
   add(name: string, value: string): Result<void, HeaderError> {
     if (!isToken(name)) {
-      return Err(InvalidHeaderName);
+      return Err(headerError(InvalidHeaderName));
     }
     if (!isFieldValue(value)) {
-      return Err(InvalidHeaderValue);
+      return Err(headerError(InvalidHeaderValue));
     }
     this.names.push(name);
     this.values.push(value);
     return Ok();
   }
 
-  // remove(name): deletes every field called `name`; the number removed. O(count).
+  // remove(name): usize -- deletes every field called `name`; the number removed (0 if there was none). O(size).
   @Ensures(this.countOf(name) == 0)
-  @Ensures(this.count() + result == old(this.count()))
+  @Ensures(this.size() + result == old(this.size()))
   @Ensures(result == old(this.countOf(name)))
   remove(name: string): usize {
     let ns: string[] = [];
@@ -693,17 +761,17 @@ export class Headers {
     return removed;
   }
 
-  // set(name, value): replaces every field called `name` by one field (appended at the end). Err (and no change)
-  // when the name or value is invalid. O(count).
+  // set(name, value): Result<void, HeaderError> -- replaces every field called `name` by one field (appended at the
+  // end). Err (and no change) when the name or value is invalid, as for `add`. O(size).
   @Ensures(result.isOk() == (isToken(name) && isFieldValue(value)))
   @Ensures(result.isOk() ==> this.countOf(name) == 1 && this.get(name).unwrap() == value)
-  @Ensures(result.isErr() ==> this.count() == old(this.count()))
+  @Ensures(result.isErr() ==> this.size() == old(this.size()))
   set(name: string, value: string): Result<void, HeaderError> {
     if (!isToken(name)) {
-      return Err(InvalidHeaderName);
+      return Err(headerError(InvalidHeaderName));
     }
     if (!isFieldValue(value)) {
-      return Err(InvalidHeaderValue);
+      return Err(headerError(InvalidHeaderValue));
     }
     this.remove(name);
     this.names.push(name);
@@ -711,10 +779,10 @@ export class Headers {
     return Ok();
   }
 
-  // equals(other): the same fields in the same order, names compared as written (byte for byte). O(size).
-  @Ensures(result ==> this.count() == other.count())
+  // equals(other): bool -- the same fields in the same order, names compared as written (byte for byte). O(size).
+  @Ensures(result ==> this.size() == other.size())
   equals(other: Headers): bool {
-    if (this.names.length != other.count()) {
+    if (this.names.length != other.size()) {
       return false;
     }
     let i: usize = 0;
@@ -728,92 +796,114 @@ export class Headers {
   }
 }
 
-// emptyHeaders(): no fields. O(1).
-@Ensures(result.count() == 0)
+// emptyHeaders(): Headers -- no fields. O(1).
+@Ensures(result.size() == 0)
 export function emptyHeaders(): Headers {
   return new Headers([], []);
 }
 
-// headersFromLists(names, values): the fields as a Result instead of a trap. O(size).
+// tryHeaders(names, values): Result<Headers, HeaderError> -- the fields (names[i], values[i]) as a Result instead of a
+// trap: Err(MismatchedLists) when the lists differ in length, Err(InvalidHeaderName) / Err(InvalidHeaderValue) for the
+// first kind of violation found (names are checked before values). The twin of `new Headers(names, values)`. O(size).
 @Ensures(result.isOk() == (names.length == values.length && allTokens(names) && allFieldValues(values)))
-export function headersFromLists(names: string[], values: string[]): Result<Headers, HeaderError> {
+export function tryHeaders(names: string[], values: string[]): Result<Headers, HeaderError> {
   if (names.length != values.length) {
-    return Err(InvalidHeaderValue);
+    return Err(headerError(MismatchedLists));
   }
   if (!allTokens(names)) {
-    return Err(InvalidHeaderName);
+    return Err(headerError(InvalidHeaderName));
   }
   if (!allFieldValues(values)) {
-    return Err(InvalidHeaderValue);
+    return Err(headerError(InvalidHeaderValue));
   }
   return Ok(new Headers(names, values));
 }
 
+// headersFromLists(names, values): Result<Headers, HeaderError> -- use `tryHeaders`.
+@Deprecated("use tryHeaders (a length mismatch is now MismatchedLists, no longer InvalidHeaderValue)")
+export function headersFromLists(names: string[], values: string[]): Result<Headers, HeaderError> {
+  return tryHeaders(names, values);
+}
+
 // ----------------------------------------------------------------------------------------------- Status
 
-// standardReason(code): the registered reason phrase of a status code (RFC 9110 §15), "" when unregistered. O(1).
-export function standardReason(code: int): string {
+// standardReason(code): Option<string> -- the registered reason phrase of a status code (RFC 9110 §15), None when
+// the code is unregistered. O(1). Internal.
+export function standardReason(code: int): Option<string> {
   return match (code) {
-    100 => "Continue",
-    101 => "Switching Protocols",
-    102 => "Processing",
-    103 => "Early Hints",
-    200 => "OK",
-    201 => "Created",
-    202 => "Accepted",
-    203 => "Non-Authoritative Information",
-    204 => "No Content",
-    205 => "Reset Content",
-    206 => "Partial Content",
-    207 => "Multi-Status",
-    300 => "Multiple Choices",
-    301 => "Moved Permanently",
-    302 => "Found",
-    303 => "See Other",
-    304 => "Not Modified",
-    305 => "Use Proxy",
-    307 => "Temporary Redirect",
-    308 => "Permanent Redirect",
-    400 => "Bad Request",
-    401 => "Unauthorized",
-    402 => "Payment Required",
-    403 => "Forbidden",
-    404 => "Not Found",
-    405 => "Method Not Allowed",
-    406 => "Not Acceptable",
-    407 => "Proxy Authentication Required",
-    408 => "Request Timeout",
-    409 => "Conflict",
-    410 => "Gone",
-    411 => "Length Required",
-    412 => "Precondition Failed",
-    413 => "Content Too Large",
-    414 => "URI Too Long",
-    415 => "Unsupported Media Type",
-    416 => "Range Not Satisfiable",
-    417 => "Expectation Failed",
-    418 => "I'm a teapot",
-    421 => "Misdirected Request",
-    422 => "Unprocessable Content",
-    426 => "Upgrade Required",
-    428 => "Precondition Required",
-    429 => "Too Many Requests",
-    431 => "Request Header Fields Too Large",
-    451 => "Unavailable For Legal Reasons",
-    500 => "Internal Server Error",
-    501 => "Not Implemented",
-    502 => "Bad Gateway",
-    503 => "Service Unavailable",
-    504 => "Gateway Timeout",
-    505 => "HTTP Version Not Supported",
-    _ => ""
+    100 => Some("Continue"),
+    101 => Some("Switching Protocols"),
+    102 => Some("Processing"),
+    103 => Some("Early Hints"),
+    200 => Some("OK"),
+    201 => Some("Created"),
+    202 => Some("Accepted"),
+    203 => Some("Non-Authoritative Information"),
+    204 => Some("No Content"),
+    205 => Some("Reset Content"),
+    206 => Some("Partial Content"),
+    207 => Some("Multi-Status"),
+    300 => Some("Multiple Choices"),
+    301 => Some("Moved Permanently"),
+    302 => Some("Found"),
+    303 => Some("See Other"),
+    304 => Some("Not Modified"),
+    305 => Some("Use Proxy"),
+    307 => Some("Temporary Redirect"),
+    308 => Some("Permanent Redirect"),
+    400 => Some("Bad Request"),
+    401 => Some("Unauthorized"),
+    402 => Some("Payment Required"),
+    403 => Some("Forbidden"),
+    404 => Some("Not Found"),
+    405 => Some("Method Not Allowed"),
+    406 => Some("Not Acceptable"),
+    407 => Some("Proxy Authentication Required"),
+    408 => Some("Request Timeout"),
+    409 => Some("Conflict"),
+    410 => Some("Gone"),
+    411 => Some("Length Required"),
+    412 => Some("Precondition Failed"),
+    413 => Some("Content Too Large"),
+    414 => Some("URI Too Long"),
+    415 => Some("Unsupported Media Type"),
+    416 => Some("Range Not Satisfiable"),
+    417 => Some("Expectation Failed"),
+    418 => Some("I'm a teapot"),
+    421 => Some("Misdirected Request"),
+    422 => Some("Unprocessable Content"),
+    426 => Some("Upgrade Required"),
+    428 => Some("Precondition Required"),
+    429 => Some("Too Many Requests"),
+    431 => Some("Request Header Fields Too Large"),
+    451 => Some("Unavailable For Legal Reasons"),
+    500 => Some("Internal Server Error"),
+    501 => Some("Not Implemented"),
+    502 => Some("Bad Gateway"),
+    503 => Some("Service Unavailable"),
+    504 => Some("Gateway Timeout"),
+    505 => Some("HTTP Version Not Supported"),
+    _ => None
   };
 }
 
-// statusHasNoBody(code): a response with this status never has a message body: 1xx, 204 and 304 (RFC 9112 §6.3). O(1).
+// statusHasNoBody(code): bool -- a response with this status never has a message body: 1xx, 204 and 304 (RFC 9112 §6.3).
+// O(1). Internal.
 @Ensures(result == (code < 200 || code == 204 || code == 304))
 export function statusHasNoBody(code: int): bool {
   return code < 200 || code == 204 || code == 304;
+}
+
+// The index of the first byte of `s` that may not occur in a reason phrase, or None. O(n).
+function badReasonByte(s: string): Option<usize> {
+  let i: usize = 0;
+  while (i < s.length) {
+    if (HTTP_CLASS.charCodeAt(s.charCodeAt(i).toUsize()) < C_HTAB) {
+      return Some(i);
+    }
+    i += 1;
+  }
+  return None;
 }
 
 // A response status: the code (100..599, the invariant) and the reason phrase, which is kept byte for byte.
@@ -823,8 +913,8 @@ export class Status {
   private statusCode: int;
   private phrase: string;
 
-  // new Status(code, reason): traps (in every build) unless 100 <= code <= 599 and `reason` has only HTAB, SP,
-  // VCHAR and obs-text. `standardStatus(code)` picks the registered phrase.
+  // new Status(code, reason) -- traps (in every build) unless 100 <= code <= 599 and `reason` has only HTAB, SP,
+  // VCHAR and obs-text. `Status.tryNew` answers a Result instead; `standardStatus(code)` picks the registered phrase.
   @Requires(code >= 100 && code <= 599 && isReasonPhrase(reason))
   constructor(code: int, reason: string) {
     this.statusCode = code;
@@ -832,49 +922,63 @@ export class Status {
     enforce(code >= 100 && code <= 599 && isReasonPhrase(reason), "invalid Status");
   }
 
-  // code(): 100..599. O(1).
+  // Status.tryNew(code, reason): Result<Status, HttpError> -- the status as a Result instead of a trap:
+  // Err(InvalidStatusCode) (offset 0) unless 100 <= code <= 599, Err(InvalidStatusReason) with the offset of the first
+  // offending byte of the phrase. The twin of `new Status(code, reason)`. O(n).
+  @Ensures(result.isOk() == (code >= 100 && code <= 599 && isReasonPhrase(reason)))
+  static tryNew(code: int, reason: string): Result<Status, HttpError> {
+    if (code < 100 || code > 599) {
+      return Err(httpError(0, InvalidStatusCode));
+    }
+    const bad = badReasonByte(reason);
+    if (bad.isSome()) {
+      return Err(httpError(bad.unwrap(), InvalidStatusReason));
+    }
+    return Ok(new Status(code, reason));
+  }
+
+  // code(): int -- 100..599. O(1).
   @Ensures(result >= 100 && result <= 599)
   code(): int {
     return this.statusCode;
   }
 
-  // reason(): the reason phrase (may be empty). O(1).
+  // reason(): string -- the reason phrase (may be empty). O(1).
   @Ensures(isReasonPhrase(result))
   reason(): string {
     return this.phrase;
   }
 
-  // hasNoBody(): see `statusHasNoBody`. O(1).
+  // hasNoBody(): bool -- see `statusHasNoBody`. O(1).
   @Ensures(result == statusHasNoBody(this.statusCode))
   hasNoBody(): bool {
     return statusHasNoBody(this.statusCode);
   }
 
-  // equals(other): same code and same phrase. O(n).
+  // equals(other): bool -- same code and same phrase. O(n).
   @Ensures(result ==> this.statusCode == other.code())
   equals(other: Status): bool {
     return this.statusCode == other.code() && this.phrase == other.reason();
   }
 }
 
-// standardStatus(code): the status with the registered phrase of `code` ("Unknown Status" for an unregistered code).
+// standardStatus(code): Status -- the status with the registered phrase of `code` ("Unknown Status" for an unregistered
+// code). Traps unless 100 <= code <= 599. O(1).
 @Requires(code >= 100 && code <= 599)
 @Ensures(result.code() == code)
 export function standardStatus(code: int): Status {
   const r = standardReason(code);
-  return new Status(code, r == "" ? "Unknown Status" : r);
+  return new Status(code, r.isSome() ? r.unwrap() : "Unknown Status");
 }
 
-// makeStatus(code, reason): the status as a Result instead of a trap. O(n).
-@Ensures(result.isOk() == (code >= 100 && code <= 599 && isReasonPhrase(reason)))
+// makeStatus(code, reason): Result<Status, string> -- use `Status.tryNew` (a typed error instead of a string).
+@Deprecated("use Status.tryNew")
 export function makeStatus(code: int, reason: string): Result<Status, string> {
-  if (code < 100 || code > 599) {
-    return Err("status code out of range 100..599");
+  const r = Status.tryNew(code, reason);
+  if (r.isErr()) {
+    return Err(httpErrorKindText(r.unwrapErr().kind));
   }
-  if (!isReasonPhrase(reason)) {
-    return Err("invalid reason phrase");
-  }
-  return Ok(new Status(code, reason));
+  return Ok(r.unwrap());
 }
 
 // ------------------------------------------------------------------------------- message validity rules
@@ -894,7 +998,7 @@ function isForbiddenTrailerName(n: string): bool {
 
 function hasForbiddenTrailer(t: Headers): bool {
   let i: usize = 0;
-  while (i < t.count()) {
+  while (i < t.size()) {
     if (isForbiddenTrailerName(t.nameAt(i))) {
       return true;
     }
@@ -903,33 +1007,34 @@ function hasForbiddenTrailer(t: Headers): bool {
   return false;
 }
 
-// framingProblem(...): "" when the header fields frame the body unambiguously and consistently with `body` and
+// framingProblem(...): None when the header fields frame the body unambiguously and consistently with `body` and
 // `trailers`, else the first violated rule. `bodyless`: the message never has a body (response to HEAD, 1xx, 204,
 // 304); `closeOk`: a body without Content-Length / Transfer-Encoding is allowed (a response: it ends at connection
 // close); `noFraming`: neither field may occur (1xx and 204 responses). The rules are exactly those of the parser.
+// Internal.
 function framingProblem(h: Headers, trailers: Headers, body: Bytes, version: HttpVersion, bodyless: bool, closeOk: bool,
-    noFraming: bool): string {
+    noFraming: bool): Option<HttpErrorKind> {
   const cl = h.countOf("content-length");
   const te = h.countOf("transfer-encoding");
   if (noFraming && (cl > 0 || te > 0)) {
-    return "Content-Length or Transfer-Encoding is not allowed in this message";
+    return Some(ForbiddenFraming);
   }
   if (cl > 1) {
-    return "duplicate Content-Length";
+    return Some(DuplicateContentLength);
   }
   if (te > 1) {
-    return "duplicate Transfer-Encoding";
+    return Some(DuplicateTransferEncoding);
   }
   if (cl == 1 && te == 1) {
-    return "both Content-Length and Transfer-Encoding";
+    return Some(ContentLengthWithTransferEncoding);
   }
   let chunked = false;
   if (te == 1) {
     if (!eqIgnoreCase(h.get("transfer-encoding").unwrap(), "chunked")) {
-      return "unsupported Transfer-Encoding";
+      return Some(UnsupportedTransferEncoding);
     }
     if (!isHttp11(version)) {
-      return "Transfer-Encoding needs HTTP/1.1";
+      return Some(UnsupportedTransferEncoding);
     }
     chunked = true;
   }
@@ -937,79 +1042,81 @@ function framingProblem(h: Headers, trailers: Headers, body: Bytes, version: Htt
   if (cl == 1) {
     const p = parseContentLength(h.get("content-length").unwrap());
     if (p.isNone()) {
-      return "invalid Content-Length";
+      return Some(InvalidContentLength);
     }
     declared = p.unwrap();
   }
   if (bodyless) {
-    if (body.length() != 0) {
-      return "a bodyless message has a body";
+    if (body.length() != 0 || trailers.size() != 0) {
+      return Some(UnexpectedBody);
     }
-    if (trailers.count() != 0) {
-      return "a bodyless message has trailers";
-    }
-    return "";
+    return None;
   }
-  if (trailers.count() > 0 && !chunked) {
-    return "trailers without chunked Transfer-Encoding";
+  if (trailers.size() > 0 && !chunked) {
+    return Some(ForbiddenTrailer);
   }
   if (hasForbiddenTrailer(trailers)) {
-    return "framing field in the trailers";
+    return Some(ForbiddenTrailer);
   }
   if (chunked) {
-    return "";
+    return None;
   }
   if (cl == 1) {
     if (declared != body.length()) {
-      return "Content-Length does not match the body";
+      return Some(BodyLengthMismatch);
     }
-    return "";
+    return None;
   }
   if (!closeOk && body.length() != 0) {
-    return "a body needs Content-Length or Transfer-Encoding";
+    return Some(MissingFraming);
   }
-  return "";
+  return None;
 }
 
-// requestProblem(...): "" when the parts form a well-formed request, else the first violated rule. The class
-// invariant of `Request`, the check of its constructor and the rules of the parser. O(size).
-export function requestProblem(method: Method, target: string, version: HttpVersion, headers: Headers, body: Bytes,
-    trailers: Headers): string {
+// requestProblem(...): None when the parts form a well-formed request, else the first violated rule. The class
+// invariant of `Request`, the check of its constructor and the rules of the parser. O(size). Internal.
+function requestProblem(method: Method, target: string, version: HttpVersion, headers: Headers, body: Bytes,
+    trailers: Headers): Option<HttpErrorKind> {
   if (!isValidMethod(method)) {
-    return "invalid method";
+    return Some(InvalidMethod);
   }
   if (!isValidTarget(method, target)) {
-    return "invalid request-target";
+    return Some(InvalidTarget);
   }
   const hosts = headers.countOf("host");
   if (hosts > 1) {
-    return "duplicate Host";
+    return Some(DuplicateHost);
   }
   if (hosts == 0 && isHttp11(version)) {
-    return "an HTTP/1.1 request needs a Host field";
+    return Some(MissingHost);
   }
   if (hosts == 1 && !isHostValue(headers.get("host").unwrap())) {
-    return "invalid Host";
+    return Some(InvalidHost);
   }
   return framingProblem(headers, trailers, body, version, false, false, false);
 }
 
-// responseProblem(...): "" when the parts form a well-formed response. `forHead`: the response to a HEAD request
-// (its headers describe a body that is not sent). O(size).
-export function responseProblem(status: Status, version: HttpVersion, headers: Headers, body: Bytes, trailers: Headers,
-    forHead: bool): string {
+// responseProblem(...): None when the parts form a well-formed response. `forHead`: the response to a HEAD request
+// (its headers describe a body that is not sent). O(size). Internal.
+function responseProblem(status: Status, version: HttpVersion, headers: Headers, body: Bytes, trailers: Headers,
+    forHead: bool): Option<HttpErrorKind> {
   const code = status.code();
   return framingProblem(headers, trailers, body, version, forHead || statusHasNoBody(code), true, code < 200 || code == 204);
 }
 
 // ---------------------------------------------------------------------------------- Request and Response
 
+// The parts of a request, for `Request.tryNew` (six positional arguments of different meaning invite transposition).
+export type RequestParts = {
+  method: Method; target: string; version: HttpVersion; headers: Headers; body: Bytes; trailers: Headers;
+};
+
 // A parsed or to-be-serialized HTTP request: method, request-target, version, header fields, body, trailers.
-// Invariant: `requestProblem(...) == ""` (valid method and target, one Host on HTTP/1.1, unambiguous framing that
+// Invariant: `requestProblem(...)` is None (valid method and target, one Host on HTTP/1.1, unambiguous framing that
 // matches the body). The constructor enforces it in every build; there is no mutating method. A chunked request
 // stores the decoded body and its trailer fields (chunk boundaries and extensions are not kept); a request with
 // `Transfer-Encoding: chunked` has `isChunked()`.
-@Invariant(requestProblem(this.reqMethod, this.reqTarget, this.reqVersion, this.reqHeaders, this.reqBody, this.reqTrailers) == "")
+@Invariant(requestProblem(this.reqMethod, this.reqTarget, this.reqVersion, this.reqHeaders, this.reqBody, this.reqTrailers).isNone())
 export class Request {
   private reqMethod: Method;
   private reqTarget: string;
@@ -1018,9 +1125,10 @@ export class Request {
   private reqBody: Bytes;
   private reqTrailers: Headers;
 
-  // new Request(method, target, version, headers, body, trailers): traps (in every build) unless
-  // `requestProblem(...) == ""`; `makeRequest` answers a Result instead.
-  @Requires(requestProblem(method, target, version, headers, body, trailers) == "")
+  // new Request(method, target, version, headers, body, trailers) -- traps (in every build) unless the parts form a
+  // well-formed request (valid method and target, one Host on HTTP/1.1, unambiguous framing matching the body);
+  // `Request.tryNew` answers a Result instead.
+  @Requires(requestProblem(method, target, version, headers, body, trailers).isNone())
   constructor(method: Method, target: string, version: HttpVersion, headers: Headers, body: Bytes, trailers: Headers) {
     this.reqMethod = method;
     this.reqTarget = target;
@@ -1028,49 +1136,61 @@ export class Request {
     this.reqHeaders = headers;
     this.reqBody = body;
     this.reqTrailers = trailers;
-    enforce(requestProblem(method, target, version, headers, body, trailers) == "", "invalid Request");
+    enforce(requestProblem(method, target, version, headers, body, trailers).isNone(), "invalid Request");
   }
 
-  // method(): the request method. O(1).
+  // Request.tryNew(parts): Result<Request, HttpError> -- the request, or the first violated rule as the kind of the
+  // error (InvalidMethod, InvalidTarget, DuplicateHost, MissingHost, InvalidHost, or a framing kind such as
+  // BodyLengthMismatch; offset 0), instead of a trap. The twin of `new Request(..)`. O(size).
+  @Ensures(result.isOk() == requestProblem(parts.method, parts.target, parts.version, parts.headers, parts.body, parts.trailers).isNone())
+  static tryNew(parts: RequestParts): Result<Request, HttpError> {
+    const p = requestProblem(parts.method, parts.target, parts.version, parts.headers, parts.body, parts.trailers);
+    if (p.isSome()) {
+      return Err(httpError(0, p.unwrap()));
+    }
+    return Ok(new Request(parts.method, parts.target, parts.version, parts.headers, parts.body, parts.trailers));
+  }
+
+  // method(): Method -- the request method. O(1).
   @Ensures(isValidMethod(result))
   method(): Method {
     return this.reqMethod;
   }
 
-  // target(): the request-target as sent. O(1).
+  // target(): string -- the request-target as sent. O(1).
   @Ensures(isValidTarget(this.reqMethod, result))
   target(): string {
     return this.reqTarget;
   }
 
-  // version(): HTTP/1.0 or HTTP/1.1. O(1).
+  // version(): HttpVersion -- HTTP/1.0 or HTTP/1.1. O(1).
   version(): HttpVersion {
     return this.reqVersion;
   }
 
-  // headers(): the header fields in order. O(1).
+  // headers(): Headers -- the header fields in order. O(1).
   headers(): Headers {
     return this.reqHeaders;
   }
 
-  // body(): the (decoded) message body. O(1).
+  // body(): Bytes -- the (decoded) message body. O(1).
   body(): Bytes {
     return this.reqBody;
   }
 
-  // trailers(): the trailer fields of a chunked body (empty otherwise). O(1).
-  @Ensures(result.count() > 0 ==> this.isChunked())
+  // trailers(): Headers -- the trailer fields of a chunked body (empty otherwise). O(1).
+  @Ensures(result.size() > 0 ==> this.isChunked())
   trailers(): Headers {
     return this.reqTrailers;
   }
 
-  // isChunked(): the body is sent with `Transfer-Encoding: chunked`. O(count).
+  // isChunked(): bool -- the body is sent with `Transfer-Encoding: chunked`. O(size of headers).
   @Ensures(result == (this.reqHeaders.countOf("transfer-encoding") == 1))
   isChunked(): bool {
     return this.reqHeaders.countOf("transfer-encoding") == 1;
   }
 
-  // equals(other): the same method, target, version, headers, body and trailers. O(size).
+  // equals(other): bool -- the same method, target, version, headers, body and trailers. O(size).
   equals(other: Request): bool {
     return methodEquals(this.reqMethod, other.method()) && this.reqTarget == other.target()
       && versionMinor(this.reqVersion) == versionMinor(other.version()) && this.reqHeaders.equals(other.headers())
@@ -1078,21 +1198,27 @@ export class Request {
   }
 }
 
-// makeRequest(...): the request, or the first violated rule (`requestProblem`), instead of a trap. O(size).
-@Ensures(result.isOk() == (requestProblem(method, target, version, headers, body, trailers) == ""))
+// makeRequest(method, target, version, headers, body, trailers): Result<Request, string> -- use `Request.tryNew`
+// (one `RequestParts` record, a typed error instead of a string).
+@Deprecated("use Request.tryNew(RequestParts)")
 export function makeRequest(method: Method, target: string, version: HttpVersion, headers: Headers, body: Bytes,
     trailers: Headers): Result<Request, string> {
   const p = requestProblem(method, target, version, headers, body, trailers);
-  if (p != "") {
-    return Err(p);
+  if (p.isSome()) {
+    return Err(httpErrorKindText(p.unwrap()));
   }
   return Ok(new Request(method, target, version, headers, body, trailers));
 }
 
-// A parsed or to-be-serialized HTTP response. Invariant: `responseProblem(...) == ""`. `forHead`: the response to
+// The parts of a response, for `Response.tryNew`. `forHead`: the response to a HEAD request.
+export type ResponseParts = {
+  status: Status; version: HttpVersion; headers: Headers; body: Bytes; trailers: Headers; forHead: bool;
+};
+
+// A parsed or to-be-serialized HTTP response. Invariant: `responseProblem(...)` is None. `forHead`: the response to
 // a HEAD request, whose headers (Content-Length, Transfer-Encoding) describe a body that is not sent; 1xx, 204
 // and 304 responses are bodyless in any case (`isBodyless()`).
-@Invariant(responseProblem(this.resStatus, this.resVersion, this.resHeaders, this.resBody, this.resTrailers, this.resForHead) == "")
+@Invariant(responseProblem(this.resStatus, this.resVersion, this.resHeaders, this.resBody, this.resTrailers, this.resForHead).isNone())
 export class Response {
   private resStatus: Status;
   private resVersion: HttpVersion;
@@ -1101,9 +1227,10 @@ export class Response {
   private resTrailers: Headers;
   private resForHead: bool;
 
-  // new Response(status, version, headers, body, trailers, forHead): traps (in every build) unless
-  // `responseProblem(...) == ""`; `makeResponse` answers a Result instead.
-  @Requires(responseProblem(status, version, headers, body, trailers, forHead) == "")
+  // new Response(status, version, headers, body, trailers, forHead) -- traps (in every build) unless the parts form a
+  // well-formed response (unambiguous framing matching the body; no body for 1xx, 204, 304 or a HEAD response);
+  // `Response.tryNew` answers a Result instead.
+  @Requires(responseProblem(status, version, headers, body, trailers, forHead).isNone())
   constructor(status: Status, version: HttpVersion, headers: Headers, body: Bytes, trailers: Headers, forHead: bool) {
     this.resStatus = status;
     this.resVersion = version;
@@ -1111,56 +1238,68 @@ export class Response {
     this.resBody = body;
     this.resTrailers = trailers;
     this.resForHead = forHead;
-    enforce(responseProblem(status, version, headers, body, trailers, forHead) == "", "invalid Response");
+    enforce(responseProblem(status, version, headers, body, trailers, forHead).isNone(), "invalid Response");
   }
 
-  // status(): code and reason phrase. O(1).
+  // Response.tryNew(parts): Result<Response, HttpError> -- the response, or the first violated rule as the kind of the
+  // error (a framing kind such as UnexpectedBody or BodyLengthMismatch; offset 0), instead of a trap. The twin of
+  // `new Response(..)`. O(size).
+  @Ensures(result.isOk() == responseProblem(parts.status, parts.version, parts.headers, parts.body, parts.trailers, parts.forHead).isNone())
+  static tryNew(parts: ResponseParts): Result<Response, HttpError> {
+    const p = responseProblem(parts.status, parts.version, parts.headers, parts.body, parts.trailers, parts.forHead);
+    if (p.isSome()) {
+      return Err(httpError(0, p.unwrap()));
+    }
+    return Ok(new Response(parts.status, parts.version, parts.headers, parts.body, parts.trailers, parts.forHead));
+  }
+
+  // status(): Status -- code and reason phrase. O(1).
   status(): Status {
     return this.resStatus;
   }
 
-  // version(): HTTP/1.0 or HTTP/1.1. O(1).
+  // version(): HttpVersion -- HTTP/1.0 or HTTP/1.1. O(1).
   version(): HttpVersion {
     return this.resVersion;
   }
 
-  // headers(): the header fields in order. O(1).
+  // headers(): Headers -- the header fields in order. O(1).
   headers(): Headers {
     return this.resHeaders;
   }
 
-  // body(): the (decoded) message body. O(1).
+  // body(): Bytes -- the (decoded) message body. O(1).
   body(): Bytes {
     return this.resBody;
   }
 
-  // trailers(): the trailer fields of a chunked body (empty otherwise). O(1).
-  @Ensures(result.count() > 0 ==> this.isChunked())
+  // trailers(): Headers -- the trailer fields of a chunked body (empty otherwise). O(1).
+  @Ensures(result.size() > 0 ==> this.isChunked())
   trailers(): Headers {
     return this.resTrailers;
   }
 
-  // isBodyless(): no body is sent: response to HEAD, or status 1xx, 204, 304. O(1).
+  // isBodyless(): bool -- no body is sent: response to HEAD, or status 1xx, 204, 304. O(1).
   @Ensures(result == (this.resForHead || this.resStatus.hasNoBody()))
   @Ensures(result ==> this.resBody.length() == 0)
   isBodyless(): bool {
     return this.resForHead || this.resStatus.hasNoBody();
   }
 
-  // isForHead(): the response to a HEAD request. O(1).
+  // isForHead(): bool -- the response to a HEAD request. O(1).
   @Ensures(result == this.resForHead)
   isForHead(): bool {
     return this.resForHead;
   }
 
-  // isChunked(): the body is sent with `Transfer-Encoding: chunked` (never true for a bodyless message when
-  // serialized: no chunks are written). O(count).
+  // isChunked(): bool -- the body is sent with `Transfer-Encoding: chunked` (never true for a bodyless message when
+  // serialized: no chunks are written). O(size of headers).
   @Ensures(result == (this.resHeaders.countOf("transfer-encoding") == 1))
   isChunked(): bool {
     return this.resHeaders.countOf("transfer-encoding") == 1;
   }
 
-  // equals(other): the same status, version, headers, body, trailers and HEAD flag. O(size).
+  // equals(other): bool -- the same status, version, headers, body, trailers and HEAD flag. O(size).
   equals(other: Response): bool {
     return this.resStatus.equals(other.status()) && versionMinor(this.resVersion) == versionMinor(other.version())
       && this.resHeaders.equals(other.headers()) && this.resBody.equals(other.body())
@@ -1168,13 +1307,14 @@ export class Response {
   }
 }
 
-// makeResponse(...): the response, or the first violated rule (`responseProblem`), instead of a trap. O(size).
-@Ensures(result.isOk() == (responseProblem(status, version, headers, body, trailers, forHead) == ""))
+// makeResponse(status, version, headers, body, trailers, forHead): Result<Response, string> -- use `Response.tryNew`
+// (one `ResponseParts` record, a typed error instead of a string).
+@Deprecated("use Response.tryNew(ResponseParts)")
 export function makeResponse(status: Status, version: HttpVersion, headers: Headers, body: Bytes, trailers: Headers,
     forHead: bool): Result<Response, string> {
   const p = responseProblem(status, version, headers, body, trailers, forHead);
-  if (p != "") {
-    return Err(p);
+  if (p.isSome()) {
+    return Err(httpErrorKindText(p.unwrap()));
   }
   return Ok(new Response(status, version, headers, body, trailers, forHead));
 }
@@ -1183,9 +1323,10 @@ export function makeResponse(status: Status, version: HttpVersion, headers: Head
 // -------------------------------------------------------------------------------------------------- Limits
 
 // The resource limits of a parser. Every message that exceeds one is refused at the first byte over the limit
-// (a request line, a header line, the header section, the header count, a chunk header line, the body). They are
-// the `@Requires` of the constructor and the invariants of the class, so a parser can never be built with a
-// limit that is zero, negative or large enough to overflow the chunk-size arithmetic.
+// (a request line, a header line, the header section, the header count, a chunk header line, the body). A parser
+// can only be built with limits that satisfy `isValidLimits`, so it can never run with a limit that is zero,
+// negative or large enough to overflow the chunk-size arithmetic. Start from `defaultLimits()` and replace fields:
+// `HttpLimits { ...defaultLimits(), maxBody: 65536 }`.
 //   maxStartLine    bytes of the request line / status line without CRLF   (default 8192, RFC 9112 §3: at least 8000)
 //   maxHeaderCount  header fields (and, separately, trailer fields)         (default 100)
 //   maxHeaderLine   bytes of one header line without CRLF                   (default 8192)
@@ -1193,79 +1334,40 @@ export function makeResponse(status: Status, version: HttpVersion, headers: Head
 //                                                                           (default 65536)
 //   maxChunkLine    bytes of a chunk-size line (size and extension)         (default 1024)
 //   maxBody         bytes of the (decoded) body                             (default 1048576 = 1 MiB)
-@Invariant(this.startLine >= 16 && this.startLine <= 1048576)
-@Invariant(this.headerCount >= 1 && this.headerCount <= 65536)
-@Invariant(this.headerLine >= 16 && this.headerLine <= 1048576)
-@Invariant(this.headerBytes >= 64 && this.headerBytes <= 67108864)
-@Invariant(this.chunkLine >= 8 && this.chunkLine <= 65536)
-@Invariant(this.bodyBytes <= 1099511627776)
-export class Limits {
-  private startLine: usize;
-  private headerCount: usize;
-  private headerLine: usize;
-  private headerBytes: usize;
-  private chunkLine: usize;
-  private bodyBytes: usize;
+export type HttpLimits = {
+  maxStartLine: usize; maxHeaderCount: usize; maxHeaderLine: usize; maxHeaderBytes: usize; maxChunkLine: usize;
+  maxBody: usize;
+};
 
-  @Requires(maxStartLine >= 16 && maxStartLine <= 1048576)
-  @Requires(maxHeaderCount >= 1 && maxHeaderCount <= 65536)
-  @Requires(maxHeaderLine >= 16 && maxHeaderLine <= 1048576)
-  @Requires(maxHeaderBytes >= 64 && maxHeaderBytes <= 67108864)
-  @Requires(maxChunkLine >= 8 && maxChunkLine <= 65536)
-  @Requires(maxBody <= 1099511627776)
-  constructor(maxStartLine: usize, maxHeaderCount: usize, maxHeaderLine: usize, maxHeaderBytes: usize,
-      maxChunkLine: usize, maxBody: usize) {
-    this.startLine = maxStartLine;
-    this.headerCount = maxHeaderCount;
-    this.headerLine = maxHeaderLine;
-    this.headerBytes = maxHeaderBytes;
-    this.chunkLine = maxChunkLine;
-    this.bodyBytes = maxBody;
-    enforce(maxStartLine >= 16 && maxStartLine <= 1048576 && maxHeaderCount >= 1 && maxHeaderCount <= 65536
-      && maxHeaderLine >= 16 && maxHeaderLine <= 1048576 && maxHeaderBytes >= 64 && maxHeaderBytes <= 67108864
-      && maxChunkLine >= 8 && maxChunkLine <= 65536 && maxBody <= 1099511627776, "invalid Limits");
-  }
-
-  // maxStartLine(): the longest request line / status line (without CRLF). O(1).
-  @Ensures(result >= 16)
-  maxStartLine(): usize {
-    return this.startLine;
-  }
-
-  // maxHeaderCount(): the most header fields (also the most trailer fields). O(1).
-  @Ensures(result >= 1)
-  maxHeaderCount(): usize {
-    return this.headerCount;
-  }
-
-  // maxHeaderLine(): the longest header line (without CRLF). O(1).
-  @Ensures(result >= 16)
-  maxHeaderLine(): usize {
-    return this.headerLine;
-  }
-
-  // maxHeaderBytes(): the largest header section, including the empty line (also the largest trailer section). O(1).
-  @Ensures(result >= 64)
-  maxHeaderBytes(): usize {
-    return this.headerBytes;
-  }
-
-  // maxChunkLine(): the longest chunk-size line (hex digits, blanks and extension, without CRLF). O(1).
-  @Ensures(result >= 8)
-  maxChunkLine(): usize {
-    return this.chunkLine;
-  }
-
-  // maxBody(): the largest decoded body. O(1).
-  maxBody(): usize {
-    return this.bodyBytes;
-  }
+// isValidLimits(l): bool -- every field is in range: maxStartLine 16..1048576, maxHeaderCount 1..65536, maxHeaderLine
+// 16..1048576, maxHeaderBytes 64..67108864, maxChunkLine 8..65536, maxBody <= 1099511627776. The constructors of the
+// parsers trap unless this holds. O(1).
+export function isValidLimits(l: HttpLimits): bool {
+  return l.maxStartLine >= 16 && l.maxStartLine <= 1048576 && l.maxHeaderCount >= 1 && l.maxHeaderCount <= 65536
+    && l.maxHeaderLine >= 16 && l.maxHeaderLine <= 1048576 && l.maxHeaderBytes >= 64 && l.maxHeaderBytes <= 67108864
+    && l.maxChunkLine >= 8 && l.maxChunkLine <= 65536 && l.maxBody <= 1099511627776;
 }
 
-// defaultLimits(): 8192 start line, 100 headers, 8192 header line, 65536 header section, 1024 chunk line, 1 MiB body. O(1).
-@Ensures(result.maxStartLine() == 8192 && result.maxHeaderCount() == 100 && result.maxBody() == 1048576)
-export function defaultLimits(): Limits {
-  return new Limits(8192, 100, 8192, 65536, 1024, 1048576);
+// defaultLimits(): HttpLimits -- 8192 start line, 100 headers, 8192 header line, 65536 header section, 1024 chunk line,
+// 1 MiB body. Valid. O(1).
+@Ensures(isValidLimits(result))
+@Ensures(result.maxStartLine == 8192 && result.maxHeaderCount == 100 && result.maxBody == 1048576)
+export function defaultLimits(): HttpLimits {
+  return HttpLimits {
+    maxStartLine: 8192, maxHeaderCount: 100, maxHeaderLine: 8192, maxHeaderBytes: 65536, maxChunkLine: 1024,
+    maxBody: 1048576
+  };
+}
+
+// What a response answers: a HEAD request (its headers describe a body that is not sent, whatever they say) or any
+// other request. A named pair instead of a `bool` (ADR-0048 rule 2.5).
+export type ResponseTo = ToHead | ToOther;
+
+function isToHead(to: ResponseTo): bool {
+  return match (to) {
+    ToHead => true,
+    ToOther => false
+  };
 }
 
 // ------------------------------------------------------------------------------------------ state machine
@@ -1294,7 +1396,7 @@ const S_BODY_CLOSE: int = 20;
 const S_DONE: int = 21;
 const S_ERROR: int = 22;
 
-// stateName(s): the name of state s, for diagnostics and tests. O(1).
+// stateName(s): string -- (internal) the name of state s, for diagnostics and tests. O(1).
 @Ensures(result.length > 0)
 export function stateName(s: int): string {
   return match (s) {
@@ -1325,7 +1427,7 @@ export function stateName(s: int): string {
   };
 }
 
-// edgeAllowed(src, dst): the transition relation of the parser (the diagram at the top of this file). Every
+// edgeAllowed(src, dst): bool -- (internal) the transition relation of the parser (the diagram at the top of this file). Every
 // state change goes through `MessageParser.go`, which requires it; `ERROR` is reachable from every non-terminal
 // state (through `fail`) and `DONE` / `ERROR` have no outgoing edge. O(1).
 @Ensures(src >= S_DONE ==> !result)
@@ -1363,7 +1465,7 @@ const F_LENGTH: int = 1;
 const F_CHUNKED: int = 2;
 const F_CLOSE: int = 3;
 
-function lineLimitReason(st: int): HttpReason {
+function lineLimitReason(st: int): HttpErrorKind {
   if (st <= S_REASON) {
     return StartLineTooLong;
   }
@@ -1499,18 +1601,18 @@ class MessageParser {
   private chunkSize: usize = 0;
   private chunkDigits: usize = 0;
 
-  constructor(isReq: bool, forHead: bool, limits: Limits) {
+  constructor(isReq: bool, forHead: bool, limits: HttpLimits) {
     this.isReq = isReq;
     this.forHead = forHead;
-    this.maxStart = limits.maxStartLine();
-    this.maxCount = limits.maxHeaderCount();
-    this.maxLine = limits.maxHeaderLine();
-    this.maxHead = limits.maxHeaderBytes();
-    this.maxChunk = limits.maxChunkLine();
-    this.maxBody = limits.maxBody();
+    this.maxStart = limits.maxStartLine;
+    this.maxCount = limits.maxHeaderCount;
+    this.maxLine = limits.maxHeaderLine;
+    this.maxHead = limits.maxHeaderBytes;
+    this.maxChunk = limits.maxChunkLine;
+    this.maxBody = limits.maxBody;
     this.state = isReq ? S_METHOD : S_VERSION;
-    this.sectionEnd = limits.maxHeaderBytes();
-    this.lineMax = limits.maxStartLine();
+    this.sectionEnd = limits.maxHeaderBytes;
+    this.lineMax = limits.maxStartLine;
   }
 
   // reset(): forget the message and start over (the next pipelined message, or after an error). O(1).
@@ -1605,8 +1707,8 @@ class MessageParser {
   // fail(pos, reason): the parser fails at the absolute offset `pos`. Sticky until `reset`.
   @Requires(this.state < S_DONE)
   @Ensures(this.state == S_ERROR && this.err.isSome())
-  @Ensures(this.err.unwrap().position == pos)
-  private fail(pos: usize, reason: HttpReason): void {
+  @Ensures(this.err.unwrap().offset == pos)
+  private fail(pos: usize, reason: HttpErrorKind): void {
     this.err = Some(httpError(pos, reason));
     this.state = S_ERROR;
   }
@@ -1800,7 +1902,7 @@ class MessageParser {
       this.cur = j + 1;
       return;
     }
-    this.fail(this.posOf(j), BadMethod);
+    this.fail(this.posOf(j), InvalidMethod);
   }
 
   // TARGET: a run of 0x21..0x7E, then SP.
@@ -1851,10 +1953,10 @@ class MessageParser {
       return;
     }
     if (c == C_CR && this.lineLen > this.methodToken.length + 1) {
-      this.fail(this.posOf(j), BadVersion);
+      this.fail(this.posOf(j), InvalidVersion);
       return;
     }
-    this.fail(this.posOf(j), BadTarget);
+    this.fail(this.posOf(j), InvalidTarget);
   }
 
   // VERSION: "HTTP/1." and a digit (0 or 1), then CR (request) or SP (response).
@@ -1871,7 +1973,7 @@ class MessageParser {
           if (k == 5 && c >= 48 && c <= 57) {
             this.fail(this.posOf(j), UnsupportedVersion);
           } else {
-            this.fail(this.posOf(j), BadVersion);
+            this.fail(this.posOf(j), InvalidVersion);
           }
           return;
         }
@@ -1885,7 +1987,7 @@ class MessageParser {
         return;
       } else {
         this.cur = j;
-        this.fail(this.posOf(j), BadVersion);
+        this.fail(this.posOf(j), InvalidVersion);
         return;
       }
       this.vidx += 1;
@@ -1898,7 +2000,7 @@ class MessageParser {
         if (this.lineLen >= this.lineMax && HTTP_CLASS.charCodeAt(xs[j].toUsize()) != C_CR) {
           this.fail(this.posOf(j), StartLineTooLong);
         } else {
-          this.fail(this.posOf(j), BadVersion);
+          this.fail(this.posOf(j), InvalidVersion);
         }
       }
       return;
@@ -1916,7 +2018,7 @@ class MessageParser {
       if (d == C_LF) {
         this.fail(this.posOf(j), BareLf);
       } else {
-        this.fail(this.posOf(j), BadVersion);
+        this.fail(this.posOf(j), InvalidVersion);
       }
       return;
     }
@@ -1935,7 +2037,7 @@ class MessageParser {
     if (d == C_LF) {
       this.fail(this.posOf(j), BareLf);
     } else {
-      this.fail(this.posOf(j), BadStatusLine);
+      this.fail(this.posOf(j), InvalidStatusLine);
     }
   }
 
@@ -1948,7 +2050,7 @@ class MessageParser {
       const c = xs[j].toInt();
       if (c < 48 || c > 57 || (this.codeDigits == 0 && (c < 49 || c > 53))) {
         this.cur = j;
-        this.fail(this.posOf(j), BadStatusCode);
+        this.fail(this.posOf(j), InvalidStatusCode);
         return;
       }
       this.code = this.code * 10 + (c - 48);
@@ -1962,7 +2064,7 @@ class MessageParser {
         if (this.lineLen >= this.lineMax && HTTP_CLASS.charCodeAt(xs[j].toUsize()) != C_CR) {
           this.fail(this.posOf(j), StartLineTooLong);
         } else {
-          this.fail(this.posOf(j), BadStatusCode);
+          this.fail(this.posOf(j), InvalidStatusCode);
         }
       }
       return;
@@ -1984,7 +2086,7 @@ class MessageParser {
     if (d == C_LF) {
       this.fail(this.posOf(j), BareLf);
     } else {
-      this.fail(this.posOf(j), BadStatusLine);
+      this.fail(this.posOf(j), InvalidStatusLine);
     }
   }
 
@@ -2032,7 +2134,7 @@ class MessageParser {
     if (c == C_LF) {
       this.fail(this.posOf(j), BareLf);
     } else {
-      this.fail(this.posOf(j), BadStatusLine);
+      this.fail(this.posOf(j), InvalidStatusLine);
     }
   }
 
@@ -2046,7 +2148,7 @@ class MessageParser {
       return;
     }
     if (this.isReq && !isValidTarget(this.meth, this.target)) {
-      this.fail(this.targetPos, BadTarget);
+      this.fail(this.targetPos, InvalidTarget);
       return;
     }
     this.go(S_HDR_LINE);
@@ -2086,7 +2188,7 @@ class MessageParser {
     } else if (c == C_SP || c == C_HTAB) {
       this.fail(this.posOf(i), ObsFold);
     } else {
-      this.fail(this.posOf(i), BadHeaderName);
+      this.fail(this.posOf(i), InvalidFieldName);
     }
   }
 
@@ -2143,7 +2245,7 @@ class MessageParser {
     } else if (c == C_LF) {
       this.fail(this.posOf(j), BareLf);
     } else {
-      this.fail(this.posOf(j), BadHeaderName);
+      this.fail(this.posOf(j), InvalidFieldName);
     }
   }
 
@@ -2220,7 +2322,7 @@ class MessageParser {
     if (c == C_LF) {
       this.fail(this.posOf(j), BareLf);
     } else {
-      this.fail(this.posOf(j), BadHeaderValue);
+      this.fail(this.posOf(j), InvalidFieldValue);
     }
   }
 
@@ -2266,7 +2368,7 @@ class MessageParser {
       }
       const v = parseContentLength(this.curValue);
       if (v.isNone()) {
-        this.fail(this.lineStart, BadContentLength);
+        this.fail(this.lineStart, InvalidContentLength);
         return;
       }
       this.clValue = v.unwrap();
@@ -2287,7 +2389,7 @@ class MessageParser {
         return;
       }
       if (!isHostValue(this.curValue)) {
-        this.fail(this.lineStart, BadHost);
+        this.fail(this.lineStart, InvalidHost);
         return;
       }
     }
@@ -2461,7 +2563,7 @@ class MessageParser {
     }
     const c = HTTP_CLASS.charCodeAt(xs[j].toUsize());
     if (this.chunkDigits == 0) {
-      this.fail(this.posOf(j), BadChunkSize);
+      this.fail(this.posOf(j), InvalidChunkSize);
       return;
     }
     if (c == C_CR) {
@@ -2482,7 +2584,7 @@ class MessageParser {
     if (c == C_LF) {
       this.fail(this.posOf(j), BareLf);
     } else {
-      this.fail(this.posOf(j), BadChunkSize);
+      this.fail(this.posOf(j), InvalidChunkSize);
     }
   }
 
@@ -2524,7 +2626,7 @@ class MessageParser {
     if (c == C_LF) {
       this.fail(this.posOf(j), BareLf);
     } else {
-      this.fail(this.posOf(j), BadChunkSize);
+      this.fail(this.posOf(j), InvalidChunkSize);
     }
   }
 
@@ -2556,7 +2658,7 @@ class MessageParser {
     if (c == C_LF) {
       this.fail(this.posOf(j), BareLf);
     } else {
-      this.fail(this.posOf(j), BadChunkExtension);
+      this.fail(this.posOf(j), InvalidChunkExtension);
     }
   }
 
@@ -2599,7 +2701,7 @@ class MessageParser {
     if (c == 10) {
       this.fail(this.posOf(i), BareLf);
     } else {
-      this.fail(this.posOf(i), BadChunkTerminator);
+      this.fail(this.posOf(i), InvalidChunkTerminator);
     }
   }
 
@@ -2674,11 +2776,15 @@ class MessageParser {
 export class RequestParser {
   private core: MessageParser;
 
-  constructor(limits: Limits) {
+  // new RequestParser(limits) -- a parser in its start state. Traps unless `isValidLimits(limits)`.
+  @Requires(isValidLimits(limits))
+  constructor(limits: HttpLimits) {
     this.core = new MessageParser(true, false, limits);
+    enforce(isValidLimits(limits), "invalid HttpLimits");
   }
 
-  // feed(chunk): the next bytes of the request. NeedMore | Done(request, used) | Failed(error). O(chunk) per call.
+  // feed(chunk): ParseResult<Request> -- the next bytes of the request: NeedMore | Done(request, used) | Failed(error).
+  // O(chunk) per call.
   @Ensures(resultKind(result) == 0 ==> !this.isDone() && !this.isFailed())
   @Ensures(resultKind(result) == 1 ==> this.isDone() && resultUsed(result) <= chunk.length())
   @Ensures(resultKind(result) == 2 ==> this.isFailed() || old(this.isDone()))
@@ -2691,7 +2797,8 @@ export class RequestParser {
     };
   }
 
-  // atEof(): the peer closed the connection: always `Failed(UnexpectedEof)` for a request that is not complete.
+  // atEof(): ParseResult<Request> -- the peer closed the connection: always `Failed(UnexpectedEof)` for a request that is
+  // not complete.
   @Ensures(resultKind(result) == 2)
   atEof(): ParseResult<Request> {
     const r = this.core.atEof();
@@ -2702,33 +2809,34 @@ export class RequestParser {
     };
   }
 
-  // reset(): start a new message. O(1).
+  // reset(): void -- forgets the current message and starts a new one. O(1).
   @Ensures(this.isIdle())
   reset(): void {
     this.core.reset();
   }
 
-  // isIdle(): no byte of a message consumed yet (a connection closed now is a clean close). O(1).
+  // isIdle(): bool -- no byte of a message consumed yet (a connection closed now is a clean close). O(1).
   @Ensures(result == (this.consumed() == 0 && !this.isDone() && !this.isFailed()))
   isIdle(): bool {
     return this.core.isIdle();
   }
 
-  // isDone() / isFailed(): terminal states. O(1).
+  // isDone(): bool -- the message is complete (call `reset()` for the next one). O(1).
   isDone(): bool {
     return this.core.isDone();
   }
 
+  // isFailed(): bool -- the message was refused; the error was returned as `Failed` (call `reset()` to start over). O(1).
   isFailed(): bool {
     return this.core.isFailed();
   }
 
-  // consumed(): bytes consumed since the start of the message. O(1).
+  // consumed(): usize -- bytes consumed since the start of the message. O(1).
   consumed(): usize {
     return this.core.consumed();
   }
 
-  // stateName(): the current state, e.g. "HDR_VALUE". O(1).
+  // stateName(): string -- the current state, e.g. "HDR_VALUE". O(1).
   @Ensures(result.length > 0)
   stateName(): string {
     return stateName(this.core.stateCode());
@@ -2742,11 +2850,16 @@ export class RequestParser {
 export class ResponseParser {
   private core: MessageParser;
 
-  constructor(limits: Limits, forHead: bool) {
-    this.core = new MessageParser(false, forHead, limits);
+  // new ResponseParser(limits, to) -- a parser in its start state; `to` says whether the response answers a HEAD
+  // request. Traps unless `isValidLimits(limits)`.
+  @Requires(isValidLimits(limits))
+  constructor(limits: HttpLimits, to: ResponseTo) {
+    this.core = new MessageParser(false, isToHead(to), limits);
+    enforce(isValidLimits(limits), "invalid HttpLimits");
   }
 
-  // feed(chunk): the next bytes of the response. NeedMore | Done(response, used) | Failed(error). O(chunk) per call.
+  // feed(chunk): ParseResult<Response> -- the next bytes of the response: NeedMore | Done(response, used) | Failed(error).
+  // O(chunk) per call.
   @Ensures(resultKind(result) == 0 ==> !this.isDone() && !this.isFailed())
   @Ensures(resultKind(result) == 1 ==> this.isDone() && resultUsed(result) <= chunk.length())
   @Ensures(resultKind(result) == 2 ==> this.isFailed() || old(this.isDone()))
@@ -2759,8 +2872,8 @@ export class ResponseParser {
     };
   }
 
-  // atEof(): the peer closed the connection: `Done` for a response whose body runs until close, else
-  // `Failed(UnexpectedEof)`.
+  // atEof(): ParseResult<Response> -- the peer closed the connection: `Done` for a response whose body runs until close,
+  // else `Failed(UnexpectedEof)`.
   @Ensures(resultKind(result) != 0)
   atEof(): ParseResult<Response> {
     const r = this.core.atEof();
@@ -2771,58 +2884,59 @@ export class ResponseParser {
     };
   }
 
-  // reset(): start a new message. O(1).
+  // reset(): void -- forgets the current message and starts a new one. O(1).
   @Ensures(this.isIdle())
   reset(): void {
     this.core.reset();
   }
 
-  // isIdle(): no byte of a message consumed yet. O(1).
+  // isIdle(): bool -- no byte of a message consumed yet. O(1).
   isIdle(): bool {
     return this.core.isIdle();
   }
 
-  // isDone() / isFailed(): terminal states. O(1).
+  // isDone(): bool -- the message is complete (call `reset()` for the next one). O(1).
   isDone(): bool {
     return this.core.isDone();
   }
 
+  // isFailed(): bool -- the message was refused; the error was returned as `Failed` (call `reset()` to start over). O(1).
   isFailed(): bool {
     return this.core.isFailed();
   }
 
-  // consumed(): bytes consumed since the start of the message. O(1).
+  // consumed(): usize -- bytes consumed since the start of the message. O(1).
   consumed(): usize {
     return this.core.consumed();
   }
 
-  // stateName(): the current state. O(1).
+  // stateName(): string -- the current state, e.g. "BODY". O(1).
   @Ensures(result.length > 0)
   stateName(): string {
     return stateName(this.core.stateCode());
   }
 }
 
-// parseRequest(data, limits): a one-shot parse of all of `data` (a fresh parser, one `feed`). NeedMore when `data`
+// parseRequest(data, limits): ParseResult<Request> -- a one-shot parse of all of `data` (a fresh parser, one `feed`). NeedMore when `data`
 // is a proper prefix of a message; `Done(request, used)` leaves `data[used..]` for the next message. O(data).
 @Ensures(resultKind(result) == 1 ==> resultUsed(result) <= data.length())
-export function parseRequest(data: Bytes, limits: Limits): ParseResult<Request> {
+export function parseRequest(data: Bytes, limits: HttpLimits): ParseResult<Request> {
   let p = new RequestParser(limits);
   return p.feed(data);
 }
 
-// parseResponse(data, limits, forHead): the same for a response; `atEof` is NOT applied (use `parseResponseToEof`
-// for a response that ends at connection close). O(data).
+// parseResponse(data, limits, to): ParseResult<Response> -- the same for a response (`to`: what it answers); `atEof` is
+// NOT applied (use `parseResponseToEof` for a response that ends at connection close). O(data).
 @Ensures(resultKind(result) == 1 ==> resultUsed(result) <= data.length())
-export function parseResponse(data: Bytes, limits: Limits, forHead: bool): ParseResult<Response> {
-  let p = new ResponseParser(limits, forHead);
+export function parseResponse(data: Bytes, limits: HttpLimits, to: ResponseTo): ParseResult<Response> {
+  let p = new ResponseParser(limits, to);
   return p.feed(data);
 }
 
-// parseResponseToEof(data, limits, forHead): `data` is everything the peer sent before it closed the connection;
+// parseResponseToEof(data, limits, to): ParseResult<Response> -- `data` is everything the peer sent before it closed the connection;
 // a close-delimited body is complete. O(data).
-export function parseResponseToEof(data: Bytes, limits: Limits, forHead: bool): ParseResult<Response> {
-  let p = new ResponseParser(limits, forHead);
+export function parseResponseToEof(data: Bytes, limits: HttpLimits, to: ResponseTo): ParseResult<Response> {
+  let p = new ResponseParser(limits, to);
   const r = p.feed(data);
   if (resultKind(r) == 0) {
     return p.atEof();
@@ -2834,7 +2948,8 @@ export function parseResponseToEof(data: Bytes, limits: Limits, forHead: bool): 
 
 // ------------------------------------------------------------------------------------------- serializer
 
-// hexString(n): n in lower-case hexadecimal without leading zeros ("0" for 0). O(digits).
+// hexString(n): string -- n in lower-case hexadecimal without leading zeros ("0" for 0). O(digits). Internal (number
+// formatting; it belongs to the numbers prelude).
 @Ensures(result.length >= 1)
 export function hexString(n: usize): string {
   if (n == 0) {
@@ -2861,7 +2976,7 @@ export function hexString(n: usize): string {
 function fieldsText(h: Headers): string {
   let out = "";
   let i: usize = 0;
-  while (i < h.count()) {
+  while (i < h.size()) {
     out += h.nameAt(i);
     out += ": ";
     out += h.valueAt(i);
@@ -2875,7 +2990,7 @@ function fieldsText(h: Headers): string {
 function headerBytes(h: Headers): usize {
   let n: usize = 0;
   let i: usize = 0;
-  while (i < h.count()) {
+  while (i < h.size()) {
     n += h.nameAt(i).length + h.valueAt(i).length + 4;
     i += 1;
   }
@@ -2904,15 +3019,15 @@ function chunkedBytes(body: Bytes, trailers: Headers, chunkSize: usize): Bytes {
 }
 
 // Limits large enough for any message of `n` bytes (the contract of the serializers parses their output with them).
-function limitsFor(n: usize): Limits {
+function limitsFor(n: usize): HttpLimits {
   const big = n < 16 ? 16 : (n > 1048576 ? 1048576 : n);
   const head = n < 64 ? 64 : (n > 67108864 ? 67108864 : n);
-  return new Limits(big, 65536, big, head, 1024, n);
+  return HttpLimits { maxStartLine: big, maxHeaderCount: 65536, maxHeaderLine: big, maxHeaderBytes: head, maxChunkLine: 1024, maxBody: n };
 }
 
 // Does the parser accept `wire` as exactly the request `r`? (The round-trip check of the contracts.)
 function roundTripsRequest(wire: Bytes, r: Request): bool {
-  if (wire.length() > 1048576 || r.headers().count() > 65536 || r.trailers().count() > 65536) {
+  if (wire.length() > 1048576 || r.headers().size() > 65536 || r.trailers().size() > 65536) {
     return true;
   }
   const p = parseRequest(wire, limitsFor(wire.length()));
@@ -2924,17 +3039,17 @@ function roundTripsRequest(wire: Bytes, r: Request): bool {
 
 // Does the parser accept `wire` as exactly the response `r`?
 function roundTripsResponse(wire: Bytes, r: Response): bool {
-  if (wire.length() > 1048576 || r.headers().count() > 65536 || r.trailers().count() > 65536) {
+  if (wire.length() > 1048576 || r.headers().size() > 65536 || r.trailers().size() > 65536) {
     return true;
   }
-  const p = parseResponseToEof(wire, limitsFor(wire.length()), r.isForHead());
+  const p = parseResponseToEof(wire, limitsFor(wire.length()), r.isForHead() ? ToHead : ToOther);
   return match (p) {
     Done(q, used) => q.equals(r),
     _ => false
   };
 }
 
-// serializeRequestChunked(r, chunkSize): the request as bytes; a chunked body is split into chunks of at most
+// serializeRequestChunked(r, chunkSize): Bytes -- the request as wire bytes; a chunked body is split into chunks of at most
 // `chunkSize` bytes. ROUND-TRIP CONTRACT: for every request `r` the parser accepts the output (with limits that fit
 // it) and returns a request equal to `r`: parse(serialize(r)) == r. O(size).
 @Requires(chunkSize >= 1)
@@ -2957,7 +3072,7 @@ export function serializeRequestChunked(r: Request, chunkSize: usize): Bytes {
   return out.build();
 }
 
-// serializeRequest(r): the request as bytes (a chunked body in one chunk). The output starts with the request line
+// serializeRequest(r): Bytes -- the request as wire bytes (a chunked body in one chunk). The output starts with the request line
 // and ends with the last byte of the body; every line ends with CRLF. Round-trip contract as above. O(size).
 @Ensures(roundTripsRequest(result, r))
 export function serializeRequest(r: Request): Bytes {
@@ -2965,7 +3080,7 @@ export function serializeRequest(r: Request): Bytes {
   return serializeRequestChunked(r, size == 0 ? 1 : size);
 }
 
-// serializeResponseChunked(r, chunkSize): the response as bytes; a chunked body is split into chunks of at most
+// serializeResponseChunked(r, chunkSize): Bytes -- the response as wire bytes; a chunked body is split into chunks of at most
 // `chunkSize` bytes; a bodyless response (HEAD, 1xx, 204, 304) has no body bytes. Round-trip contract: the parser
 // (`parseResponseToEof`, with `forHead` as in `r`) accepts the output and returns a response equal to `r`. O(size).
 @Requires(chunkSize >= 1)
@@ -2990,7 +3105,7 @@ export function serializeResponseChunked(r: Response, chunkSize: usize): Bytes {
   return out.build();
 }
 
-// serializeResponse(r): the response as bytes (a chunked body in one chunk). Round-trip contract as above. O(size).
+// serializeResponse(r): Bytes -- the response as wire bytes (a chunked body in one chunk). Round-trip contract as above. O(size).
 @Ensures(roundTripsResponse(result, r))
 export function serializeResponse(r: Response): Bytes {
   const size = r.body().length();
