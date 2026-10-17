@@ -6,7 +6,7 @@ import { Span } from "../diag";
 import {
   TypeExpr, Block, Stmt, Expr, ContractClause, MatchArm, ArmBody, Ident,
   SLet, SAssign, SExpr, SReturn, SIf, SBlock, SContract, SWhile, SForOf, SBreak, SContinue,
-  EInt, EBool, EIdent, EThis, EBinary, ECall, EMember, EIndex, EMatch, EUnary, ECond, EArrow, EArray, ERecord, ENew, ETemplate,
+  EInt, EBigInt, EStr, EBool, EIdent, EThis, ETry, FieldInit, EBinary, ECall, EMember, EIndex, EMatch, EUnary, ECond, EArrow, EArray, ERecord, ENew, ETemplate,
   BAdd, BLt, BLe, BGt, BGe, BAnd, BOr, BImplies, BSub, BMul, BDiv, BRem, BEq, BNe,
   OpAssign, OpAddAssign, OpSubAssign, OpMulAssign, OpDivAssign, OpRemAssign, AssignOp, BinaryOp,
   BExpr, BBlock, CInvariant, CDecreases, CRequires, CEnsures
@@ -19,7 +19,7 @@ import { Gen, Obl, SortR, sortOf, opaqueSort } from "./gen";
 import { bareOf } from "./scope";
 import {
   Var, Chk, TR, St, Ret, Ex, Fn, Cls, Prog, Cx, lineOf, clauseText, srcText, lit, inKind, guarded, concat, concatChk, unionUsize, andAll,
-  noChks, noExp, lookupVar, prefix, tailFrom, mk, sortS, tyOf, fresh, freshFree, typeFact, arrLen, arrData, arrMk, arrSel, inBounds, isSomeT,
+  noChks, noExp, lookupVar, prefix, tailFrom, mk, sortS, tyOf, fresh, freshFree, typeFact, arrLen, arrData, arrMk, arrSel, inBounds, isSomeT, isOkT,
   recField, mapHas, mapSize, mapFact, tfOf, assignedIn, hasJump, rootOf, isThisExpr, clausesOfList, exprOf, hasClauses, valKey
 } from "./ctx";
 import { tr, trClause, wdOf, callFnX, isUnit, sigOf, Cl, clHyp, clGoal, matchPattern } from "./expr";
@@ -312,6 +312,498 @@ function execCallStmt(g0: Gen, st0: St, cx: Cx, e: Expr): Result<Option<MutR>, s
   };
 }
 
+// ------------------------------------------------------------------------------------ hoisting effects
+
+// Effects inside an expression: a call of a mutating method (`this.next()`, `xs.pop()`) and `e?` (an early return on
+// Err / None). The expression translation is pure, so these are executed as statements before the expression, in the
+// order the expression evaluates them (left to right), and replaced by a temporary holding the value. Everything
+// that the expression evaluates before an effect is bound to a temporary first, so an effect never changes what an
+// earlier operand reads and a trap of an earlier operand still comes first. Only operands that are always evaluated
+// are hoisted from: the right operand of `&&` / `||` / `==>`, the branches of `?:` and the arms of a `match` stay as
+// they are (the expression is then not supported, as before).
+
+export type HX = { g: Gen; st: St; e: Expr; rets: Ret[]; };
+type Kids = { g: Gen; ops: Expr[]; mut: bool; baseIn: bool; };
+type HO = { g: Gen; st: St; ops: Expr[]; rets: Ret[]; };
+type MC = { g: Gen; mut: bool; };
+
+function isBuiltinMut(n: string): bool {
+  return n == "push" || n == "pop" || n == "set" || n == "delete";
+}
+
+function one(x: Expr): Expr[] {
+  let out: Expr[] = [];
+  out.push(x);
+  return out;
+}
+
+function isAtom(e: Expr): bool {
+  return match (e.kind) {
+    EInt(_) => true,
+    EBigInt(_) => true,
+    EBool(_) => true,
+    EStr(_) => true,
+    EIdent(id) => id.name.startsWith("$h") || id.name == "$unit",
+    _ => false
+  };
+}
+
+function isSimplePlace(e: Expr): bool {
+  return match (e.kind) {
+    EIdent(_) => true,
+    EThis => true,
+    EMember(b, _) => isSimplePlace(b),
+    _ => false
+  };
+}
+
+// A syntactic over-approximation of "contains an effect": the exact test (with types) is `effNode`.
+export function mayEffect(cx: Cx, e: Expr): bool {
+  return match (e.kind) {
+    ETry(_) => true,
+    EUnary(_, x) => mayEffect(cx, x),
+    EBinary(_, l, r) => mayEffect(cx, l) || mayEffect(cx, r),
+    ECond(c, a, b) => mayEffect(cx, c) || mayEffect(cx, a) || mayEffect(cx, b),
+    EMember(b, _) => mayEffect(cx, b),
+    EIndex(b, i) => mayEffect(cx, b) || mayEffect(cx, i),
+    EMatch(sc, _) => mayEffect(cx, sc),
+    EArray(xs) => anyEffect(cx, xs),
+    ENew(_, _, args) => anyEffect(cx, args),
+    ETemplate(_, xs) => anyEffect(cx, xs),
+    ERecord(_, sp, inits) => {
+      if (sp.isSome() && mayEffect(cx, sp.unwrap())) {
+        return true;
+      }
+      for (const i of inits) {
+        if (mayEffect(cx, i.value)) {
+          return true;
+        }
+      }
+      return false;
+    },
+    ECall(c, args) => {
+      match (c.kind) {
+        EMember(b, m) => {
+          if (isBuiltinMut(m.name) || cx.p.mutNames.has(m.name) || mayEffect(cx, b)) {
+            return true;
+          }
+        },
+        EIdent(_) => {},
+        _ => {
+          if (mayEffect(cx, c)) {
+            return true;
+          }
+        }
+      }
+      return anyEffect(cx, args);
+    },
+    _ => false
+  };
+}
+
+function anyEffect(cx: Cx, xs: Expr[]): bool {
+  for (const x of xs) {
+    if (mayEffect(cx, x)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Is `b.name(..)` a call of a method that changes `b` (as `execCallStmt` executes it)?
+function isMutCall(g0: Gen, st: St, cx: Cx, b: Expr, name: string): Result<MC, string> {
+  let g = g0;
+  if (!isBuiltinMut(name) && !cx.p.mutNames.has(name)) {
+    return Ok(MC { g: g, mut: false });
+  }
+  const r = tr(g, st.vars, cx, b, noExp());
+  return match (r) {
+    Err(_) => Ok(MC { g: g, mut: false }),
+    Ok(x) => {
+      g = x.g;
+      return match (x.vt) {
+        VArr(_) => Ok(MC { g: g, mut: name == "push" || name == "pop" }),
+        VMap(_, _) => Ok(MC { g: g, mut: name == "set" || name == "delete" }),
+        VRec(cn) => {
+          const mi = cx.p.fnIx.get(cn + "." + name);
+          if (mi.isNone()) {
+            return Ok(MC { g: g, mut: false });
+          }
+          const f = cx.p.fns[mi.unwrap()];
+          return Ok(MC { g: g, mut: f.mutating && f.kind == 1 });
+        },
+        _ => Ok(MC { g: g, mut: false })
+      };
+    }
+  };
+}
+
+// The operands of `e` that are always evaluated, in evaluation order. `mut`: `e` is a call of a mutating method (its
+// receiver is a place, not an operand); `baseIn`: the first operand is the receiver of a method call.
+function kidsOf(g0: Gen, st: St, cx: Cx, e: Expr): Result<Kids, string> {
+  let g = g0;
+  return match (e.kind) {
+    EUnary(_, x) => Ok(Kids { g: g, ops: one(x), mut: false, baseIn: false }),
+    EBinary(op, l, r) => {
+      const sc = match (op) {
+        BAnd => true,
+        BOr => true,
+        BImplies => true,
+        _ => false
+      };
+      let ops = one(l);
+      if (!sc) {
+        ops.push(r);
+      }
+      return Ok(Kids { g: g, ops: ops, mut: false, baseIn: false });
+    },
+    ECond(c, _, _) => Ok(Kids { g: g, ops: one(c), mut: false, baseIn: false }),
+    EMember(b, _) => Ok(Kids { g: g, ops: one(b), mut: false, baseIn: false }),
+    EIndex(b, i) => {
+      let ops = one(b);
+      ops.push(i);
+      return Ok(Kids { g: g, ops: ops, mut: false, baseIn: false });
+    },
+    EMatch(sc, _) => Ok(Kids { g: g, ops: one(sc), mut: false, baseIn: false }),
+    EArray(xs) => Ok(Kids { g: g, ops: xs, mut: false, baseIn: false }),
+    ENew(_, _, args) => Ok(Kids { g: g, ops: args, mut: false, baseIn: false }),
+    ETemplate(_, xs) => Ok(Kids { g: g, ops: xs, mut: false, baseIn: false }),
+    ERecord(_, sp, inits) => {
+      let ops: Expr[] = [];
+      if (sp.isSome()) {
+        ops.push(sp.unwrap());
+      }
+      for (const i of inits) {
+        ops.push(i.value);
+      }
+      return Ok(Kids { g: g, ops: ops, mut: false, baseIn: false });
+    },
+    ECall(c, args) => match (c.kind) {
+      EIdent(_) => Ok(Kids { g: g, ops: args, mut: false, baseIn: false }),
+      EMember(b, m) => {
+        let isVal = true;
+        match (b.kind) {
+          EIdent(id) => {
+            if (lookupVar(st.vars, id.name).isNone()) {
+              isVal = false;
+            }
+          },
+          _ => {}
+        }
+        if (!isVal) {
+          return Ok(Kids { g: g, ops: args, mut: false, baseIn: false });
+        }
+        const mc = isMutCall(g, st, cx, b, m.name)?;
+        g = mc.g;
+        if (!mc.mut) {
+          let ops = one(b);
+          for (const a of args) {
+            ops.push(a);
+          }
+          return Ok(Kids { g: g, ops: ops, mut: false, baseIn: true });
+        }
+        if (mayEffect(cx, b)) {
+          return Err("an effect inside the receiver of a mutating method call is not supported");
+        }
+        if (anyEffect(cx, args) && !isSimplePlace(b)) {
+          return Err("an effect inside the arguments of a mutating method call on `" + srcText(cx.text, b) + "`: the order of evaluation is not preserved");
+        }
+        return Ok(Kids { g: g, ops: args, mut: true, baseIn: false });
+      },
+      _ => Ok(Kids { g: g, ops: [], mut: false, baseIn: false })
+    },
+    _ => Ok(Kids { g: g, ops: [], mut: false, baseIn: false })
+  };
+}
+
+function one1(x: Stmt): Stmt[] {
+  let out: Stmt[] = [];
+  out.push(x);
+  return out;
+}
+
+// A `match` whose arms are all expressions and one of them contains an effect.
+function armsHaveEffect(cx: Cx, arms: MatchArm[]): bool {
+  let eff = false;
+  for (const a of arms) {
+    match (a.body) {
+      BExpr(x) => {
+        if (mayEffect(cx, x)) {
+          eff = true;
+        }
+      },
+      BBlock(_) => { return false; }
+    }
+  }
+  return eff;
+}
+
+function tailE(xs: Expr[], start: usize): Expr[] {
+  let out: Expr[] = [];
+  let i = start;
+  while (i < xs.length) {
+    out.push(xs[i]);
+    i += 1;
+  }
+  return out;
+}
+
+// `e` with its operands (as `kidsOf` lists them) replaced.
+function withOps(e: Expr, ops: Expr[], k: Kids): Expr {
+  return match (e.kind) {
+    EUnary(op, _) => Expr { kind: EUnary(op, ops[0]), span: e.span },
+    EBinary(op, _, r) => Expr { kind: EBinary(op, ops[0], ops.length == 2 ? ops[1] : r), span: e.span },
+    ECond(_, a, b) => Expr { kind: ECond(ops[0], a, b), span: e.span },
+    EMember(_, f) => Expr { kind: EMember(ops[0], f), span: e.span },
+    EIndex(_, _) => Expr { kind: EIndex(ops[0], ops[1]), span: e.span },
+    EMatch(_, arms) => Expr { kind: EMatch(ops[0], arms), span: e.span },
+    EArray(_) => Expr { kind: EArray(ops), span: e.span },
+    ENew(n, t, _) => Expr { kind: ENew(n, t, ops), span: e.span },
+    ETemplate(ps, _) => Expr { kind: ETemplate(ps, ops), span: e.span },
+    ERecord(n, sp, inits) => {
+      let off: usize = 0;
+      let sp2 = sp;
+      if (sp.isSome()) {
+        sp2 = Some(ops[0]);
+        off = 1;
+      }
+      let inits2: FieldInit[] = [];
+      let i: usize = 0;
+      while (i < inits.length) {
+        inits2.push(FieldInit { name: inits[i].name, value: ops[off + i], span: inits[i].span });
+        i += 1;
+      }
+      return Expr { kind: ERecord(n, sp2, inits2), span: e.span };
+    },
+    ECall(c, _) => match (c.kind) {
+      EMember(_, m) => {
+        if (k.baseIn) {
+          return Expr { kind: ECall(Expr { kind: EMember(ops[0], m), span: c.span }, tailE(ops, 1)), span: e.span };
+        }
+        return Expr { kind: ECall(c, ops), span: e.span };
+      },
+      _ => Expr { kind: ECall(c, ops), span: e.span }
+    },
+    _ => e
+  };
+}
+
+// Does `e` contain an effect (exactly: with the types of the receivers)?
+function effNode(g0: Gen, st: St, cx: Cx, e: Expr): Result<bool, string> {
+  let g = g0;
+  if (!mayEffect(cx, e)) {
+    return Ok(false);
+  }
+  match (e.kind) {
+    ETry(_) => { return Ok(true); },
+    _ => {}
+  }
+  const k = kidsOf(g, st, cx, e)?;
+  if (k.mut) {
+    return Ok(true);
+  }
+  for (const o of k.ops) {
+    if (effNode(k.g, st, cx, o)?) {
+      return Ok(true);
+    }
+  }
+  return Ok(false);
+}
+
+function tmpName(st: St): string {
+  return "$h" + st.vars.length.toString();
+}
+
+function mkId(name: string, at: Expr): Expr {
+  return Expr { kind: EIdent(Ident { name: name, span: at.span }), span: at.span };
+}
+
+// Evaluate `e` now and keep its value in a temporary.
+function bindTemp(g0: Gen, st0: St, cx: Cx, e: Expr): Result<HX, string> {
+  let g = g0;
+  let st = st0;
+  match (e.kind) {
+    EArrow(_, _, _) => { return Err("a function value before an effect: the order of evaluation is not preserved"); },
+    _ => {}
+  }
+  const t = trEmit(g, st, cx, e, noExp())?;
+  g = t.g;
+  st = t.st;
+  if (isUnit(t.vt)) {
+    return Err("a void value before an effect");
+  }
+  const ty = concrete(t.vt);
+  if (isBad(ty)) {
+    return Err("a value of an unsupported type before an effect (" + badReason(ty) + ")");
+  }
+  const f = fresh(g, cx, ty, t.t)?;
+  g = f.g;
+  const nm = tmpName(st);
+  st.vars.push(Var { name: nm, term: f.name, vt: ty });
+  return Ok(HX { g: g, st: st, e: mkId(nm, e), rets: [] });
+}
+
+// Bind a value computed by an effect (`t` of type `vt`) to a temporary; a void value has none (`$unit`).
+function bindValue(g0: Gen, st0: St, cx: Cx, at: Expr, t: string, vt: VT): Result<HX, string> {
+  let g = g0;
+  let st = st0;
+  if (isUnit(vt)) {
+    return Ok(HX { g: g, st: st, e: mkId("$unit", at), rets: [] });
+  }
+  const ty = concrete(vt);
+  if (isBad(ty)) {
+    return Err("a value of an unsupported type (" + badReason(ty) + ")");
+  }
+  const f = fresh(g, cx, ty, t)?;
+  g = f.g;
+  const nm = tmpName(st);
+  st.vars.push(Var { name: nm, term: f.name, vt: ty });
+  return Ok(HX { g: g, st: st, e: mkId(nm, at), rets: [] });
+}
+
+// Hoist the effects out of the operands `ops` (evaluated left to right).
+function hoistOps(g0: Gen, st0: St, cx: Cx, ops: Expr[]): Result<HO, string> {
+  let g = g0;
+  let st = st0;
+  let rets: Ret[] = [];
+  let last: usize = 0;
+  let found = false;
+  let j: usize = 0;
+  while (j < ops.length) {
+    if (effNode(g, st, cx, ops[j])?) {
+      last = j;
+      found = true;
+    }
+    j += 1;
+  }
+  if (!found) {
+    return Ok(HO { g: g, st: st, ops: ops, rets: rets });
+  }
+  let out: Expr[] = [];
+  j = 0;
+  while (j < ops.length) {
+    if (j > last) {
+      out.push(ops[j]);
+    } else {
+      const hx = hoistExec(g, st, cx, ops[j], true)?;
+      g = hx.g;
+      st = hx.st;
+      for (const r of hx.rets) {
+        rets.push(r);
+      }
+      let x = hx.e;
+      if (j < last && !isAtom(x)) {
+        const b = bindTemp(g, st, cx, x)?;
+        g = b.g;
+        st = b.st;
+        x = b.e;
+      }
+      out.push(x);
+    }
+    j += 1;
+  }
+  return Ok(HO { g: g, st: st, ops: out, rets: rets });
+}
+
+// Execute the effects inside `e` (and, when `exec`, the effect that `e` itself is) in evaluation order. The result is
+// `e` with each effect replaced by a temporary; `rets` are the early returns of `?` on the way.
+export function hoistExec(g0: Gen, st0: St, cx: Cx, e: Expr, exec: bool): Result<HX, string> {
+  let g = g0;
+  let st = st0;
+  if (!mayEffect(cx, e)) {
+    return Ok(HX { g: g, st: st, e: e, rets: [] });
+  }
+  match (e.kind) {
+    ETry(x) => {
+      const hx = hoistExec(g, st, cx, x, true)?;
+      g = hx.g;
+      st = hx.st;
+      let rets = hx.rets;
+      const v = trEmit(g, st, cx, hx.e, noExp())?;
+      g = v.g;
+      st = v.st;
+      const fv = fresh(g, cx, concrete(v.vt), v.t)?;
+      g = fv.g;
+      const tq = tryOn(g, st, cx, e, fv.name, v.vt)?;
+      g = tq.g;
+      st = tq.st;
+      rets.push(tq.ret);
+      const b = bindValue(g, st, cx, e, tq.val, tq.vt)?;
+      return Ok(HX { g: b.g, st: b.st, e: b.e, rets: rets });
+    },
+    _ => {}
+  }
+  const k = kidsOf(g, st, cx, e)?;
+  g = k.g;
+  const ho = hoistOps(g, st, cx, k.ops)?;
+  g = ho.g;
+  st = ho.st;
+  const e2 = withOps(e, ho.ops, k);
+  if (k.mut && exec) {
+    const mr = execCallStmt(g, st, cx, e2)?;
+    if (mr.isNone()) {
+      return Err("internal: a mutating call that is not executed as a statement");
+    }
+    const b = bindValue(mr.unwrap().g, mr.unwrap().st, cx, e, mr.unwrap().t, mr.unwrap().vt)?;
+    return Ok(HX { g: b.g, st: b.st, e: b.e, rets: ho.rets });
+  }
+  return Ok(HX { g: g, st: st, e: e2, rets: ho.rets });
+}
+
+type TryR = { g: Gen; st: St; ret: Ret; val: string; vt: VT; };
+
+// `v?` for the Result / Option value `v` (a variable): when it is Err / None the function returns at once (that return
+// is `ret`, from the state where `v` is Err / None); the path continues where it is Ok / Some, with the payload `val`.
+function tryOn(g0: Gen, st0: St, cx: Cx, e: Expr, v: string, vt: VT): Result<TryR, string> {
+  let g = g0;
+  let st = st0;
+  const so = sortS(g, cx, vt)?;
+  g = so.g;
+  const rs = sortS(g, cx, cx.ret)?;
+  g = rs.g;
+  let good = "";
+  let retVal = "";
+  let pay = "";
+  let pvt = VUnit;
+  match (vt) {
+    VRes(a, b) => {
+      match (cx.ret) {
+        VRes(_, b2) => {
+          if (!vtEq(b, b2)) {
+            return Err("`?` converts the error type `" + vtName(b) + "` to `" + vtName(b2) + "`");
+          }
+        },
+        _ => { return Err("`?` on a Result in a function that returns `" + vtName(cx.ret) + "`"); }
+      }
+      good = isOkT(so.s, v);
+      retVal = "(err" + rs.s + " (errv" + so.s + " " + v + "))";
+      pay = "(okv" + so.s + " " + v + ")";
+      pvt = a;
+    },
+    VOpt(t) => {
+      match (cx.ret) {
+        VOpt(_) => {},
+        _ => { return Err("`?` on an Option in a function that returns `" + vtName(cx.ret) + "`"); }
+      }
+      good = isSomeT(so.s, v);
+      retVal = "none" + rs.s;
+      pay = "(val" + so.s + " " + v + ")";
+      pvt = t;
+    },
+    _ => { return Err("`?` on a value of type `" + vtName(vt) + "`"); }
+  }
+  const stRet = St { vars: st.vars, pc: concat(st.pc, ["(not " + good + ")"]), deps: st.deps, approx: st.approx };
+  const ret = Ret { st: stRet, val: retVal, vt: cx.ret, isVoid: false };
+  st.pc.push(good);
+  if (!isUnit(pvt)) {
+    const tf = tfOf(g, cx, pvt, pay)?;
+    const em = emit(tf.g, st, cx, tf.chks);
+    g = em.g;
+    st = em.st;
+  }
+  return Ok(TryR { g: g, st: st, ret: ret, val: pay, vt: pvt });
+}
+
 // ---------------------------------------------------------------------------------------- statements
 
 function binOfAssign(op: AssignOp): Option<BinaryOp> {
@@ -374,7 +866,13 @@ export function execStmts(g0: Gen, st0: St, cx: Cx, stmts: Stmt[], top: bool): R
           },
           None => {}
         }
-        const mr = execCallStmt(g, st, cx, init)?;
+        const hx = hoistExec(g, st, cx, init, false)?;
+        g = hx.g;
+        st = hx.st;
+        for (const r of hx.rets) {
+          rets.push(r);
+        }
+        const mr = execCallStmt(g, st, cx, hx.e)?;
         let val = "";
         let vty = noExp();
         if (mr.isSome()) {
@@ -383,7 +881,7 @@ export function execStmts(g0: Gen, st0: St, cx: Cx, stmts: Stmt[], top: bool): R
           val = mr.unwrap().t;
           vty = mr.unwrap().vt;
         } else {
-          const t = trEmit(g, st, cx, init, exp)?;
+          const t = trEmit(g, st, cx, hx.e, exp)?;
           g = t.g;
           st = t.st;
           val = t.t;
@@ -407,6 +905,15 @@ export function execStmts(g0: Gen, st0: St, cx: Cx, stmts: Stmt[], top: bool): R
         g = cur0.g;
         const cur = TS { g: g, st: st, t: cur0.t, vt: cur0.vt };
         let rhs = value;
+        if (bo.isNone() && isSimplePlace(target)) {
+          const hx = hoistExec(g, st, cx, value, false)?;
+          g = hx.g;
+          st = hx.st;
+          for (const r of hx.rets) {
+            rets.push(r);
+          }
+          rhs = hx.e;
+        }
         if (bo.isSome()) {
           rhs = Expr { kind: EBinary(bo.unwrap(), target, value), span: s.span };
         }
@@ -432,7 +939,15 @@ export function execStmts(g0: Gen, st0: St, cx: Cx, stmts: Stmt[], top: bool): R
         g = sp.g;
         st = sp.st;
       },
-      SExpr(e) => {
+      SExpr(e0) => {
+        const hx = hoistExec(g, st, cx, e0, false)?;
+        g = hx.g;
+        st = hx.st;
+        for (const r of hx.rets) {
+          rets.push(r);
+        }
+        // `f()?;`: all there is to do has been done (the value is not used)
+        const e = isAtom(hx.e) ? Expr { kind: EBool(true), span: e0.span } : hx.e;
         if (isCallNamed(e, "exit") && valKey(cx, "exit").isNone()) {
           // The process ends: no path continues.
           match (e.kind) {
@@ -486,8 +1001,44 @@ export function execStmts(g0: Gen, st0: St, cx: Cx, stmts: Stmt[], top: bool): R
       },
       SReturn(v) => {
         match (v) {
-          Some(e) => {
-            const t = trEmit(g, st, cx, e, cx.ret)?;
+          Some(e0) => {
+            // `return match (s) { P => e, .. }` with an effect in an arm: each arm is a `return` of its own
+            match (e0.kind) {
+              EMatch(sc, arms) => {
+                if (armsHaveEffect(cx, arms)) {
+                  const hs = hoistExec(g, st, cx, sc, true)?;
+                  g = hs.g;
+                  st = hs.st;
+                  for (const r of hs.rets) {
+                    rets.push(r);
+                  }
+                  let arms2: MatchArm[] = [];
+                  for (const a of arms) {
+                    match (a.body) {
+                      BExpr(x) => {
+                        const ret = Stmt { kind: SReturn(Some(x)), span: a.span };
+                        arms2.push(MatchArm { pattern: a.pattern, body: BBlock(Block { stmts: one1(ret), span: a.span }), span: a.span });
+                      },
+                      BBlock(_) => {}
+                    }
+                  }
+                  const mr = execMatch(g, st, cx, hs.e, arms2, 0)?;
+                  for (const r of mr.rets) {
+                    rets.push(r);
+                  }
+                  // every arm returns; the path where no arm matched is excluded by the exhaustiveness of the match
+                  return Ok(Ex { g: mr.g, st: mr.st, fall: false, rets: rets });
+                }
+              },
+              _ => {}
+            }
+            const hx = hoistExec(g, st, cx, e0, true)?;
+            g = hx.g;
+            st = hx.st;
+            for (const r of hx.rets) {
+              rets.push(r);
+            }
+            const t = trEmit(g, st, cx, hx.e, cx.ret)?;
             g = t.g;
             rets.push(Ret { st: t.st, val: t.t, vt: t.vt, isVoid: false });
             return Ok(Ex { g: g, st: t.st, fall: false, rets: rets });
@@ -511,8 +1062,14 @@ export function execStmts(g0: Gen, st0: St, cx: Cx, stmts: Stmt[], top: bool): R
         st = r.st;
         st.vars = prefix(st.vars, n0);
       },
-      SIf(c, thenB, els) => {
-        const r = execIf(g, st, cx, c, thenB, els)?;
+      SIf(c0, thenB, els) => {
+        const hx = hoistExec(g, st, cx, c0, true)?;
+        g = hx.g;
+        st = hx.st;
+        for (const r of hx.rets) {
+          rets.push(r);
+        }
+        const r = execIf(g, st, cx, hx.e, thenB, els)?;
         g = r.g;
         for (const x of r.rets) {
           rets.push(x);
