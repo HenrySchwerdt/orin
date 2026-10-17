@@ -1,10 +1,31 @@
 # Orin 1.0 roadmap
 
-Status: **proposal for owner review**, 2026-10-16. Factual baseline: `origin/main` at `5029153`
-(merge of PR #146). This document is a plan. It implements nothing and changes no accepted decision.
+Status: **proposal; defaults taken 2026-10-16** (see [Defaults taken](#defaults-taken-on-2026-10-16)), 2026-10-16. Factual baseline: `origin/main` at `5029153`
+(merge of PR #146). This document is a plan. It implements nothing and changes no accepted decision by itself.
 Where it proposes to change an accepted ADR, the text says so and the change is listed in
-[Decisions for the owner](#5-decisions-for-the-owner). Sizes are relative (S/M/L), not durations.
+[Decisions for the owner](#5-decisions-for-the-owner); the defaults below are being implemented, each with its own ADR or amendment.
+Sizes are relative (S/M/L), not durations.
 Statements marked _(inference)_ are the author's reading of the sources, not something a document states.
+
+## Defaults taken on 2026-10-16
+
+Henry said "mach die Sprache erstmal fertig" (finish the language first, then provability). Work therefore proceeds on the
+recommendation of every open decision. Henry can still overturn each one; a reversal is a new ADR or amendment.
+
+| D# | Default taken (the recommendation of section 5) |
+|---|---|
+| D1 | Option B: OS threads, cancellation, deadlines, `select`, sleep, concurrent sockets; later an M:N scheduler behind the same API; no `async`/`await` in 1.0 |
+| D2 | Amend ADR-0016 once: add ADR-0034/0040, the D1 `std:task` surface and user annotations; relax the "core complete" clause per D5 |
+| D3 | HTTP/1.1 client and server over `std:net` without TLS; TLS post-1.0 behind a reverse proxy |
+| D4 | linux-x86_64, macos-arm64, linux-aarch64, macos-x86_64 with a dry run each; Windows via WSL2, native Windows post-1.0 |
+| D5 | Amend: 1.0 requires a self-hosted, reproducible, behaviour-stable compiler, not the finished ADR-0015 rewrite |
+| D6 | A short named experimental list; everything else frozen under ADR-0048 |
+| D7 | Raise the L0 budget to 1,400 code lines by ADR, each addition with contracts and a CBMC harness (ADR-0054) |
+| D8 | Do not gate 1.0 on R3f; gate on R3d/R3e being merged |
+| D9 | Park T6 #98 and T5 #91 until after 1.0 |
+| D10 | `v1.0.0-beta.1` at M4, `-rc.N` at M5, `--prerelease` tied to the tag suffix |
+| D11 | Beta freezes syntax and std names; semantic fixes allowed |
+| D12 | Static site generated from `docs/` and the language reference; hosting and tutorial authorship stay open |
 
 Related plans this one consolidates and does not replace: [roadmap.md](../roadmap.md) (integrated
 plan), [progress.md](../progress.md) (status), [release-1.0-readiness.md](../release-1.0-readiness.md)
