@@ -7,6 +7,7 @@ that a feature has shipped. [Progress](progress.md) records implementation statu
 
 ## Using Orin
 
+- [Getting started](getting-started.md), [tutorial](tutorial/README.md), [stability policy](stability.md).
 - [Install and packages](install.md), [project CLI](cli.md), [testing](testing.md).
 - [Language reference](reference/README.md) (normative, as implemented), [language specification](../spec/spec.md) (design RFC), [TypeScript migration guide](ts-developers.md).
 - [Standard library](std.md), [capabilities and effects](capabilities.md).

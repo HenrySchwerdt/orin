@@ -1,6 +1,6 @@
 name: release
 
-# Tag push (v*): build all four targets and publish a GitHub pre-release.
+# Tag push (v*): build all four targets and publish a GitHub release (a pre-release for -alpha/-beta/-rc versions).
 # Manual run: same build; with dry_run (the default) nothing is published, the packages stay as
 # workflow artifacts. Untick dry_run to publish release v<version> from the selected ref.
 on:
@@ -110,8 +110,19 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           python3 tools/changelog.py --render -o "$RUNNER_TEMP/notes.md"
+          # Pre-release status follows the version suffix (roadmap D10): -alpha.N, -beta.N and -rc.N are pre-releases,
+          # a plain x.y.z is a normal release. The tag is created by this step on $GITHUB_SHA when it does not exist,
+          # so a manual run (workflow_dispatch, dry_run unticked) publishes without anyone pushing a tag.
+          ver="${TAG#v}"
+          case "$ver" in
+            *-alpha*) pre="--prerelease"; title="Orin $TAG (alpha)" ;;
+            *-beta*)  pre="--prerelease"; title="Orin $TAG (beta)" ;;
+            *-rc*)    pre="--prerelease"; title="Orin $TAG (release candidate)" ;;
+            *-*)      pre="--prerelease"; title="Orin $TAG (pre-release)" ;;
+            *)        pre="";             title="Orin $TAG" ;;
+          esac
           gh release create "$TAG" dist/*.tar.gz dist/*.tar.gz.sha256 dist/SHA256SUMS \
-            --target "$GITHUB_SHA" --prerelease --title "Orin $TAG (experimental)" \
+            --target "$GITHUB_SHA" $pre --title "$title" \
             --notes-file "$RUNNER_TEMP/notes.md"
       - name: Dry run summary
         if: env.DRY_RUN == 'true'
@@ -126,6 +137,8 @@ jobs:
     needs: release
     if: github.event_name == 'push' || inputs.dry_run == false
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -134,6 +147,10 @@ jobs:
           path: dist
       - name: Render Formula/orin.rb
         run: ./tools/homebrew_formula.sh "${TAG#v}" --sums dist/SHA256SUMS > orin.rb && cat orin.rb
+      - name: Attach orin.rb to the release (the tap can be updated from it by hand when no token is set)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" orin.rb --clobber --repo "$GITHUB_REPOSITORY"
       - name: Open the formula update PR on the tap
         env:
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
