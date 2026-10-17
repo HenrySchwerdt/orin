@@ -165,7 +165,7 @@ only names, `this` and fields, so reading it at the call is the same as evaluati
 
 When the prefix is a single name that is no value in scope but a class (`<Ui.Card title="x" />`, with `Ui` declared or
 imported), the tag calls the class's **static** method, as `Ui.Card(..)` does; an instance method there is E0491
-(call it on a value instead). Modules are not values in orin (there is no `import * as m`), so there are no member
+(call it on a value instead). A namespace import (`import * as m`) is not a value either (ADR-0048 addendum), so there are no member
 tags on a module: import the component by name (`import { Card } from "./ui";`) and write `<Card>`.
 
 A member that is not a method (a field of function type has no parameter names) or does not exist is E0491. A dotted tag
