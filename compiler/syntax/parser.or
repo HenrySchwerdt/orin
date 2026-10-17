@@ -73,6 +73,7 @@ function errAt(t: Token, msg: string): Diagnostic {
   return diag("E0200", t.span, msg);
 }
 
+@Ensures(result ==> !isEofTok(t))
 function isPunctTok(t: Token, s: string): bool {
   return match (t.kind) {
     KPunct => t.text == s,
@@ -80,6 +81,7 @@ function isPunctTok(t: Token, s: string): bool {
   };
 }
 
+@Ensures(result ==> !isEofTok(t))
 function isKeywordTok(t: Token, s: string): bool {
   return match (t.kind) {
     KKeyword => t.text == s,
@@ -87,6 +89,7 @@ function isKeywordTok(t: Token, s: string): bool {
   };
 }
 
+@Ensures(result ==> !isEofTok(t))
 function isIdentTok(t: Token, s: string): bool {
   return match (t.kind) {
     KIdent => t.text == s,
@@ -94,6 +97,7 @@ function isIdentTok(t: Token, s: string): bool {
   };
 }
 
+@Ensures(result ==> !isEofTok(t))
 function isAnyIdentTok(t: Token): bool {
   return match (t.kind) {
     KIdent => true,
@@ -101,6 +105,7 @@ function isAnyIdentTok(t: Token): bool {
   };
 }
 
+@Ensures(result ==> !isEofTok(t))
 function isKindInt(t: Token): bool {
   return match (t.kind) {
     KInt => true,
@@ -108,6 +113,7 @@ function isKindInt(t: Token): bool {
   };
 }
 
+@Ensures(result ==> !isEofTok(t))
 function isStrTok(t: Token): bool {
   return match (t.kind) {
     KStr => true,
@@ -150,6 +156,7 @@ function mkExpr(kind: ExprKind, sp: Span): Expr {
 export const MAX_SYNTAX_ERRORS: usize = 20;
 export const SUPPRESSED_NOTE: string = "further syntax errors suppressed";
 
+@Ensures(result ==> !isEofTok(t))
 function isKwTok(t: Token, s: string): bool {
   return match (t.kind) {
     KKeyword => t.text == s,
@@ -158,6 +165,7 @@ function isKwTok(t: Token, s: string): bool {
 }
 
 // A keyword that starts a top-level declaration (inside a block or a class body it means a `}` is missing).
+@Ensures(result ==> !isEofTok(t))
 function isDeclKwTok(t: Token): bool {
   return match (t.kind) {
     KKeyword => t.text == "function"
@@ -171,6 +179,7 @@ function isDeclKwTok(t: Token): bool {
 }
 
 // A token where a statement starts for sure: a statement keyword or `@` (loop contract clauses).
+@Ensures(result ==> !isEofTok(t))
 function isStmtStartTok(t: Token): bool {
   return match (t.kind) {
     KKeyword => t.text == "let"
@@ -268,6 +277,7 @@ export class Parser {
   private nsNames: string[] = []; // the namespace imports of the file (`import * as m`), found by a scan of the tokens
   private nsUses: Ident[] = []; // every `m.x` merged into one identifier so far (ADR-0048 addendum)
 
+  @Requires(toks.length > 0 && isEofTok(toks[toks.length - 1]))
   constructor(toks: Token[]) {
     this.toks = toks;
     let i: usize = 0;
@@ -302,6 +312,9 @@ export class Parser {
   // Reports `d` unless it is a cascade (it starts at or before the last error or resume point). The error past the cap
   // is not reported: the last reported one gets SUPPRESSED_NOTE and the parse stops.
   @Requires(this.recovering)
+  @Requires(this.pos < this.toks.length && this.toks.length > 0 && isEofTok(this.toks[this.toks.length - 1]))
+  @Ensures(this.pos == old(this.pos) && this.unwinding == old(this.unwinding)
+      || this.unwinding && this.pos == this.toks.length - 1)
   @Ensures(this.errs.length >= old(this.errs.length)
       && this.errs.length <= old(this.errs.length) + 1)
   @Ensures(this.errs.length == old(this.errs.length) + 1
@@ -328,7 +341,9 @@ export class Parser {
   }
 
   // Ends the parse: the cursor goes to the final KEof and the catchers unwind.
+  @Requires(this.toks.length > 0 && isEofTok(this.toks[this.toks.length - 1]))
   @Ensures(this.unwinding && this.atEnd())
+  @Ensures(this.pos == this.toks.length - 1)
   private stop(): void {
     this.pos = this.toks.length - 1;
     this.unwinding = true;
@@ -379,7 +394,7 @@ export class Parser {
   // the body of an `if` / `while` / `for` / block statement (unless `else` follows); or to a token after the error that
   // starts a statement. False (propagate `d`): no recovery, the parse is unwinding, a declaration keyword at the
   // statement's level (resume there, at the top level) or the end of the file (stop).
-  @Requires(st <= this.pos)
+  @Requires(st <= this.pos && this.pos < this.toks.length && this.toks.length > 0 && isEofTok(this.toks[this.toks.length - 1]))
   @Ensures(result ==> this.recovering && !this.unwinding && (this.pos > st || this.isP("}")))
   @Ensures(!result && this.recovering ==> this.unwinding)
   private recoverStmt(d: Diagnostic, st: usize): bool {
@@ -398,6 +413,8 @@ export class Parser {
         || isKwTok(first, "for")
         || isPunctTok(first, "{");
     let i = fail;
+    @Invariant(fail <= i && i < this.toks.length && this.toks.length > 0 && isEofTok(this.toks[this.toks.length - 1]))
+    @Invariant(this.recovering && !this.unwinding)
     while (true) {
       const t = this.toks[i];
       if (isEofTok(t)) {
@@ -433,7 +450,7 @@ export class Parser {
   // A member of a class or interface body failed with `d`; it started at token `st`. Reports `d` and skips to the next
   // member: after a `;` or after the `}` that closes a method body, at the member's brace level; to a `@` after the
   // error; to the `}` that closes the body (not consumed). False: as `recoverStmt`.
-  @Requires(st <= this.pos)
+  @Requires(st <= this.pos && this.pos < this.toks.length && this.toks.length > 0 && isEofTok(this.toks[this.toks.length - 1]))
   @Ensures(result ==> this.recovering && !this.unwinding && (this.pos > st || this.isP("}")))
   @Ensures(!result && this.recovering ==> this.unwinding)
   private recoverMember(d: Diagnostic, st: usize): bool {
@@ -447,6 +464,8 @@ export class Parser {
     const fail = this.pos;
     let depth = this.braceDepth(st, fail);
     let i = fail;
+    @Invariant(fail <= i && i < this.toks.length && this.toks.length > 0 && isEofTok(this.toks[this.toks.length - 1]))
+    @Invariant(this.recovering && !this.unwinding)
     while (true) {
       const t = this.toks[i];
       if (isEofTok(t)) {
@@ -482,7 +501,7 @@ export class Parser {
   // A top-level declaration failed with `d`; it started at token `st`. Reports `d` (unless it was reported where it was
   // caught, `unwinding`) and skips to the next `function`, `class`, `interface`, `type`, `import`, `export` or `@` at the
   // declaration's brace level after the error, or to the end of the file. False only without recovery.
-  @Requires(st <= this.pos)
+  @Requires(st <= this.pos && this.pos < this.toks.length && this.toks.length > 0 && isEofTok(this.toks[this.toks.length - 1]))
   @Ensures(result == this.recovering)
   @Ensures(result ==> !this.unwinding && (this.pos > st || this.atEnd()))
   private recoverItem(d: Diagnostic, st: usize): bool {
@@ -501,6 +520,7 @@ export class Parser {
     const fail = this.pos;
     let depth = this.braceDepth(st, fail);
     let i = fail;
+    @Invariant(fail <= i && i < this.toks.length)
     while (!isEofTok(this.toks[i])) {
       const t = this.toks[i];
       if (isPunctTok(t, "{")) {
@@ -531,6 +551,7 @@ export class Parser {
   }
 
   // True at the final KEof token.
+  @Ensures(result == isEofTok(this.toks[this.pos]))
   atEnd(): bool {
     return isEofTok(this.toks[this.pos]);
   }
@@ -2020,6 +2041,7 @@ export class Parser {
 
   // Does an arrow function start at the cursor? 1: `name =>`; 2: `( .. ) [: R] =>`; 0: no (beyond Orin-B,
   // ADR-0011). Looks ahead without moving the cursor (a return type is tried on a copy of the parser).
+  @Requires(this.pos < this.toks.length && this.toks.length > 0 && isEofTok(this.toks[this.toks.length - 1]))
   @Ensures(result >= 0 && result <= 2)
   private arrowStart(): int {
     if (this.isIdentAt(0)) {
