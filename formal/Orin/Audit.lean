@@ -138,3 +138,9 @@ import Orin
 #print axioms Orin.Range.fix_total
 #print axioms Orin.Range.fix_every_run_ends
 #print axioms Orin.Range.u1_total
+#print axioms Orin.Range.source_inb
+#print axioms Orin.Range.pass_inb
+#print axioms Orin.Range.dom_sound
+#print axioms Orin.Range.t2_sound
+#print axioms Orin.Range.t2_block
+#print axioms Orin.Range.t2_machine

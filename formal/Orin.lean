@@ -54,3 +54,4 @@ import Orin.RangeCfg
 import Orin.RangeFix
 import Orin.RangeNarrow
 import Orin.RangeTerm
+import Orin.RangeDom

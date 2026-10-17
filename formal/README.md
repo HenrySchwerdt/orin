@@ -65,6 +65,7 @@ Array contents are not tracked. A ghost bit `ctd x` says that the local holds a 
 | `RangeCfg.lean` | `Fn`, `Reach`, `PostFix`, `postfix_sound` |
 | `RangeFix.lean` | the worklist: `WReach`, `WInv`, `feed_spec`, `fix_sound` (when the iteration ends, for **every** pop order, threshold list and widening delay) |
 | `RangeNarrow.lean` | `NarrowRel`, `narrow_sound` (strong induction on the block index), `accessOk`, `inRange_sound` (U1), `u1_sound`, `range_accepted`, `u1_machine`, kernel-evaluated examples |
+| `RangeDom.lean` | T2 dominated-by-check: the scan of `unchecked.or`/`scan.or` (`verdict`, `scan`, `domOk`), `source_inb`, `pass_inb`, `dom_sound`, `t2_sound`, `t2_block`, `t2_machine` |
 | `RangeTerm.lean` | termination: `Valid` (bounds stay in the lattice, `valid_step`, `valid_outEdge`), the measure (blocks without state, changes before widening, position of the bounds among the thresholds, length of the worklist), `feed_dec`, `wstep_dec`, `fix_acc`, `fix_total` (the iteration reaches an empty worklist, whatever the pop order, and the table is sound), `fix_every_run_ends`, `u1_total` |
 | `CallGen.lean` | `Site`, `StkW`, `GoodW`: the call-machine invariant with explicit call-site data; `goodW_step`, `goodW_reach` |
 | `CallLink.lean` | `callRI`, `RetGenOK`, `ret_genok`, `RetGenOK.exec`, `prog_ret_genok`: the contract `GenOK` of a call derived from the ownership model |
@@ -135,6 +136,18 @@ given by `NarrowRel`.
 * **Well-formedness the proofs take from `wf.or`**: the index operand of an access is a scalar
   (`IdxScalar`); an instruction is executable only when its operand classes are right (`Exec` carries
   the class conditions).
-* **Not modelled.** The dominated-by-check source of U1 (T2, `unchecked.or`), array contents, the
-  cost guard `MAX_CELLS` (refusing is sound), the equality of the Orin code with this transcription
-  (C4 level), and the emitters.
+* **T2, dominated-by-check** (`RangeDom.lean`). `verdict`, `Defs`, `KeyDefs`, `scan`, `WINDOW`, `domOk`
+  transcribe `unchecked.or` / `scan.or` over `RI`. `dom_sound` / `t2_sound`: if the backward scan over
+  the instructions of the block before the access accepts, then in every execution of that prefix the
+  array local holds a live array and the index is a valid slot (`InBounds`); `t2_machine` carries this
+  to the machine heap (`u1_machine`), `t2_block` states it for a reachable block entry. The proof is
+  an induction over the reversed prefix: the source (`source_inb`) establishes the fact, every PASS
+  instruction keeps it (`pass_inb`, by cases over `Exec`; the `gen` case uses the `own` clause of
+  `GenOK`). Assumptions, each named in the theorem: the index is a scalar (`wf.or`), an element store
+  never stores the array into itself (`NoSelf`, `wf.or`'s `valueOk`), and **`Held`**: whenever the
+  array local holds a reference it is a counted one (the `ctd` bit). The last one is the stated
+  residual: for an array that is only *borrowed* in the frame (a parameter) the range frame has no
+  `ctd` bit, so that case rests on the prose argument of `docs/tcb.md` (a live local excludes
+  `rc == 1`), not on this theorem.
+* **Not modelled.** Array contents, the cost guard `MAX_CELLS` (refusing is sound), the equality of the
+  Orin code with this transcription (C4 level), and the emitters.
