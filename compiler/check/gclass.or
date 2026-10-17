@@ -7,10 +7,10 @@
 // methods of a generic class the FuncInfo also carries the class mode (ADR-0009), so private members,
 // `this` and mutation inference work in the abstract check exactly as in an ordinary class.
 
-import { Diagnostic } from "../diag";
+import { Diagnostic, diag } from "../diag";
 import { Ident, FunctionDecl } from "../syntax";
 import { Type } from "../hir";
-import { Env, FuncInfo, isCtorMode } from "./env";
+import { Env, FuncInfo, IfaceSig, isCtorMode, typeEq, showIfaceSig } from "./env";
 import { scopeOf, mkOpaque, mkOpaqueBound, resolveSig } from "./types";
 import { boundIface } from "./classes";
 
@@ -30,9 +30,12 @@ export function opaquesFor(env: Env, params: Ident[]): Opaques {
   return Opaques { env: e, names: names, tys: tys };
 }
 
-// Like `opaquesFor`, with the bounds `T extends Shape` (ADR-0019) of `bounds` (parallel to `params`): a
-// bounded parameter gets an opaque type that carries the interface. `unit` is the unit that names the bounds.
-export function opaquesBounded(env: Env, unit: usize, params: Ident[], bounds: Option<Ident>[]): Result<Opaques, Diagnostic> {
+// Like `opaquesFor`, with the bounds `T extends Shape` / `T extends Ord & Hash` (ADR-0019, ADR-0034) of `bounds` (a list
+// per parameter, parallel to `params`; empty: unbounded): a bounded parameter gets an opaque type that carries the
+// interfaces. `unit` is the unit that names the bounds. The same bound twice is E0304; two bounds that declare a method
+// of the same name with different signatures are E0477, because a call on a value of the parameter could not tell which
+// one is meant.
+export function opaquesBounded(env: Env, unit: usize, params: Ident[], bounds: Ident[][]): Result<Opaques, Diagnostic> {
   let e = env;
   let names: string[] = [];
   let tys: Type[] = [];
@@ -40,9 +43,17 @@ export function opaquesBounded(env: Env, unit: usize, params: Ident[], bounds: O
   while (k < params.length) {
     const p = params[k];
     let o = mkOpaque(e, p.name);
-    if (k < bounds.length && bounds[k].isSome()) {
-      const i = boundIface(e, unit, bounds[k].unwrap())?;
-      o = mkOpaqueBound(e, p.name, i);
+    if (k < bounds.length && bounds[k].length > 0) {
+      let ifs: usize[] = [];
+      for (const b of bounds[k]) {
+        const i = boundIface(e, unit, b)?;
+        if (ifs.includes(i)) {
+          return Err(diag("E0304", b.span, "duplicate bound `" + b.name + "` of type parameter `" + p.name + "`"));
+        }
+        ifs.push(i);
+      }
+      boundConflict(e, p.name, bounds[k], ifs)?;
+      o = mkOpaqueBound(e, p.name, ifs);
     }
     e = o.env;
     names.push(p.name);
@@ -50,6 +61,44 @@ export function opaquesBounded(env: Env, unit: usize, params: Ident[], bounds: O
     k += 1;
   }
   return Ok(Opaques { env: e, names: names, tys: tys });
+}
+
+function sameSig(a: IfaceSig, b: IfaceSig): bool {
+  if (a.params.length != b.params.length || !typeEq(a.ret, b.ret)) {
+    return false;
+  }
+  let k: usize = 0;
+  while (k < a.params.length) {
+    if (!typeEq(a.params[k], b.params[k])) {
+      return false;
+    }
+    k += 1;
+  }
+  return true;
+}
+
+// E0477 when two of the interfaces `is` (named by `names`, parallel) declare a method of the same name whose signature differs.
+function boundConflict(env: Env, tp: string, names: Ident[], ifs: usize[]): Result<bool, Diagnostic> {
+  let x: usize = 0;
+  while (x < ifs.length) {
+    let y = x + 1;
+    while (y < ifs.length) {
+      for (const mx of env.ifaces[ifs[x]].methods) {
+        for (const my of env.ifaces[ifs[y]].methods) {
+          if (mx.name == my.name && !sameSig(mx, my)) {
+            return Err(diag(
+              "E0477", names[y].span,
+              "the bounds `" + names[x].name + "` and `" + names[y].name + "` of type parameter `" + tp + "` both declare `" + mx.name
+                + "` with different signatures: `" + showIfaceSig(env, mx) + "` and `" + showIfaceSig(env, my) + "`"
+            ));
+          }
+        }
+      }
+      y += 1;
+    }
+    x += 1;
+  }
+  return Ok(true);
 }
 
 export function opaquesForFn(env: Env, unit: usize, decl: FunctionDecl): Result<Opaques, Diagnostic> {

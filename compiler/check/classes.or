@@ -20,7 +20,7 @@ import {
 import { LoadedProgram, Unit } from "../loader";
 import { Type } from "../hir";
 import {
-  Env, ClassInfo, FieldAcc, MethodInfo, EntRecord, EntGen, EntIface, VFunc, VGFunc, findType, findVal, originOf, boundOf, showType,
+  Env, ClassInfo, FieldAcc, MethodInfo, EntRecord, EntGen, EntIface, VFunc, VGFunc, findType, findVal, originOf, boundsOf, showType,
   FmCtor, FmMethod, FmStatic, isRecordKind, cmpKindOfIface, builtinIface, isOpaqueRec, mapOrigin, parOrigin, typeEq, isVoid, isMapKeyType,
 } from "./env";
 
@@ -568,8 +568,7 @@ export function recordImplements(env: Env, r: usize, iface: usize): bool {
     }
     return false;
   }
-  const b = boundOf(env, r);
-  return b.isSome() && b.unwrap() == iface;
+  return boundsOf(env, r).includes(iface);
 }
 
 // ---------------------------------------------------------------------------
@@ -684,9 +683,8 @@ function cmpProb(env: Env, t: Type, kind: usize, seen: string[], deep: bool): Op
 function recProb(env: Env, r: usize, kind: usize, seen: string[], deep: bool): Option<CmpProb> {
   const w = cmpWord(kind);
   if (isOpaqueRec(env, r)) {
-    const b = boundOf(env, r);
-    if (b.isSome()) {
-      const bk = cmpKindOfIface(env, b.unwrap());
+    for (const b of boundsOf(env, r)) {
+      const bk = cmpKindOfIface(env, b);
       if (bk == kind || kind == 1 && bk > 0) {
         return None;
       }
@@ -870,46 +868,55 @@ export function boundIface(env: Env, unit: usize, b: Ident): Result<usize, Diagn
   };
 }
 
-// A type argument of a generic class (`Box<Foo>`) that does not satisfy the bound of its parameter (E0417).
+// Checks the type argument `t` of the type parameter `tp` against every bound in `bl` (`T extends Ord & Hash`), in
+// order: the first bound it does not satisfy is the error. `owner` names the declaration in the message (`` `f` `` or
+// ``class `C` ``). E0417 for a declared interface, E0475 / E0476 for `Eq` / `Ord` / `Hash`. `unit` names the bounds.
+export function checkParamBounds(env: Env, unit: usize, bl: Ident[], t: Type, tp: string, owner: string, span: Span): Option<Diagnostic> {
+  for (const b of bl) {
+    match (boundIface(env, unit, b)) {
+      Ok(i) => {
+        const ck = cmpKindOfIface(env, i);
+        if (ck > 0) {
+          const bad = cmpBoundError(env, t, ck, owner, span);
+          if (bad.isSome()) {
+            return bad;
+          }
+        } else if (!satisfies(env, t, i)) {
+          let why = "";
+          match (t) {
+            TyRecord(r) => {
+              const co = classOfRec(env, r);
+              if (co.isSome()) {
+                why = ": class `" + env.classes[co.unwrap()].name + "` does not declare `implements " + b.name + "`";
+              }
+            },
+            _ => {}
+          }
+          return Some(diag(
+            "E0417", span,
+            "type `" + showType(env, t) + "` does not satisfy the bound `" + tp + " extends " + env.ifaces[i].name + "` of " + owner + why
+          ));
+        }
+      },
+      Err(d) => {
+        return Some(d);
+      }
+    }
+  }
+  return None;
+}
+
+// A type argument of a generic class (`Box<Foo>`) that does not satisfy a bound of its parameter (E0417).
 // Checked wherever the instance is created (ADR-0026).
 export function checkClassBounds(env: Env, ci: usize, args: Type[], span: Span): Option<Diagnostic> {
   const c = env.classes[ci];
   let k: usize = 0;
   while (k < c.bounds.length && k < args.length) {
-    match (c.bounds[k]) {
-      Some(b) => {
-        match (boundIface(env, c.unit, b)) {
-          Ok(i) => {
-            const ck = cmpKindOfIface(env, i);
-            if (ck > 0) {
-              const bad = cmpBoundError(env, args[k], ck, "class `" + c.name + "`", span);
-              if (bad.isSome()) {
-                return bad;
-              }
-            } else if (!satisfies(env, args[k], i)) {
-              let why = "";
-              match (args[k]) {
-                TyRecord(r) => {
-                  const co = classOfRec(env, r);
-                  if (co.isSome()) {
-                    why = ": class `" + env.classes[co.unwrap()].name + "` does not declare `implements " + b.name + "`";
-                  }
-                },
-                _ => {}
-              }
-              return Some(diag(
-                "E0417", span,
-                "type `" + showType(env, args[k]) + "` does not satisfy the bound `" + env.gtypes[c.gid.toUsize()].decl.typeParams[k].name
-                  + " extends " + env.ifaces[i].name + "` of class `" + c.name + "`" + why
-              ));
-            }
-          },
-          Err(d) => {
-            return Some(d);
-          }
-        }
-      },
-      None => {}
+    const bad = checkParamBounds(
+      env, c.unit, c.bounds[k], args[k], env.gtypes[c.gid.toUsize()].decl.typeParams[k].name, "class `" + c.name + "`", span
+    );
+    if (bad.isSome()) {
+      return bad;
     }
     k += 1;
   }

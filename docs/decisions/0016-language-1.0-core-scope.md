@@ -41,7 +41,7 @@ program can change meaning). Reserved semantics so nothing else claims these tok
 - shifts by a negative amount or by >= the bit width **trap** (no C-style undefined behaviour);
   `>>` is arithmetic on signed, logical on unsigned types;
 - `|` keeps its meaning in type position (unions), `&` stays reserved in type position for
-  multiple bounds (`T extends A & B`, E0408 today);
+  the bound separator of `T extends A & B` (accepted since ADR-0040's multiple-bounds addendum);
 - the lexer never produces a `>>` token in type context (`Box<Box<int>>`, ADR-0026); a shift
   operator, when added, is recognised in expression context only.
 
