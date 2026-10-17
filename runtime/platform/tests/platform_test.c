@@ -828,6 +828,125 @@ static void test_net(void) {
     CHECK(orin_platform_monotonic_millis() >= t0);
 }
 
+
+/* ---- wake sources (ADR-0017 Addendum D): generation-tagged handles, a tree of tokens, and waits that a signal interrupts ---- */
+#include <pthread.h>
+static int64_t g_sig_handle, g_sig_delay_ms;
+static int64_t g_thread_bound = -1;
+static void *signal_later(void *arg) {
+    (void)arg;
+    usleep((useconds_t)(g_sig_delay_ms * 1000));
+    orin_platform_wake_signal(g_sig_handle);
+    return NULL;
+}
+static void *report_bound(void *arg) {
+    (void)arg;
+    g_thread_bound = orin_platform_wake_bound();
+    return NULL;
+}
+static int64_t ms_since(int64_t t0) { return orin_platform_monotonic_millis() - t0; }
+
+static void test_wake(void) {
+    CHECK(orin_platform_wake_bound() == 0 && orin_platform_wake_check(0) == 2 && orin_platform_wake_signal(0) == 0);
+    CHECK(orin_platform_wake_close(0) == ORIN_PLATFORM_EINVAL && orin_platform_wake_close(-1) == ORIN_PLATFORM_EINVAL);
+    int fds = open_fds();
+
+    /* handles: open binds, signal is idempotent, a child observes its ancestors, close rebinds the parent */
+    int64_t a = orin_platform_wake_open();
+    CHECK(a > 0 && orin_platform_wake_bound() == a && orin_platform_wake_check(a) == 0);
+    int64_t b = orin_platform_wake_open();
+    CHECK(b > 0 && b != a && orin_platform_wake_bound() == b && orin_platform_wake_check(b) == 0);
+    CHECK(orin_platform_wake_signal(a) == 1 && orin_platform_wake_signal(a) == 0);
+    CHECK(orin_platform_wake_check(a) == 1 && orin_platform_wake_check(b) == 1); /* b is not set itself, its parent is */
+    CHECK(orin_platform_wake_close(b) == 0 && orin_platform_wake_bound() == a);
+    CHECK(orin_platform_wake_close(b) == ORIN_PLATFORM_EINVAL); /* closed twice */
+    CHECK(orin_platform_wake_close(a) == 0 && orin_platform_wake_bound() == 0);
+
+    /* stale handles: the slot is reused under a new generation; the old handle neither signals nor reads the new token */
+    int64_t c = orin_platform_wake_open();
+    CHECK(c > 0 && c != a && (c & 0xffffffff) == (a & 0xffffffff)); /* the same slot ... */
+    CHECK(((uint64_t)c >> 32) != ((uint64_t)a >> 32)); /* ... a different generation */
+    CHECK(orin_platform_wake_signal(a) == 0 && orin_platform_wake_check(a) == 2 && orin_platform_wake_check(c) == 0);
+    CHECK(orin_platform_wake_close(a) == ORIN_PLATFORM_EINVAL && orin_platform_wake_check(c) == 0);
+    CHECK(orin_platform_wake_bind(a) == c && orin_platform_wake_bound() == a); /* a stale binding is "nothing": waits ignore it */
+    CHECK(orin_platform_wake_bind(c) == a);
+    CHECK(orin_platform_wake_close(c) == 0 && orin_platform_wake_bound() == 0);
+
+    /* depth: WAKE_DEPTH + 1 levels, then the table refuses and binds nothing */
+    int64_t chain[ORIN_PLATFORM_WAKE_DEPTH + 2];
+    int made = 0;
+    while (made < ORIN_PLATFORM_WAKE_DEPTH + 2 && (chain[made] = orin_platform_wake_open()) != 0) made++;
+    CHECK(made == ORIN_PLATFORM_WAKE_DEPTH + 1 && orin_platform_wake_bound() == chain[made - 1]);
+    CHECK(orin_platform_wake_signal(chain[0]) == 1 && orin_platform_wake_check(chain[made - 1]) == 1); /* the root reaches the leaf */
+    while (made > 0) CHECK(orin_platform_wake_close(chain[--made]) == 0);
+    CHECK(orin_platform_wake_bound() == 0);
+
+    /* a new thread starts unbound, whatever the creator is bound to */
+    int64_t t = orin_platform_wake_open();
+    pthread_t th;
+    pthread_create(&th, NULL, report_bound, NULL);
+    pthread_join(th, NULL);
+    CHECK(g_thread_bound == 0 && orin_platform_wake_bound() == t);
+    CHECK(orin_platform_wake_close(t) == 0);
+
+    /* waits: a set token stops every operation BEFORE it touches the socket, and nothing is lost */
+    orin_platform_net root = root_grant(), ln, cs, as, junk;
+    int port = 0, pp = 0;
+    size_t n = 0;
+    char peer[64], area[16];
+    CHECK(orin_platform_tcp_listen(&root, "127.0.0.1", 9, 0, 8, 1, &ln, &port) == 0);
+    CHECK(orin_platform_tcp_connect(&root, "127.0.0.1", 9, port, 1000, 1, &cs) == 0);
+    int64_t w = orin_platform_wake_open();
+    CHECK(orin_platform_stream_send(&cs, "queued", 6, 1000, &n) == 0 && n == 6);
+    CHECK(orin_platform_wake_signal(w) == 1);
+    CHECK(orin_platform_tcp_accept(&ln, 1000, 1, &junk, peer, sizeof peer, &pp) == ORIN_PLATFORM_NET_CANCELLED); /* a connection is waiting */
+    CHECK(orin_platform_stream_recv(&cs, area, 16, 1000, &n) == ORIN_PLATFORM_NET_CANCELLED && n == 0);
+    CHECK(orin_platform_stream_send(&cs, "x", 1, 1000, &n) == ORIN_PLATFORM_NET_CANCELLED && n == 0);
+    CHECK(orin_platform_tcp_connect(&root, "127.0.0.1", 9, port, 1000, 1, &junk) == ORIN_PLATFORM_NET_CANCELLED);
+    CHECK(orin_platform_tcp_connect(&root, "localhost", 9, port, 1000, 1, &junk) == ORIN_PLATFORM_NET_CANCELLED);
+    CHECK(orin_platform_dns_resolve(&root, "localhost", 9, area, sizeof area, &n) == ORIN_PLATFORM_NET_CANCELLED);
+    CHECK(orin_platform_stream_recv(&cs, area, 0, 10, &n) == ORIN_PLATFORM_EINVAL); /* argument errors are still reported */
+    CHECK(orin_platform_wake_bind(0) == w); /* unbound again: the connection and the bytes are still there */
+    CHECK(orin_platform_tcp_accept(&ln, 1000, 1, &as, peer, sizeof peer, &pp) == 0);
+    CHECK(orin_platform_stream_recv(&as, area, 16, 1000, &n) == 0 && n == 6 && memcmp(area, "queued", 6) == 0);
+    CHECK(orin_platform_wake_close(w) == 0);
+
+    /* a blocked wait wakes promptly when the token is signalled from another thread (accept, recv, send, a parent token) */
+    for (int round = 0; round < 4; round++) {
+        int64_t parent = orin_platform_wake_open(), tok = round == 3 ? orin_platform_wake_open() : parent;
+        g_sig_handle = parent, g_sig_delay_ms = 100;
+        pthread_create(&th, NULL, signal_later, NULL);
+        int64_t t0 = orin_platform_monotonic_millis();
+        int rc;
+        if (round == 0) rc = orin_platform_tcp_accept(&ln, 20000, 1, &junk, peer, sizeof peer, &pp);
+        else if (round == 1) rc = orin_platform_stream_recv(&as, area, 16, 20000, &n);
+        else {
+            rc = 0;
+            static char big[1 << 16];
+            memset(big, 'x', sizeof big);
+            for (int i = 0; i < 4000 && rc == 0; i++) rc = orin_platform_stream_send(&as, big, sizeof big, 20000, &n);
+        }
+        int64_t took = ms_since(t0);
+        pthread_join(th, NULL);
+        CHECK(rc == ORIN_PLATFORM_NET_CANCELLED);
+        CHECK(took >= 80 && took < 5000); /* not before the signal, long before the 20 s timeout */
+        CHECK(orin_platform_wake_close(tok) == 0 || tok == parent);
+        if (tok != parent) CHECK(orin_platform_wake_close(parent) == 0);
+        else CHECK(orin_platform_wake_bound() == 0);
+        if (round >= 2) { /* the writer filled the socket: drain it so the next round starts clean */
+            while (orin_platform_stream_recv(&cs, area, 16, 50, &n) == 0) {}
+        }
+    }
+
+    /* timeouts and EOF are unaffected by an unset token */
+    int64_t u = orin_platform_wake_open();
+    CHECK(orin_platform_tcp_accept(&ln, 30, 1, &junk, peer, sizeof peer, &pp) == ORIN_PLATFORM_NET_TIMEOUT);
+    CHECK(orin_platform_stream_recv(&cs, area, 16, 30, &n) == ORIN_PLATFORM_NET_TIMEOUT);
+    CHECK(orin_platform_wake_close(u) == 0);
+    CHECK(orin_platform_net_close(&cs) == 0 && orin_platform_net_close(&as) == 0 && orin_platform_net_close(&ln) == 0);
+    CHECK(open_fds() == fds); /* the eventfds are closed with their tokens, and no socket leaked */
+}
+
 int main(void) {
     snprintf(tmpdir, sizeof tmpdir, "/tmp/orin_platform_test_%d", (int)getpid());
     mkdir(tmpdir, 0700);
@@ -842,6 +961,7 @@ int main(void) {
     test_policy_and_scopes();
     test_threads_and_monitors();
     test_net();
+    test_wake();
     char cmd[300];
     snprintf(cmd, sizeof cmd, "rm -rf '%s'", tmpdir);
     if (system(cmd)) {}

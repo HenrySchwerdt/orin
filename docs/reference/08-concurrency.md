@@ -1,6 +1,6 @@
 # 8. Concurrency surface
 
-Normative for the language-visible part of concurrency as implemented (stage 0 plus Gate 1 C1). Sources: ADR-0017 (with its
+Normative for the language-visible part of concurrency as implemented (stage 0 plus Gate 1 C1 and C3). Sources: ADR-0017 (with its
 addenda), ADR-0039 (`parallel()`), ADR-0048 (task errors), `docs/concurrency.md`, `docs/std.md` "Parallel pipelines",
 `library/std/task.or`, `compiler/check/{tasks,parallel}.or`. Conventions: see [README](README.md).
 
@@ -10,7 +10,8 @@ Tasks are created through `std:task` (`import { scope, spawn, channel } from "st
 Test locations. The `task_` and `par_` programs of `tests/next/run` are conformance tests. The programs of `tests/concurrency/`
 (timed waits, panic chains, stress) are not run by the conformance runner; they run under `tools/test_concurrency.sh` (plain,
 ThreadSanitizer, ASan + UBSan). `tests/std/` unit tests run under `orin test`. The central soundness claim (no object is
-reachable from two tasks) is `TESTED_ONLY`; absence of deadlock, fairness and cancellation of running tasks are not guaranteed.
+reachable from two tasks) is `TESTED_ONLY`; absence of deadlock, fairness and cancellation of running tasks (other than the
+network waits of 8.6) are not guaranteed.
 
 ## 8.1 Tasks and scopes
 
@@ -105,6 +106,32 @@ Tests: tests/concurrency/timed_waits.or.
 the monotonic clock; `sleepUntil` of a past deadline returns at once.
 Tests: tests/concurrency/timed_waits.or.
 
+## 8.4a Cancellation of network waits (Gate 1 C3, ADR-0017 Addendum D)
+
+**TSK-15a. Scope tokens.** Every scope has a cancellation token. `s.token(): CancelToken` is a copyable value (a task body may capture
+it; it cannot capture `Scope`, E0481). `token.cancel(): bool` and `s.cancel(): bool` set it and return `true` exactly once;
+cancellation is permanent. `isCancelled()` (free function) and `token.isCancelled()` / `s.isCancelled()` report whether the calling
+task's token, or the one named, or any enclosing scope's, is set. A task is bound to the token of the scope it was spawned in; a
+scope opened inside a task has a child token, so an outer cancel reaches every depth and an inner cancel only its own tasks.
+Tests: tests/concurrency/cancel_tokens.or, tests/concurrency/cancel_storm.or.
+
+**TSK-15b. Stale tokens.** A token kept after its scope has ended is stale: `cancel()` returns `false`, `isCancelled()` returns `false`, and
+it never affects another scope, whichever slot that scope reuses (the handle is generation-tagged).
+Tests: tests/concurrency/cancel_tokens.or.
+
+**TSK-15c. Network waits observe the token.** A task blocked in `accept`, `connect`, `recv` or `send` of `std:net` (including the readers
+`StreamReader.readExact` / `readUntil` and the `...Until` forms) returns when its token is set, within milliseconds, with
+`Err(NetError { kind: Cancelled })` (`RecvError(..)` / `FillError(..)` for `recv` and the readers); every later network call of
+that task fails the same way without touching the socket. Not interrupted: name resolution (`getaddrinfo`; documented limitation), waits on
+channels, `join`, `select` and `sleep` (C2), and computation.
+Tests: tests/net/interrupt.or (via tools/test_net.sh), tests/std/net_test.or, tests/concurrency/cancel_storm.or.
+
+**TSK-15d. Operation-wide deadlines.** `recvUntil`, `sendUntil`, `sendAllUntil`, `StreamReader.readExactUntil`, `readDelimitedUntil`,
+`withAcceptedUntil`, `acceptDetachedUntil`, `withConnectionUntil` and `useConnectionUntil` end at an absolute `Deadline` however many
+reads or writes the operation takes; an operation that is ready at a deadline that has passed still completes once. `Timeout` is the kind
+when the deadline passes.
+Tests: tests/net/interrupt.or, tests/std/net_test.or.
+
 ## 8.5 Data-parallel helpers and `parallel()` (ADR-0039)
 
 **TSK-16. `parallelMap`.** `parallelMap(xs, f, parts)` equals `xs.map(f)`, computed by `parts` tasks over contiguous chunks,
@@ -155,5 +182,5 @@ Tests: tests/next/run/par_float_reduce.or, tests/next/run/par_ops.or.
   unsigned-`+` no-warning case.
 - E0482 for a non-constant zero capacity is a run-time trap; the trap test is tests/std/expect_trap/task_capacity_zero.or only.
 - Generic-method forms (`s.spawn(f)`) are not available; landing in PR (pending), ADR-0040.
-- Absence of deadlock detection, cancellation tokens (Gate 1 C2: `Cancelled` kind) and a `timeout` arm for `select` are not
-  implemented, so there is nothing to test.
+- Absence of deadlock detection, the cancellation of channel waits and of a scope by a trapped task (Gate 1 C2) and a `timeout` arm
+  for `select` are not implemented, so there is nothing to test.
