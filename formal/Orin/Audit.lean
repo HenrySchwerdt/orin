@@ -122,3 +122,11 @@ import Orin
 #print axioms Orin.Range.u1_sound
 #print axioms Orin.Range.range_accepted
 #print axioms Orin.Range.u1_machine
+#print axioms Orin.goodW_step
+#print axioms Orin.goodW_reach
+#print axioms Orin.ret_genok
+#print axioms Orin.RetGenOK.exec
+#print axioms Orin.prog_ret_genok
+#print axioms Orin.mop_len
+#print axioms Orin.drain_len
+#print axioms Orin.step_len

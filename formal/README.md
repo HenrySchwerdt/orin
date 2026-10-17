@@ -65,6 +65,9 @@ Array contents are not tracked. A ghost bit `ctd x` says that the local holds a 
 | `RangeCfg.lean` | `Fn`, `Reach`, `PostFix`, `postfix_sound` |
 | `RangeFix.lean` | the worklist: `WReach`, `WInv`, `feed_spec`, `fix_sound` (when the iteration ends, for **every** pop order, threshold list and widening delay) |
 | `RangeNarrow.lean` | `NarrowRel`, `narrow_sound` (strong induction on the block index), `accessOk`, `inRange_sound` (U1), `u1_sound`, `range_accepted`, `u1_machine`, kernel-evaluated examples |
+| `CallGen.lean` | `Site`, `StkW`, `GoodW`: the call-machine invariant with explicit call-site data; `goodW_step`, `goodW_reach` |
+| `CallLink.lean` | `callRI`, `RetGenOK`, `ret_genok`, `RetGenOK.exec`, `prog_ret_genok`: the contract `GenOK` of a call derived from the ownership model |
+| `OpLen.lean` | `mop_len`, `drain_len`, `step_len`: no builtin and no release step changes the length of an array behind a counted local |
 
 Headline statement: `range_accepted` + `u1_sound`: for a function whose worklist iteration ended
 and whose narrowing round ran, an instruction that `accessOk` accepts at its program point
@@ -79,12 +82,29 @@ the bounds check of `opArrayGet` (`arrayGet_oob`) cannot fire.
   get, set, `makeUnique` and `gen`. `gen` stands for every other instruction (calls, builtins, field
   operations): it is described by the local it defines (`dst`), the locals it mentions (`men`), the array
   operands it keeps (borrowed positions, `kept`) and the in/out receiver it redefines (`recv`).
-* **The contract of `gen` (assumed).** `GenOK`: an unmentioned local keeps its value; a counted
-  reference keeps its object, alive and with the same number of slots, unless the instruction mentions
-  the local and does not keep it. This is what `Frozen`/`frozen_step` (ownership model) establish for
-  borrowed arguments, but it is **not derived from the ownership model here**; it is the one bridge
-  between the two Lean developments that is stated, not proved. `exec_summ` shows the other
-  instructions meet it.
+* **The contract of `gen` (derived for calls, builtins at the machine level).** `GenOK`: an unmentioned
+  local keeps its value; a counted reference keeps its object, alive and with the same number of slots,
+  unless the instruction mentions the local and does not keep it. It is **no longer an assumption of
+  the range proof for calls**: `CallLink.lean` proves it from the call machine. `CallGen.lean` states
+  the stack invariant with the call-site data explicit (`Site`: the caller's kinds, operands, locals and
+  heap at the call; `GoodW`, preserved by every step, `goodW_step`, implies `Good`). `ret_genok`: at the
+  return of a call the caller's frame stands in the relation `GenOK` to the frame before the call, for
+  the instruction `callRI d args ps` (defines the result local, mentions the operands, keeps the
+  borrowed ones); `RetGenOK.exec` reads it as an `Exec.gen` step and `prog_ret_genok` states it for
+  every return in a run of a `pcheck`-accepted program. The proof uses what `Frozen` gives (the
+  caller's counted locals are anchors of the callee's frame, the objects they reach keep their slots)
+  and that only the owned operands and the result local are cleared or written. For builtins and field
+  operations `OpLen.lean` proves the facts the contract rests on, for the machine's own instructions:
+  `mop_len` (no instruction frees an object or changes its number of slots), `drain_len` (a release step
+  never frees the object of a counted local), `step_len` (no step changes the length of an array behind
+  a counted local). Remaining, stated: (a) the descriptor of a builtin (`dst`, `men`, `kept`) is not tied
+  per instruction to the machine's `MI` (only the length/liveness facts are); (b) the type discipline of
+  the result: `RetGenOK` takes `hcls` (an owned operand is a reference-class local) and `hres` (the
+  stored result respects the class of its local: a `usize` is never negative, a `bool` is 0 or 1);
+  the ownership model has no integer classes, so this stays an explicit hypothesis, as the class
+  conditions of `Exec`; (c) the ghost bit `ctd` is related to the ownership kinds only through the
+  hypothesis `ctd x -> counted (kinds at the call) x`, i.e. the caller of the bridge supplies the
+  simulation between the range frame and the ownership analysis.
 * **Integers** are mathematical; overflow, underflow and bounds traps stop the execution, so a trap has
   no successor. A `usize` is never negative (`Cls.okv`; `wf.or`). Every written value respects the class
   of its local.
