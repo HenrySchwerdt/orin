@@ -735,7 +735,7 @@ networking configuration.
 **Server demo** (`examples/http_server.or`, `tools/test_net.sh`): `GET /health`, `POST /echo`, request limits (line 2048,
 50 headers, head 16 KiB, body 64 KiB), a deadline for the whole request, idle and send timeouts, 100 requests per
 connection, graceful close after an error answer. It listens on loopback only through a grant narrowed to that address.
-One connection at a time (no tasks, ADR-0017): a slow client holds the server until a deadline passes. Indicative
+Since C5 the example is the concurrent server (a bounded worker pool, `POST /shutdown` for a graceful stop, `tools/test_server_campaign.sh`; docs/roadmaps/async-concurrency.md "Server acceptance campaign"): a slow client holds one worker, for at most the deadlines. The throughput below is from the earlier one-connection-at-a-time server. Indicative
 throughput on the loopback, one keep-alive connection, sequential requests from a Python client: about 20,000 requests/s
 (single core, verbose logging on).
 
@@ -763,7 +763,7 @@ What ADR-0033 provides is enough to do that *correctly*; what it lacks to do it 
    server is `acceptEach(listener, timeout, (stream) => ...)` with the `RequestParser`, a normal value, living beside the
    stream inside the callback. The listener grant should narrow to `addr:port` as in the ADR; the accepted stream
    should carry the peer address as a value (for logs and `Forwarded` checks).
-6. **One connection at a time until ADR-0017 lands**: a slow client blocks every other, so the first server is only
+6. **One connection at a time until ADR-0017 landed** (the example is concurrent since C5): a slow client blocks every other, so the first server is only
    safe behind the timeouts of items 3-4; keep-alive needs an idle timeout shorter than the header deadline.
 7. **Socket options in `tcp_listen`**: `SO_REUSEADDR` on by default, `TCP_NODELAY` per stream, a backlog parameter
    (already in the ADR). `Expect: 100-continue` only needs `send` before the body is read, but then the parser must
