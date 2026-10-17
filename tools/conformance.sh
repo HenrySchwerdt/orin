@@ -14,6 +14,7 @@
 # tools/check_conformance_parity.py compares the two (docs/testing.md, "Conformance runner").
 set -eu
 cd "$(dirname "$0")/.."
+. tools/runtime_files.sh   # the runtime source list: tools/runtime-sources.txt
 OUT=build/conformance
 RUNNER=$OUT/orin-conformance
 BUILD_ONLY=
@@ -48,7 +49,7 @@ if [ ! -x "$RUNNER" ] || [ "$(cat "$OUT/stamp" 2>/dev/null || true)" != "$stamp"
   mkdir -p "$OUT"
   echo "[conformance] $BUILDER builds tooling/conformance -> $RUNNER" >&2
   "$BUILDER" compile tooling/conformance/src/main.or -o "$OUT/runner.c"
-  $CC -O1 -w -I runtime/core "$OUT/runner.c" runtime/core/orin_runtime.c runtime/platform/orin_platform.c -lm -o "$OUT/runner.tmp"
+  $CC -O1 -w $(rt_inc) "$OUT/runner.c" $(rt_src) -lm -o "$OUT/runner.tmp"
   mv "$OUT/runner.tmp" "$RUNNER"
   echo "$stamp" > "$OUT/stamp"
 fi

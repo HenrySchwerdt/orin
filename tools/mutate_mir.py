@@ -84,6 +84,7 @@ import sys
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
+from runtime_files import rt_inc, rt_src, rt_llvm  # the runtime source list: tools/runtime-sources.txt
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -1101,8 +1102,7 @@ def build_driver(orinc, out_dir):
     c = os.path.join(out_dir, "verify_text.c")
     exe = os.path.join(out_dir, "verify_text")
     subprocess.run([orinc, "compile", "compiler/tests/verify_text.or", "-o", c], cwd=ROOT, check=True)
-    subprocess.run(["cc", "-O1", "-w", "-I", "runtime/core", c, "runtime/core/orin_runtime.c",
-                    "runtime/platform/orin_platform.c", "-lm", "-o", exe], cwd=ROOT, check=True)
+    subprocess.run(["cc", "-O1", "-w", *rt_inc(), c, *rt_src(), "-lm", "-o", exe], cwd=ROOT, check=True)
     return exe
 
 

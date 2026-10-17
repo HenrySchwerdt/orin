@@ -10,6 +10,7 @@
 # processors still interleave, but a clean run is evidence, not a proof.
 set -eu
 cd "$(dirname "$0")/.."
+. tools/runtime_files.sh   # the runtime source list: tools/runtime-sources.txt
 ORIN2=${ORIN2:-build/bootstrap/orin2}
 CC=${CC:-cc}
 B=build/parallel
@@ -23,7 +24,7 @@ TSAN_RUN=""
 if command -v setarch >/dev/null 2>&1 && setarch "$ARCH" -R true >/dev/null 2>&1; then
   TSAN_RUN="setarch $ARCH -R"
 fi
-RT="runtime/core/orin_runtime.c runtime/platform/orin_platform.c"
+RT="$(rt_src)"
 count=0
 for t in tests/next/run/par_*.or tests/concurrency/par_*.or; do
   [ -f "$t" ] || continue
