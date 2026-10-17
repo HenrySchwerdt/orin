@@ -16,10 +16,11 @@ import {
   vtName, isBad, badReason, vtEq, isIntTy, intKindOf, concrete, joinKinds, fieldIndex, resolveTy, fieldTyOf
 } from "./vt";
 import { Gen, Obl, SortR, sortOf, opaqueSort } from "./gen";
+import { bareOf } from "./scope";
 import {
   Var, Chk, TR, St, Ret, Ex, Fn, Cls, Prog, Cx, lineOf, clauseText, srcText, lit, inKind, guarded, concat, concatChk, unionUsize, andAll,
   noChks, noExp, lookupVar, prefix, tailFrom, mk, sortS, tyOf, fresh, freshFree, typeFact, arrLen, arrData, arrMk, arrSel, inBounds, isSomeT,
-  recField, mapHas, mapSize, mapFact, tfOf, assignedIn, hasJump, rootOf, isThisExpr, clausesOfList, exprOf, hasClauses
+  recField, mapHas, mapSize, mapFact, tfOf, assignedIn, hasJump, rootOf, isThisExpr, clausesOfList, exprOf, hasClauses, valKey
 } from "./ctx";
 import { tr, trClause, wdOf, callFnX, isUnit, sigOf, Cl, clHyp, clGoal, matchPattern } from "./expr";
 
@@ -37,7 +38,7 @@ export function emit(g0: Gen, st0: St, cx: Cx, chks: Chk[]): Emitted {
     if (c.oblig) {
       const o = Obl {
         kind: c.kind, what: c.what, line: c.line, clause: c.clause, goal: c.goal, pc: st.pc, deps: st.deps, approx: st.approx,
-        file: cx.f.file, fn: cx.f.key, text: cx.f.text, hidden: false, exact: g.isExact()
+        file: cx.f.file, fn: cx.f.disp, text: cx.f.text, hidden: false, exact: g.isExact()
       };
       // An obligation that repeats an earlier one on the same path (same place, same goal, and the earlier goal
       // is already assumed here) is redundant: the earlier one is reported.
@@ -94,7 +95,7 @@ function assignIndex(vars: Var[], name: string): Option<usize> {
 }
 
 function cxPlain(cx: Cx): Cx {
-  return Cx { p: cx.p, f: cx.f, res: None, ens: false, body: false, olds: [], ret: cx.ret, inQ: false, text: cx.text };
+  return Cx { p: cx.p, unit: cx.unit, f: cx.f, res: None, ens: false, body: false, olds: [], ret: cx.ret, inQ: false, text: cx.text };
 }
 
 // ----------------------------------------------------------------------------------------- places
@@ -141,22 +142,22 @@ export function setPlace(g0: Gen, st0: St, cx: Cx, place: Expr, val: string, vt:
         VRec(rn) => {
           const rd = cx.p.tab.findRec(rn);
           if (rd.isNone()) {
-            return Err("unknown record `" + rn + "`");
+            return Err("unknown record `" + bareOf(rn) + "`");
           }
           const d = rd.unwrap();
           if (cx.p.tab.isCyclic("r:" + rn)) {
-            return Err("the fields of the recursive type `" + rn + "` are not modelled");
+            return Err("the fields of the recursive type `" + bareOf(rn) + "` are not modelled");
           }
           const fi = fieldIndex(d, fld.name);
           if (fi.isNone()) {
-            return Err("no field `" + fld.name + "` on `" + rn + "`");
+            return Err("no field `" + fld.name + "` on `" + bareOf(rn) + "`");
           }
           const ft = fieldTyOf(cx.p.tab, d, fi.unwrap());
           if (isBad(ft)) {
-            return Err("field `" + rn + "." + fld.name + "` has an unsupported type (" + badReason(ft) + ")");
+            return Err("field `" + bareOf(rn) + "." + fld.name + "` has an unsupported type (" + badReason(ft) + ")");
           }
           if (!vtEq(ft, vt)) {
-            return Err("field `" + rn + "." + fld.name + "` has type `" + vtName(ft) + "`, assigned `" + vtName(vt) + "`");
+            return Err("field `" + bareOf(rn) + "." + fld.name + "` has type `" + vtName(ft) + "`, assigned `" + vtName(vt) + "`");
           }
           const so = sortS(g, cx, bt.vt)?;
           g = so.g;
@@ -432,7 +433,7 @@ export function execStmts(g0: Gen, st0: St, cx: Cx, stmts: Stmt[], top: bool): R
         st = sp.st;
       },
       SExpr(e) => {
-        if (isCallNamed(e, "exit") && cx.p.fnCount.get("exit").unwrapOr(0) == 0) {
+        if (isCallNamed(e, "exit") && valKey(cx, "exit").isNone()) {
           // The process ends: no path continues.
           match (e.kind) {
             ECall(_, args) => {
@@ -1155,7 +1156,7 @@ function execLoop(g0: Gen, st0: St, cx: Cx, isWhile: bool, cond: Option<Expr>, i
         const hidden = inv.clause.isNone();
         const id = g.addObl(Obl {
           kind: "loop-invariant", what: "entry", line: inv.line, clause: inv.label + " (holds on entry to the loop)", goal: goal, pc: st.pc,
-          deps: st.deps, approx: st.approx, file: cx.f.file, fn: cx.f.key, text: cx.f.text, hidden: hidden, exact: false
+          deps: st.deps, approx: st.approx, file: cx.f.file, fn: cx.f.disp, text: cx.f.text, hidden: hidden, exact: false
         });
         g.loopAdd(lid, id);
         kept.push(inv);
@@ -1213,7 +1214,7 @@ function execLoop(g0: Gen, st0: St, cx: Cx, isWhile: bool, cond: Option<Expr>, i
           const goal = clGoal(x);
           const id = g.addObl(Obl {
             kind: "loop-invariant", what: "preserved", line: inv.line, clause: inv.label + " (preserved by the loop body)", goal: goal, pc: bodyR.st.pc,
-            deps: bodyR.st.deps, approx: bodyR.st.approx, file: cx.f.file, fn: cx.f.key, text: cx.f.text, hidden: inv.clause.isNone(), exact: false
+            deps: bodyR.st.deps, approx: bodyR.st.approx, file: cx.f.file, fn: cx.f.disp, text: cx.f.text, hidden: inv.clause.isNone(), exact: false
           });
           g.loopAdd(lid, id);
         },

@@ -1,0 +1,216 @@
+// Name scopes of the contract verifier: which declaration a bare name means in a unit.
+//
+// The verifier keys functions, classes, records, unions and constants by their DEFINING unit ("unit::name", see
+// `qualKey`), so two units may declare `mk` or `Scope` without any call or type reference being confused. A bare name
+// in the source of a unit is resolved here the way the checker's collection phase (check/collect.or) binds it: the
+// declarations of the unit itself, plus the names its `import { .. } from ".."` items take from the exports of the
+// target unit; the exports of a unit are its `export`ed declarations plus its `export { .. } from ".."` re-exports.
+// A companion module (`m.gen`) starts with the scope of its source module `m`.
+//
+// Soundness: a name that is bound twice in one scope is AMBIGUOUS (`AMBIG`, the empty key): the verifier resolves it to
+// nothing and the obligation stays UNKNOWN. A name that is not bound at all (a built-in, a local, a type parameter) has no
+// entry. The verifier never guesses between two declarations.
+
+import { Item, IImport, IReExport, IFunction, IType, IConst, IClass, ImportDecl } from "../syntax";
+import { LoadedProgram, ImportTarget, ImportUnit } from "../loader";
+
+// The key of a declaration `name` of the unit `unit`.
+export function qualKey(unit: string, name: string): string {
+  return unit + "::" + name;
+}
+
+// The source name of a key: `u::Name` -> `Name`, `u::Class.method` -> `Class.method`; a key without a unit as it is.
+export function bareOf(key: string): string {
+  const i = key.indexOf("::");
+  if (i.isNone()) {
+    return key;
+  }
+  return key.substring(i.unwrap() + 2, key.length);
+}
+
+// The key of a name looked up in the scope of a unit.
+export function scopeKey(unit: string, name: string): string {
+  return unit + "::" + name;
+}
+
+// The empty key: a name bound more than once in one scope.
+export const AMBIG: string = "";
+
+// A name imported from something the verifier does not track (a std module, an interface): it means a built-in or
+// opaque entity, never a declaration of the program. Looked up, it is reported like a name that is not bound.
+export const UNMODELLED: string = "#";
+
+// The key a scope entry stands for: None when the name is unbound or unmodelled.
+export function entryKey(e: Option<string>): Option<string> {
+  if (e.isSome() && e.unwrap() == UNMODELLED) {
+    return None;
+  }
+  return e;
+}
+export type Scopes = {
+  types: Map<string, string>;   // scopeKey(unit, bare) -> key of the type (record, union, alias, class) or AMBIG
+  vals: Map<string, string>;    // scopeKey(unit, bare) -> key of the function or constant or AMBIG
+};
+
+type Names = { t: Map<string, string>; v: Map<string, string>; };
+
+function bindName(m0: Map<string, string>, name: string, key: string): Map<string, string> {
+  let m = m0;
+  const old = m.get(name);
+  if (old.isNone()) {
+    m.set(name, key);
+  } else if (old.unwrap() != key) {
+    m.set(name, AMBIG);
+  }
+  return m;
+}
+
+function importDeclOf(it: Item): Option<ImportDecl> {
+  return match (it) {
+    IImport(d) => Some(d),
+    IReExport(d) => Some(d),
+    _ => None
+  };
+}
+
+function isReExport(it: Item): bool {
+  return match (it) {
+    IReExport(_) => true,
+    _ => false
+  };
+}
+
+function isCompanion(path: string): bool {
+  return !path.startsWith("$") && path.endsWith(".gen");
+}
+
+function sourceOfCompanion(prog: LoadedProgram, path: string): Option<usize> {
+  const want = path.substring(0, path.length - 4) + ".or";
+  let i: usize = 0;
+  while (i < prog.units.length) {
+    if (prog.units[i].path == want) {
+      return Some(i);
+    }
+    i += 1;
+  }
+  return None;
+}
+
+function copyMap(m: Map<string, string>): Map<string, string> {
+  let out = new Map<string, string>();
+  for (const k of m.keys()) {
+    out.set(k, m.get(k).unwrapOr(AMBIG));
+  }
+  return out;
+}
+
+// The scope of every unit of `prog`.
+export function buildScopes(prog: LoadedProgram): Scopes {
+  let types = new Map<string, string>();
+  let vals = new Map<string, string>();
+  let exportsT: Map<string, string>[] = [];
+  let exportsV: Map<string, string>[] = [];
+  let scopesT: Map<string, string>[] = [];
+  let scopesV: Map<string, string>[] = [];
+  let ui: usize = 0;
+  for (const unit of prog.units) {
+    let st = new Map<string, string>();
+    let sv = new Map<string, string>();
+    let et = new Map<string, string>();
+    let ev = new Map<string, string>();
+    if (isCompanion(unit.path)) {
+      const src = sourceOfCompanion(prog, unit.path);
+      if (src.isSome() && src.unwrap() < scopesT.length) {
+        st = copyMap(scopesT[src.unwrap()]);
+        sv = copyMap(scopesV[src.unwrap()]);
+      }
+    }
+    for (const it of unit.ast.items) {
+      match (it) {
+        IFunction(d) => {
+          const k = qualKey(unit.name, d.name.name);
+          sv = bindName(sv, d.name.name, k);
+          if (d.exported) { ev = bindName(ev, d.name.name, k); }
+        },
+        IConst(d) => {
+          const k = qualKey(unit.name, d.name.name);
+          sv = bindName(sv, d.name.name, k);
+          if (d.exported) { ev = bindName(ev, d.name.name, k); }
+        },
+        IType(d) => {
+          const k = qualKey(unit.name, d.name.name);
+          st = bindName(st, d.name.name, k);
+          if (d.exported) { et = bindName(et, d.name.name, k); }
+        },
+        IClass(d) => {
+          const k = qualKey(unit.name, d.name.name);
+          st = bindName(st, d.name.name, k);
+          if (d.exported) { et = bindName(et, d.name.name, k); }
+        },
+        _ => {}
+      }
+    }
+    // imports and re-exports, in item order; `unit.imports` has one entry per such item
+    let imp: usize = 0;
+    for (const it of unit.ast.items) {
+      const dd = importDeclOf(it);
+      if (dd.isNone()) {
+        continue;
+      }
+      const d = dd.unwrap();
+      const re = isReExport(it);
+      let tgt: Option<usize> = None;
+      if (imp < unit.imports.length) {
+        match (unit.imports[imp]) {
+          ImportUnit(j) => { tgt = Some(j); },
+          _ => {}
+        }
+      }
+      imp += 1;
+      for (const n of d.names) {
+        if (tgt.isNone() || tgt.unwrap() >= exportsT.length) {
+          // a std module or a unit not seen yet: the name is bound to something the verifier does not model
+          if (re) {
+            et = bindName(et, n.name, UNMODELLED);
+            ev = bindName(ev, n.name, UNMODELLED);
+          } else {
+            st = bindName(st, n.name, UNMODELLED);
+            sv = bindName(sv, n.name, UNMODELLED);
+          }
+          continue;
+        }
+        const j = tgt.unwrap();
+        const tk = exportsT[j].get(n.name);
+        const vk = exportsV[j].get(n.name);
+        if (tk.isSome()) {
+          if (re) { et = bindName(et, n.name, tk.unwrap()); } else { st = bindName(st, n.name, tk.unwrap()); }
+        }
+        if (vk.isSome()) {
+          if (re) { ev = bindName(ev, n.name, vk.unwrap()); } else { sv = bindName(sv, n.name, vk.unwrap()); }
+        }
+        if (tk.isNone() && vk.isNone()) {
+          // exported by the target in a form the verifier does not track (a std type, an interface)
+          if (re) {
+            et = bindName(et, n.name, UNMODELLED);
+            ev = bindName(ev, n.name, UNMODELLED);
+          } else {
+            st = bindName(st, n.name, UNMODELLED);
+            sv = bindName(sv, n.name, UNMODELLED);
+          }
+        }
+      }
+    }
+    for (const k of st.keys()) {
+      types.set(scopeKey(unit.name, k), st.get(k).unwrapOr(AMBIG));
+    }
+    for (const k of sv.keys()) {
+      vals.set(scopeKey(unit.name, k), sv.get(k).unwrapOr(AMBIG));
+    }
+    scopesT.push(st);
+    scopesV.push(sv);
+    exportsT.push(et);
+    exportsV.push(ev);
+    ui += 1;
+  }
+  return Scopes { types: types, vals: vals };
+}

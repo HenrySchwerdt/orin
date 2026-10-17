@@ -287,8 +287,10 @@ A call is replaced by the callee's contract: its `@Requires` (with well-definedn
 uninterpreted function of its arguments (`uf_f`): two calls with equal arguments return equal values, and each call site gets the
 instance `requires(args) ==> ensures(args, uf_f(args))` of its contract, so no quantifier is needed. Other functions return a
 fresh value. Recursion assumes the function's own contract at the recursive call (partial correctness); this is the assumption
-**A-CALL** on every result that went through a call. Calls of a function that is not unique by name, generic, or whose
-signature is outside the fragment make the caller UNKNOWN.
+**A-CALL** on every result that went through a call. Functions, classes and types are keyed by the unit that declares them, and a name is resolved in the scope of the unit
+it is written in (its own declarations and its imports, the way the checker binds them; `compiler/vc/scope.or`), so two units
+may declare the same function or type name. Calls of a generic function, of a name the verifier cannot resolve (a built-in, or a name
+bound more than once in one scope), or of a function whose signature is outside the fragment make the caller UNKNOWN.
 
 ### Class invariants and frames (B8, B9)
 

@@ -37,9 +37,10 @@ import { Res, QWarn, Report, assumptionsFor } from "./report";
 import { replyValues } from "./sx";
 import {
   VT, VInt, VBool, VStr, VUnit, VArr, VOpt, VRes, VMap, VRec, VUni, VBad,
-  vtKey, vtName, isBad, badReason, vtEq, isIntTy, RecDef, UniDef, AliasDef, Tab, recOfType, recOfClass, uniOfType, resolveTy, resolveTyP, fieldTyOf, identNames, sealTab, fieldIndex
+  vtKey, vtName, isBad, badReason, vtEq, isIntTy, RecDef, UniDef, AliasDef, Tab, recOfType, recOfClass, uniOfType, payloadTy, resolveTyP, fieldTyOf, identNames, sealTab, fieldIndex
 } from "./vt";
 import { Gen, Obl, SortR, sortOf, opaqueSort } from "./gen";
+import { qualKey, bareOf, buildScopes } from "./scope";
 import {
   Var, Chk, TR, St, Ret, Ex, Fn, Cls, ConstInfo, Prog, Cx, I64_MIN, I64_MAX, lineOf, clauseText, lit, inRange, inKind, concat, unionUsize, andAll,
   noChks, noExp, lookupVar, sortS, tyOf, fresh, freshFree, wfOf, recField, arrLen, arrSel, clausesOfList, exprOf, rulesOfList, hasClauses,
@@ -74,7 +75,7 @@ function unitFns(u: string, file: string, text: string, d: FunctionDecl): Fn {
     acc.push(0);
   }
   return Fn {
-    key: d.name.name, name: d.name.name, unit: u, file: file, text: text, cls: "", kind: 0, priv: false, generic: d.typeParams.length > 0,
+    key: qualKey(u, d.name.name), disp: d.name.name, sym: d.name.name, name: d.name.name, unit: u, file: file, text: text, cls: "", kind: 0, priv: false, generic: d.typeParams.length > 0,
     pnames: names, ptys: tys, pacc: acc, ret: d.ret, body: d.body, contracts: d.contracts, span: d.span, pure: false, mutating: false,
     frame: [], frameAll: false, line: lineOf(text, d.span.start), params: d.params, verify: !u.startsWith("$"), tparams: identNames(d.typeParams)
   };
@@ -90,7 +91,7 @@ function methodFn(u: string, file: string, text: string, c: ClassDecl, m: Method
     acc.push(0);
   }
   return Fn {
-    key: c.name.name + "." + m.name.name, name: m.name.name, unit: u, file: file, text: text, cls: c.name.name, kind: m.isStatic ? 2 : 1, priv: m.priv,
+    key: qualKey(u, c.name.name) + "." + m.name.name, disp: c.name.name + "." + m.name.name, sym: c.name.name + "." + m.name.name, name: m.name.name, unit: u, file: file, text: text, cls: qualKey(u, c.name.name), kind: m.isStatic ? 2 : 1, priv: m.priv,
     generic: m.typeParams.length > 0 || c.typeParams.length > 0, pnames: names, ptys: tys, pacc: acc, ret: m.ret, body: m.body, contracts: m.contracts,
     span: m.span, pure: false, mutating: false, frame: [], frameAll: false, line: lineOf(text, m.span.start), params: m.params, verify: !u.startsWith("$"), tparams: concatNames(identNames(c.typeParams), identNames(m.typeParams))
   };
@@ -108,7 +109,7 @@ function ctorFn(u: string, file: string, text: string, c: ClassDecl, k: CtorDecl
     ps.push(Param { name: p.name, ty: p.ty, span: p.span });
   }
   return Fn {
-    key: c.name.name + ".constructor", name: "constructor", unit: u, file: file, text: text, cls: c.name.name, kind: 3, priv: false, generic: c.typeParams.length > 0,
+    key: qualKey(u, c.name.name) + ".constructor", disp: c.name.name + ".constructor", sym: c.name.name + ".constructor", name: "constructor", unit: u, file: file, text: text, cls: qualKey(u, c.name.name), kind: 3, priv: false, generic: c.typeParams.length > 0,
     pnames: names, ptys: tys, pacc: acc, ret: None, body: k.body, contracts: k.contracts, span: k.span, pure: false, mutating: false,
     frame: [], frameAll: false, line: lineOf(text, k.span.start), params: ps, verify: !u.startsWith("$"), tparams: identNames(c.typeParams)
   };
@@ -142,7 +143,7 @@ function classInfo(u: string, file: string, text: string, c: ClassDecl, ctor: Op
       _ => {}
     }
   }
-  return Cls { name: c.name.name, unit: u, file: file, text: text, fields: fields, ftys: ftys, finit: finit, invs: clausesOfList(c.contracts, 4), generic: c.typeParams.length > 0, ctor: ctor, tparams: identNames(c.typeParams) };
+  return Cls { name: qualKey(u, c.name.name), unit: u, file: file, text: text, fields: fields, ftys: ftys, finit: finit, invs: clausesOfList(c.contracts, 4), generic: c.typeParams.length > 0, ctor: ctor, tparams: identNames(c.typeParams) };
 }
 
 // Count of a name in a map (0 when absent).
@@ -257,16 +258,16 @@ function buildProg(prog: LoadedProgram, sm: SourceMap, hir: Program): Prog {
       match (it) {
         IType(d) => {
           match (d.body) {
-            DRecord(fs) => { tab.addRec(recOfType(d, fs, f.text)); },
-            DUnion(vs) => { tab.addUni(uniOfType(d, vs)); },
-            DAlias(t) => { tab.addAlias(AliasDef { name: d.name.name, target: t, generic: d.typeParams.length > 0 }); }
+            DRecord(fs) => { tab.addRec(recOfType(u.name, d, fs, f.text)); },
+            DUnion(vs) => { tab.addUni(uniOfType(u.name, d, vs)); },
+            DAlias(t) => { tab.addAlias(AliasDef { name: qualKey(u.name, d.name.name), unit: u.name, target: t, generic: d.typeParams.length > 0 }); }
           }
         },
         IClass(c) => {
-          tab.addRec(recOfClass(c, f.text));
+          tab.addRec(recOfClass(u.name, c, f.text));
         },
         IConst(c) => {
-          consts.push(ConstInfo { name: c.name.name, decl: c, text: f.text });
+          consts.push(ConstInfo { key: qualKey(u.name, c.name.name), name: c.name.name, unit: u.name, decl: c, text: f.text });
         },
         _ => {}
       }
@@ -298,7 +299,7 @@ function buildProg(prog: LoadedProgram, sm: SourceMap, hir: Program): Prog {
               _ => {}
             }
           }
-          clsIx.set(c.name.name, classes.length);
+          clsIx.set(qualKey(u.name, c.name.name), classes.length);
           classes.push(classInfo(u.name, f.path, f.text, c, ctorIx));
           for (const m of c.members) {
             match (m) {
@@ -322,8 +323,22 @@ function buildProg(prog: LoadedProgram, sm: SourceMap, hir: Program): Prog {
       }
     }
   }
+  // SMT symbols: the source-like name, plus a counter when two functions of the program share it
+  let dispCount = new Map<string, usize>();
+  for (const fn of fns) {
+    dispCount = bumped(dispCount, fn.disp);
+  }
+  let fx: usize = 0;
+  while (fx < fns.length) {
+    if (dispCount.get(fns[fx].disp).unwrapOr(0) > 1) {
+      fns[fx].sym = fns[fx].disp + "_u" + fx.toString();
+    }
+    fx += 1;
+  }
+  const scopes = buildScopes(prog);
+  tab.setScope(scopes.types);
   const sealed = sealTab(tab);
-  let p = Prog { tab: sealed, fns: fns, fnIx: fnIx, fnCount: fnCount, classes: classes, clsIx: clsIx, consts: consts, mutNames: mutNames };
+  let p = Prog { tab: sealed, fns: fns, fnIx: fnIx, fnCount: fnCount, classes: classes, clsIx: clsIx, consts: consts, mutNames: mutNames, vscope: scopes.vals };
   return computeFrames(p);
 }
 
@@ -499,7 +514,7 @@ function probesOf(g: Gen, tab: Tab, label: string, term: string, vt: VT, depth: 
           out.push(Probe { label: tl, term: "((_ is " + sn.unwrap() + "." + v.name + ") " + term + ")", kind: 0, guard: "", idx: 0 });
           let i: usize = 0;
           while (i < v.payload.length) {
-            const pt = resolveTy(tab, v.payload[i]);
+            const pt = payloadTy(tab, u.unwrap(), v.payload[i]);
             if (!isBad(pt)) {
               const before = out.length;
               out = probesOf(g, tab, label + "." + v.name + "." + i.toString(), "(" + sn.unwrap() + "." + v.name + "." + i.toString() + " " + term + ")", pt, depth + 1, out);
@@ -593,7 +608,7 @@ function describeSolverUnknown(): string {
 function pushRes(rt0: Rt, f: Fn, line: usize, kind: string, clause: string, v: Verdict, used: string[]): Rt {
   let rt = rt0;
   rt.out.push(Res {
-    fn: f.key, file: f.file, line: line, kind: kind, clause: clause, rules: rulesOfList(f.contracts), status: v.status, reason: v.reason, cex: v.cex,
+    fn: f.disp, file: f.file, line: line, kind: kind, clause: clause, rules: rulesOfList(f.contracts), status: v.status, reason: v.reason, cex: v.cex,
     assumes: v.status == "VERIFIED" ? assumptionsFor(used) : []
   });
   return rt;
@@ -638,7 +653,7 @@ function allUnknown(rt0: Rt, f: Fn, c: Option<Cls>, reason: string): Rt {
 // invariants of the objects passed in are assumed (A-INV).
 function entryOf(rt: Rt, f: Fn, c: Option<Cls>): Result<Entry, string> {
   let g = new Gen();
-  const cx0 = Cx { p: rt.p, f: f, res: None, ens: false, body: true, olds: [], ret: VUnit, inQ: false, text: f.text };
+  const cx0 = Cx { p: rt.p, unit: f.unit, f: f, res: None, ens: false, body: true, olds: [], ret: VUnit, inQ: false, text: f.text };
   const sig = sigOf(cx0, f)?;
   let vars: Var[] = [];
   let base: string[] = [];
@@ -668,7 +683,7 @@ function entryOf(rt: Rt, f: Fn, c: Option<Cls>): Result<Entry, string> {
     }
     vars.push(Var { name: "this", term: "p_this", vt: ct });
   }
-  const cx = Cx { p: rt.p, f: f, res: None, ens: false, body: true, olds: [], ret: sig.rty, inQ: false, text: f.text };
+  const cx = Cx { p: rt.p, unit: f.unit, f: f, res: None, ens: false, body: true, olds: [], ret: sig.rty, inQ: false, text: f.text };
   return Ok(Entry { g: g, vars: vars, base: base, rangeBase: base, probes: [], sig: sig, cx: cx, cls: c });
 }
 
@@ -924,12 +939,12 @@ function ctorEntry(en0: Entry, f: Fn, cls: Cls): Result<Entry, string> {
   const ct = VRec(cls.name);
   const so = sortS(g, en.cx, ct)?;
   g = so.g;
-  const icx = Cx { p: en.cx.p, f: f, res: None, ens: false, body: false, olds: [], ret: VUnit, inQ: false, text: cls.text };
+  const icx = Cx { p: en.cx.p, unit: cls.unit, f: f, res: None, ens: false, body: false, olds: [], ret: VUnit, inQ: false, text: cls.text };
   let args: string[] = [];
   let i: usize = 0;
   while (i < cls.fields.length) {
     const name = cls.fields[i];
-    const ft = resolveTyP(en.cx.p.tab, cls.ftys[i], cls.tparams);
+    const ft = resolveTyP(en.cx.p.tab, cls.unit, cls.ftys[i], cls.tparams);
     let term = "";
     let k: usize = 0;
     while (k < f.pnames.length) {
@@ -993,7 +1008,7 @@ function verifyFn(fs: FsGrant, proc: ProcessGrant, rt0: Rt, f: Fn): Rt {
   }
 
   if (f.kind != 0 && cls.isNone()) {
-    return allUnknown(rt, f, cls, "class `" + f.cls + "` is outside the fragment");
+    return allUnknown(rt, f, cls, "class `" + bareOf(f.cls) + "` is outside the fragment");
   }
   const enR = entryOf(rt, f, cls);
   if (enR.isErr()) {
@@ -1009,7 +1024,7 @@ function verifyFn(fs: FsGrant, proc: ProcessGrant, rt0: Rt, f: Fn): Rt {
   }
   en = assumeInvariants(rt, f, en);
   // @Requires: hypotheses.
-  const rcx = Cx { p: rt.p, f: f, res: None, ens: false, body: false, olds: [], ret: en.sig.rty, inQ: false, text: f.text };
+  const rcx = Cx { p: rt.p, unit: f.unit, f: f, res: None, ens: false, body: false, olds: [], ret: en.sig.rty, inQ: false, text: f.text };
   let reqTerms: string[] = [];
   for (const c of clausesOfList(f.contracts, 0)) {
     const ex = exprOf(c);
@@ -1150,7 +1165,7 @@ function verifyFn(fs: FsGrant, proc: ProcessGrant, rt0: Rt, f: Fn): Rt {
         res = Some(Var { name: "result", term: r.val, vt: r.vt });
       }
       let env = postVars(en.vars, r.st.vars);
-      let ecx = Cx { p: rt.p, f: f, res: res, ens: true, body: false, olds: en.vars, ret: rty, inQ: false, text: t.ctext };
+      let ecx = Cx { p: rt.p, unit: f.unit, f: f, res: res, ens: true, body: false, olds: en.vars, ret: rty, inQ: false, text: t.ctext };
       if (t.inv) {
         const tv = lookupVar(env, "this");
         if (tv.isNone()) {
@@ -1158,7 +1173,7 @@ function verifyFn(fs: FsGrant, proc: ProcessGrant, rt0: Rt, f: Fn): Rt {
           continue;
         }
         env = [Var { name: "this", term: tv.unwrap().term, vt: tv.unwrap().vt }];
-        ecx = Cx { p: rt.p, f: f, res: None, ens: false, body: false, olds: [], ret: rty, inQ: false, text: t.ctext };
+        ecx = Cx { p: rt.p, unit: f.unit, f: f, res: None, ens: false, body: false, olds: [], ret: rty, inQ: false, text: t.ctext };
       }
       const c = trClause(g, env, ecx, t.e);
       match (c) {
@@ -1199,7 +1214,7 @@ function entails(fs: FsGrant, proc: ProcessGrant, rt0: Rt, g: Gen, base: string[
 function pushWarn(rt0: Rt, f: Fn, code: string, kind: string, c: ContractClause, message: string): Rt {
   let rt = rt0;
   rt.warns.push(QWarn {
-    code: code, fn: f.key, file: f.file, line: lineOf(f.text, c.span.start), kind: kind,
+    code: code, fn: f.disp, file: f.file, line: lineOf(f.text, c.span.start), kind: kind,
     clause: clauseText(f.text, c), message: message, status: "VERIFIED"
   });
   return rt;
@@ -1224,7 +1239,7 @@ function qualityChecks(fs: FsGrant, proc: ProcessGrant, rt0: Rt, f: Fn, en: Entr
   let g = en.g;
   const reqs = clausesOfList(f.contracts, 0);
   const enss = clausesOfList(f.contracts, 1);
-  const rcx = Cx { p: rt.p, f: f, res: None, ens: false, body: false, olds: [], ret: en.sig.rty, inQ: false, text: f.text };
+  const rcx = Cx { p: rt.p, unit: f.unit, f: f, res: None, ens: false, body: false, olds: [], ret: en.sig.rty, inQ: false, text: f.text };
   for (const c of reqs) {
     const e = exprOf(c);
     if (e.isNone()) {
@@ -1248,7 +1263,7 @@ function qualityChecks(fs: FsGrant, proc: ProcessGrant, rt0: Rt, f: Fn, en: Entr
     const u = entails(fs, proc, rt, g, withReqs, "false");
     rt = u.rt;
     if (u.holds) {
-      return pushWarn(rt, f, W_UNSAT_REQUIRES, "unsatisfiable-requires", reqs[0], "the `@Requires` clauses of `" + f.key + "` are unsatisfiable: the function can never be called, and every `@Ensures` holds vacuously");
+      return pushWarn(rt, f, W_UNSAT_REQUIRES, "unsatisfiable-requires", reqs[0], "the `@Requires` clauses of `" + f.disp + "` are unsatisfiable: the function can never be called, and every `@Ensures` holds vacuously");
     }
   }
   // `result` is a fresh unconstrained value: what holds for all of them cannot be violated by the body.
@@ -1263,7 +1278,7 @@ function qualityChecks(fs: FsGrant, proc: ProcessGrant, rt0: Rt, f: Fn, en: Entr
     g2 = fr.unwrap().g;
     res = Some(Var { name: "result", term: fr.unwrap().name, vt: en.sig.rty });
   }
-  const ecx = Cx { p: rt.p, f: f, res: res, ens: true, body: false, olds: en.vars, ret: en.sig.rty, inQ: false, text: f.text };
+  const ecx = Cx { p: rt.p, unit: f.unit, f: f, res: res, ens: true, body: false, olds: en.vars, ret: en.sig.rty, inQ: false, text: f.text };
   for (const c of enss) {
     const e = exprOf(c);
     if (e.isNone()) {

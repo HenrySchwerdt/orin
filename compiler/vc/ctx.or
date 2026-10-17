@@ -11,6 +11,7 @@ import {
 } from "../syntax";
 import { VT, VInt, VStr, VBad, VArr, VOpt, VRes, VMap, VRec, intLo, intHi, resolveTy, resolveTyP, fieldTyOf, RecDef, Tab, fieldIndex } from "./vt";
 import { Gen, SortR, sortOf } from "./gen";
+import { scopeKey, entryKey, AMBIG } from "./scope";
 
 export const I64_MIN: string = "(- 9223372036854775808)";
 export const I64_MAX: string = "9223372036854775807";
@@ -35,8 +36,13 @@ export type Ex = { g: Gen; st: St; fall: bool; rets: Ret[]; };
 // Functions, methods (instance and static) and constructors in one shape. kind: 0 function, 1 instance method,
 // 2 static method, 3 constructor. `frame` is the set of fields a method writes (`frameAll`: not known, every
 // field), `mutating` is the mutation analysis' verdict, `pure` the purity analysis' verdict.
+//
+// `key` is the key of the function in `Prog.fnIx` (unit-qualified, scope.or: `unit::name`, `unit::Class.method`);
+// `disp` is the source-like name for reports and messages (`name`, `Class.method`); `sym` the SMT symbol stem (the
+// `disp`, plus a counter when another function of the program has the same `disp`). `cls` is the key of the class
+// (`unit::Class`) or "" for a free function.
 export type Fn = {
-  key: string; name: string; unit: string; file: string; text: string; cls: string; kind: int; priv: bool; generic: bool;
+  key: string; disp: string; sym: string; name: string; unit: string; file: string; text: string; cls: string; kind: int; priv: bool; generic: bool;
   pnames: string[]; ptys: TypeExpr[]; pacc: int[]; ret: Option<TypeExpr>; body: Block; contracts: ContractClause[];
   span: Span; pure: bool; mutating: bool; frame: string[]; frameAll: bool; line: usize; params: Param[]; verify: bool; tparams: string[];
 };
@@ -46,19 +52,22 @@ export type Cls = {
   invs: ContractClause[]; generic: bool; ctor: Option<usize>; tparams: string[];
 };
 
-export type ConstInfo = { name: string; decl: ConstDecl; text: string; };
+export type ConstInfo = { key: string; name: string; unit: string; decl: ConstDecl; text: string; };
 
 export type Prog = {
   tab: Tab; fns: Fn[]; fnIx: Map<string, usize>; fnCount: Map<string, usize>; classes: Cls[]; clsIx: Map<string, usize>;
   consts: ConstInfo[]; mutNames: Map<string, bool>;
+  vscope: Map<string, string>;   // scopeKey(unit, name) -> key of a function or constant (scope.or)
 };
 
 // Translation context. `ens`: `old(..)` and `result` are available; `body`: code (true) or a contract (false);
 // `olds`: the entry state `old(..)` reads; `ret`: declared result type of the function (types `None` / `Ok` /
 // `Err`); `inQ`: inside the body of a quantifier (no fresh constants: it may mention the bound variable);
-// `text`: source text of the file of the expression, for line numbers.
+// `text`: source text of the file of the expression, for line numbers; `unit`: the unit that text belongs to (the scope
+// its names are resolved in: it is `f.unit` for the code and contracts of `f`, the unit of the declaration for the
+// invariants of a class or record and for a constant).
 export type Cx = {
-  p: Prog; f: Fn; res: Option<Var>; ens: bool; body: bool; olds: Var[]; ret: VT; inQ: bool; text: string;
+  p: Prog; unit: string; f: Fn; res: Option<Var>; ens: bool; body: bool; olds: Var[]; ret: VT; inQ: bool; text: string;
 };
 
 // ---------------------------------------------------------------------------------------------- helpers
@@ -215,12 +224,37 @@ export function mk(g: Gen, t: string, vt: VT, chks: Chk[]): Result<TR, string> {
   return Ok(TR { g: g, t: t, vt: vt, chks: chks });
 }
 
+// The key of the function or constant a bare name means in the scope of `cx.unit`: None when the name is not bound there,
+// is bound to something the verifier does not model, or is ambiguous. (A local variable is looked up first by the callers.)
+export function valKey(cx: Cx, name: string): Option<string> {
+  const k = entryKey(cx.p.vscope.get(scopeKey(cx.unit, name)));
+  if (k.isSome() && k.unwrap() == AMBIG) {
+    return None;
+  }
+  return k;
+}
+
+// The key of the type (record, class, union, alias) a bare name means in the scope of `cx.unit`; None as `valKey`.
+export function typeKey(cx: Cx, name: string): Option<string> {
+  const k = cx.p.tab.typeIn(cx.unit, name);
+  if (k.isSome() && k.unwrap() == AMBIG) {
+    return None;
+  }
+  return k;
+}
+
 export function sortS(g: Gen, cx: Cx, vt: VT): Result<SortR, string> {
   return sortOf(g, cx.p.tab, vt);
 }
 
 export function tyOf(cx: Cx, t: TypeExpr): VT {
-  return resolveTyP(cx.p.tab, t, cx.f.tparams);
+  return resolveTyP(cx.p.tab, cx.unit, t, cx.f.tparams);
+}
+
+// The type of a type expression written in the unit `unit` (the signature of a callee, a variant payload, a constant):
+// its names mean what they mean in that unit, not in the unit of the caller.
+export function tyIn(cx: Cx, unit: string, t: TypeExpr): VT {
+  return resolveTyP(cx.p.tab, unit, t, cx.f.tparams);
 }
 
 // Name an SMT symbol after a source name: letters, digits and `_` only.
@@ -694,10 +728,10 @@ function writesExpr(p: Prog, cls: Cls, e: Expr, w0: Writes): Writes {
             if (m.name == "push" || m.name == "pop" || m.name == "set" || m.name == "delete") {
               w = addField(w, r.field);
             } else {
-              const rd = RecDef { name: cls.name, fields: cls.fields, ftys: cls.ftys, isClass: true, generic: false, contracts: [], text: "", tparams: cls.tparams };
+              const rd = RecDef { name: cls.name, unit: cls.unit, fields: cls.fields, ftys: cls.ftys, isClass: true, generic: false, contracts: [], text: "", tparams: cls.tparams };
               const fi = fieldIndex(rd, r.field);
               if (fi.isSome()) {
-                const ft = resolveTyP(p.tab, cls.ftys[fi.unwrap()], cls.tparams);
+                const ft = resolveTyP(p.tab, cls.unit, cls.ftys[fi.unwrap()], cls.tparams);
                 match (ft) {
                   VRec(cn) => {
                     const mi = p.fnIx.get(cn + "." + m.name);
