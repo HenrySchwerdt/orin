@@ -21,8 +21,9 @@ assumption is the **ownership contract** `GenOK`, the formal form of "why a borr
 it" (`docs/mir.md`, R2): a local that the instruction neither mentions nor defines keeps its value,
 and a *counted* reference keeps its object (alive, with the same number of slots) unless the
 instruction mentions the local and does not keep it: nobody else can change or free an object that
-a local holds a count of.  In the Lean ownership model this is `Frozen`/`frozen_step`
-(`Frozen.lean`, `CallStep.lean`).
+a local holds a count of.  For calls this is **derived** from the ownership model
+(`CallLink.lean`: `ret_genok`, from `Frozen`/`frozen_step`; for the machine's builtins `OpLen.lean`);
+this file states it as the interface of `gen`.
 -/
 
 namespace Orin
