@@ -73,6 +73,20 @@ function selfTypeOf(c: ClassDecl): TypeExpr {
   return TypeExpr { kind: TNamed(c.name, paramTypes(c.typeParams)), span: c.name.span };
 }
 
+function identNames(ids: Ident[]): string[] {
+  return ids.map(i => i.name);
+}
+
+function countNamed(ids: Ident[], n: string): usize {
+  let k: usize = 0;
+  for (const i of ids) {
+    if (i.name == n) {
+      k += 1;
+    }
+  }
+  return k;
+}
+
 function fieldNamed(names: string[], n: string): bool {
   for (const x of names) {
     if (x == n) {
@@ -129,8 +143,6 @@ function lowerClass(ui: usize, c: ClassDecl): ClassOut {
     None => {}
   }
   const generic = c.typeParams.length > 0;
-  const noBounds: Option<Ident>[] = [];
-  const noTps: Ident[] = [];
   let fields: ClassField[] = [];
   let ctors: CtorDecl[] = [];
   let methods: MethodDecl[] = [];
@@ -270,11 +282,21 @@ function lowerClass(ui: usize, c: ClassDecl): ClassOut {
   let minfos: MethodInfo[] = [];
   let seen: string[] = [];
   for (const m of methods) {
-    if (m.typeParams.length > 0) {
-      diags.push(diag(
-        "E0460", m.typeParams[0].span,
-        "generic methods are not supported in Orin 1.0 (ADR-0026); make the class generic or use a generic function"
-      ));
+    // Generic methods (ADR-0040): the type parameters of the method follow those of the class in the generic function
+    // that `C.m` becomes (a static method has only its own).
+    for (const mp of m.typeParams) {
+      if (fieldNamed(identNames(c.typeParams), mp.name)) {
+        diags.push(diag(
+          "E0304", mp.span,
+          "type parameter `" + mp.name + "` of method `" + m.name.name + "` has the same name as a type parameter of class `"
+            + c.name.name + "`"
+        ));
+      }
+    }
+    for (const mp of m.typeParams) {
+      if (countNamed(m.typeParams, mp.name) > 1) {
+        diags.push(diag("E0304", mp.span, "duplicate type parameter `" + mp.name + "` of method `" + m.name.name + "`"));
+      }
     }
     if (generic && m.isStatic) {
       // A static method has no instance, hence no type arguments (as in TypeScript): its signature may
@@ -321,8 +343,8 @@ function lowerClass(ui: usize, c: ClassDecl): ClassOut {
     items.push(IFunction(FunctionDecl {
       exported: false,
       name: Ident { name: c.name.name + "." + m.name.name, span: m.name.span },
-      typeParams: m.isStatic ? noTps : c.typeParams,
-      bounds: m.isStatic ? noBounds : c.bounds,
+      typeParams: m.isStatic ? m.typeParams : c.typeParams.concat(m.typeParams),
+      bounds: m.isStatic ? m.bounds : c.bounds.concat(m.bounds),
       params: params,
       ret: m.ret,
       body: Block { stmts: stmts, span: m.body.span },
@@ -337,7 +359,9 @@ function lowerClass(ui: usize, c: ClassDecl): ClassOut {
       priv: m.priv,
       mutating: false,
       hasRet: false,
-      retRec: 0
+      retRec: 0,
+      gen: m.isStatic ? m.typeParams.length > 0 : (generic || m.typeParams.length > 0),
+      ownTps: m.typeParams.length
     });
   }
   const info = ClassInfo {
@@ -454,7 +478,7 @@ export function buildClassTables(env0: Env, infos: ClassInfo[]): Env {
             },
             VGFunc(f) => {
               mi.fid = f;
-              env.gfuncs[f].mode = FmMethod;
+              env.gfuncs[f].mode = m.isStatic ? FmStatic : FmMethod;
               env.gfuncs[f].cls = ci;
             },
             _ => {}
@@ -761,6 +785,9 @@ function methodProb(env: Env, c: ClassInfo, rec: usize, m: usize, kind: usize): 
   }
   if (mi.mutating) {
     return prob("E0476", "`" + n + "` of class `" + c.name + "` mutates its receiver; it must not");
+  }
+  if (mi.ownTps > 0) {
+    return prob("E0476", "`" + n + "` of class `" + c.name + "` is generic; it must not be: `" + sig + "`");
   }
   if (c.gid < 0 && env.funcs[mi.fid].params.length > 0) {
     // (a method whose signature is not resolved yet, while declarations are resolved, is accepted here and checked on use)

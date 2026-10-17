@@ -109,3 +109,23 @@ ADR.
   (instances, inference, classes), `lower/` (void slots) and `verify/` (the void rule).
 - **Gate:** bootstrap fixed point and byte-identical output for every existing program, because the extension must
   not change any existing instance.
+
+## Implementation status
+
+Implemented on branch `claude/project-thread-5wtl8u-gm`.
+
+- **Generic methods.** A class method is desugared to a generic function whose type parameters are the class
+  parameters followed by the method's own, so instances are keyed by (class instance, method, type arguments) in the
+  existing instance table. Inference pre-fills the class prefix from the receiver. `obj.m<T>(...)` parses as
+  `EMethodT`. Errors: E0460 (interface method generic), E0417 (generic method implementing an interface method, or a
+  bound not satisfied), E0304 (method type parameter shadows a class one), E0461 (generic static method mentions a
+  class type parameter), E0400/E0404/E0407 for type-argument count, arity and non-inferable parameters, E0476 for
+  generic `equals`/`compare`/`hash`. Contract wrappers carry the method bounds and are checked per instance.
+- **`void` as a type argument.** The abstract check of a generic body still validates it with opaque types; an
+  instance check relaxes the void rules (`FnCtx.inst`). `void` as a value, variable or parameter type stays an
+  error. Lowering uses a HIR pass `lower/voiderase.or` that drops void locals, fields and variant payloads, plus
+  operand filtering in the lowerer (evaluation order and side effects of void operands are kept). `void[]` is a
+  scalar array of placeholder zeros (length only); `Some(void)` / `Ok(void)` are payload-less variants. The MIR
+  verifier rule "no local of type void" (`verify/wf.or`) is the backstop.
+- **Not done.** Multiple bounds `T extends Ord & Hash` (E0408) remain out of scope: they need a bound list through
+  the whole checker, not a local change.

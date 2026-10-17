@@ -171,6 +171,12 @@ export type PlaceInfo = { place: Place; mutable: bool; rootName: string; };
 
 type InferOut = { tys: Type[]; args: HExpr[]; };
 type MethSig = { fid: usize; params: Type[]; ret: Type; srcRet: Type; retRec: usize; };
+type GenMeth = { ms: MethSig; args: HExpr[]; };
+
+// Explicit type arguments on something that is not a generic method (ADR-0040).
+function notGenericMethod(name: Ident): Diagnostic {
+  return diag("E0400", name.span, "`" + name.name + "` is not a generic method and takes no type arguments");
+}
 type Pair = { l: HExpr; r: HExpr; };
 
 // The environment the context works on stays well-formed (the instance table fits its tables, every
@@ -303,6 +309,9 @@ export class ExprChecker {
         return Err(
           diag("E0400", span, "type arguments are only allowed on a call or a record literal"),
         );
+      },
+      EMethodT(_, _, _) => {
+        return Err(diag("E0400", span, "type arguments of a method are only allowed on a call"));
       },
       EMatch(s, arms) => {
         const r = this.host.matchExpr(this.fx, span, s, arms, exp, false)?;
@@ -1136,6 +1145,9 @@ export class ExprChecker {
           ),
         );
       }
+      if (mi.ownTps > 0) {
+        return Err(diag("E0491", tag.span, "`" + shown + "` is a generic method; a member tag cannot call a generic method (ADR-0040)"));
+      }
       // a static method is a plain function, also in a generic class (as in `staticCall`)
       const f = env.funcs[mi.fid];
       return this.oxCall(p, el, "static method `" + shown + "`", None, None, oxSigOfParams(f.decl.params, Some(f.params)));
@@ -1164,9 +1176,12 @@ export class ExprChecker {
           if (mo.isSome()) {
             isMethod = true;
             const mi = ci.methods[mo.unwrap()];
-            const ps = ci.gid < 0 ? env.funcs[mi.fid].decl.params : env.gfuncs[mi.fid].decl.params;
+            if (mi.ownTps > 0) {
+              return Err(diag("E0491", tag.span, "`" + shown + "` is a generic method; a member tag cannot call a generic method (ADR-0040)"));
+            }
+            const ps = !mi.gen ? env.funcs[mi.fid].decl.params : env.gfuncs[mi.fid].decl.params;
             const own = mi.isStatic ? ps : ps.slice(1, ps.length);
-            const tys: Option<Type[]> = ci.gid < 0 && !mi.isStatic ? Some(tailTypes(env.funcs[mi.fid].params)) : None;
+            const tys: Option<Type[]> = !mi.gen && !mi.isStatic ? Some(tailTypes(env.funcs[mi.fid].params)) : None;
             sig = Some(oxSigOfParams(own, tys));
           }
         }
@@ -1944,7 +1959,7 @@ export class ExprChecker {
         pre[0] = Some(he);
       }
     }
-    if (isVoid(elemTy)) {
+    if (isVoid(elemTy) && !this.fx.inst && elems.length > 0) {
       return Err(diag("E0400", span, "array elements cannot be `void`"));
     }
     let out: HExpr[] = [];
@@ -2310,7 +2325,11 @@ export class ExprChecker {
         return this.callTyApp(span, callee, id, targs, args, exp);
       },
       EMember(base, name) => {
-        return this.callMember(span, base, name, args, exp);
+        const noTargs: Option<TypeExpr[]> = None;
+        return this.callMember(span, base, name, noTargs, args, exp);
+      },
+      EMethodT(base, name, targs) => {
+        return this.callMember(span, base, name, Some(targs), args, exp);
       },
       _ => {
         return this.callValue(span, callee, args);
@@ -2534,6 +2553,7 @@ export class ExprChecker {
       exp,
       explicit,
       noPre(args.length),
+      [],
     );
   }
 
@@ -2633,6 +2653,7 @@ export class ExprChecker {
     exp: Option<Type>,
     explicit: Option<TypeExpr[]>,
     pre: Option<HExpr>[],
+    fixed: Type[],
   ): Result<InferOut, Diagnostic> {
     if (args.length != paramTEs.length) {
       return Err(
@@ -2646,21 +2667,27 @@ export class ExprChecker {
     }
     const tp = paramNameList(tps);
     let inf = new Inference(tp, args.length);
+    // The first type parameters are fixed by the receiver of a method call (the class's type arguments, ADR-0040).
+    let k0: usize = 0;
+    while (k0 < fixed.length && k0 < tp.length) {
+      inf.explicit(k0, fixed[k0]);
+      k0 += 1;
+    }
     match (explicit) {
       Some(ts) => {
-        if (ts.length != tp.length) {
+        if (ts.length + k0 != tp.length) {
           return Err(
             diag(
               "E0400",
               span,
-              what + " expects " + tp.length.toString() + " type argument(s), found "
+              what + " expects " + (tp.length - k0).toString() + " type argument(s), found "
                   + ts.length.toString(),
             ),
           );
         }
-        let k: usize = 0;
+        let k: usize = k0;
         for (const t of ts) {
-          const ty = this.resolve(t, false)?;
+          const ty = this.resolve(t, true)?;
           inf.explicit(k, ty);
           k += 1;
         }
@@ -3139,6 +3166,7 @@ export class ExprChecker {
     span: Span,
     base: Expr,
     name: Ident,
+    explicit: Option<TypeExpr[]>,
     args: Expr[],
     exp: Option<Type>,
   ): Result<HExpr, Diagnostic> {
@@ -3161,6 +3189,9 @@ export class ExprChecker {
               diag("E0405", name.span, "`" + bid.name + "` has no member `" + name.name + "`"),
             );
           }
+          if (explicit.isSome()) {
+            return Err(notGenericMethod(name));
+          }
           return this.callBuiltin(span, "`" + bid.name + "." + name.name + "`", b.unwrap(), args);
         }
         if (!this.fx.isVisibleVar(bid.name)
@@ -3171,13 +3202,13 @@ export class ExprChecker {
               EntRecord(r) => {
                 const co = classOfRec(this.fx.env, r);
                 if (co.isSome()) {
-                  return this.staticCall(span, co.unwrap(), name, args);
+                  return this.staticCall(span, co.unwrap(), name, explicit, args, exp);
                 }
               },
               EntGen(g) => {
                 const co = classOfGeneric(this.fx.env, g);
                 if (co.isSome()) {
-                  return this.staticCall(span, co.unwrap(), name, args);
+                  return this.staticCall(span, co.unwrap(), name, explicit, args, exp);
                 }
               },
               _ => {},
@@ -3187,7 +3218,7 @@ export class ExprChecker {
       },
       _ => {},
     }
-    return this.methodCall(span, base, name, args, exp);
+    return this.methodCall(span, base, name, explicit, args, exp);
   }
 
   private builtinCtor(
@@ -3255,7 +3286,7 @@ export class ExprChecker {
         p = this.ex(args[0], None)?;
       },
     }
-    if (isVoid(p.ty)) {
+    if (isVoid(p.ty) && !this.fx.inst) {
       return Err(diag("E0400", args[0].span, "`Option<void>` is not allowed"));
     }
     return Ok(mk(XVariant(0, [p]), TyOption(p.ty), span));
@@ -3264,6 +3295,11 @@ export class ExprChecker {
   @Ensures(result.isOk() ==> typeEq(result.unwrap().ty, TyResult(t, e)))
   private okCtor(span: Span, args: Expr[], t: Type, e: Type): Result<HExpr, Diagnostic> {
     const want: usize = isVoid(t) ? 0 : 1;
+    if (want == 0 && args.length == 1 && this.fx.inst) {
+      // `Ok(x)` with `x: T` in an instance with `T = void` (ADR-0040): the unit value, evaluated and dropped by the lowering
+      const vp = this.ep(args[0], TyVoid)?;
+      return Ok(mk(XVariant(0, [vp]), TyResult(t, e), span));
+    }
     if (args.length != want) {
       return Err(
         diag(
@@ -3308,6 +3344,7 @@ export class ExprChecker {
     span: Span,
     base: Expr,
     name: Ident,
+    explicit: Option<TypeExpr[]>,
     args: Expr[],
     exp: Option<Type>,
   ): Result<HExpr, Diagnostic> {
@@ -3316,6 +3353,19 @@ export class ExprChecker {
     // place from the unchanged context.
     const saved = this.fx;
     const bo = this.ex(base, None);
+    if (bo.isOk() && explicit.isSome()) {
+      // explicit type arguments belong to a generic method of a class (ADR-0040)
+      const isClassMethod = match (bo.unwrap().ty) {
+        TyRecord(r) => classOfRec(this.fx.env, r).isSome()
+            && findMethod(this.fx.env.classes[classOfRec(this.fx.env, r).unwrap()], n).isSome()
+            && mapOrigin(this.fx.env, bo.unwrap().ty).isNone()
+            && parOrigin(this.fx.env, bo.unwrap().ty).isNone(),
+        _ => false,
+      };
+      if (!isClassMethod) {
+        return Err(notGenericMethod(name));
+      }
+    }
     if (bo.isOk()) {
       const b0 = bo.unwrap();
       // `equals` / `compare` / `hash` of an `Eq` / `Ord` / `Hash` type (ADR-0034)
@@ -3341,7 +3391,7 @@ export class ExprChecker {
           if (co.isSome()) {
             const mi = findMethod(this.fx.env.classes[co.unwrap()], n);
             if (mi.isSome() || !recordHasFnField(this.fx.env.records[r].fields, n)) {
-              return this.classMethodCall(span, base, b0, co.unwrap(), name, args);
+              return this.classMethodCall(span, base, b0, co.unwrap(), name, explicit, args, exp);
             }
           }
           const bd = boundOf(this.fx.env, r);
@@ -3679,7 +3729,14 @@ export class ExprChecker {
     return Ok(mk(XCall(ci.ctor, a), TyRecord(ci.rec), span));
   }
 
-  private staticCall(span: Span, c: usize, name: Ident, args: Expr[]): Result<HExpr, Diagnostic> {
+  private staticCall(
+    span: Span,
+    c: usize,
+    name: Ident,
+    explicit: Option<TypeExpr[]>,
+    args: Expr[],
+    exp: Option<Type>,
+  ): Result<HExpr, Diagnostic> {
     const ci = this.fx.env.classes[c];
     const mo = findMethod(ci, name.name);
     if (mo.isNone()) {
@@ -3710,6 +3767,13 @@ export class ExprChecker {
         ),
       );
     }
+    if (mi.gen) {
+      // a generic static method (ADR-0040): inferred and instantiated like a generic function
+      return this.callGenericW(span, mi.fid, "method `" + ci.name + "." + name.name + "`", explicit, args, exp);
+    }
+    if (explicit.isSome()) {
+      return Err(notGenericMethod(name));
+    }
     const f = this.fx.env.funcs[mi.fid];
     const a = this.argsExpect(span, "method `" + name.name + "`", args, f.params)?;
     return Ok(mk(XCall(mi.fid, a), f.ret, span));
@@ -3722,7 +3786,9 @@ export class ExprChecker {
     b: HExpr,
     c: usize,
     name: Ident,
+    explicit: Option<TypeExpr[]>,
     args: Expr[],
+    exp: Option<Type>,
   ): Result<HExpr, Diagnostic> {
     const ci = this.fx.env.classes[c];
     const mo = findMethod(ci, name.name);
@@ -3751,11 +3817,25 @@ export class ExprChecker {
         ),
       );
     }
-    const ms = this.methodSigOf(ci, mi, b.ty, span)?;
-    const a = this.argsExpect(span, "method `" + name.name + "`", args, tailTypes(ms.params))?;
+    let ms: MethSig = MethSig { fid: 0, params: [], ret: TyVoid, srcRet: TyVoid, retRec: 0 };
     let all: HExpr[] = [b];
-    for (const x of a) {
-      all.push(x);
+    if (mi.ownTps > 0) {
+      // a generic method (ADR-0040): the method's type arguments are explicit or inferred from the arguments and the
+      // expected type; the class's come from the receiver
+      const gm = this.genericMethodSig(span, ci, mi, base, b, name, explicit, args, exp)?;
+      ms = gm.ms;
+      for (const x of gm.args) {
+        all.push(x);
+      }
+    } else {
+      if (explicit.isSome()) {
+        return Err(notGenericMethod(name));
+      }
+      ms = this.methodSigOf(ci, mi, b.ty, span)?;
+      const a = this.argsExpect(span, "method `" + name.name + "`", args, tailTypes(ms.params))?;
+      for (const x of a) {
+        all.push(x);
+      }
     }
     if (!mi.mutating) {
       return Ok(mk(XCall(ms.fid, all), ms.srcRet, span));
@@ -3863,6 +3943,112 @@ export class ExprChecker {
     }
     this.fx.adopt(fo.env);
     return Ok(MethSig { fid: fo.fid, params: f.params, ret: f.ret, srcRet: f.srcRet, retRec: rr });
+  }
+
+  // The call `recv.m<..>(args)` of a generic method `mi` of class `ci` (ADR-0040). The method is the generic function
+  // `C.m<class params.., method params..>(this$: C<..>, params..)`: the class's type arguments are fixed by the receiver,
+  // the method's are explicit or inferred like those of a generic function. The instance is keyed by (class instance, method,
+  // type arguments) because the class's arguments are the first ones. In an abstract check or a mutation probe no instance
+  // is created. Returns the signature and the checked arguments (without the receiver).
+  private genericMethodSig(
+    span: Span,
+    ci: ClassInfo,
+    mi: MethodInfo,
+    base: Expr,
+    b: HExpr,
+    name: Ident,
+    explicit: Option<TypeExpr[]>,
+    args: Expr[],
+    exp: Option<Type>,
+  ): Result<GenMeth, Diagnostic> {
+    const gf = this.fx.env.gfuncs[mi.fid];
+    let fixed: Type[] = [];
+    if (ci.gid >= 0) {
+      const o = originOf(this.fx.env, b.ty);
+      match (o) {
+        Some(i) => {
+          fixed = i.args;
+        },
+        None => {
+          return Err(
+            diag(
+              "E0400",
+              span,
+              "`" + showType(this.fx.env, b.ty) + "` is not an instance of class `" + ci.name + "`",
+            ),
+          );
+        },
+      }
+    }
+    if (args.length + 1 != gf.decl.params.length) {
+      return Err(
+        diag(
+          "E0404",
+          span,
+          "method `" + name.name + "` expects " + (gf.decl.params.length - 1).toString()
+              + " argument(s), found " + args.length.toString(),
+        ),
+      );
+    }
+    let ptes: TypeExpr[] = [];
+    for (const p of gf.decl.params) {
+      ptes.push(p.ty);
+    }
+    // The receiver is argument 0 (already checked; its source expression is not used).
+    let all: Expr[] = [base];
+    let pre: Option<HExpr>[] = [Some(b)];
+    for (const a of args) {
+      all.push(a);
+      pre.push(None);
+    }
+    const io = this.inferPre(
+      span,
+      "method `" + name.name + "`",
+      gf.unit,
+      gf.decl.typeParams,
+      ptes,
+      gf.decl.ret,
+      all,
+      exp,
+      explicit,
+      pre,
+      fixed,
+    )?;
+    match (checkBounds(this.fx.env, gf.unit, gf.decl, io.tys, span)) {
+      Some(d) => {
+        return Err(d);
+      },
+      None => {},
+    }
+    let rest: HExpr[] = [];
+    let i: usize = 1;
+    while (i < io.args.length) {
+      rest.push(io.args[i]);
+      i += 1;
+    }
+    if (this.fx.abs || this.fx.probe) {
+      const sc = new TScope(gf.unit, paramNameList(gf.decl.typeParams), io.tys, 0);
+      const sig = resolveSig(this.fx.env, sc, gf.decl)?;
+      this.fx.adopt(sig.env);
+      return Ok(GenMeth {
+        ms: MethSig { fid: 0, params: sig.params, ret: sig.ret, srcRet: sig.ret, retRec: 0 },
+        args: rest,
+      });
+    }
+    const fo = instFunc(this.fx.env, mi.fid, io.tys, this.fx.depth + 1, span)?;
+    const f = fo.env.funcs[fo.fid];
+    let rr: usize = 0;
+    if (isMutRetMode(f.mode)) {
+      rr = match (f.ret) {
+        TyRecord(r) => r,
+        _ => 0,
+      };
+    }
+    this.fx.adopt(fo.env);
+    return Ok(GenMeth {
+      ms: MethSig { fid: fo.fid, params: f.params, ret: f.ret, srcRet: f.srcRet, retRec: rr },
+      args: rest,
+    });
   }
 
   // `r.f(args)` where field `f` of record `r` has a function type.
@@ -4377,6 +4563,7 @@ export class ExprChecker {
           exp,
           noExplicit,
           pre,
+          [],
         )?;
         let ret: Type = TyVoid;
         match (gf.decl.ret) {

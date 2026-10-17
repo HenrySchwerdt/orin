@@ -231,7 +231,8 @@ export function isSyntaxCode(code: string): bool {
       || code == "E0440"
       || code == "E0441"
       || code == "E0442"
-      || code == "E0447";
+      || code == "E0447"
+      || code == "E0460";
 }
 
 function hasIdentNamed(ids: Ident[], name: string): bool {
@@ -1417,9 +1418,9 @@ export class Parser {
     if (this.isP("<")) {
       return Err(
         diag(
-          "E0408",
+          "E0460",
           this.toks[this.pos].span,
-          "generic interface methods are not supported (ADR-0019)",
+          "an interface method cannot be generic (a virtual call cannot pick a monomorphised instance, ADR-0040)",
         ),
       );
     }
@@ -1503,14 +1504,15 @@ export class Parser {
     if (this.isP("(") || this.isP("<")) {
       checkPlacement(cls, T_METHOD)?;
       checkAnnoPlacement(annos, T_METHOD)?;
-      const tps = this.parseTypeParams()?;
+      const tps = this.parseTypeParamsB()?;
       const sg = this.parseSigBody()?;
       return Ok(
         MMethod(MethodDecl {
           priv: priv,
           isStatic: isStatic,
           name: name,
-          typeParams: tps,
+          typeParams: tps.ids,
+          bounds: tps.bounds,
           params: sg.params,
           ret: sg.ret,
           body: sg.body,
@@ -2196,7 +2198,23 @@ export class Parser {
       } else if (this.isP(".")) {
         this.pos += 1;
         const m = this.parseIdent()?;
-        e = mkExpr(EMember(e, m), spanTo(e.span, m.span));
+        // `recv.m<T, U>(args)`: explicit type arguments of a generic method (ADR-0040), decided by backtracking like
+        // `f<T>(x)`: the `>` must be followed by `(`.
+        let targs: Option<TypeExpr[]> = None;
+        if (this.isP("<")) {
+          const afterName = this.pos;
+          const ta = this.tryTypeArgs();
+          if (ta.isSome() && this.isP("(")) {
+            targs = ta;
+          } else {
+            this.pos = afterName;
+          }
+        }
+        if (targs.isSome()) {
+          e = mkExpr(EMethodT(e, m, targs.unwrap()), spanTo(e.span, this.lastSpan()));
+        } else {
+          e = mkExpr(EMember(e, m), spanTo(e.span, m.span));
+        }
       } else if (this.isP("[")) {
         this.pos += 1;
         const ix = this.parseExpr()?;
