@@ -1478,30 +1478,38 @@ void orin_process_exit(int64_t code) { orin_platform_exit((int)code); }
  * that is std:task (library/std/task.or). Every task owns its heap: reference counts stay NON-atomic because an object
  * graph is only ever reachable from one thread at a time (a transfer moves a uniquely owned graph, or copies). */
 
-/* Transfer slots: a value in flight between two tasks, owned by nobody. A token is `generation << 32 | (index + 1)`. */
+/* Transfer slots: a value in flight between two tasks, owned by nobody. A token is `generation << 32 | (index + 1)`.
+ * The table is in the shared block (orin_shared.transfer: pointer, n, cap, free head), read and written only under the runtime lock, and
+ * its slots are the 32-byte slots of runtime/core/transfer.or (ADR-0052 Addendum B, R3e.2): the Orin functions that std:task calls
+ * (put, take, drop) and these C functions (the task code below, the lend, the unit tests) work on one table. A slot with `pins` != NULL is
+ * a LEND (see "lending" below). */
 typedef struct {
     OrinObj *box; /* NULL = free */
     uint32_t gen, next;
-    OrinObj **pins; /* a LEND (see "lending" below): the objects this lend pinned; NULL for a value in flight */
+    OrinObj **pins; /* a LEND: the objects this lend pinned; NULL for a value in flight */
     uint64_t npins;
-    int lend;
 } TrSlot;
-static TrSlot *g_tr;
-static uint32_t g_tr_n, g_tr_cap, g_tr_free; /* g_tr_free: 1-based head of the free list, 0 = empty */
+_Static_assert(sizeof(TrSlot) == 32 && offsetof(TrSlot, gen) == 8 && offsetof(TrSlot, next) == 12 && offsetof(TrSlot, pins) == 16 &&
+                   offsetof(TrSlot, npins) == 24,
+               "transfer slot: box @0, gen @8, next @12, pins @16, npins @24 (runtime/core/transfer.or)");
+#define g_tr ((TrSlot *)(uintptr_t)orin_shared.transfer[0])
+#define g_tr_n orin_shared.transfer[1]
+#define g_tr_cap orin_shared.transfer[2]
+#define g_tr_free orin_shared.transfer[3] /* 1-based head of the free list, 0 = empty */
 
 static uint64_t tr_publish(OrinObj *box) {
     orin_platform_runtime_lock();
     if (!g_tr_free && g_tr_n == g_tr_cap) {
-        uint32_t cap = g_tr_cap ? g_tr_cap * 2 : 256;
+        uint64_t cap = g_tr_cap ? g_tr_cap * 2 : 256;
         TrSlot *t = (TrSlot *)orin_platform_realloc(g_tr, (size_t)cap * sizeof(TrSlot));
         if (!t) {
             orin_platform_runtime_unlock();
             orin_trap("out of memory");
         }
-        g_tr = t;
+        orin_shared.transfer[0] = (uint64_t)(uintptr_t)t;
         g_tr_cap = cap;
     }
-    uint32_t i;
+    uint64_t i;
     if (g_tr_free) {
         i = g_tr_free - 1;
         g_tr_free = g_tr[i].next;
@@ -1512,7 +1520,6 @@ static uint64_t tr_publish(OrinObj *box) {
     g_tr[i].box = box;
     g_tr[i].pins = NULL;
     g_tr[i].npins = 0;
-    g_tr[i].lend = 0;
     g_tr[i].gen++;
     uint64_t tok = ((uint64_t)g_tr[i].gen << 32) | (i + 1);
     orin_platform_runtime_unlock();
@@ -1527,7 +1534,7 @@ static OrinObj *tr_claim_kind(uint64_t tok, int lend, OrinObj ***pins, uint64_t 
         orin_platform_runtime_unlock();
         orin_trap("invalid transfer token (taken twice, dropped, or forged)");
     }
-    if (g_tr[i].lend != lend) {
+    if ((g_tr[i].pins != NULL) != lend) {
         orin_platform_runtime_unlock();
         orin_trap("a lent value cannot be taken, only ended");
     }
@@ -1537,10 +1544,9 @@ static OrinObj *tr_claim_kind(uint64_t tok, int lend, OrinObj ***pins, uint64_t 
     }
     g_tr[i].pins = NULL;
     g_tr[i].npins = 0;
-    g_tr[i].lend = 0;
     OrinObj *b = g_tr[i].box;
     g_tr[i].box = NULL;
-    g_tr[i].next = g_tr_free;
+    g_tr[i].next = (uint32_t)g_tr_free;
     g_tr_free = i + 1;
     orin_platform_runtime_unlock();
     return b;
@@ -1552,7 +1558,7 @@ static OrinObj *tr_claim(uint64_t tok) { return tr_claim_kind(tok, 0, NULL, NULL
 static int tr_is_lend(uint64_t tok) {
     uint32_t i = (uint32_t)(tok & 0xffffffffu) - 1u;
     orin_platform_runtime_lock();
-    int r = tok != 0 && i < g_tr_n && g_tr[i].box && g_tr[i].gen == (uint32_t)(tok >> 32) && g_tr[i].lend;
+    int r = tok != 0 && i < g_tr_n && g_tr[i].box && g_tr[i].gen == (uint32_t)(tok >> 32) && g_tr[i].pins != NULL;
     orin_platform_runtime_unlock();
     return r;
 }
@@ -1614,7 +1620,6 @@ static uint64_t lend_put(OrinObj *box) {
     orin_platform_runtime_lock();
     g_tr[i].pins = pins;
     g_tr[i].npins = n;
-    g_tr[i].lend = 1;
     orin_platform_runtime_unlock();
     return tok;
 }
