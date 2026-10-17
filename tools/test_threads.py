@@ -36,6 +36,37 @@ def run(cmd, threads, cwd):
     return r.returncode, r.stdout, r.stderr
 
 
+def optimiser_cases(orin, threads, failures):
+    """Row 15a: the optimiser's per-function steps run on the task pool; the optimised MIR and the C and LLVM output
+    must not depend on ORIN_THREADS."""
+    base = os.path.join(ROOT, "tests", "run")
+    progs = []
+    for e in sorted(os.listdir(base)):
+        p = os.path.join(base, e)
+        if os.path.isdir(p) and os.path.isfile(os.path.join(p, "main.or")):
+            progs.append(os.path.relpath(os.path.join(p, "main.or"), ROOT))
+        elif e.endswith(".or"):
+            progs.append(os.path.relpath(p, ROOT))
+    progs = progs[:40] + ["compiler/main.or"]
+    n0 = len(failures)
+    with tempfile.TemporaryDirectory(prefix="orin-threads-o-") as d:
+        for rel in progs:
+            for what, cmd in (("mir", [orin, "mir", rel]),
+                              ("c", [orin, "compile", rel, "-o", os.path.join(d, "o-%d.c")]),
+                              ("llvm", [orin, "compile", rel, "--backend=llvm", "-o", os.path.join(d, "o-%d.ll")])):
+                if what != "mir" and rel != "compiler/main.or" and rel != progs[0]:
+                    continue
+                outs = []
+                for t in threads:
+                    c = [x % t if "%d" in x else x for x in cmd]
+                    rc, out, err = run(c, t, ROOT)
+                    if what != "mir" and rc == 0:
+                        with open(c[-1], "rb") as f:
+                            out = f.read()
+                    outs.append((rc, out, err))
+                if any(o != outs[0] for o in outs[1:]):
+                    failures.append("optimiser %s %s: output differs between thread counts" % (what, rel))
+    print("%-24s %d programs (mir), main.or (c, llvm), %d differences" % ("optimiser", len(progs), len(failures) - n0), flush=True)
 def same(name, cmd, threads, cwd, failures, filt=None, want=None):
     """Run cmd for every thread count; the (filtered) exit status, stdout and stderr must be equal."""
     outs = []
@@ -107,6 +138,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--orin2", default=os.environ.get("ORIN2", "build/bootstrap/orin2"))
     ap.add_argument("--threads", default="1,2,4,8")
+    ap.add_argument("--no-optimiser", action="store_true", help="skip the optimiser cases")
     ap.add_argument("--no-verifier", action="store_true", help="skip the (slower) verifier cases")
     ap.add_argument("--mutant-programs", type=int, default=24, help="corpus programs mutated by the verifier case")
     a = ap.parse_args()
@@ -164,6 +196,8 @@ def main():
         if any(r != results[0] for r in results[1:]):
             failures.append("fmt (in place): results differ between thread counts")
         print("%-20s exit %d, same files for threads %s" % ("fmt (in place)", results[0][0], a.threads))
+    if not a.no_optimiser:
+        optimiser_cases(orin, threads, failures)
     if not a.no_verifier:
         verifier_cases(orin, threads, a.mutant_programs, failures)
     for f in failures:
