@@ -1,10 +1,13 @@
-// Exact JSON numeric lexemes; no changes to std:json or compiler/json.
-// Grammar, errors, precedence, allocation and bounds: docs/std-jsonnumber.md.
+// std:json/number -- exact JSON numeric lexemes (ADR-0048 section 7.1; formerly std:jsonnumber).
+// Grammar, errors, precedence, allocation and bounds: docs/std-json-number.md.
 // Every JsonNumber is validated even when contracts are disabled.
+
+// JsonNumber -- the exact validated ASCII lexeme (`1`, `1.0`, `-0`, `1e999` stay distinct); only this
+// module can construct one.
 @Sealed
 export type JsonNumber = { token: string; };
 
-// The final three kinds are reserved by the approved JSON RFC for later float
+// NumberErrorKind -- why a number operation failed. The final three kinds are reserved by the approved JSON RFC for later float
 // utilities; none of the current functions emits them.
 export type NumberErrorKind =
   InvalidNumber
@@ -15,12 +18,15 @@ export type NumberErrorKind =
   | NonFinite
   | FloatOverflow
   | FloatUnderflow;
+// NumberError -- `offset` is the byte offset of the first invalid byte (or the limit) when the input text is at
+// fault, None for conversion failures of a valid token.
 export type NumberError = { kind: NumberErrorKind; offset: Option<usize>; };
 
 function error(kind: NumberErrorKind, offset: Option<usize>): NumberError {
   return NumberError { kind: kind, offset: offset };
 }
 
+// numberErrorMessage(e: NumberError): string -- the cause, plus " at byte N" when `offset` is present. O(1).
 @Ensures(result.length > 0)
 export function numberErrorMessage(e: NumberError): string {
   const why = match (e.kind) {
@@ -87,8 +93,10 @@ function invalidAt(s: string): Option<usize> {
   return i == n ? None : Some(i);
 }
 
-// Limit errors precede syntax: do not scan an over-budget input. Retains the
-// original immutable string (no token copy); valid lexeme spelling is preserved.
+// jsonNumber(text, maxBytes): Result<JsonNumber, NumberError> -- validates `text` as one JSON number token.
+// Errors, in order: InvalidLimits (maxBytes == 0), NumberLimit (text longer than maxBytes, offset maxBytes),
+// InvalidNumber (offset of the first invalid byte or text.length). Retains the original immutable string (no
+// token copy); the lexeme spelling is preserved. Never traps. O(n) time, O(1) allocation.
 @Ensures(result.isOk() ==> result.unwrap().token == text && text.length <= maxBytes)
 @Ensures(result.isErr()
     ==> result.unwrapErr().offset.isNone() || result.unwrapErr().offset.unwrap() <= text.length)
@@ -106,13 +114,17 @@ export function jsonNumber(text: string, maxBytes: usize): Result<JsonNumber, Nu
   return Ok(JsonNumber { token: text });
 }
 
-// Always exact, including -9223372036854775808. Bounded by the machine int width.
+// numberFromInt(n: int): JsonNumber -- the token of `n`, exact including -9223372036854775808. Never fails.
+// O(1) (bounded by the int width).
 @Ensures(result.token == n.toString())
 export function numberFromInt(n: int): JsonNumber {
   return JsonNumber { token: n.toString() };
 }
 
-// All integer conversion failures have no byte offset: the token is valid.
+// numberAsInt(n: JsonNumber): Result<int, NumberError> -- the integer value of the token when it is integral
+// (`1e3`, `10.0`) and fits the int range. Errors: NotIntegral, IntegerRange (a NotIntegral result wins for
+// fractional values); `offset` is always None because the token is valid. Never traps. O(token bytes), no
+// exponent expansion.
 @Ensures(result.isErr() ==> result.unwrapErr().offset.isNone())
 export function numberAsInt(n: JsonNumber): Result<int, NumberError> {
   const s = n.token;

@@ -170,7 +170,7 @@ similar bounded builders; do not reuse legacy recursive concatenation unchecked.
 
 ## Decision 4: field-path-aware decoders, with ordinary Result composition
 
-Implemented initial slice: [std:jsondecode](../std-jsondecode.md) provides the
+Implemented initial slice: [std:jsondecode](../std-json-decode.md) provides the
 non-floating-point helpers below, plus `cursorValue`, `cursorPath`, and
 `formatPath`. Error constructors use a `Decode` prefix to coexist with imported
 number errors. The sealed wrapper contains opaque read-only state to protect
@@ -314,7 +314,7 @@ Json/JNum and both parsers are unchanged. Numeric type identities are therefore
 owned by std:jsonnumber; a future JsonValue module can import/re-export them
 rather than define a second number type. Float utilities, document parsing/writing,
 decoders and bridges remain proposals, not shipped APIs. See
-[the concrete number API](../std-jsonnumber.md) for this slice's contract.
+[the concrete number API](../std-json-number.md) for this slice's contract.
 
 ## Approved document slice: std:jsonvalue
 
@@ -325,4 +325,4 @@ sealed number type instead of duplicating it. This keeps opt-in tree semantics
 and stricter Unicode/duplicate policies distinct from both legacy parsers.
 No JsonValue re-export or behavior change is added to std:json. Float conversion,
 decoders and protocol migration remain deferred. See the
-[document API and exact error policies](../std-jsonvalue.md).
+[document API and exact error policies](../std-json.md).

@@ -1,10 +1,20 @@
-# std:jsonvalue — bounded opt-in JSON documents
+# std:json — bounded opt-in JSON documents
 
-Implements the document slice of the [JSON RFC](rfcs/json-completeness.md), using
-[std:jsonnumber](std-jsonnumber.md) for exact numeric tokens. This is a separate
-module: legacy `std:json.Json`/`JNum(int)` and both existing parsers retain their
-behavior. No float conversion, decoders, pretty printer or protocol migration is
-included. New values have independent variant names and type identities.
+`std:json` is the exact, bounded JSON model (ADR-0048 section 7.1): it was `std:jsonvalue` and
+now owns the module name. Its submodules are [std:json/number](std-json-number.md) (exact numeric
+tokens) and [std:json/decode](std-json-decode.md) (field-path decoders). The integer-only
+`Json`/`JNum(int)` model moved to `std:json/legacy` (deprecated) and is reachable from here with
+`toValue` / `fromValue`. No float conversion, pretty printer or protocol migration is included.
+
+## Migration (ADR-0048)
+
+| Before | Now |
+|---|---|
+| `import ... from "std:json"` (integer-only `Json`, `parse`, `stringify`, `get`, ...) | `from "std:json/legacy"` |
+| `std:jsonvalue`, `std:jsonnumber`, `std:jsondecode` | `std:json`, `std:json/number`, `std:json/decode` |
+| `defaultJsonLimits()`, `defaultJsonOptions()` | `defaultLimits()`, `defaultReadOptions()` (old names stay one release, `@Deprecated`) |
+| legacy `at(j, i)`, `path(j, keys)`, `formatError(e)` | `getIndex`, `getPath`, `jsonErrorMessage` (old names stay one release, `@Deprecated`) |
+| no renderer | `jsonParseErrorMessage(e)`, `jsonWriteErrorMessage(e)`, `decodeErrorMessage(e)` |
 
 ## API and representation
 
@@ -18,8 +28,8 @@ type JsonReadOptions = { limits: JsonLimits; duplicates: JsonDuplicatePolicy; };
 
 | Signature | Meaning |
 |---|---|
-| `defaultJsonLimits(): JsonLimits` | the explicit defaults below |
-| `defaultJsonOptions(): JsonReadOptions` | default limits and RejectDuplicates |
+| `defaultLimits(): JsonLimits` | the explicit defaults below |
+| `defaultReadOptions(): JsonReadOptions` | default limits and RejectDuplicates |
 | `parseDocument(text: string, options: JsonReadOptions): Result<JsonValue, JsonParseError>` | one complete UTF-8 JSON document, optional surrounding JSON whitespace |
 | `writeDocument(value: JsonValue, limits: JsonLimits): Result<string, JsonWriteError>` | compact output; validates budgets and UTF-8 even for caller-built trees |
 
@@ -27,24 +37,24 @@ Objects are ordered member lists. Parsing in preserve mode and writing retain
 member order and duplicate occurrences; no implicit map conversion takes place.
 Numbers retain their exact validated ASCII spelling, including huge integers,
 exponents, trailing zeros and negative zero. No numeric conversion takes place.
-Only std:jsonnumber can construct/mutate its existing sealed JsonNumber type.
+Only std:json/number can construct/mutate its existing sealed JsonNumber type.
 
 ```typescript
-import { parseDocument, writeDocument, defaultJsonOptions, defaultJsonLimits,
-  JsonValue, JsonMember } from "std:jsonvalue";
-import { numberFromInt } from "std:jsonnumber";
+import { parseDocument, writeDocument, defaultReadOptions, defaultLimits,
+  JsonValue, JsonMember } from "std:json";
+import { numberFromInt } from "std:json/number";
 function main(): void {
-  const value = parseDocument("{\"id\":9007199254740993,\"n\":1.00e+3}", defaultJsonOptions()).unwrap();
-  console.log(writeDocument(value, defaultJsonLimits()).unwrap());
+  const value = parseDocument("{\"id\":9007199254740993,\"n\":1.00e+3}", defaultReadOptions()).unwrap();
+  console.log(writeDocument(value, defaultLimits()).unwrap());
   const built = ValueObject([
     JsonMember { key: "port", value: ValueNumber(numberFromInt(8080)) },
   ]);
-  console.log(writeDocument(built, defaultJsonLimits()).unwrap());
+  console.log(writeDocument(built, defaultLimits()).unwrap());
 }
 ```
 
 For duplicate preservation, import `JsonDuplicatePolicy` as well as
-`JsonReadOptions`, and pass `JsonReadOptions { limits: defaultJsonLimits(),
+`JsonReadOptions`, and pass `JsonReadOptions { limits: defaultLimits(),
 duplicates: PreserveDuplicates }`. Default rejection compares **decoded UTF-8 key
 bytes**: `"a"` and `"\u0061"` collide, as do literal/escaped representations of the
 same non-ASCII key. Case and Unicode normalization are not applied. Duplicate
@@ -54,7 +64,7 @@ Writers always preserve supplied lists, irrespective of how values were built.
 ## Strict text and number rules
 
 Numbers use the strict full-token JSON number grammar implemented by
-std:jsonnumber. Leading plus/zeros, incomplete fractions/exponents, NaN and
+std:json/number. Leading plus/zeros, incomplete fractions/exponents, NaN and
 Infinity are errors; large finite-text exponents are accepted within the token
 budget without conversion or expansion. Surrounding whitespace is limited to
 space, tab, LF and CR. Comments, BOM, trailing commas and trailing values are
@@ -116,7 +126,8 @@ Parse offset is zero-based in source **bytes**, or source length at EOF; line
 and column are 1-based byte coordinates, with LF advancing a line (CR alone does
 not). Errors are fail-fast; no partially parsed value or partially written
 string is returned. Writers have no source position because their tree may have
-been built directly. Writer error kinds are InvalidLimits, LimitExceeded or
+been built directly. Renderers: `jsonParseErrorMessage` gives "line L, column C: cause (limit)", `jsonWriteErrorMessage` the cause
+(and limit name); neither contains input text. Writer error kinds are InvalidLimits, LimitExceeded or
 InvalidUtf8; syntax, surrogate and duplicate errors belong to parsing only.
 
 Precedence is invalid options, input byte budget, whole-source UTF-8, then parsing
