@@ -162,24 +162,26 @@ capabilities.
 
 ## Try it
 
-Orin releases are experimental pre-releases for Linux (x86-64, arm64) and macOS (arm64, Intel); use
-**v0.1.0-alpha.2** or later for the features listed here, or build from source. You need a C compiler
+Orin releases are pre-releases until 1.0 ([stability policy](docs/stability.md)) for Linux (x86-64, arm64) and
+macOS (arm64, Intel); use the latest on the [releases page](https://github.com/orin-lang/orin-lang/releases)
+(**0.1.0-beta.1** is the first with all four platforms), or build from source. New to Orin? Start with
+[getting started](docs/getting-started.md) and the [tutorial](docs/tutorial/README.md). You need a C compiler
 (`cc`, gcc or clang) on your PATH for the default backend. An LLVM IR backend is also implemented; see the
 [build and backend documentation](docs/architecture.md). Details, options and troubleshooting:
 [docs/install.md](docs/install.md).
+
+**Homebrew** (macOS arm64 and Intel, Linux x86-64 and arm64):
+
+```bash
+brew install orin-lang/orin/orin
+orin doctor        # checks the install and the C compiler, prints fixes
+```
 
 **One line (Linux, macOS)**: downloads the release for your platform, verifies its sha256, installs to
 `~/.orin`:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/orin-lang/orin-lang/main/install.sh | sh
-orin doctor        # checks the install and the C compiler, prints fixes
-```
-
-**Homebrew** (macOS on Apple silicon):
-
-```bash
-brew install orin-lang/orin/orin
 ```
 
 **Windows**: WSL2 works today ([docs/windows.md](docs/windows.md)); a native build is planned.
@@ -258,6 +260,7 @@ single root. See [`docs/bootstrap.md`](docs/bootstrap.md).
 
 ## Learn more
 
+- [Getting started](docs/getting-started.md), [tutorial](docs/tutorial/README.md) and [stability policy](docs/stability.md)
 - [Documentation index](docs/README.md): current guides, implementation status, decisions and dated release evidence
 - Coming from TypeScript? [Orin for TypeScript developers](docs/ts-developers.md): where code that looks the same behaves differently
 - Language reference (normative, as implemented, rules traced to tests): [`docs/reference/`](docs/reference/README.md)

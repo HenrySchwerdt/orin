@@ -1,21 +1,40 @@
 # Installing Orin
 
-Orin ships experimental pre-release tarballs. The [current release workflow](../.github/workflows/release.yml)
-targets four platforms; available downloads depend on the version:
+Orin releases are pre-releases until 1.0 (every `-alpha`, `-beta` and `-rc` version is a GitHub pre-release; see
+the [stability policy](stability.md)). The latest ones are listed on the
+[releases page](https://github.com/orin-lang/orin-lang/releases). The
+[release workflow](../.github/workflows/release.yml) builds four platforms:
 
-| Platform | Workflow filename | Published v0.1.0-alpha.2 asset |
-|---|---|---|
-| Linux x86-64 | `orin-<version>-linux-x86_64.tar.gz` | available |
-| Linux arm64 | `orin-<version>-linux-aarch64.tar.gz` | absent |
-| macOS Apple silicon | `orin-<version>-macos-arm64.tar.gz` | available |
-| macOS Intel | `orin-<version>-macos-x86_64.tar.gz` | absent |
+| Platform | Package filename |
+|---|---|
+| Linux x86-64 | `orin-<version>-linux-x86_64.tar.gz` |
+| Linux arm64 | `orin-<version>-linux-aarch64.tar.gz` |
+| macOS Apple silicon | `orin-<version>-macos-arm64.tar.gz` |
+| macOS Intel | `orin-<version>-macos-x86_64.tar.gz` |
 
-As checked on 2026-10-15, [v0.1.0-alpha.2](https://github.com/orin-lang/orin-lang/releases/tag/v0.1.0-alpha.2)
-is the latest published release. It contains those two tarballs and a combined `SHA256SUMS`, without
-individual `.sha256` assets. The current workflow additionally generates `<file>.sha256` for each tarball
-and a combined `SHA256SUMS`; that configuration is not a claim that older releases contain all four targets.
-Features documented on main can be newer than the downloaded alpha. Check the selected release's assets
-before choosing a platform/version. Windows: [windows.md](windows.md) (WSL2 today, native later).
+From 0.1.0-beta.1 on, all four platforms are published. Earlier alphas (for example 0.1.0-alpha.2) have only
+some of them, and no individual `.sha256` files; check the assets of the release you pick. Each release also
+has a combined `SHA256SUMS`. Features documented on main can be newer than the release you download.
+Windows: [windows.md](windows.md) (WSL2 today, native later). New here? See [getting-started.md](getting-started.md).
+
+## Homebrew (macOS, Linux)
+
+```sh
+brew install orin-lang/orin/orin
+orin doctor
+```
+
+Supported platforms: macOS arm64 and Intel, Linux x86-64 and arm64 (the formula lists a platform only when
+the release contains its package). Upgrade with `brew upgrade orin`, remove with `brew uninstall orin`.
+
+The tap is [orin-lang/homebrew-orin](https://github.com/orin-lang/homebrew-orin). Its formula pins the URL and
+sha256 of each package and runs `orin --version`, `orin doctor`, `orin run` and `orin build` as its test. You still
+need a C compiler on PATH (Xcode command line tools on macOS).
+
+How the tap is kept current: `tools/homebrew_formula.sh <version> --sums SHA256SUMS` renders `Formula/orin.rb`;
+the `homebrew` job of the release workflow runs it after each published release and opens a PR on the tap (repository
+secret `HOMEBREW_TAP_TOKEN`, write access to the tap only; without it the job only renders the formula). The tap's CI
+installs and tests the formula. The tap's README and workflow live in `dist/homebrew/tap/`.
 
 **Requirements:** Bash 3.2 or later for the release CLI, and a C compiler (`cc`, gcc or clang) on PATH, because the default backend emits C and
 `orin build/run/test` compile it. The release binaries are built on glibc (Linux) and the macOS runners'
@@ -72,23 +91,6 @@ The installer only deletes a directory that it created itself (it writes a `.ori
 The latest release is found with the GitHub API (`/releases?per_page=1`), which is rate limited to 60
 requests per hour per IP for anonymous callers; pin `ORIN_VERSION` in CI.
 
-## Homebrew (macOS, Apple silicon)
-
-```sh
-brew install orin-lang/orin/orin
-orin doctor
-```
-
-The tap is [orin-lang/homebrew-orin](https://github.com/orin-lang/homebrew-orin). Its formula installs the
-`macos-arm64` release package (pinned URL and sha256) and runs `orin --version`, `orin doctor`, `orin run` and
-`orin build` as its test. `brew upgrade orin` updates, `brew uninstall orin` removes it. Intel macOS and Linux use
-the one-line install until their Homebrew smoke tests exist.
-
-How the tap is kept current: `tools/homebrew_formula.sh <version> --sums SHA256SUMS` renders `Formula/orin.rb`;
-the `homebrew` job of the release workflow runs it after each published release and opens a PR on the tap (repository
-secret `HOMEBREW_TAP_TOKEN`, write access to the tap only; without it the job only renders the formula). The tap's CI
-installs and tests the formula on macOS. The tap's README and workflow live in `dist/homebrew/tap/`.
-
 ## Manual tarball
 
 ```sh
@@ -137,7 +139,7 @@ build it locally with `npx @vscode/vsce package` in `editors/vscode`.
 
 ## Updating and uninstalling
 
-Update by running the installer again (it replaces the previous version). Uninstall with `--uninstall`
+Homebrew: `brew upgrade orin` / `brew uninstall orin`. Otherwise update by running the installer again (it replaces the previous version). Uninstall with `--uninstall`
 (above) or, for a manual install, delete the directory and the symlink.
 
 ## Building from source
