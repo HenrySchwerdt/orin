@@ -1,0 +1,423 @@
+// Tests of the generic collections of std:collections (ADR-0034, slice 2): Set<T extends Hash>, OrderedMap<K extends Ord, V>
+// and MinHeap<T extends Ord>, with std:test's assertEqual<T extends Eq>. Where a specialised version exists (IntSet / StringSet,
+// SortedMap / SortedStringMap, PriorityQueue) the generic one is driven with the same random operations and must answer
+// identically (differential tests); records, options, arrays and classes with their own equals / compare / hash are the
+// cases only the generic versions can do. Run with and without contract checking (tools/test_std.sh).
+import { assert, assertEq, assertEqUsize, assertEqString, assertEqBool, assertEqual } from "std:test";
+import { IntSet, StringSet, Set, SortedMap, SortedStringMap, OrderedMap, OrderedEntry, PriorityQueue, MinHeap,
+  isStrictlyIncreasingOrd, isMinHeap4Ord } from "std:collections";
+
+function nextRand(s: int): int {
+  return (s * 1103515245 + 12345) % 2147483648;
+}
+
+type Pt = { x: int; y: int; };
+type Name = { first: string; last: string; };
+
+// A class whose equality ignores `note` (tier 2): two values with the same id are the same key.
+class Ticket {
+  id: int;
+  note: string;
+  constructor(id: int, note: string) {
+    this.id = id;
+    this.note = note;
+  }
+  equals(other: Ticket): bool {
+    return this.id == other.id;
+  }
+  compare(other: Ticket): int {
+    if (this.id < other.id) { return -1; }
+    if (this.id > other.id) { return 1; }
+    return 0;
+  }
+  hash(): usize {
+    return this.id.toUsize();
+  }
+}
+
+// ----------------------------------------------------------------------------------- assertEqual
+
+@Test
+function assertEqualGeneric(): void {
+  assertEqual(3, 3, "int");
+  assertEqual("a", "a", "string");
+  assertEqual(Pt { x: 1, y: 2 }, Pt { x: 1, y: 2 }, "record");
+  assertEqual(Some(4), Some(4), "option");
+  assertEqual([1, 2, 3], [1, 2, 3], "array");
+  assertEqual(new Ticket(1, "a"), new Ticket(1, "b"), "class equals");
+}
+
+// ----------------------------------------------------------------------------------- Set<T>
+
+@Test
+function setBasics(): void {
+  let s = new Set<Pt>();
+  assertEqBool(s.isEmpty(), true, "empty");
+  assertEqBool(s.add(Pt { x: 1, y: 2 }), true, "add new");
+  assertEqBool(s.add(Pt { x: 1, y: 2 }), false, "add equal");
+  assertEqBool(s.add(Pt { x: 2, y: 1 }), true, "add other");
+  assertEqUsize(s.size(), 2, "size");
+  assertEqBool(s.has(Pt { x: 2, y: 1 }), true, "has");
+  assertEqBool(s.has(Pt { x: 3, y: 3 }), false, "has not");
+  assertEqBool(s.remove(Pt { x: 1, y: 2 }), true, "remove");
+  assertEqBool(s.remove(Pt { x: 1, y: 2 }), false, "remove again");
+  assertEqual(s.toArray(), [Pt { x: 2, y: 1 }], "toArray");
+  s.clear();
+  assertEqBool(s.isEmpty(), true, "cleared");
+}
+
+@Test
+function setKeyKinds(): void {
+  let o = new Set<Option<int>>();
+  o.add(None);
+  o.add(Some(0));
+  o.add(Some(0));
+  o.add(None);
+  assertEqUsize(o.size(), 2, "options");
+  let a = new Set<int[]>();
+  a.add([1, 2]);
+  a.add([1, 2]);
+  a.add([2, 1]);
+  a.add([]);
+  assertEqUsize(a.size(), 3, "arrays");
+  assertEqBool(a.has([2, 1]), true, "array has");
+  let n = new Set<Name>();
+  n.add(Name { first: "Ada", last: "Lovelace" });
+  n.add(Name { first: "Ada", last: "Byron" });
+  n.add(Name { first: "Ada", last: "Lovelace" });
+  assertEqUsize(n.size(), 2, "records with strings");
+  let t = new Set<Ticket>();
+  assertEqBool(t.add(new Ticket(7, "first")), true, "class add");
+  assertEqBool(t.add(new Ticket(7, "second")), false, "class equal by id");
+  assertEqBool(t.has(new Ticket(7, "")), true, "class has");
+  assertEqString(t.toArray()[0].note, "first", "the first value stays");
+  let b = new Set<bool>();
+  b.add(true);
+  b.add(false);
+  b.add(true);
+  assertEqUsize(b.size(), 2, "bools");
+}
+
+@Test
+function setAlgebra(): void {
+  let a = new Set<string>();
+  let b = new Set<string>();
+  for (const w of ["a", "b", "c", "d"]) { a.add(w); }
+  for (const w of ["c", "d", "e"]) { b.add(w); }
+  assertEqUsize(a.union(b).size(), 5, "union");
+  assertEqUsize(a.intersection(b).size(), 2, "intersection");
+  assertEqual(a.difference(b).toArray(), ["a", "b"], "difference");
+  assertEqBool(a.intersection(b).isSubsetOf(a), true, "subset");
+  assertEqBool(a.isSubsetOf(b), false, "not subset");
+  assertEqBool(a.difference(a).isEmpty(), true, "self difference");
+}
+
+function sortedInts(xs: int[]): int[] {
+  return xs.sort((p: int, q: int): int => p - q);
+}
+
+@Test
+function setVersusIntSet(): void {
+  let seed: int = 11;
+  let g = new Set<int>();
+  let s = new IntSet();
+  let step: int = 0;
+  while (step < 4000) {
+    seed = nextRand(seed);
+    const op = (seed / 16) % 7;
+    seed = nextRand(seed);
+    const x = (seed / 16) % 60;
+    if (op < 3) {
+      assertEqBool(g.add(x), s.add(x), "add");
+    } else if (op < 5) {
+      assertEqBool(g.remove(x), s.remove(x), "remove");
+    } else {
+      assertEqBool(g.has(x), s.has(x), "has");
+    }
+    assertEqUsize(g.size(), s.size(), "size");
+    step += 1;
+  }
+  assertEqual(g.toArray(), s.toArray(), "same insertion order");
+  let h = new Set<int>();
+  let t = new IntSet();
+  for (const x of [1, 5, 9, 70, 71]) { h.add(x); t.add(x); }
+  assertEqual(sortedInts(g.union(h).toArray()), sortedInts(s.union(t).toArray()), "union");
+  assertEqual(sortedInts(g.intersection(h).toArray()), sortedInts(s.intersection(t).toArray()), "intersection");
+  assertEqual(sortedInts(g.difference(h).toArray()), sortedInts(s.difference(t).toArray()), "difference");
+}
+
+@Test
+function setVersusStringSet(): void {
+  let seed: int = 5;
+  let g = new Set<string>();
+  let s = new StringSet();
+  let step: int = 0;
+  while (step < 3000) {
+    seed = nextRand(seed);
+    const op = (seed / 16) % 7;
+    seed = nextRand(seed);
+    const x = "k" + ((seed / 16) % 50).toString();
+    if (op < 3) {
+      assertEqBool(g.add(x), s.add(x), "add");
+    } else if (op < 5) {
+      assertEqBool(g.remove(x), s.remove(x), "remove");
+    } else {
+      assertEqBool(g.has(x), s.has(x), "has");
+    }
+    assertEqUsize(g.size(), s.size(), "size");
+    step += 1;
+  }
+  assertEqual(g.toArray(), s.toArray(), "same insertion order");
+}
+
+// ----------------------------------------------------------------------------------- OrderedMap<K, V>
+
+@Test
+function orderedMapBasics(): void {
+  let m = new OrderedMap<Pt, string>(2);
+  assertEqBool(m.isEmpty(), true, "empty");
+  assertEqBool(m.put(Pt { x: 2, y: 0 }, "b"), true, "new");
+  assertEqBool(m.put(Pt { x: 1, y: 9 }, "a"), true, "new");
+  assertEqBool(m.put(Pt { x: 1, y: 10 }, "c"), true, "new");
+  assertEqBool(m.put(Pt { x: 2, y: 0 }, "B"), false, "replace");
+  // get after put returns the value put (lexicographic order on the record)
+  assertEqual(m.get(Pt { x: 2, y: 0 }), Some("B"), "get");
+  assertEqual(m.get(Pt { x: 5, y: 5 }), None, "absent");
+  assertEqual(m.keyArray(), [Pt { x: 1, y: 9 }, Pt { x: 1, y: 10 }, Pt { x: 2, y: 0 }], "keys in order");
+  assertEqual(m.valueArray(), ["a", "c", "B"], "values in key order");
+  assertEqual(m.firstKey(), Some(Pt { x: 1, y: 9 }), "first");
+  assertEqual(m.lastKey(), Some(Pt { x: 2, y: 0 }), "last");
+  assertEqual(m.floorKey(Pt { x: 1, y: 100 }), Some(Pt { x: 1, y: 10 }), "floor");
+  assertEqual(m.ceilKey(Pt { x: 1, y: 11 }), Some(Pt { x: 2, y: 0 }), "ceil");
+  assertEqual(m.floorKey(Pt { x: 0, y: 0 }), None, "floor none");
+  assertEqual(m.remove(Pt { x: 1, y: 10 }), Some("c"), "remove");
+  assertEqual(m.remove(Pt { x: 1, y: 10 }), None, "remove again");
+  const e = m.popFirst().unwrap();
+  assertEqual(e.key, Pt { x: 1, y: 9 }, "popFirst key");
+  assertEqString(e.value, "a", "popFirst value");
+  const l = m.popLast().unwrap();
+  assertEqual(l.key, Pt { x: 2, y: 0 }, "popLast key");
+  assertEqBool(m.isEmpty(), true, "drained");
+  assertEqual(m.popFirst().isNone(), true, "popFirst empty");
+}
+
+@Test
+function orderedMapKeyKinds(): void {
+  let n = new OrderedMap<Name, int>(3);
+  n.put(Name { first: "b", last: "x" }, 1);
+  n.put(Name { first: "a", last: "z" }, 2);
+  n.put(Name { first: "a", last: "y" }, 3);
+  assertEqual(n.valueArray(), [3, 2, 1], "record of strings, field order");
+  let o = new OrderedMap<Option<int>, int>(2);
+  o.put(Some(3), 30);
+  o.put(None, 0);
+  o.put(Some(-1), -10);
+  assertEqual(o.keyArray(), [None, Some(-1), Some(3)], "None first");
+  let a = new OrderedMap<int[], int>(2);
+  a.put([2], 1);
+  a.put([1, 5], 2);
+  a.put([1], 3);
+  a.put([], 4);
+  assertEqual(a.valueArray(), [4, 3, 2, 1], "arrays lexicographic, shorter prefix first");
+  let t = new OrderedMap<Ticket, string>(2);
+  t.put(new Ticket(9, "x"), "nine");
+  t.put(new Ticket(3, "y"), "three");
+  assertEqBool(t.put(new Ticket(9, "ignored"), "NINE"), false, "equal by id");
+  assertEqual(t.get(new Ticket(9, "")), Some("NINE"), "class key");
+  assertEqual(t.firstKey().unwrap().id, 3, "class ordered by id");
+  let b = new OrderedMap<bool, int>(2);
+  b.put(true, 1);
+  b.put(false, 0);
+  assertEqual(b.keyArray(), [false, true], "false < true");
+}
+
+@Test
+function orderedMapIsStrictlyIncreasing(): void {
+  const emptyInts: int[] = [];
+  assertEqBool(isStrictlyIncreasingOrd([Pt { x: 0, y: 1 }, Pt { x: 1, y: 0 }]), true, "records");
+  assertEqBool(isStrictlyIncreasingOrd([Pt { x: 1, y: 1 }, Pt { x: 1, y: 1 }]), false, "equal");
+  assertEqBool(isStrictlyIncreasingOrd(["a", "b", "a"]), false, "strings");
+  assertEqBool(isStrictlyIncreasingOrd(emptyInts), true, "empty");
+}
+
+function diffMapInt(t: usize, steps: int, range: int, seed0: int): void {
+  let a = new OrderedMap<int, int>(t);
+  let b = new SortedMap<int>(t);
+  let seed = seed0;
+  let step: int = 0;
+  while (step < steps) {
+    seed = nextRand(seed);
+    const op = (seed / 16) % 12;
+    seed = nextRand(seed);
+    const k = (seed / 16) % range;
+    if (op < 4) {
+      assertEqBool(a.put(k, step), b.put(k, step), "put");
+      assertEqual(a.get(k), Some(step), "get after put");
+    } else if (op < 7) {
+      assertEqual(a.remove(k), b.remove(k), "remove");
+    } else if (op == 7) {
+      assertEqual(a.floorKey(k), b.floorKey(k), "floor");
+    } else if (op == 8) {
+      assertEqual(a.ceilKey(k), b.ceilKey(k), "ceil");
+    } else if (op == 9) {
+      const x = a.popFirst();
+      const y = b.popFirst();
+      assertEqBool(x.isSome(), y.isSome(), "popFirst");
+      if (x.isSome()) {
+        assertEq(x.unwrap().key, y.unwrap().key, "popFirst key");
+        assertEq(x.unwrap().value, y.unwrap().value, "popFirst value");
+      }
+    } else if (op == 10) {
+      const x = a.popLast();
+      const y = b.popLast();
+      assertEqBool(x.isSome(), y.isSome(), "popLast");
+      if (x.isSome()) {
+        assertEq(x.unwrap().key, y.unwrap().key, "popLast key");
+      }
+    } else {
+      assertEqual(a.get(k), b.get(k), "get");
+    }
+    assertEqUsize(a.size(), b.size(), "size");
+    step += 1;
+  }
+  assertEqual(a.keyArray(), b.keyArray(), "keys");
+  assertEqual(a.valueArray(), b.valueArray(), "values");
+  assertEqUsize(a.height(), b.height(), "same tree shape");
+}
+
+@Test
+function orderedMapVersusSortedMapInt(): void {
+  diffMapInt(2, 3000, 40, 1);
+  diffMapInt(3, 3000, 200, 2);
+  diffMapInt(16, 4000, 1000, 3);
+}
+
+@Test
+function orderedMapVersusSortedStringMap(): void {
+  let a = new OrderedMap<string, int>(2);
+  let b = new SortedStringMap<int>(2);
+  let seed: int = 9;
+  let step: int = 0;
+  while (step < 2500) {
+    seed = nextRand(seed);
+    const op = (seed / 16) % 8;
+    seed = nextRand(seed);
+    const k = "key" + ((seed / 16) % 70).toString();
+    if (op < 4) {
+      assertEqBool(a.put(k, step), b.put(k, step), "put");
+      assertEqual(a.get(k), Some(step), "get after put");
+    } else if (op < 6) {
+      assertEqual(a.remove(k), b.remove(k), "remove");
+    } else if (op == 6) {
+      assertEqual(a.floorKey(k), b.floorKey(k), "floor");
+    } else {
+      assertEqual(a.ceilKey(k), b.ceilKey(k), "ceil");
+    }
+    assertEqUsize(a.size(), b.size(), "size");
+    step += 1;
+  }
+  assertEqual(a.keyArray(), b.keyArray(), "keys");
+  assertEqual(a.valueArray(), b.valueArray(), "values");
+}
+
+@Test
+function orderedMapRecordStress(): void {
+  // 600 record keys inserted in a scrambled order, then removed in another; checked against the count and ordering
+  let m = new OrderedMap<Pt, int>(2);
+  let i: int = 0;
+  while (i < 600) {
+    m.put(Pt { x: (i * 37) % 20, y: (i * 11) % 31 }, i);
+    i += 1;
+  }
+  const ks = m.keyArray();
+  assertEqBool(isStrictlyIncreasingOrd(ks), true, "sorted");
+  for (const k of ks) {
+    assertEqBool(m.has(k), true, "has every key");
+  }
+  let n = ks.length;
+  for (const k of ks) {
+    assertEqual(m.remove(k).isSome(), true, "remove every key");
+    n -= 1;
+    assertEqUsize(m.size(), n, "size");
+  }
+  assertEqBool(m.isEmpty(), true, "empty again");
+}
+
+// ----------------------------------------------------------------------------------- MinHeap<T>
+
+@Test
+function minHeapBasics(): void {
+  let h = new MinHeap<string>();
+  assertEqBool(h.isEmpty(), true, "empty");
+  assertEqual(h.pop(), None, "pop empty");
+  assertEqual(h.peek(), None, "peek empty");
+  h.push("pear");
+  h.push("apple");
+  h.push("fig");
+  h.push("apple");
+  assertEqUsize(h.size(), 4, "size");
+  assertEqual(h.peek(), Some("apple"), "peek");
+  assertEqual(h.pop(), Some("apple"), "pop 1");
+  assertEqual(h.pop(), Some("apple"), "pop 2");
+  assertEqual(h.pop(), Some("fig"), "pop 3");
+  assertEqual(h.pop(), Some("pear"), "pop 4");
+  assertEqBool(h.isEmpty(), true, "drained");
+  h.push("x");
+  h.clear();
+  assertEqBool(h.isEmpty(), true, "cleared");
+}
+
+@Test
+function minHeapRecordsAndClasses(): void {
+  let h = new MinHeap<Pt>();
+  h.push(Pt { x: 2, y: 1 });
+  h.push(Pt { x: 1, y: 5 });
+  h.push(Pt { x: 1, y: 2 });
+  assertEqual(h.pop(), Some(Pt { x: 1, y: 2 }), "lexicographic 1");
+  assertEqual(h.pop(), Some(Pt { x: 1, y: 5 }), "lexicographic 2");
+  assertEqual(h.pop(), Some(Pt { x: 2, y: 1 }), "lexicographic 3");
+  // equal by compare but distinguishable by note: first pushed leaves first (FIFO among equals)
+  let t = new MinHeap<Ticket>();
+  t.push(new Ticket(2, "b1"));
+  t.push(new Ticket(1, "a"));
+  t.push(new Ticket(2, "b2"));
+  t.push(new Ticket(2, "b3"));
+  assertEqString(t.pop().unwrap().note, "a", "smallest");
+  assertEqString(t.pop().unwrap().note, "b1", "FIFO 1");
+  assertEqString(t.pop().unwrap().note, "b2", "FIFO 2");
+  assertEqString(t.pop().unwrap().note, "b3", "FIFO 3");
+  assertEqBool(isMinHeap4Ord([1, 2, 3], [0, 1, 2]), true, "heap predicate");
+  assertEqBool(isMinHeap4Ord([2, 1], [0, 1]), false, "heap predicate violated");
+  assertEqBool(isMinHeap4Ord([1, 1], [1, 0]), false, "equal values need increasing insertion numbers");
+}
+
+@Test
+function minHeapVersusPriorityQueue(): void {
+  let g = new MinHeap<int>();
+  let q = new PriorityQueue<int>();
+  let seed: int = 21;
+  let step: int = 0;
+  while (step < 5000) {
+    seed = nextRand(seed);
+    const op = (seed / 16) % 5;
+    seed = nextRand(seed);
+    const x = (seed / 16) % 300 - 100;
+    if (op < 3) {
+      g.push(x);
+      q.push(x, x);
+    } else {
+      const a = g.pop();
+      const b = q.pop();
+      assertEqBool(a.isSome(), b.isSome(), "pop");
+      if (a.isSome()) {
+        assertEq(a.unwrap(), b.unwrap().value, "pop value");
+      }
+    }
+    assertEqUsize(g.size(), q.size(), "size");
+    assertEqBool(g.peek().isSome(), q.peek().isSome(), "peek");
+    if (g.peek().isSome()) {
+      assertEq(g.peek().unwrap(), q.peek().unwrap().value, "peek value");
+    }
+    step += 1;
+  }
+}
