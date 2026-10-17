@@ -41,6 +41,15 @@ def counted : AS → Bool
   | .unique => true
   | _ => false
 
+/-- the object behind the local cannot be freed or resized by anything that does not mention the
+local: it holds a count of its own, or it is a parameter lent by the caller for the whole call.  This
+is the meaning of the ghost bit `ctd` of the interval analysis (`RangeSem.lean`, `RangePin.lean`). -/
+def pinned : AS → Bool
+  | .owned => true
+  | .unique => true
+  | .param => true
+  | _ => false
+
 /-- a kind that a borrow may be rooted at -/
 def isRoot : AS → Bool
   | .owned => true
