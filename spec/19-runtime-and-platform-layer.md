@@ -140,6 +140,7 @@ separator is raised through `process.exit(101)` after printing the same message.
     | `memRealloc(addr, n) -> usize` (R3d.0) | `orin_platform_realloc`, never 0 (traps "out of memory", the old block stays valid) |
     | `memMove(dst, src, n)` (R3d.0) | `orin_platform_mem_move` (ranges may overlap) |
     | `memCmp(a, b, n) -> int` (R3d.0) | `orin_platform_mem_cmp` normalised to -1, 0 or 1 (unsigned bytes) |
+    | `hook(k, a, b, c: usize) -> usize` (R3d.5) | a call of the C runtime function `orin_core_hook(k, a, b, c)` (`runtime/core/orin_runtime.c`; the numbers are the `HK_*` constants of `runtime/core/heap.or`): the services that are still C when the Orin runtime needs them, namely `getenv`, one line on stderr, the runtime lock, the address of the totals of finished tasks (`g_fold`, `g_fold_live`), whether the hot counters are built in, and the allocation-site census hooks. Not pure; reachable like the other core operations only from `$rt/` |
 
   - **R3d.0 preparation (done, ADR-0052 Addendum A; each item is a working assumption of its section 6 until the owner
     confirms it).** (1) *The `$rt` root* (question 1): `runtime/core/*.or` is the fourth embedded prelude root
@@ -187,8 +188,7 @@ separator is raised through `process.exit(101)` after printing the same message.
     the entries directly (`newStruct`, array-new); the C shells of `orin_runtime.c` reach them through wrappers that the emitted code defines under the
     old C names (`backends/{c,llvm}/rtwrap.or`), so the C runtime keeps its call sites. New pure core operations 24..26: `wadd`, `wsub`, `wmul`
     (wrapping `usize` arithmetic; `wrappingAdd` is an out-of-line call and `+` adds trap paths). Census builds (`-DORIN_SITE_STATS`, `--stats-sites`)
-    keep the C definitions, because the census hooks are C: `rtIdsFor(prog, sites)` leaves the entries out and the C versions stay under
-    `#ifdef ORIN_SITE_STATS` until R3d.5; `sb_drain` stays C. `cfg(0)` is a constant 1 in LLVM, so LLVM builds under ASan keep the free lists
+    kept the C definitions until R3d.5 (the census hooks were C); `sb_drain` stays C. `cfg(0)` is a constant 1 in LLVM, so LLVM builds under ASan keep the free lists
     (ASan then does not see a recycled header). The C unit tests of the runtime link `tools/rt_stub.sh` (an empty program compiled to C with `main`
     renamed), which carries the wrappers. `compiler/mir/rt.or` also holds `rtAlways` (the entries `opt/prune.or` always keeps).
   - **R3d.4 strings and arrays in Orin (done, ADR-0052 Addendum A section 5).** `runtime/core/str.or` (`strConcat`, `strAppend`, `strAppendSub`,
@@ -197,8 +197,28 @@ separator is raised through `process.exit(101)` after printing the same message.
     (`rtCallC`, `rtCallL`; objects as address words); without `$rt` (`--c-builtins`) they emit the old C call, which the frozen snapshot defines.
     Only `str_concat`, `str_append`, `array_slice`, `array_concat`, `array_extend`, `bytes_to_string` and `string_to_bytes` get a C-named wrapper
     (`rtWraps`), because the C unit tests call them; the others (`rtPlain`) have none. Growth, fresh allocation and the copying path of
-    `arrayExtend` are separate `noinline` functions (`rtCold`). Counters are updated exactly as the C versions did. Census builds keep the C
-    versions under `#ifdef ORIN_SITE_STATS` (`rtIdsFor` leaves all of these entries out) until R3d.5. `rc.or` exports `retain` and `release`.
+    `arrayExtend` are separate `noinline` functions (`rtCold`). Counters are updated exactly as the C versions did. Census builds kept the C
+    versions until R3d.5. `rc.or` exports `retain` and `release`.
+  - **R3d.5 stats, live count and the census on the Orin object model (done, ADR-0052 Addendum A section 5).** (1) `runtime/core/stats.or`:
+    `statsReport` (the `ORIN_STATS=1` line, byte for byte the one the C `stats_report` printed, assembled in a raw buffer so that no Orin
+    object is allocated while the counters are read) and `liveCount`, entries 28 and 29 of `compiler/mir/rt.or` with the C-named wrappers
+    `orin_stats_report` (registered by `orin_init` with the platform at-exit list) and `orin_live_count`. (2) *Census prefix word* (Addendum
+    rule 4): in a census build (`cfg(2)`) every heap object starts `pfx()` = 8 bytes after its block, the word before the header holds
+    the allocating site, so `OrinObj` has no census fields and the offsets of the layout are the same in all builds; free lists and
+    the small-block cache hold block addresses (the link is in the first word of the block, the prefix word). Immortal static objects
+    have no prefix word: `ORIN_SITE_OF(o)` reads it unless the top two bits of the count are 11 (immortal; a lend-pinned object, bits 10, has one). (3) The census runs on the Orin entries: `rtIdsFor` and every
+    `#ifdef ORIN_SITE_STATS` C copy (`struct_new`, `variant1`, `array_new`, `destroy`, `make_unique_slow`, the small-block functions,
+    `str_alloc`, `array_push_grow`, the string append family, array slice/concat/extend, the byte conversions) are deleted. The Orin
+    code reports to the census with `siteAlloc`, `siteGrow`, `siteFree` and `siteRc` (`heap.or`; constant-folded away unless `cfg(2)`),
+    including `retain` / `release` / `decRef` of `rc.or`, as the header inlines of generated C do. Functions of `$rt` get no census
+    sites (`sites.or` `isRtFunction`: no marks, no table entries), so what the runtime does is attributed to the site that called
+    it, as when it was C. (4) *The C hook.* The census engine (`SiteCtr` tables, pair and call hash tables, fold at task end, the
+    report) stays C in `orin_runtime.c`; Orin reaches it, `getenv`, the stderr line, the runtime lock and the totals of finished tasks
+    (`g_fold`, `g_fold_live`, which `orin_rt_heap_exit` still writes) through the one new core operation 27, `hook(k, a, b, c)`, which calls
+    `orin_core_hook` (a switch over 12 services, `HK_*` in `heap.or`); `HK_STATS_ON` keeps the `"counters"` field of an LLVM binary
+    what it was (the label comes from the build of the C runtime, not from `cfg(1)`). (5) Census summaries: `peak_live_bytes` and
+    `live_bytes` of a census run were 8 bytes per object larger (the widened header) and are now those of the normal build. `tools/test_resources.sh`
+    checks that the objects a census run attributes to sites add up to its `alloc_total`.
   - **R3d.1 the per-thread heap block (done, ADR-0052 Addendum A section 5).** `g_live`, the free lists, the small-block cache, the
     work stack of `orin_destroy` and `orin_stats` are fields of one exported `__thread OrinHeap orin_heap` (1024 bytes, zero-initialised,
     the block `heapBase()` returns), so Orin code reaches each at a fixed offset. ADR-0017 behaviour is unchanged (per task, returned in
@@ -219,7 +239,7 @@ separator is raised through `process.exit(101)` after printing the same message.
     | 512 | 272 | `sb[17]` (`{head, n}` pairs, 16 bytes each) | `sb_list`, `sb_cnt` (u32) | small-block cache by 16-byte class 0..16 (`SB_MAX` 256): list head @+0, length @+8, cap `SB_CAP` = 2^15 |
     | 784 | 240 | reserved | | up to 1024 bytes (128 words) |
 
-    **Not moved (they stay `static __thread` in C until R3e):** `t_sites`, `t_pairs`, `t_calls` (census), `g_grants`, `g_files`, `t_task`, `t_joined_msg`, `orin_site_cur`, `orin_site_par`.
+    **Not moved (they stay `static __thread` in C until R3e; the census tables stay C, R3d.5):** `t_sites`, `t_pairs`, `t_calls` (census), `g_grants`, `g_files`, `t_task`, `t_joined_msg`, `orin_site_cur`, `orin_site_par`.
     Offsets do not depend on the build configuration (the lists and counters exist unused under `-DORIN_NO_FREELIST` or without `ORIN_STATS_ENABLED`) and are pinned by `_Static_assert`s in `runtime/core/orin_runtime.h`.
     `orin_stats` is now `#define orin_stats (orin_heap.stats)`, so inline code and generated C are unchanged; the block is `extern __thread OrinHeap orin_heap` (local-exec as before), `heapBase()` is its address (the C backend emits `&orin_heap`, the LLVM declaration is `[128 x i64]`).
 
