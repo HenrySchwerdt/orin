@@ -10,7 +10,7 @@ Use **JavaScript/TypeScript-familiar names** and predictably typed signatures. A
 |---|---|---|
 | `std:array` | `map`, `filter`, `find`, `reduce`, `some`, `every`, `get`, `sort` | `find/get: Option<T>` |
 | `std:string` | `split`, `trim`, `includes`, `replace`, `toLowerCase`, `join` | fallible variants return `Result` |
-| `std:map` | `new Map<K,V>()`, `get`, `set`, `has`, `delete`, `size`, `keys`, `values`, `entries` (built in, no import; keys int/usize/bool/string; insertion order; value semantics; Orin prelude `library/collections/map.or`, ADR-0018) | `get: Option<V>` |
+| `std:map` | `new Map<K,V>()`, `get`, `set`, `has`, `delete`, `size`, `keys`, `values`, `entries` (built in, no import; keys: any `Hash` type, ADR-0034 (integers, bool, string, and records, unions, `Option`, arrays and classes with `hash` built from them); insertion order; value semantics; Orin prelude `library/collections/map.or`, ADR-0018) | `get: Option<V>` |
 | `std:json` | `parse<T>`, `stringify` | `Result<_, JsonError>` where fallible |
 | `std:fs` | `readFile`, `writeFile`, `exists` | `Result<_, FileError>` |
 | `std:path` | `join`, `basename`, `extension` | typed, platform-aware |

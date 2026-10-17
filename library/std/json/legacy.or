@@ -1,0 +1,758 @@
+// std:json/legacy -- the integer-only JSON model (spec 08, ADR-0016), moved here from std:json by ADR-0048
+// section 7.1. DEPRECATED for new code: use std:json (exact numbers, bounded parser and writer) and cross over
+// with `toValue` / `fromValue` below. The module stays for callers that need the old shape (LSP/MCP protocol
+// servers, tooling); it receives no new features.
+//
+// Data model: `Json` is a plain union (no classes), so values copy like any other value and are
+// inspected with `match`. Numbers are INTEGERS ONLY (`JNum(int)`) until floats land; see the
+// TODO(after floats/map) notes. Objects are ordered field lists (`JField[]`), not maps.
+//
+//   * parse accepts RFC 8259 JSON with these restrictions: numbers must be integers in the
+//     range -9223372036854775807 .. 9223372036854775807; a fraction or exponent (`1.5`, `1e3`)
+//     is a JsonError ("floats are not supported yet"). Nesting deeper than 200 levels is an error.
+//   * Strings are Orin byte strings holding UTF-8. `\uXXXX` escapes decode to UTF-8; a surrogate
+//     pair gives one 4-byte sequence, a lone surrogate gives U+FFFD. Raw control characters
+//     (< 0x20) inside strings are rejected. Bytes >= 0x80 are copied through unchanged (the
+//     input is not validated as UTF-8).
+//   * Duplicate object keys are kept (in order); `get` returns the LAST occurrence (JS semantics).
+//   * Errors carry the byte offset plus a 1-based line and column (column counts bytes after the
+//     last "\n"; "\r\n" ends a line at "\n").
+//   * stringify is compact and deterministic; `pretty` indents with spaces. Object field order is
+//     insertion order. Strings escape `"`, `\`, \b \f \n \r \t and other control characters as
+//     \u00XX; all other bytes pass through unchanged.
+//
+// TODO(after floats/map): JNum(float) / separate JFloat, `parse<T>` is post-1.0 (ADR-0016).
+
+import { JsonValue, JsonMember } from "std:json";
+import { NumberError, numberFromInt, numberAsInt } from "std:json/number";
+
+// Json -- the integer-only value: JNull | JBool | JNum(int) | JStr | JArr | JObj (ordered fields).
+export type Json = JNull | JBool(bool) | JNum(int) | JStr(string) | JArr(Json[]) | JObj(JField[]);
+
+// JField -- one object field in source order (duplicates are kept).
+export type JField = { key: string; value: Json; };
+
+// JsonError -- parse failure: `message` describes the problem, `offset` is the 0-based byte offset where it was
+// detected (== text length for "unexpected end of input"), `line`/`column` are 1-based.
+export type JsonError = { message: string; offset: usize; line: usize; column: usize; };
+
+// ---- constructors -------------------------------------------------------------------------
+
+// field(key: string, value: Json): JField -- builds an object field. O(1).
+export function field(key: string, value: Json): JField {
+  return JField { key: key, value: value };
+}
+
+// ---- parser -------------------------------------------------------------------------------
+
+type PErr = { msg: string; at: usize; };
+type PRes = { v: Json; pos: usize; };
+type SRes = { text: string; pos: usize; };
+type NRes = { n: int; pos: usize; };
+
+const MAX_DEPTH: int = 200;
+
+function fail(msg: string, at: usize): PErr {
+  return PErr { msg: msg, at: at };
+}
+
+function isWs(c: int): bool {
+  return c == 32 || c == 9 || c == 10 || c == 13;
+}
+
+function skipWs(s: string, start: usize): usize {
+  let i = start;
+  while (i < s.length && isWs(s.charCodeAt(i))) {
+    i += 1;
+  }
+  return i;
+}
+
+function hexVal(c: int): int {
+  if (c >= 48 && c <= 57) {
+    return c - 48;
+  }
+  if (c >= 97 && c <= 102) {
+    return c - 87;
+  }
+  if (c >= 65 && c <= 70) {
+    return c - 55;
+  }
+  return -1;
+}
+
+// Four hex digits at `at`, or -1.
+function hex4(s: string, at: usize): int {
+  if (at + 4 > s.length) {
+    return -1;
+  }
+  let v = 0;
+  let k: usize = 0;
+  while (k < 4) {
+    const h = hexVal(s.charCodeAt(at + k));
+    if (h < 0) {
+      return -1;
+    }
+    v = v * 16 + h;
+    k += 1;
+  }
+  return v;
+}
+
+function utf8(cp: int): string {
+  if (cp < 128) {
+    return String.fromCharCode(cp);
+  }
+  if (cp < 2048) {
+    return String.fromCharCode(192 + cp / 64) + String.fromCharCode(128 + cp % 64);
+  }
+  if (cp < 65536) {
+    return String.fromCharCode(224 + cp / 4096) + String.fromCharCode(128 + (cp / 64) % 64)
+      + String.fromCharCode(128 + cp % 64);
+  }
+  return String.fromCharCode(240 + cp / 262144) + String.fromCharCode(128 + (cp / 4096) % 64)
+    + String.fromCharCode(128 + (cp / 64) % 64) + String.fromCharCode(128 + cp % 64);
+}
+
+// `s[start]` is the opening quote.
+function parseString(s: string, start: usize): Result<SRes, PErr> {
+  let out = "";
+  let i = start + 1;
+  let runStart = i;
+  while (true) {
+    if (i >= s.length) {
+      return Err(fail("unterminated string", start));
+    }
+    const c = s.charCodeAt(i);
+    if (c == 34) {
+      if (i > runStart) {
+        out += s.substring(runStart, i);
+      }
+      return Ok(SRes { text: out, pos: i + 1 });
+    }
+    if (c < 32) {
+      return Err(fail("control character in string", i));
+    }
+    if (c != 92) {
+      i += 1;
+      continue;
+    }
+    if (i > runStart) {
+      out += s.substring(runStart, i);
+    }
+    if (i + 1 >= s.length) {
+      return Err(fail("unterminated escape", i));
+    }
+    const e = s.charCodeAt(i + 1);
+    i += 2;
+    if (e == 34) {
+      out += "\"";
+    } else if (e == 92) {
+      out += "\\";
+    } else if (e == 47) {
+      out += "/";
+    } else if (e == 98) {
+      out += String.fromCharCode(8);
+    } else if (e == 102) {
+      out += String.fromCharCode(12);
+    } else if (e == 110) {
+      out += "\n";
+    } else if (e == 114) {
+      out += "\r";
+    } else if (e == 116) {
+      out += "\t";
+    } else if (e == 117) {
+      const u = hex4(s, i);
+      if (u < 0) {
+        return Err(fail("invalid \\u escape", i - 2));
+      }
+      i += 4;
+      let cp = u;
+      if (u >= 55296 && u <= 56319) {
+        // High surrogate: needs a following \uDC00..\uDFFF.
+        let lo = -1;
+        if (i + 1 < s.length && s.charCodeAt(i) == 92 && s.charCodeAt(i + 1) == 117) {
+          lo = hex4(s, i + 2);
+        }
+        if (lo >= 56320 && lo <= 57343) {
+          cp = 65536 + (u - 55296) * 1024 + (lo - 56320);
+          i += 6;
+        } else {
+          cp = 65533;
+        }
+      } else if (u >= 56320 && u <= 57343) {
+        cp = 65533;
+      }
+      out += utf8(cp);
+    } else {
+      return Err(fail("invalid escape", i - 2));
+    }
+    runStart = i;
+  }
+  return Err(fail("unreachable", i));
+}
+
+function isDigit(c: int): bool {
+  return c >= 48 && c <= 57;
+}
+
+const INT_MAX: int = 9223372036854775807;
+
+function parseNumber(s: string, start: usize): Result<NRes, PErr> {
+  let i = start;
+  let neg = false;
+  if (s.charCodeAt(i) == 45) {
+    neg = true;
+    i += 1;
+  }
+  const ds = i;
+  while (i < s.length && isDigit(s.charCodeAt(i))) {
+    i += 1;
+  }
+  if (i == ds) {
+    return Err(fail("invalid number", start));
+  }
+  if (i - ds > 1 && s.charCodeAt(ds) == 48) {
+    return Err(fail("leading zero in number", ds));
+  }
+  let v = 0;
+  let k = ds;
+  while (k < i) {
+    const d = s.charCodeAt(k) - 48;
+    if (v > (INT_MAX - d) / 10) {
+      return Err(fail("integer out of range", start));
+    }
+    v = v * 10 + d;
+    k += 1;
+  }
+  if (i < s.length && (s.charCodeAt(i) == 46 || s.charCodeAt(i) == 101 || s.charCodeAt(i) == 69)) {
+    return Err(fail("floats are not supported yet (integers only)", i));
+  }
+  if (neg) {
+    v = 0 - v;
+  }
+  return Ok(NRes { n: v, pos: i });
+}
+
+function expectLit(s: string, at: usize, lit: string): bool {
+  if (at + lit.length > s.length) {
+    return false;
+  }
+  return s.substring(at, at + lit.length) == lit;
+}
+
+function parseValue(s: string, start: usize, depth: int): Result<PRes, PErr> {
+  const i = skipWs(s, start);
+  if (i >= s.length) {
+    return Err(fail("unexpected end of input", i));
+  }
+  if (depth > MAX_DEPTH) {
+    return Err(fail("nesting too deep", i));
+  }
+  const c = s.charCodeAt(i);
+  if (c == 34) {
+    const r = parseString(s, i)?;
+    return Ok(PRes { v: JStr(r.text), pos: r.pos });
+  }
+  if (c == 123) {
+    return parseObject(s, i, depth);
+  }
+  if (c == 91) {
+    return parseArray(s, i, depth);
+  }
+  if (c == 45 || isDigit(c)) {
+    const r = parseNumber(s, i)?;
+    return Ok(PRes { v: JNum(r.n), pos: r.pos });
+  }
+  if (expectLit(s, i, "true")) {
+    return Ok(PRes { v: JBool(true), pos: i + 4 });
+  }
+  if (expectLit(s, i, "false")) {
+    return Ok(PRes { v: JBool(false), pos: i + 5 });
+  }
+  if (expectLit(s, i, "null")) {
+    return Ok(PRes { v: JNull, pos: i + 4 });
+  }
+  return Err(fail("unexpected character", i));
+}
+
+function parseArray(s: string, start: usize, depth: int): Result<PRes, PErr> {
+  let items: Json[] = [];
+  let i = skipWs(s, start + 1);
+  if (i < s.length && s.charCodeAt(i) == 93) {
+    return Ok(PRes { v: JArr(items), pos: i + 1 });
+  }
+  while (true) {
+    const r = parseValue(s, i, depth + 1)?;
+    items.push(r.v);
+    i = skipWs(s, r.pos);
+    if (i >= s.length) {
+      return Err(fail("unexpected end of input, expected `,` or `]`", i));
+    }
+    const c = s.charCodeAt(i);
+    if (c == 93) {
+      return Ok(PRes { v: JArr(items), pos: i + 1 });
+    }
+    if (c != 44) {
+      return Err(fail("expected `,` or `]`", i));
+    }
+    i += 1;
+  }
+  return Err(fail("unreachable", i));
+}
+
+function parseObject(s: string, start: usize, depth: int): Result<PRes, PErr> {
+  let fields: JField[] = [];
+  let i = skipWs(s, start + 1);
+  if (i < s.length && s.charCodeAt(i) == 125) {
+    return Ok(PRes { v: JObj(fields), pos: i + 1 });
+  }
+  while (true) {
+    i = skipWs(s, i);
+    if (i >= s.length) {
+      return Err(fail("unexpected end of input, expected string key", i));
+    }
+    if (s.charCodeAt(i) != 34) {
+      return Err(fail("expected string key", i));
+    }
+    const k = parseString(s, i)?;
+    i = skipWs(s, k.pos);
+    if (i >= s.length) {
+      return Err(fail("unexpected end of input, expected `:`", i));
+    }
+    if (s.charCodeAt(i) != 58) {
+      return Err(fail("expected `:`", i));
+    }
+    const r = parseValue(s, i + 1, depth + 1)?;
+    fields.push(JField { key: k.text, value: r.v });
+    i = skipWs(s, r.pos);
+    if (i >= s.length) {
+      return Err(fail("unexpected end of input, expected `,` or `}`", i));
+    }
+    const c = s.charCodeAt(i);
+    if (c == 125) {
+      return Ok(PRes { v: JObj(fields), pos: i + 1 });
+    }
+    if (c != 44) {
+      return Err(fail("expected `,` or `}`", i));
+    }
+    i += 1;
+  }
+  return Err(fail("unreachable", i));
+}
+
+// 1-based line and column of byte `offset` in `s`.
+function locate(s: string, offset: usize): JsonError {
+  let line: usize = 1;
+  let lineStart: usize = 0;
+  let i: usize = 0;
+  while (i < offset && i < s.length) {
+    if (s.charCodeAt(i) == 10) {
+      line += 1;
+      lineStart = i + 1;
+    }
+    i += 1;
+  }
+  return JsonError { message: "", offset: offset, line: line, column: offset - lineStart + 1 };
+}
+
+function toError(s: string, e: PErr): JsonError {
+  const l = locate(s, e.at);
+  return JsonError { message: e.msg, offset: e.at, line: l.line, column: l.column };
+}
+
+// parse(text: string): Result<Json, JsonError>
+// Parses one JSON document (surrounding whitespace allowed, trailing characters are an error:
+// "trailing characters"). Errors: syntax errors, unsupported floats, integer overflow, nesting
+// deeper than 200, each with offset/line/column. Complexity: O(n) time and allocation (plus
+// O(n) to locate the line/column of an error).
+export function parse(text: string): Result<Json, JsonError> {
+  const r = parseValue(text, 0, 0);
+  if (r.isErr()) {
+    return Err(toError(text, r.unwrapErr()));
+  }
+  const ok = r.unwrap();
+  const end = skipWs(text, ok.pos);
+  if (end < text.length) {
+    return Err(toError(text, fail("trailing characters", end)));
+  }
+  return Ok(ok.v);
+}
+
+// jsonErrorMessage(e: JsonError): string -- "line L, column C: message". Never fails. O(1).
+export function jsonErrorMessage(e: JsonError): string {
+  return "line " + e.line.toString() + ", column " + e.column.toString() + ": " + e.message;
+}
+
+// formatError(e: JsonError): string -- deprecated spelling of jsonErrorMessage.
+@Deprecated("use jsonErrorMessage(e)")
+export function formatError(e: JsonError): string {
+  return jsonErrorMessage(e);
+}
+
+// ---- printers -----------------------------------------------------------------------------
+
+function hexDigit(n: int): string {
+  if (n < 10) {
+    return String.fromCharCode(48 + n);
+  }
+  return String.fromCharCode(87 + n);
+}
+
+// quote(s: string): string -- `s` as a JSON string literal with escapes. O(n).
+export function quote(s: string): string {
+  let out = "\"";
+  let runStart: usize = 0;
+  let i: usize = 0;
+  while (i < s.length) {
+    const c = s.charCodeAt(i);
+    if (c == 34 || c == 92 || c < 32) {
+      if (i > runStart) {
+        out += s.substring(runStart, i);
+      }
+      if (c == 34) {
+        out += "\\\"";
+      } else if (c == 92) {
+        out += "\\\\";
+      } else if (c == 10) {
+        out += "\\n";
+      } else if (c == 13) {
+        out += "\\r";
+      } else if (c == 9) {
+        out += "\\t";
+      } else if (c == 8) {
+        out += "\\b";
+      } else if (c == 12) {
+        out += "\\f";
+      } else {
+        out += "\\u00" + hexDigit(c / 16) + hexDigit(c % 16);
+      }
+      runStart = i + 1;
+    }
+    i += 1;
+  }
+  if (s.length > runStart) {
+    out += s.substring(runStart, s.length);
+  }
+  out += "\"";
+  return out;
+}
+
+function emit(j: Json, out: string[]): string[] {
+  let o = out;
+  match (j) {
+    JNull => { o.push("null"); },
+    JBool(b) => { o.push(b ? "true" : "false"); },
+    JNum(n) => { o.push(n.toString()); },
+    JStr(s) => { o.push(quote(s)); },
+    JArr(a) => {
+      o.push("[");
+      let i: usize = 0;
+      while (i < a.length) {
+        if (i > 0) {
+          o.push(",");
+        }
+        o = emit(a[i], o);
+        i += 1;
+      }
+      o.push("]");
+    },
+    JObj(fs) => {
+      o.push("{");
+      let i: usize = 0;
+      while (i < fs.length) {
+        if (i > 0) {
+          o.push(",");
+        }
+        o.push(quote(fs[i].key));
+        o.push(":");
+        o = emit(fs[i].value, o);
+        i += 1;
+      }
+      o.push("}");
+    }
+  }
+  return o;
+}
+
+// stringify(j: Json): string
+// Compact deterministic serialization (no whitespace). Never fails. O(n) in the size of `j`.
+// parse(stringify(j)) == j for every j whose integers are in range.
+export function stringify(j: Json): string {
+  const out: string[] = [];
+  return emit(j, out).join("");
+}
+
+function spaces(n: usize): string {
+  let out = "";
+  let i: usize = 0;
+  while (i < n) {
+    out += " ";
+    i += 1;
+  }
+  return out;
+}
+
+function emitPretty(j: Json, indent: usize, level: usize, out: string[]): string[] {
+  let o = out;
+  match (j) {
+    JArr(a) => {
+      if (a.length == 0) {
+        o.push("[]");
+      } else {
+        o.push("[\n");
+        let i: usize = 0;
+        while (i < a.length) {
+          o.push(spaces(indent * (level + 1)));
+          o = emitPretty(a[i], indent, level + 1, o);
+          o.push(i + 1 < a.length ? ",\n" : "\n");
+          i += 1;
+        }
+        o.push(spaces(indent * level));
+        o.push("]");
+      }
+    },
+    JObj(fs) => {
+      if (fs.length == 0) {
+        o.push("{}");
+      } else {
+        o.push("{\n");
+        let i: usize = 0;
+        while (i < fs.length) {
+          o.push(spaces(indent * (level + 1)));
+          o.push(quote(fs[i].key));
+          o.push(": ");
+          o = emitPretty(fs[i].value, indent, level + 1, o);
+          o.push(i + 1 < fs.length ? ",\n" : "\n");
+          i += 1;
+        }
+        o.push(spaces(indent * level));
+        o.push("}");
+      }
+    },
+    _ => { o = emit(j, o); }
+  }
+  return o;
+}
+
+// pretty(j: Json, indent: usize): string
+// Multi-line serialization: one array element / object field per line, `indent` spaces per
+// nesting level, ": " after keys, empty containers as `[]` / `{}`, no trailing newline.
+// `pretty(j, 0)` still puts every element on its own line (use `stringify` for compact output).
+// Never fails. O(n) in the size of `j` (plus the indentation written).
+export function pretty(j: Json, indent: usize): string {
+  const out: string[] = [];
+  return emitPretty(j, indent, 0, out).join("");
+}
+
+// ---- accessors ----------------------------------------------------------------------------
+// All accessors are total: a wrong kind or a missing key gives None. They never trap.
+
+// get(j: Json, key: string): Option<Json>
+// The value of field `key` when `j` is an object (the LAST field with that key), else None.
+// O(fields).
+export function get(j: Json, key: string): Option<Json> {
+  return match (j) {
+    JObj(fs) => lastField(fs, key),
+    _ => None
+  };
+}
+
+function lastField(fs: JField[], key: string): Option<Json> {
+  let i = fs.length;
+  while (i > 0) {
+    i -= 1;
+    if (fs[i].key == key) {
+      return Some(fs[i].value);
+    }
+  }
+  return None;
+}
+
+// getIndex(j: Json, index: usize): Option<Json> -- element `index` of an array, else None. O(1).
+export function getIndex(j: Json, index: usize): Option<Json> {
+  return match (j) {
+    JArr(a) => index < a.length ? Some(a[index]) : None,
+    _ => None
+  };
+}
+
+// at(j: Json, index: usize): Option<Json> -- deprecated spelling of getIndex (`at` means a trapping read elsewhere).
+@Deprecated("use getIndex(j, index)")
+export function at(j: Json, index: usize): Option<Json> {
+  return getIndex(j, index);
+}
+
+// getPath(j: Json, keys: string[]): Option<Json> -- follows object keys: getPath(j, ["a", "b"]) is
+// get(get(j, "a"), "b"); an empty `keys` gives Some(j). O(sum of fields visited).
+export function getPath(j: Json, keys: string[]): Option<Json> {
+  let cur = j;
+  for (const k of keys) {
+    const f = get(cur, k);
+    if (f.isNone()) {
+      return None;
+    }
+    cur = f.unwrap();
+  }
+  return Some(cur);
+}
+
+// path(j: Json, keys: string[]): Option<Json> -- deprecated spelling of getPath (collides with std:path).
+@Deprecated("use getPath(j, keys)")
+export function path(j: Json, keys: string[]): Option<Json> {
+  return getPath(j, keys);
+}
+
+// asString(j: Json): Option<string> -- Some for JStr. O(1).
+export function asString(j: Json): Option<string> {
+  return match (j) {
+    JStr(s) => Some(s),
+    _ => None
+  };
+}
+
+// asInt(j: Json): Option<int> -- Some for JNum. O(1).
+export function asInt(j: Json): Option<int> {
+  return match (j) {
+    JNum(n) => Some(n),
+    _ => None
+  };
+}
+
+// asBool(j: Json): Option<bool> -- Some for JBool. O(1).
+export function asBool(j: Json): Option<bool> {
+  return match (j) {
+    JBool(b) => Some(b),
+    _ => None
+  };
+}
+
+// asArray(j: Json): Option<Json[]> -- Some for JArr. O(1) (the array is copied lazily).
+export function asArray(j: Json): Option<Json[]> {
+  return match (j) {
+    JArr(a) => Some(a),
+    _ => None
+  };
+}
+
+// asObject(j: Json): Option<JField[]> -- Some for JObj, in insertion order. O(1).
+export function asObject(j: Json): Option<JField[]> {
+  return match (j) {
+    JObj(fs) => Some(fs),
+    _ => None
+  };
+}
+
+// isNull(j: Json): bool -- true for JNull. O(1).
+export function isNull(j: Json): bool {
+  return match (j) {
+    JNull => true,
+    _ => false
+  };
+}
+
+// keys(j: Json): string[] -- the field names of an object in order (duplicates included);
+// [] for any non-object. O(fields).
+export function keys(j: Json): string[] {
+  let out: string[] = [];
+  match (j) {
+    JObj(fs) => {
+      for (const f of fs) {
+        out.push(f.key);
+      }
+    },
+    _ => {}
+  }
+  return out;
+}
+
+// getString(j: Json, key: string): Option<string> -- `get` followed by `asString`; None when the key is missing
+// or has another kind. O(fields).
+export function getString(j: Json, key: string): Option<string> {
+  const f = get(j, key);
+  if (f.isNone()) {
+    return None;
+  }
+  return asString(f.unwrap());
+}
+
+// getInt(j: Json, key: string): Option<int> -- `get` followed by `asInt`. O(fields).
+export function getInt(j: Json, key: string): Option<int> {
+  const f = get(j, key);
+  if (f.isNone()) {
+    return None;
+  }
+  return asInt(f.unwrap());
+}
+
+// getBool(j: Json, key: string): Option<bool> -- `get` followed by `asBool`. O(fields).
+export function getBool(j: Json, key: string): Option<bool> {
+  const f = get(j, key);
+  if (f.isNone()) {
+    return None;
+  }
+  return asBool(f.unwrap());
+}
+
+// getArray(j: Json, key: string): Option<Json[]> -- `get` followed by `asArray`. O(fields).
+export function getArray(j: Json, key: string): Option<Json[]> {
+  const f = get(j, key);
+  if (f.isNone()) {
+    return None;
+  }
+  return asArray(f.unwrap());
+}
+
+// ---- bridge to std:json -------------------------------------------------------------------
+
+// toValue(j: Json): JsonValue -- the same tree in the exact model: JNum(n) becomes the token of n, fields keep
+// their order and duplicates. Never fails (no limits are applied; check the result with writeDocument or
+// decodeRoot if it must satisfy JsonLimits). O(size of j).
+export function toValue(j: Json): JsonValue {
+  match (j) {
+    JNull => { return ValueNull; },
+    JBool(b) => { return ValueBool(b); },
+    JNum(n) => { return ValueNumber(numberFromInt(n)); },
+    JStr(s) => { return ValueString(s); },
+    JArr(a) => {
+      let out: JsonValue[] = [];
+      for (const e of a) {
+        out.push(toValue(e));
+      }
+      return ValueArray(out);
+    },
+    JObj(fs) => {
+      let out: JsonMember[] = [];
+      for (const f of fs) {
+        out.push(JsonMember { key: f.key, value: toValue(f.value) });
+      }
+      return ValueObject(out);
+    }
+  }
+}
+
+// fromValue(v: JsonValue): Result<Json, NumberError> -- the tree in the integer-only model. Error: a number
+// that is not an int (NotIntegral, e.g. `1.5`, or IntegerRange); `offset` is None. `1.0` and `1e3` convert
+// (they are integral). Integers survive exactly, so fromValue(toValue(j)) == Ok(j). O(size of v).
+export function fromValue(v: JsonValue): Result<Json, NumberError> {
+  match (v) {
+    ValueNull => { return Ok(JNull); },
+    ValueBool(b) => { return Ok(JBool(b)); },
+    ValueNumber(n) => { return Ok(JNum(numberAsInt(n)?)); },
+    ValueString(s) => { return Ok(JStr(s)); },
+    ValueArray(a) => {
+      let out: Json[] = [];
+      for (const e of a) {
+        out.push(fromValue(e)?);
+      }
+      return Ok(JArr(out));
+    },
+    ValueObject(ms) => {
+      let out: JField[] = [];
+      for (const m of ms) {
+        out.push(JField { key: m.key, value: fromValue(m.value)? });
+      }
+      return Ok(JObj(out));
+    }
+  }
+}

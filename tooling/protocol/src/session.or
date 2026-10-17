@@ -1,0 +1,294 @@
+// A running server and the bookkeeping of one suite. The language has no pipes to a child process (`std:io` offers
+// `shell`/`shellTimeout`, which run a command to completion), so the server is started in the background by the shell
+// with its stdin on a named pipe and its stdout/stderr on files; the harness writes messages to the pipe (`cat`) and
+// polls the stdout file for complete frames (rpc.or). A holder process keeps the write end of the stdin pipe open, so
+// the server does not see end of input between two messages; it ends when the control pipe is written, which is the
+// `p.stdin.close()` of the Python scripts.
+//
+// A mutating method needs a `let` receiver, and the checks are spread over many helper functions that only receive the
+// session as a parameter. So the session is immutable and its mutable state (request id, read offset, notifications
+// seen, check log, fatal error) lives in small files of its work directory, like the module globals of the Python
+// scripts. Handles (`FsGrant`, `ProcessGrant`) cannot be stored in a class either, so every method takes them.
+
+import { FsGrant, readFile, writeFile, exists, useFile, Append } from "std:fs";
+import { ProcessGrant } from "std:process";
+import { shell } from "std:io";
+import { Json, parse } from "std:json/legacy";
+import { shq, strip } from "./text";
+import { Frame, nextLspFrame, nextLine, frameLsp, frameLine } from "./rpc";
+import { O, F, S, N, nil, at, isIntEq, isStrEq, isBoolEq, str, has, show } from "./jx";
+
+export const LSP: int = 0;
+export const MCP: int = 1;
+
+// One poll step is a `sleep 0.02` plus the shell start and the read of the output file: about 25 ms.
+const POLL_MS: int = 25;
+
+// The outcome of waiting for one message: `ok` false on timeout, end of output or a malformed frame.
+export type Msg = { ok: bool; value: Json; error: string; };
+
+// A `tools/call` result (MCP): `err` is `isError`, `value` the parsed text (or the text as a JSON string), `raw` the text.
+export type ToolResult = { err: bool; value: Json; raw: string; };
+
+// The totals of a finished run.
+export type Totals = { checks: int; failures: int; };
+
+function readText(fs: FsGrant, path: string): string {
+  const r = readFile(fs, path);
+  return r.isOk() ? r.unwrap() : "";
+}
+
+function readInt(fs: FsGrant, path: string, dflt: int): int {
+  return parseInt(strip(readText(fs, path))).unwrapOr(dflt);
+}
+
+function appendText(fs: FsGrant, path: string, text: string): void {
+  useFile(fs, path, Append, f => { f.write(text); });
+}
+
+export class Session {
+  dir: string;            // private work directory (pipes, output files, state files)
+  proto: int;             // LSP | MCP
+
+  constructor(dir: string, proto: int) {
+    this.dir = dir;
+    this.proto = proto;
+  }
+
+  // Forgets everything of an earlier server (request ids, read offset, notifications); keeps the check log.
+  reset(fs: FsGrant): void {
+    writeFile(fs, this.dir + "/id", "1");
+    writeFile(fs, this.dir + "/pos", "0");
+    writeFile(fs, this.dir + "/notes", "");
+  }
+
+  fatal(fs: FsGrant): string {
+    return readText(fs, this.dir + "/fatal");
+  }
+
+  setFatal(fs: FsGrant, msg: string): void {
+    writeFile(fs, this.dir + "/fatal", msg);
+  }
+
+  // check(cond, what): the `check` of the Python scripts. Prints `FAIL: <what>` and logs the outcome.
+  check(fs: FsGrant, cond: bool, what: string): void {
+    if (exists(fs, this.dir + "/fatal")) {
+      return;
+    }
+    appendText(fs, this.dir + "/log", cond ? "ok\n" : "FAIL\n");
+    if (!cond) {
+      console.log("FAIL: " + what);
+    }
+  }
+
+  totals(fs: FsGrant): Totals {
+    let checks = 0;
+    let failures = 0;
+    for (const line of readText(fs, this.dir + "/log").split("\n")) {
+      if (line == "ok") {
+        checks += 1;
+      } else if (line == "FAIL") {
+        checks += 1;
+        failures += 1;
+      }
+    }
+    return Totals { checks: checks, failures: failures };
+  }
+
+  // Starts `<exe> <args>` with stdin on a pipe and stdout/stderr on files. False when the shell failed.
+  start(fs: FsGrant, proc: ProcessGrant, exe: string, args: string): bool {
+    this.reset(fs);
+    const d = shq(this.dir);
+    const script = "cd " + d + " && rm -f in ctl out err rc pid && mkfifo in ctl"
+      + " && { ( exec 3>in; cat ctl >/dev/null 2>&1 ) </dev/null >/dev/null 2>&1 & }"
+      + " && { ( " + shq(exe) + " " + args + " <in >out 2>err & pid=$!; echo $pid >pid; wait $pid; echo $? >rc )"
+      + " </dev/null >/dev/null 2>&1 & }";
+    return shell(proc, script) == 0;
+  }
+
+  // Writes raw bytes to the server's stdin.
+  sendRaw(fs: FsGrant, proc: ProcessGrant, data: string): void {
+    const f = this.dir + "/msg";
+    writeFile(fs, f, data);
+    // `1<>` opens the pipe read-write, which never blocks for want of a reader (a server that already exited)
+    shell(proc, "cat " + shq(f) + " 1<> " + shq(this.dir + "/in"));
+  }
+
+  // One JSON-RPC message to the server (framed for the protocol).
+  send(fs: FsGrant, proc: ProcessGrant, msg: Json): void {
+    const body = show(msg);
+    this.sendRaw(fs, proc, this.proto == LSP ? frameLsp(body) : frameLine(body));
+  }
+
+  frameAt(buf: string, pos: usize): Frame {
+    return this.proto == LSP ? nextLspFrame(buf, pos) : nextLine(buf, pos);
+  }
+
+  // The next message from the server, waiting up to `ms` milliseconds.
+  receive(fs: FsGrant, proc: ProcessGrant, ms: int): Msg {
+    let waited = 0;
+    const limit = ms / POLL_MS;
+    const pos = readInt(fs, this.dir + "/pos", 0).toUsize();
+    while (true) {
+      const fr = this.frameAt(readText(fs, this.dir + "/out"), pos);
+      if (fr.found) {
+        writeFile(fs, this.dir + "/pos", fr.next.toString());
+        if (fr.error != "") {
+          return Msg { ok: false, value: nil(), error: fr.error };
+        }
+        const j = parse(fr.body);
+        if (j.isErr()) {
+          return Msg { ok: false, value: nil(), error: "invalid JSON from the server: " + fr.body };
+        }
+        return Msg { ok: true, value: j.unwrap(), error: "" };
+      }
+      if (exists(fs, this.dir + "/rc")) {
+        // the server exited: one more look, it may have written its last message just before
+        if (!this.frameAt(readText(fs, this.dir + "/out"), pos).found) {
+          return Msg { ok: false, value: nil(), error: "server closed stdout" };
+        }
+      } else {
+        if (waited >= limit) {
+          return Msg { ok: false, value: nil(), error: "timeout" };
+        }
+        shell(proc, "sleep 0.02");
+        waited += 1;
+      }
+    }
+    return Msg { ok: false, value: nil(), error: "unreachable" };
+  }
+
+  // The contents of the server's stderr file.
+  stderrText(fs: FsGrant): string {
+    return readText(fs, this.dir + "/err");
+  }
+
+  // Ends the server's input (the `stdin.close()` of the Python scripts).
+  closeInput(proc: ProcessGrant): void {
+    shell(proc, ": 1<> " + shq(this.dir + "/ctl"));
+  }
+
+  // Waits up to `seconds` for the server to exit; its exit status, or -1 on timeout (the server is then killed).
+  waitExit(fs: FsGrant, proc: ProcessGrant, seconds: int): int {
+    let waited = 0;
+    const limit = seconds * 1000 / POLL_MS;
+    while (!exists(fs, this.dir + "/rc")) {
+      if (waited >= limit) {
+        shell(proc, "kill $(cat " + shq(this.dir + "/pid") + ") 2>/dev/null; : 1<> " + shq(this.dir + "/ctl") + "; true");
+        return -1;
+      }
+      shell(proc, "sleep 0.02");
+      waited += 1;
+    }
+    return readInt(fs, this.dir + "/rc", -1);
+  }
+
+  // The id of the next request.
+  takeId(fs: FsGrant): int {
+    const i = readInt(fs, this.dir + "/id", 1);
+    writeFile(fs, this.dir + "/id", (i + 1).toString());
+    return i;
+  }
+
+  // ---- LSP client (the `Client` of tools/test_lsp.py) ---------------------------------------------------------
+
+  // A request; waits for the response with the same id, keeping everything else as a note. JNull after a failure.
+  lspRequest(fs: FsGrant, proc: ProcessGrant, method: string, params: Json): Json {
+    if (exists(fs, this.dir + "/fatal")) {
+      return nil();
+    }
+    const i = this.takeId(fs);
+    this.send(fs, proc, O([F("jsonrpc", S("2.0")), F("id", N(i)), F("method", S(method)), F("params", params)]));
+    while (true) {
+      const m = this.receive(fs, proc, 60000);
+      if (!m.ok) {
+        this.setFatal(fs, "server closed stdout while waiting for " + method + " (" + m.error + "): " + this.stderrText(fs));
+        return nil();
+      }
+      if (isIntEq(at(m.value, ["id"]), i) && !has(m.value, "method")) {
+        return m.value;
+      }
+      appendText(fs, this.dir + "/notes", show(m.value) + "\n");
+    }
+    return nil();
+  }
+
+  notify(fs: FsGrant, proc: ProcessGrant, method: string, params: Json): void {
+    this.send(fs, proc, O([F("jsonrpc", S("2.0")), F("method", S(method)), F("params", params)]));
+  }
+
+  // A notification without `params` (MCP `notifications/initialized`).
+  notifyBare(fs: FsGrant, proc: ProcessGrant, method: string): void {
+    this.send(fs, proc, O([F("jsonrpc", S("2.0")), F("method", S(method))]));
+  }
+
+  // The latest publishDiagnostics for `uri` among the notes (they are consumed); JNull if there was none.
+  diagnosticsFor(fs: FsGrant, uri: string): Json {
+    let got: Json = nil();
+    let rest = "";
+    for (const line of readText(fs, this.dir + "/notes").split("\n")) {
+      if (line == "") {
+        continue;
+      }
+      const n = parse(line);
+      if (n.isOk() && isStrEq(at(n.unwrap(), ["method"]), "textDocument/publishDiagnostics")
+        && isStrEq(at(n.unwrap(), ["params", "uri"]), uri)) {
+        got = at(n.unwrap(), ["params", "diagnostics"]);
+      } else {
+        rest += line + "\n";
+      }
+    }
+    writeFile(fs, this.dir + "/notes", rest);
+    return got;
+  }
+
+  // Reads messages until `ms` pass without a new one.
+  drain(fs: FsGrant, proc: ProcessGrant, ms: int): void {
+    while (!exists(fs, this.dir + "/fatal")) {
+      const m = this.receive(fs, proc, ms);
+      if (!m.ok) {
+        return;
+      }
+      appendText(fs, this.dir + "/notes", show(m.value) + "\n");
+    }
+  }
+
+  // ---- MCP client (the `Client` of tools/test_mcp.py) ---------------------------------------------------------
+
+  // A request; `params` is omitted when `withParams` is false. Checks that the response id matches.
+  mcpRequest(fs: FsGrant, proc: ProcessGrant, method: string, params: Json, withParams: bool): Json {
+    if (exists(fs, this.dir + "/fatal")) {
+      return nil();
+    }
+    const i = this.takeId(fs);
+    if (withParams) {
+      this.send(fs, proc, O([F("jsonrpc", S("2.0")), F("id", N(i)), F("method", S(method)), F("params", params)]));
+    } else {
+      this.send(fs, proc, O([F("jsonrpc", S("2.0")), F("id", N(i)), F("method", S(method))]));
+    }
+    const m = this.receive(fs, proc, 120000);
+    if (!m.ok) {
+      this.setFatal(fs, "server closed: " + m.error + " " + this.stderrText(fs));
+      return nil();
+    }
+    this.check(fs, isIntEq(at(m.value, ["id"]), i), "response id matches for " + method);
+    return m.value;
+  }
+
+  // tools/call -> (is_error, parsed JSON or the text as a string, raw text).
+  mcpCall(fs: FsGrant, proc: ProcessGrant, name: string, args: Json): ToolResult {
+    const r = this.mcpRequest(fs, proc, "tools/call", O([F("name", S(name)), F("arguments", args)]), true);
+    const res = at(r, ["result"]);
+    const text = str(at(res, ["content", "0", "text"]));
+    const parsed = parse(text);
+    const value: Json = parsed.isOk() ? parsed.unwrap() : S(text);
+    return ToolResult { err: isBoolEq(at(res, ["isError"]), true), value: value, raw: text };
+  }
+
+  // The MCP `close()`: end of input, then the server must exit 0 within 10 s.
+  mcpClose(fs: FsGrant, proc: ProcessGrant): void {
+    this.closeInput(proc);
+    const code = this.waitExit(fs, proc, 10);
+    this.check(fs, code == 0, "server exits 0 at end of input (got " + code.toString() + ")");
+  }
+}

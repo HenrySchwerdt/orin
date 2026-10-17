@@ -400,7 +400,7 @@ native_build() {
   # Compile output goes to an adjacent temporary executable; failed builds preserve the last success.
   local generated=$tmp/out.c
   [ "$backend" != llvm ] || generated=$tmp/out.ll
-  if ! compiler compile "$src" -o "$generated" "--backend=$backend" > "$tmp/compile.out" 2> "$tmp/compile.err"; then
+  if ! compiler compile "$src" -o "$generated" "--backend=$backend" --runtime "$RT" --cc "$CC" > "$tmp/compile.out" 2> "$tmp/compile.err"; then
     if $json; then result_json false error "$(cat "$tmp/compile.err")"; else cat "$tmp/compile.err" >&2; fi
     rm -rf "$tmp"; return 1
   fi
@@ -764,6 +764,8 @@ case $command in
         project_target "$validation_path"
         validate_locked_dependencies "$project" || exit 1
         if $json && [ "$command" != graph ]; then args+=(--format=json); fi
+        # `check` may run annotation processors (ADR-0046): they need the C runtime and a C compiler.
+        if [ "$command" = check ]; then args+=(--runtime "$RT" --cc "$CC"); fi
         compiler "$command" "${args[@]}" ;;
       compile)
         validation_path=''; expect=false
@@ -774,6 +776,7 @@ case $command in
         project_target "$validation_path"
         validate_locked_dependencies "$project" || exit 1
         $json && args+=(--format=json)
+        args+=(--runtime "$RT" --cc "$CC")
         compiler "$command" "${args[@]}" ;;
       diff) $json && args+=(--format=json); compiler "$command" "${args[@]}" ;;
       *) fail "Unknown command '$command'. Run 'orin --help' to see available commands." 2 ;;

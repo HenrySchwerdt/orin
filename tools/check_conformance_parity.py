@@ -103,7 +103,7 @@ def fixtures(with_hang):
 def build_tree(dest, with_hang):
     files, broken = fixtures(with_hang)
     os.makedirs(os.path.join(dest, "tools"))
-    for name in ("run_tests.py", "parallel.py"):
+    for name in ("run_tests.py", "parallel.py", "runtime_files.py", "runtime-sources.txt"):
         shutil.copy(os.path.join(ROOT, "tools", name), os.path.join(dest, "tools", name))
     for d in ("runtime",):
         os.symlink(os.path.join(ROOT, d), os.path.join(dest, d))

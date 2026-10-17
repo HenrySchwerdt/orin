@@ -22,6 +22,7 @@
 #     tools/conformance.sh --suite all; tools/test_std.sh; tools/test_tooling.sh; ...
 set -eu
 cd "$(dirname "$0")/.."
+. tools/runtime_files.sh   # the runtime source list: tools/runtime-sources.txt
 D=build/dev
 B=build/bootstrap
 CC=${CC:-cc}
@@ -61,8 +62,18 @@ build() {
   fi
   t0=$(now)
   echo "[dev] $host compiles compiler/main.or -> $D/orin (cc -O1)"
-  $host compile compiler/main.or -o $D/orin.c
-  $CC -O1 -w -I runtime/core $D/orin.c runtime/core/orin_runtime.c runtime/platform/orin_platform.c -lm -o $D/orin.tmp
+  # a host that knows `--split` (ADR-0049 P1) has its C compiled in parallel; an older one builds the single file
+  jobs=${ORIN_JOBS:-$( (nproc || sysctl -n hw.ncpu) 2>/dev/null || echo 1)}
+  if [ "$jobs" -gt 1 ] && "$host" help 2>&1 | grep -q -e '--split'; then
+    $host compile compiler/main.or -o $D/orin.c --split "$jobs"
+    CC=$CC JOBS=$jobs tools/cc_split.sh $D/orin.c $D/orin.tmp -O1 -w -- -lm
+    rm -f $D/orin.h $D/orin.data.c $D/orin.[0-9]*.c
+  else
+    $host compile compiler/main.or -o $D/orin.c
+    # C from the seed compiler (orin0) links the frozen legacy runtime, as in tools/bootstrap.sh
+    world=core; [ "$host" = $B/orin0 ] && world=legacy
+    $CC -O1 -w $(rt_inc $world) $D/orin.c $(rt_src $world) -lm -o $D/orin.tmp
+  fi
   mv $D/orin.tmp $D/orin
   echo "$stamp" > $D/stamp
   echo "[dev] built $D/orin in $(( $(now) - t0 )) s"
@@ -91,9 +102,9 @@ case "$CMD" in
     tools/test_std.sh $files ;;
   tooling)
     tools/test_tooling.sh
-    python3 tools/test_lsp.py --orin $D/orin
-    python3 tools/test_mcp.py --orin $D/orin
-    python3 tools/test_osig.py --orin $D/orin
+    tools/protocol.sh lsp --orin $D/orin
+    tools/protocol.sh mcp --orin $D/orin
+    tools/clitests.sh osig --orin $D/orin
     python3 tools/test_effects.py --orin $D/orin ;;
 esac
 echo "[dev] $CMD done in $(( $(now) - t0 )) s (with $D/orin; before a PR: tools/bootstrap.sh)"

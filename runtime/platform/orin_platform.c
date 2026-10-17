@@ -672,8 +672,14 @@ int64_t orin_platform_monitor_new(size_t nwords) {
             return 0;
         }
         pthread_mutex_init(&m->mu, NULL);
-        pthread_cond_init(&m->cv[0], NULL);
-        pthread_cond_init(&m->cv[1], NULL);
+        pthread_condattr_t ca;
+        pthread_condattr_init(&ca);
+#ifndef __APPLE__
+        pthread_condattr_setclock(&ca, CLOCK_MONOTONIC); /* wait_until takes absolute CLOCK_MONOTONIC instants */
+#endif
+        pthread_cond_init(&m->cv[0], &ca);
+        pthread_cond_init(&m->cv[1], &ca);
+        pthread_condattr_destroy(&ca);
         i = g_mon_hi;
         __atomic_store_n(&g_mon[i], m, __ATOMIC_RELEASE);
         __atomic_store_n(&g_mon_hi, i + 1, __ATOMIC_RELEASE);
@@ -717,6 +723,36 @@ int orin_platform_monitor_wait(int64_t h, int cond) {
     __atomic_store_n(&m->owner, orin_platform_thread_id(), __ATOMIC_RELAXED);
     m->waiters--;
     return 0;
+}
+
+int orin_platform_millis_split(int64_t ms, int64_t *sec, int64_t *nsec) {
+    if (ms < 0) return ORIN_PLATFORM_EINVAL;
+    *sec = ms / 1000;
+    *nsec = (ms % 1000) * 1000000;
+    return 0;
+}
+
+int orin_platform_monitor_wait_until(int64_t h, int cond, int64_t deadline_ms) {
+    Mon *m = mon_ref(h);
+    if (!m || !mon_held(m) || (cond != 0 && cond != 1) || deadline_ms < 0) return ORIN_PLATFORM_EINVAL;
+    int64_t sec, nsec;
+#ifdef __APPLE__
+    int64_t now = orin_platform_monotonic_millis();
+    orin_platform_millis_split(now < 0 || deadline_ms < now ? 0 : deadline_ms - now, &sec, &nsec); /* relative */
+#else
+    orin_platform_millis_split(deadline_ms, &sec, &nsec); /* absolute */
+#endif
+    struct timespec ts = {(time_t)sec, (long)nsec};
+    m->waiters++;
+    __atomic_store_n(&m->owner, 0, __ATOMIC_RELAXED);
+#ifdef __APPLE__
+    int rc = pthread_cond_timedwait_relative_np(&m->cv[cond], &m->mu, &ts);
+#else
+    int rc = pthread_cond_timedwait(&m->cv[cond], &m->mu, &ts);
+#endif
+    __atomic_store_n(&m->owner, orin_platform_thread_id(), __ATOMIC_RELAXED);
+    m->waiters--;
+    return rc == ETIMEDOUT ? ORIN_PLATFORM_WAIT_TIMEOUT : 0;
 }
 
 int orin_platform_monitor_notify(int64_t h, int cond, int all) {

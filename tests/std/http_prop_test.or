@@ -11,11 +11,14 @@
 // Run with `orin test tests/std/http_prop_test.or`, with and without `--no-contracts` (the checked build also
 // runs the round-trip contract of the serializers on every call). Iteration counts are in the test names.
 import { assert, assertEq, assertEqUsize, assertEqString, assertEqBool, fail } from "std:test";
-import { Bytes, bytesFromString, bytesFromInts, emptyBytes } from "std:bytes";
-import { Request, Response, Headers, Status, Limits, ParseResult, NeedMore, Done, Failed, Method, Get, Head, Post, Put, Delete, Connect,
-  Options, Trace, Patch, Ext, HttpVersion, Http10, Http11, RequestParser, ResponseParser, defaultLimits, parseRequest, parseResponse,
-  parseResponseToEof, methodName, versionText, reasonName, emptyHeaders, standardStatus, serializeRequest,
-  serializeRequestChunked, serializeResponse, serializeResponseChunked, makeRequest, makeResponse, toLowerAscii } from "std:http";
+import { Bytes, fromString, fromInts, empty } from "std:bytes";
+import {
+  Request, Response, Headers, Status, HttpLimits, ParseResult, NeedMore, Done, Failed, Method, Get, Head, Post, Put,
+  Delete, Connect, Options, Trace, Patch, Ext, HttpVersion, Http10, Http11, RequestParser, ResponseParser,
+  defaultLimits, parseRequest, parseResponse, parseResponseToEof, methodName, versionText, httpErrorKindName,
+  emptyHeaders, standardStatus, serializeRequest, serializeRequestChunked, serializeResponse,
+  serializeResponseChunked, toLowerAscii, ToHead, ToOther, httpErrorMessage
+} from "std:http";
 
 // ---------------------------------------------------------------------------------------------- random
 
@@ -23,7 +26,7 @@ const TCHARS: string = "!#$%&'*+-.^_`|~0123456789abcdefghijklmnopqrstuvwxyzABCDE
 const HOSTCHARS: string = "-._~%!$&'()*+,;=:[]0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
 function bs(s: string): Bytes {
-  return bytesFromString(s);
+  return fromString(s);
 }
 
 // A pseudo-random generator of messages and mutations. Orin values are copied, so all generators are methods of
@@ -114,7 +117,7 @@ class Gen {
       xs.push(k == 0 ? 13 : (k == 1 ? 10 : any));
       i += 1;
     }
-    return bytesFromInts(xs);
+    return fromInts(xs);
   }
 
   target(m: Method): string {
@@ -225,7 +228,7 @@ class Gen {
       h.add(hostName, hostValue).unwrap();
     }
     h = this.fields(h, 3);
-    let body = emptyBytes();
+    let body = empty();
     let trailers = emptyHeaders();
     const framing = this.next(3);
     if (framing == 1) {
@@ -237,7 +240,7 @@ class Gen {
       trailers = this.fields(trailers, 3);
     }
     h = this.fields(h, 2);
-    return makeRequest(m, target, v, h, body, trailers).unwrap();
+    return new Request(m, target, v, h, body, trailers);
   }
 
   phrase(): string {
@@ -281,7 +284,7 @@ class Gen {
     const forHead = this.next(5) == 0;
     let h = emptyHeaders();
     h = this.fields(h, 3);
-    let body = emptyBytes();
+    let body = empty();
     let trailers = emptyHeaders();
     const noFraming = code < 200 || code == 204;
     const bodyless = forHead || code < 200 || code == 204 || code == 304;
@@ -305,7 +308,7 @@ class Gen {
       }
     }
     h = this.fields(h, 2);
-    return makeResponse(status, v, h, body, trailers, forHead).unwrap();
+    return new Response(status, v, h, body, trailers, forHead);
   }
 
   // One random mutation of the bytes `xs`.
@@ -408,7 +411,7 @@ class Gen {
   }
 
   // The request parsed from chunks cut at random positions (also empty chunks); the answer must be the one-shot answer.
-  feedRandomly(wire: Bytes, limits: Limits): ParseResult<Request> {
+  feedRandomly(wire: Bytes, limits: HttpLimits): ParseResult<Request> {
     let p = new RequestParser(limits);
     let start: usize = 0;
     let last: ParseResult<Request> = NeedMore;
@@ -460,8 +463,8 @@ class Gen {
         return 0;
       },
       Failed(e) => {
-        assert(ref.status != 1, "parser refuses (" + reasonName(e.reason) + " at " + e.position.toString() + "), specification accepts: " + toHexLabel(input));
-        assert(e.position <= wire.length(), "position within the input");
+        assert(ref.status != 1, "parser refuses (" + httpErrorKindName(e.kind) + " at " + e.offset.toString() + "), specification accepts: " + toHexLabel(input));
+        assert(e.offset <= wire.length(), "position within the input");
         return 2;
       }
     };
@@ -473,7 +476,7 @@ class Gen {
 function fieldLines(h: Headers): string {
   let s = "";
   let i: usize = 0;
-  while (i < h.count()) {
+  while (i < h.size()) {
     s += h.nameAt(i) + ": " + h.valueAt(i) + "\r\n";
     i += 1;
   }
@@ -955,7 +958,7 @@ function refRequest(s: string): Ref {
 function dumpFields(h: Headers): string {
   let parts: string[] = [];
   let i: usize = 0;
-  while (i < h.count()) {
+  while (i < h.size()) {
     parts.push(h.nameAt(i) + "=" + h.valueAt(i));
     i += 1;
   }
@@ -967,9 +970,9 @@ function dumpRequest(q: Request): string {
     + q.body().toHex() + "|" + dumpFields(q.trailers());
 }
 
-// Limits that cannot trigger on the test inputs (the reference parser has no limits).
-function bigLimits(): Limits {
-  return new Limits(1048576, 65536, 1048576, 67108864, 65536, 1099511627776);
+// HttpLimits that cannot trigger on the test inputs (the reference parser has no limits).
+function bigLimits(): HttpLimits {
+  return HttpLimits { maxStartLine: 1048576, maxHeaderCount: 65536, maxHeaderLine: 1048576, maxHeaderBytes: 67108864, maxChunkLine: 65536, maxBody: 1099511627776 };
 }
 
 function toInts(s: string): int[] {
@@ -982,7 +985,7 @@ function toInts(s: string): int[] {
   return xs;
 }
 
-function fromInts(xs: int[]): string {
+function intsToString(xs: int[]): string {
   let parts: string[] = [];
   let i: usize = 0;
   while (i < xs.length) {
@@ -1001,7 +1004,7 @@ function sig(r: ParseResult<Request>): string {
   return match (r) {
     NeedMore => "NeedMore",
     Done(q, used) => "Done " + used.toString() + " " + dumpRequest(q),
-    Failed(e) => "Failed " + reasonName(e.reason) + " " + e.position.toString()
+    Failed(e) => "Failed " + httpErrorKindName(e.kind) + " " + e.offset.toString()
   };
 }
 
@@ -1009,7 +1012,7 @@ function sigResponse(r: ParseResult<Response>): string {
   return match (r) {
     NeedMore => "NeedMore",
     Done(q, used) => "Done " + q.status().code().toString() + " " + q.status().reason() + " " + dumpFields(q.headers()) + " " + q.body().toHex() + " " + dumpFields(q.trailers()),
-    Failed(e) => "Failed " + reasonName(e.reason) + " " + e.position.toString()
+    Failed(e) => "Failed " + httpErrorKindName(e.kind) + " " + e.offset.toString()
   };
 }
 
@@ -1022,7 +1025,7 @@ function checkStable(q: Request): void {
       assert(p.equals(q), "parse(serialize(parse(x))) == parse(x)");
     },
     NeedMore => { fail("stable: NeedMore"); },
-    Failed(e) => { fail("stable: refused " + e.message); }
+    Failed(e) => { fail("stable: refused " + httpErrorMessage(e)); }
   };
 }
 
@@ -1044,7 +1047,7 @@ function requestRoundTrip500(): void {
         assert(p.equals(q), "parse(serialize(m)) == m, message " + n.toString());
       },
       NeedMore => { fail("NeedMore for message " + n.toString()); },
-      Failed(e) => { fail("refused " + e.message + " for message " + n.toString()); }
+      Failed(e) => { fail("refused " + httpErrorMessage(e) + " for message " + n.toString()); }
     };
     // random chunk sizes and random input chunking
     const pick = g.next(32768);
@@ -1057,7 +1060,7 @@ function requestRoundTrip500(): void {
         assert(p.equals(q), "round trip in random chunks, message " + n.toString());
       },
       NeedMore => { fail("NeedMore (random chunks) for message " + n.toString()); },
-      Failed(e) => { fail("refused (random chunks) " + e.message); }
+      Failed(e) => { fail("refused (random chunks) " + httpErrorMessage(e)); }
     };
     n += 1;
   }
@@ -1071,25 +1074,25 @@ function responseRoundTrip500(): void {
     const q = g.response();
     const wire = serializeResponse(q);
     assertEqString(wire.toRawString(), refSerializeResponse(q, q.body().length() == 0 ? 1 : q.body().length()), "serializer vs reference, response " + n.toString());
-    const r = parseResponseToEof(wire, defaultLimits(), q.isForHead());
+    const r = parseResponseToEof(wire, defaultLimits(), (q.isForHead() ? ToHead : ToOther));
     match (r) {
       Done(p, used) => { assert(p.equals(q), "parse(serialize(m)) == m, response " + n.toString()); },
       NeedMore => { fail("NeedMore for response " + n.toString()); },
-      Failed(e) => { fail("refused " + e.message + " for response " + n.toString()); }
+      Failed(e) => { fail("refused " + httpErrorMessage(e) + " for response " + n.toString()); }
     };
     const pick = g.next(32768);
     const size = q.body().length() == 0 ? 1 : 1 + pick % q.body().length().toInt();
     const wire2 = serializeResponseChunked(q, size.toUsize());
     assertEqString(wire2.toRawString(), refSerializeResponse(q, size.toUsize()), "chunk size, response " + n.toString());
     // byte by byte
-    let p2 = new ResponseParser(defaultLimits(), q.isForHead());
+    let p2 = new ResponseParser(defaultLimits(), (q.isForHead() ? ToHead : ToOther));
     let k: usize = 0;
     let got = "";
     while (k < wire2.length() && got == "") {
       match (p2.feed(wire2.slice(k, k + 1))) {
         Done(p, used) => { got = p.equals(q) ? "equal" : "different"; },
         NeedMore => { assert(true, ""); },
-        Failed(e) => { got = "refused " + e.message; }
+        Failed(e) => { got = "refused " + httpErrorMessage(e); }
       };
       k += 1;
     }
@@ -1097,7 +1100,7 @@ function responseRoundTrip500(): void {
       match (p2.atEof()) {
         Done(p, used) => { got = p.equals(q) ? "equal" : "different"; },
         NeedMore => { got = "need more"; },
-        Failed(e) => { got = "refused " + e.message; }
+        Failed(e) => { got = "refused " + httpErrorMessage(e); }
       };
     }
     assertEqString(got, "equal", "round trip of response " + n.toString() + " byte by byte");
@@ -1114,12 +1117,12 @@ function everyStandardStatusRoundTrips(): void {
     if (code >= 200 && code != 204) {
       h.add("Content-Length", noBody ? "7" : "2").unwrap();
     }
-    const q = makeResponse(standardStatus(code), Http11, h, noBody ? emptyBytes() : bs("hi"), emptyHeaders(), false).unwrap();
+    const q = new Response(standardStatus(code), Http11, h, noBody ? empty() : bs("hi"), emptyHeaders(), false);
     const wire = serializeResponse(q);
-    match (parseResponseToEof(wire, defaultLimits(), false)) {
+    match (parseResponseToEof(wire, defaultLimits(), ToOther)) {
       Done(p, used) => { assert(p.equals(q), "status " + code.toString()); },
       NeedMore => { fail("NeedMore " + code.toString()); },
-      Failed(e) => { fail(e.message); }
+      Failed(e) => { fail(httpErrorMessage(e)); }
     };
     code += 1;
   }
@@ -1157,7 +1160,7 @@ function fuzzRequestMutations20000(): void {
       xs = g.mutate(xs);
       i += 1;
     }
-    const r = g.differential(fromInts(xs));
+    const r = g.differential(intsToString(xs));
     if (r == 1) {
       done += 1;
     } else if (r == 2) {
@@ -1187,10 +1190,10 @@ function fuzzRandomGarbageNeverTraps10000(): void {
       xs.push(k == 0 ? 13 : (k == 1 ? 10 : (k == 2 ? 32 : (k == 3 ? 58 : any))));
       i += 1;
     }
-    const wire = bytesFromInts(xs);
+    const wire = fromInts(xs);
     const a = sig(parseRequest(wire, defaultLimits()));
     assert(a.length > 0, "an answer");
-    let p = new ResponseParser(defaultLimits(), n % 2 == 0);
+    let p = new ResponseParser(defaultLimits(), (n % 2 == 0 ? ToHead : ToOther));
     p.feed(wire);
     p.atEof();
     n += 1;
@@ -1219,11 +1222,11 @@ function fuzzResponseMutations10000(): void {
       xs = g.mutate(xs);
       i += 1;
     }
-    const wire = bytesFromInts(xs);
+    const wire = fromInts(xs);
     const forHead = q.isForHead();
     // one-shot and byte-by-byte give the same answer (with EOF at the end)
-    const whole = parseResponseToEof(wire, bigLimits(), forHead);
-    let p = new ResponseParser(bigLimits(), forHead);
+    const whole = parseResponseToEof(wire, bigLimits(), (forHead ? ToHead : ToOther));
+    let p = new ResponseParser(bigLimits(), (forHead ? ToHead : ToOther));
     let k: usize = 0;
     let res: ParseResult<Response> = NeedMore;
     let stop = false;
@@ -1243,14 +1246,14 @@ function fuzzResponseMutations10000(): void {
       Done(m, used) => {
         done += 1;
         const wire2 = serializeResponse(m);
-        match (parseResponseToEof(wire2, bigLimits(), forHead)) {
+        match (parseResponseToEof(wire2, bigLimits(), (forHead ? ToHead : ToOther))) {
           Done(m2, u2) => { assert(m2.equals(m), "response parse -> serialize -> parse is stable"); },
           NeedMore => { fail("stable: need more"); },
-          Failed(e) => { fail("stable: " + e.message); }
+          Failed(e) => { fail("stable: " + httpErrorMessage(e)); }
         };
       },
       NeedMore => { assert(true, ""); },
-      Failed(e) => { assert(e.position <= wire.length(), "position within the input"); }
+      Failed(e) => { assert(e.offset <= wire.length(), "position within the input"); }
     };
     n += 1;
   }

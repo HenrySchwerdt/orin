@@ -249,6 +249,8 @@ Format: `path:line:col: error[CODE]: message` on stderr, exit status 1. Codes:
 | E0445 | a `@Test` function is called or used as a value (tests are only run by `orin test` and erased from ordinary builds) — beyond Orin-B (ADR-0024) |
 | E0446 | a field of an `@Annotation` record has a type an annotation cannot hold (allowed: `bool`, `int`, `usize`, `float`, `f32`, `string`, a union of payload-free tags, and arrays and `Option`s of those), or the record is generic — beyond Orin-B (ADR-0046) |
 | E0447 | an `@Annotation` definition takes a reserved name (`Test`, `Deprecated`, `Inline`, `Sealed`, `Annotation`, `Processor`, `Requires`, `Ensures`, `Invariant`, `Decreases`, `Rule`), or an identifier starts with `__g` (reserved for generated code) (ADR-0046) |
+| E0475 | a type does not satisfy `Eq` / `Ord` / `Hash`: a type argument for a `T extends Eq/Ord/Hash` bound (function or class), a `Map` key that is not `Hash` (a record with a `float`, a function value, a class without `hash`, ...) — beyond Orin-B (ADR-0034) |
+| E0476 | an explicit `equals` / `compare` / `hash` of a class cannot be used: wrong signature (`equals(other: C): bool`, `compare(other: C): int`, `hash(): usize`), static, private or mutating; or `implements Ord` / `Hash` next to an explicit `equals` without the matching `compare` / `hash` — beyond Orin-B (ADR-0034) |
 | W0440 | **warning** (never fails a build): use of a `@Deprecated` symbol; printed as `warning[W0440]`, JSON `"severity":"warning"`, LSP severity 2 with the Deprecated tag — beyond Orin-B (ADR-0024) |
 | W0450 | **warning**: `@Invariant` of a class or record that mentions no `this` (constrains no state) — beyond Orin-B (ADR-0028) |
 | W0451 | **warning**: `@Ensures` that mentions neither `result` nor (non-static method) `this`; parameters are immutable, so it cannot fail — beyond Orin-B (ADR-0028) |
@@ -260,6 +262,14 @@ Format: `path:line:col: error[CODE]: message` on stderr, exit status 1. Codes:
 | W0471 | **warning**, strict mode only: public method that mutates `this` and has no `@Ensures` — beyond Orin-B (ADR-0028) |
 | E0473 | a module may perform an effect outside its `[effects]` allowance in `orin.toml` (transitive; the notes carry the explanation path) — beyond Orin-B (ADR-0037 D2/D4, docs/capabilities.md) |
 | E0474 | an `[effects]` `allowed` entry names no effect the compiler knows — beyond Orin-B (docs/capabilities.md) |
+| E0448 | invalid `@Processor(A)`: not an exported top-level function `(input: Input): Output` with both types from `std:meta`, generic, called `main`, `A` not an `@Annotation` record declared in the same module, a second processor for `A`, `@Processor` on anything but a function, or a processor that is not pure (the message carries the explanation of check/purity.or, e.g. `performs I/O (console.log)`) (ADR-0046 S5) |
+| E0449 | a companion module (`./m.gen`) generates one name more than once and at least one of them is exported (ADR-0046 S4) |
+| E0520 | a processor run failed or its output is unusable. Failed run (ADR-0046 S5): the helper trapped (exit 101), timed out (`--processor-timeout`), exited with a status, wrote more than 16 MiB, could not be built (C compiler or loader error), or the output has more than 10,000 generated declarations; the message names the processor, the annotation use and the module, the note carries the captured stderr. Unusable output (also the recorded output of the test hook): not JSON, wrong format or version, missing key, unknown declaration kind, invalid identifier, unsupported construct, import of a module the program has not loaded, unknown diagnostic reference (ADR-0046 S4) |
+| E0521 | cyclic companion: `./a.gen` imported while `a` is loading, or a module that runs a processor depends on a companion (ADR-0046 S4) |
+| E0522 | a processor reported an error diagnostic (ADR-0046 S4) |
+| W0490 | **warning**: processors not run: `orin check` has no C compiler and no cached output for a processor; the companion module stays empty (ADR-0046 S5) |
+| W0491 | **warning**: a processor reported a warning (ADR-0046 S4) |
+| W0492 | **warning**: the processor of an annotation from a dependency was not run because `[annotations] processors` of orin.toml does not list it (ADR-0046 S5) |
 | E0500 | `orin.toml` syntax error (beyond Orin-B; self-hosted compiler only, spec 04) |
 | E0501 | import violates a module's `allowed_dependencies` rule in `orin.toml` (beyond Orin-B) |
 | E0502 | `orin.toml` names a module that does not exist (no `module.or`), in `[modules.x]` or `[effects.x]` (beyond Orin-B) |

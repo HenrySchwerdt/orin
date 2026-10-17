@@ -46,6 +46,7 @@ extern "C" {
 #define ORIN_PLATFORM_EINVAL 22 /* path contains a NUL byte (same value on Linux and macOS) */
 #define ORIN_PLATFORM_ENOMEM 12
 #define ORIN_PLATFORM_EBUSY 16
+#define ORIN_PLATFORM_WAIT_TIMEOUT 1 /* orin_platform_monitor_wait_until: the deadline passed */
 #define ORIN_PLATFORM_EDEADLK EDEADLK /* a monitor locked twice by the same thread (35 on Linux, 11 on macOS) */
 
 /* ================================================================ memory
@@ -246,6 +247,24 @@ int orin_platform_monitor_unlock(int64_t h);
             queue (or spuriously), and holds the monitor again: re-check the condition in a loop;
     ensures \result == ORIN_PLATFORM_EINVAL ==> as unlock, or cond is not 0 or 1; assigns the monitor; */
 int orin_platform_monitor_wait(int64_t h, int cond);
+
+/*@ requires as wait; deadline_ms >= 0 is an ABSOLUTE instant on the clock of orin_platform_monotonic_millis (CLOCK_MONOTONIC),
+            so retries and nested waits cannot stretch it (ADR-0017 Addendum B section 5);
+    ensures \result == 0 ==> as wait (notified or spuriously woken before the deadline: re-check the condition and call again
+            with the SAME deadline);
+    ensures \result == ORIN_PLATFORM_WAIT_TIMEOUT ==> the deadline has passed (also when it had passed before the call, then
+            without sleeping); the caller released the monitor while waiting and holds it again: re-check the condition once more,
+            a notification that raced with the timeout is not lost;
+    ensures \result == ORIN_PLATFORM_EINVAL ==> as wait, or deadline_ms < 0; assigns the monitor;
+    Linux: pthread_cond_timedwait on a condition variable created with CLOCK_MONOTONIC (pthread_condattr_setclock).
+    macOS has no condattr_setclock: the remaining time is computed from the same clock and passed to
+    pthread_cond_timedwait_relative_np (a wait never ends earlier than the deadline except by a notification). */
+int orin_platform_monitor_wait_until(int64_t h, int cond, int64_t deadline_ms);
+
+/*@ requires ms >= 0 and sec, nsec valid; ensures \result == 0 ==> *sec * 1000 + *nsec / 1000000 == ms, 0 <= *nsec < 10^9
+            (a struct timespec, exactly: no rounding, no overflow); \result == ORIN_PLATFORM_EINVAL ==> ms < 0, nothing written;
+    assigns *sec, *nsec; */
+int orin_platform_millis_split(int64_t ms, int64_t *sec, int64_t *nsec);
 
 /*@ requires the caller holds the monitor and cond is 0 or 1;
     ensures \result == 0 ==> all threads waiting on queue `cond` (all != 0) or one of them, if any (all == 0), wake up

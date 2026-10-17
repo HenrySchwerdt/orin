@@ -1,0 +1,807 @@
+// A recorded processor `Output` (library/std/metajson.or `encodeOutput`) as syntax trees (ADR-0046 S4).
+//
+// The JSON text is read with the compiler's own JSON parser and converted straight into `Item`s: nothing is printed and
+// parsed again (the parser rejects the `__g` names of generated code). Every node gets the span `sp`, the use of the
+// annotation that caused the code, so a diagnostic in generated code points at the annotation. Decoding is strict and
+// total like std:meta's `decodeOutput`: a wrong format or version, a missing key, a wrong kind of value or an unknown tag
+// is an `Err` with the path of the offending value, e.g. `.decls[0].decl.body[1].value: unknown expression kind "x"`. The
+// identifiers are checked too (a generated name must be an identifier that is not a keyword).
+//
+// What the syntax tree cannot say is an error as well: anonymous union types (`MUnion`), the bit operators, statements
+// before the value of a `match` arm in an expression, and a literal pattern that is not an integer, string or bool.
+
+import { Span } from "../diag";
+import {
+  Ident, Item, ImportDecl, FunctionDecl, Param, TypeDecl, TypeDeclBody, FieldDecl, VariantDecl, ConstDecl, TypeExpr,
+  TypeExprKind, FnTyParam, Block, Stmt, StmtKind, AssignOp, Expr, ExprKind, UnaryOp, BinaryOp, FieldInit, MatchArm,
+  ArmBody, Pattern, PatternKind, ClassDecl, ClassMember, ClassField, CtorDecl, CtorParam, MethodDecl, ContractClause,
+  Annotation, isKeyword, isReserved,
+} from "../syntax";
+import { Json, JArr, JObj, JStr, JNum, JBool, JNull, getField, parseJson } from "../json";
+
+// A diagnostic of the processor (`MDiagnostic`): `at` is a ref of the input.
+export type ProcDiag = { error: bool; message: string; at: int; };
+
+export type GenOutput = { imports: ImportDecl[]; items: Item[]; docs: string[]; diags: ProcDiag[]; };
+
+function intMin(): int {
+  return -9223372036854775807 - 1;
+}
+
+function at(path: string, msg: string): string {
+  return path == "" ? msg : path + ": " + msg;
+}
+
+function member(j: Json, k: string, path: string): Result<Json, string> {
+  return match (j) {
+    JObj(_) => match (getField(j, k)) {
+      Some(v) => Ok(v),
+      None => Err(at(path, "missing key `" + k + "`")),
+    },
+    _ => Err(at(path, "expected an object")),
+  };
+}
+
+function dStr(j: Json, k: string, path: string): Result<string, string> {
+  const v = member(j, k, path)?;
+  return match (v) {
+    JStr(s) => Ok(s),
+    _ => Err(at(path + "." + k, "expected a string")),
+  };
+}
+
+function dInt(j: Json, k: string, path: string): Result<int, string> {
+  const v = member(j, k, path)?;
+  return match (v) {
+    JNum(n) => Ok(n),
+    _ => Err(at(path + "." + k, "expected an integer")),
+  };
+}
+
+function dBool(j: Json, k: string, path: string): Result<bool, string> {
+  const v = member(j, k, path)?;
+  return match (v) {
+    JBool(b) => Ok(b),
+    _ => Err(at(path + "." + k, "expected a boolean")),
+  };
+}
+
+function dArr(j: Json, k: string, path: string): Result<Json[], string> {
+  const v = member(j, k, path)?;
+  return match (v) {
+    JArr(xs) => Ok(xs),
+    _ => Err(at(path + "." + k, "expected an array")),
+  };
+}
+
+function dStrs(j: Json, k: string, path: string): Result<string[], string> {
+  const xs = dArr(j, k, path)?;
+  let out: string[] = [];
+  let i: usize = 0;
+  while (i < xs.length) {
+    match (xs[i]) {
+      JStr(s) => {
+        out.push(s);
+      },
+      _ => {
+        return Err(at(path + "." + k + "[" + i.toString() + "]", "expected a string"));
+      },
+    }
+    i += 1;
+  }
+  return Ok(out);
+}
+
+// A member that may be null: None for null.
+function dOpt(j: Json, k: string, path: string): Result<Option<Json>, string> {
+  const v = member(j, k, path)?;
+  return match (v) {
+    JNull => Ok(None),
+    _ => Ok(Some(v)),
+  };
+}
+
+function dKind(j: Json, path: string): Result<string, string> {
+  return dStr(j, "k", path);
+}
+
+function badKind(what: string, kind: string, path: string): string {
+  return at(path, "unknown " + what + " kind \"" + kind + "\"");
+}
+
+function idx(path: string, k: string, i: usize): string {
+  return path + "." + k + "[" + i.toString() + "]";
+}
+
+// ---- identifiers ----------------------------------------------------------------------------------------------------
+
+function isIdent(s: string): bool {
+  if (s.length == 0) {
+    return false;
+  }
+  let i: usize = 0;
+  while (i < s.length) {
+    const c = s.charCodeAt(i);
+    const alpha = c >= 65 && c <= 90 || c >= 97 && c <= 122 || c == 95;
+    const digit = c >= 48 && c <= 57;
+    if (!alpha && !(digit && i > 0)) {
+      return false;
+    }
+    i += 1;
+  }
+  return !isKeyword(s) && !isReserved(s);
+}
+
+function ident(name: string, path: string, sp: Span): Result<Ident, string> {
+  if (!isIdent(name)) {
+    return Err(at(path, "`" + name + "` is not an identifier (generated names must be identifiers and not keywords)"));
+  }
+  return Ok(Ident { name: name, span: sp });
+}
+
+function idents(names: string[], path: string, sp: Span): Result<Ident[], string> {
+  let out: Ident[] = [];
+  let i: usize = 0;
+  while (i < names.length) {
+    out.push(ident(names[i], path + "[" + i.toString() + "]", sp)?);
+    i += 1;
+  }
+  return Ok(out);
+}
+
+// ---- types ----------------------------------------------------------------------------------------------------------
+
+function typeNode(kind: TypeExprKind, sp: Span): TypeExpr {
+  return TypeExpr { kind: kind, span: sp };
+}
+
+function cType(j: Json, path: string, sp: Span): Result<TypeExpr, string> {
+  const k = dKind(j, path)?;
+  if (k == "named") {
+    const n = ident(dStr(j, "name", path)?, path + ".name", sp)?;
+    const args = cTypes(j, "args", path, sp)?;
+    return Ok(typeNode(TNamed(n, args), sp));
+  }
+  if (k == "array") {
+    return Ok(typeNode(TArray(cType(member(j, "elem", path)?, path + ".elem", sp)?), sp));
+  }
+  if (k == "option") {
+    const e = cType(member(j, "elem", path)?, path + ".elem", sp)?;
+    return Ok(typeNode(TNamed(Ident { name: "Option", span: sp }, [e]), sp));
+  }
+  if (k == "result") {
+    const o = cType(member(j, "ok", path)?, path + ".ok", sp)?;
+    const e = cType(member(j, "err", path)?, path + ".err", sp)?;
+    return Ok(typeNode(TNamed(Ident { name: "Result", span: sp }, [o, e]), sp));
+  }
+  if (k == "fn") {
+    const ps = cTypes(j, "params", path, sp)?;
+    const r = cType(member(j, "returns", path)?, path + ".returns", sp)?;
+    let fps: FnTyParam[] = [];
+    let i: usize = 0;
+    while (i < ps.length) {
+      fps.push(FnTyParam { name: Ident { name: "p" + i.toString(), span: sp }, ty: ps[i] });
+      i += 1;
+    }
+    return Ok(typeNode(TFn(fps, r), sp));
+  }
+  if (k == "union") {
+    return Err(at(path, "an anonymous union type cannot be written in generated code; declare it with `unionType`"));
+  }
+  return Err(badKind("type", k, path));
+}
+
+function cTypes(j: Json, key: string, path: string, sp: Span): Result<TypeExpr[], string> {
+  const xs = dArr(j, key, path)?;
+  let out: TypeExpr[] = [];
+  let i: usize = 0;
+  while (i < xs.length) {
+    out.push(cType(xs[i], idx(path, key, i), sp)?);
+    i += 1;
+  }
+  return Ok(out);
+}
+
+function cOptType(j: Json, key: string, path: string, sp: Span): Result<Option<TypeExpr>, string> {
+  const o = dOpt(j, key, path)?;
+  return match (o) {
+    Some(t) => Ok(Some(cType(t, path + "." + key, sp)?)),
+    None => Ok(None),
+  };
+}
+
+function cParam(j: Json, path: string, sp: Span): Result<Param, string> {
+  const n = ident(dStr(j, "name", path)?, path + ".name", sp)?;
+  const t = cType(member(j, "ty", path)?, path + ".ty", sp)?;
+  return Ok(Param { name: n, ty: t, span: sp });
+}
+
+function cParams(j: Json, key: string, path: string, sp: Span): Result<Param[], string> {
+  const xs = dArr(j, key, path)?;
+  let out: Param[] = [];
+  let i: usize = 0;
+  while (i < xs.length) {
+    out.push(cParam(xs[i], idx(path, key, i), sp)?);
+    i += 1;
+  }
+  return Ok(out);
+}
+
+function cVariants(j: Json, key: string, path: string, sp: Span): Result<VariantDecl[], string> {
+  const xs = dArr(j, key, path)?;
+  let out: VariantDecl[] = [];
+  let i: usize = 0;
+  while (i < xs.length) {
+    const p = idx(path, key, i);
+    const n = ident(dStr(xs[i], "name", p)?, p + ".name", sp)?;
+    const payload = cTypes(xs[i], "payload", p, sp)?;
+    out.push(VariantDecl { name: n, payload: payload, span: sp });
+    i += 1;
+  }
+  return Ok(out);
+}
+
+// ---- patterns -------------------------------------------------------------------------------------------------------
+
+function patNode(kind: PatternKind, sp: Span): Pattern {
+  return Pattern { kind: kind, span: sp };
+}
+
+function cPattern(j: Json, path: string, sp: Span): Result<Pattern, string> {
+  const k = dKind(j, path)?;
+  if (k == "wild") {
+    return Ok(patNode(PWildcard, sp));
+  }
+  if (k == "bind") {
+    const n = ident(dStr(j, "name", path)?, path + ".name", sp)?;
+    return Ok(patNode(PIdent(n), sp));
+  }
+  if (k == "variant") {
+    const n = ident(dStr(j, "name", path)?, path + ".name", sp)?;
+    const xs = dArr(j, "subs", path)?;
+    if (xs.length == 0) {
+      return Ok(patNode(PIdent(n), sp));
+    }
+    let subs: Pattern[] = [];
+    let i: usize = 0;
+    while (i < xs.length) {
+      subs.push(cPattern(xs[i], idx(path, "subs", i), sp)?);
+      i += 1;
+    }
+    return Ok(patNode(PVariant(n, subs), sp));
+  }
+  if (k == "lit") {
+    const v = member(j, "value", path)?;
+    const vp = path + ".value";
+    const vk = dKind(v, vp)?;
+    if (vk == "int") {
+      return Ok(patNode(PInt(dInt(v, "v", vp)?), sp));
+    }
+    if (vk == "string") {
+      return Ok(patNode(PStr(dStr(v, "v", vp)?), sp));
+    }
+    if (vk == "bool") {
+      return Ok(patNode(PBool(dBool(v, "v", vp)?), sp));
+    }
+    return Err(at(vp, "a literal pattern must be an int, string or bool (found \"" + vk + "\")"));
+  }
+  return Err(badKind("pattern", k, path));
+}
+
+// ---- expressions ----------------------------------------------------------------------------------------------------
+
+function exprNode(kind: ExprKind, sp: Span): Expr {
+  return Expr { kind: kind, span: sp };
+}
+
+function unaryOp(s: string, path: string): Result<UnaryOp, string> {
+  if (s == "neg") {
+    return Ok(UNeg);
+  }
+  if (s == "not") {
+    return Ok(UNot);
+  }
+  if (s == "bitnot") {
+    return Err(at(path, "the bit operators are not supported in generated code"));
+  }
+  return Err(at(path, "unknown unary operator \"" + s + "\""));
+}
+
+function binaryOp(s: string, path: string): Result<BinaryOp, string> {
+  if (s == "+") {
+    return Ok(BAdd);
+  }
+  if (s == "-") {
+    return Ok(BSub);
+  }
+  if (s == "*") {
+    return Ok(BMul);
+  }
+  if (s == "/") {
+    return Ok(BDiv);
+  }
+  if (s == "%") {
+    return Ok(BRem);
+  }
+  if (s == "==") {
+    return Ok(BEq);
+  }
+  if (s == "!=") {
+    return Ok(BNe);
+  }
+  if (s == "<") {
+    return Ok(BLt);
+  }
+  if (s == "<=") {
+    return Ok(BLe);
+  }
+  if (s == ">") {
+    return Ok(BGt);
+  }
+  if (s == ">=") {
+    return Ok(BGe);
+  }
+  if (s == "&&") {
+    return Ok(BAnd);
+  }
+  if (s == "||") {
+    return Ok(BOr);
+  }
+  if (s == "&" || s == "|" || s == "^" || s == "<<" || s == ">>") {
+    return Err(at(path, "the bit operators are not supported in generated code"));
+  }
+  return Err(at(path, "unknown binary operator \"" + s + "\""));
+}
+
+function cExprs(j: Json, key: string, path: string, sp: Span): Result<Expr[], string> {
+  const xs = dArr(j, key, path)?;
+  let out: Expr[] = [];
+  let i: usize = 0;
+  while (i < xs.length) {
+    out.push(cExpr(xs[i], idx(path, key, i), sp)?);
+    i += 1;
+  }
+  return Ok(out);
+}
+
+function cExprAt(j: Json, key: string, path: string, sp: Span): Result<Expr, string> {
+  return cExpr(member(j, key, path)?, path + "." + key, sp);
+}
+
+function intLiteral(n: int, sp: Span): Expr {
+  if (n >= 0) {
+    return exprNode(EInt(n), sp);
+  }
+  if (n == intMin()) {
+    return exprNode(EUnary(UNeg, exprNode(EBigInt(intMin()), sp)), sp);
+  }
+  return exprNode(EUnary(UNeg, exprNode(EInt(0 - n), sp)), sp);
+}
+
+function cExpr(j: Json, path: string, sp: Span): Result<Expr, string> {
+  const k = dKind(j, path)?;
+  if (k == "int") {
+    return Ok(intLiteral(dInt(j, "v", path)?, sp));
+  }
+  if (k == "float") {
+    const text = dStr(j, "v", path)?;
+    if (text.startsWith("-")) {
+      return Ok(exprNode(EUnary(UNeg, exprNode(EFloat(text.substring(1, text.length)), sp)), sp));
+    }
+    return Ok(exprNode(EFloat(text), sp));
+  }
+  if (k == "string") {
+    return Ok(exprNode(EStr(dStr(j, "v", path)?), sp));
+  }
+  if (k == "bool") {
+    return Ok(exprNode(EBool(dBool(j, "v", path)?), sp));
+  }
+  if (k == "name") {
+    const n = dStr(j, "name", path)?;
+    if (n == "this") {
+      return Ok(exprNode(EThis, sp));
+    }
+    return Ok(exprNode(EIdent(ident(n, path + ".name", sp)?), sp));
+  }
+  if (k == "call") {
+    const targs = cTypes(j, "typeArgs", path, sp)?;
+    let callee = cExprAt(j, "callee", path, sp)?;
+    if (targs.length > 0) {
+      match (callee.kind) {
+        EIdent(id) => {
+          callee = exprNode(ETyApp(id, targs), sp);
+        },
+        _ => {
+          return Err(at(path + ".callee", "type arguments can only be given to a function name"));
+        },
+      }
+    }
+    return Ok(exprNode(ECall(callee, cExprs(j, "args", path, sp)?), sp));
+  }
+  if (k == "method") {
+    const recv = cExprAt(j, "recv", path, sp)?;
+    const n = ident(dStr(j, "name", path)?, path + ".name", sp)?;
+    return Ok(exprNode(ECall(exprNode(EMember(recv, n), sp), cExprs(j, "args", path, sp)?), sp));
+  }
+  if (k == "field") {
+    const recv = cExprAt(j, "recv", path, sp)?;
+    const n = ident(dStr(j, "name", path)?, path + ".name", sp)?;
+    return Ok(exprNode(EMember(recv, n), sp));
+  }
+  if (k == "index") {
+    return Ok(exprNode(EIndex(cExprAt(j, "recv", path, sp)?, cExprAt(j, "index", path, sp)?), sp));
+  }
+  if (k == "record") {
+    const n = ident(dStr(j, "type", path)?, path + ".type", sp)?;
+    const xs = dArr(j, "fields", path)?;
+    let inits: FieldInit[] = [];
+    let i: usize = 0;
+    while (i < xs.length) {
+      const p = idx(path, "fields", i);
+      const fname = ident(dStr(xs[i], "name", p)?, p + ".name", sp)?;
+      const v = cExprAt(xs[i], "value", p, sp)?;
+      inits.push(FieldInit { name: fname, value: v, span: sp });
+      i += 1;
+    }
+    return Ok(exprNode(ERecord(n, None, inits), sp));
+  }
+  if (k == "array") {
+    return Ok(exprNode(EArray(cExprs(j, "items", path, sp)?), sp));
+  }
+  if (k == "unary") {
+    const op = unaryOp(dStr(j, "op", path)?, path + ".op")?;
+    return Ok(exprNode(EUnary(op, cExprAt(j, "operand", path, sp)?), sp));
+  }
+  if (k == "binary") {
+    const op = binaryOp(dStr(j, "op", path)?, path + ".op")?;
+    return Ok(exprNode(EBinary(op, cExprAt(j, "left", path, sp)?, cExprAt(j, "right", path, sp)?), sp));
+  }
+  if (k == "match") {
+    const scrut = cExprAt(j, "scrutinee", path, sp)?;
+    return Ok(exprNode(EMatch(scrut, cArms(j, path, sp, false)?), sp));
+  }
+  if (k == "try") {
+    return Ok(exprNode(ETry(cExprAt(j, "operand", path, sp)?), sp));
+  }
+  if (k == "cond") {
+    return Ok(
+      exprNode(ECond(cExprAt(j, "cond", path, sp)?, cExprAt(j, "then", path, sp)?, cExprAt(j, "else", path, sp)?), sp),
+    );
+  }
+  return Err(badKind("expression", k, path));
+}
+
+// The arms of a `match` (`inStmt`: statement position, where an arm is a block and its value is evaluated for effect).
+// In an expression an arm is `pattern => value`; an arm with statements before its value cannot be written (a block arm
+// of an expression has no value), and an arm without a value must end in a statement that leaves (`return`).
+function cArms(j: Json, path: string, sp: Span, inStmt: bool): Result<MatchArm[], string> {
+  const xs = dArr(j, "arms", path)?;
+  let out: MatchArm[] = [];
+  let i: usize = 0;
+  while (i < xs.length) {
+    const p = idx(path, "arms", i);
+    const pat = cPattern(member(xs[i], "pattern", p)?, p + ".pattern", sp)?;
+    const stmts = cStmts(xs[i], "stmts", p, sp)?;
+    const v = dOpt(xs[i], "value", p)?;
+    let value: Option<Expr> = None;
+    match (v) {
+      Some(vj) => {
+        value = Some(cExpr(vj, p + ".value", sp)?);
+      },
+      None => {},
+    }
+    let body: ArmBody = BBlock(Block { stmts: [], span: sp });
+    if (inStmt) {
+      let all = stmts;
+      match (value) {
+        Some(x) => {
+          all.push(Stmt { kind: SExpr(x), span: sp });
+        },
+        None => {},
+      }
+      if (stmts.length == 0 && value.isSome()) {
+        body = BExpr(value.unwrap());
+      } else {
+        body = BBlock(Block { stmts: all, span: sp });
+      }
+    } else if (value.isSome()) {
+      if (stmts.length > 0) {
+        return Err(
+          at(p, "an arm of a match expression cannot run statements before its value; compute them before the match"),
+        );
+      }
+      body = BExpr(value.unwrap());
+    } else {
+      body = BBlock(Block { stmts: stmts, span: sp });
+    }
+    out.push(MatchArm { pattern: pat, body: body, span: sp });
+    i += 1;
+  }
+  return Ok(out);
+}
+
+// ---- statements -----------------------------------------------------------------------------------------------------
+
+function stmtNode(kind: StmtKind, sp: Span): Stmt {
+  return Stmt { kind: kind, span: sp };
+}
+
+function cStmts(j: Json, key: string, path: string, sp: Span): Result<Stmt[], string> {
+  const xs = dArr(j, key, path)?;
+  let out: Stmt[] = [];
+  let i: usize = 0;
+  while (i < xs.length) {
+    out.push(cStmt(xs[i], idx(path, key, i), sp)?);
+    i += 1;
+  }
+  return Ok(out);
+}
+
+function cBlock(j: Json, key: string, path: string, sp: Span): Result<Block, string> {
+  return Ok(Block { stmts: cStmts(j, key, path, sp)?, span: sp });
+}
+
+function cStmt(j: Json, path: string, sp: Span): Result<Stmt, string> {
+  const k = dKind(j, path)?;
+  if (k == "const" || k == "let") {
+    const n = ident(dStr(j, "name", path)?, path + ".name", sp)?;
+    const t = cOptType(j, "ty", path, sp)?;
+    const v = cExprAt(j, "value", path, sp)?;
+    return Ok(stmtNode(SLet(k == "let", n, t, v), sp));
+  }
+  if (k == "assign") {
+    return Ok(stmtNode(SAssign(cExprAt(j, "target", path, sp)?, OpAssign, cExprAt(j, "value", path, sp)?), sp));
+  }
+  if (k == "return") {
+    const v = dOpt(j, "value", path)?;
+    return match (v) {
+      Some(x) => Ok(stmtNode(SReturn(Some(cExpr(x, path + ".value", sp)?)), sp)),
+      None => Ok(stmtNode(SReturn(None), sp)),
+    };
+  }
+  if (k == "expr") {
+    return Ok(stmtNode(SExpr(cExprAt(j, "expr", path, sp)?), sp));
+  }
+  if (k == "if") {
+    const c = cExprAt(j, "cond", path, sp)?;
+    const a = cBlock(j, "then", path, sp)?;
+    const b = cBlock(j, "else", path, sp)?;
+    if (b.stmts.length == 0) {
+      return Ok(stmtNode(SIf(c, a, None), sp));
+    }
+    return Ok(stmtNode(SIf(c, a, Some(stmtNode(SBlock(b), sp))), sp));
+  }
+  if (k == "while") {
+    return Ok(stmtNode(SWhile(cExprAt(j, "cond", path, sp)?, cBlock(j, "body", path, sp)?), sp));
+  }
+  if (k == "forof") {
+    const n = ident(dStr(j, "var", path)?, path + ".var", sp)?;
+    return Ok(stmtNode(SForOf(n, cExprAt(j, "iter", path, sp)?, cBlock(j, "body", path, sp)?), sp));
+  }
+  if (k == "match") {
+    const scrut = cExprAt(j, "scrutinee", path, sp)?;
+    return Ok(stmtNode(SExpr(exprNode(EMatch(scrut, cArms(j, path, sp, true)?), sp)), sp));
+  }
+  return Err(badKind("statement", k, path));
+}
+
+// ---- declarations ---------------------------------------------------------------------------------------------------
+
+function noBounds(n: usize): Option<Ident>[] {
+  let out: Option<Ident>[] = [];
+  let i: usize = 0;
+  while (i < n) {
+    out.push(None);
+    i += 1;
+  }
+  return out;
+}
+
+function noContracts(): ContractClause[] {
+  return [];
+}
+
+function noAnnotations(): Annotation[] {
+  return [];
+}
+
+function cFn(j: Json, path: string, sp: Span): Result<FunctionDecl, string> {
+  const n = ident(dStr(j, "name", path)?, path + ".name", sp)?;
+  const e = dBool(j, "exported", path)?;
+  const tps = idents(dStrs(j, "typeParams", path)?, path + ".typeParams", sp)?;
+  const ps = cParams(j, "params", path, sp)?;
+  const r = cType(member(j, "returns", path)?, path + ".returns", sp)?;
+  const body = cBlock(j, "body", path, sp)?;
+  return Ok(FunctionDecl {
+    exported: e,
+    name: n,
+    typeParams: tps,
+    bounds: noBounds(tps.length),
+    params: ps,
+    ret: Some(r),
+    body: body,
+    contracts: noContracts(),
+    annotations: noAnnotations(),
+    span: sp,
+  });
+}
+
+function cConst(j: Json, path: string, sp: Span): Result<ConstDecl, string> {
+  const n = ident(dStr(j, "name", path)?, path + ".name", sp)?;
+  const e = dBool(j, "exported", path)?;
+  const t = cType(member(j, "ty", path)?, path + ".ty", sp)?;
+  const v = cExprAt(j, "value", path, sp)?;
+  return Ok(ConstDecl { exported: e, name: n, ty: Some(t), value: v, annotations: noAnnotations(), span: sp });
+}
+
+function typeDecl(n: Ident, e: bool, tps: Ident[], body: TypeDeclBody, sp: Span): TypeDecl {
+  return TypeDecl {
+    exported: e,
+    name: n,
+    typeParams: tps,
+    body: body,
+    contracts: noContracts(),
+    annotations: noAnnotations(),
+    span: sp,
+  };
+}
+
+function cRecord(j: Json, path: string, sp: Span): Result<TypeDecl, string> {
+  const n = ident(dStr(j, "name", path)?, path + ".name", sp)?;
+  const e = dBool(j, "exported", path)?;
+  const tps = idents(dStrs(j, "typeParams", path)?, path + ".typeParams", sp)?;
+  const ps = cParams(j, "fields", path, sp)?;
+  let fs: FieldDecl[] = [];
+  for (const p of ps) {
+    fs.push(FieldDecl { name: p.name, ty: p.ty, annotations: noAnnotations(), span: sp });
+  }
+  return Ok(typeDecl(n, e, tps, DRecord(fs), sp));
+}
+
+function cUnion(j: Json, path: string, sp: Span): Result<TypeDecl, string> {
+  const n = ident(dStr(j, "name", path)?, path + ".name", sp)?;
+  const e = dBool(j, "exported", path)?;
+  const tps = idents(dStrs(j, "typeParams", path)?, path + ".typeParams", sp)?;
+  const vs = cVariants(j, "variants", path, sp)?;
+  return Ok(typeDecl(n, e, tps, DUnion(vs), sp));
+}
+
+function cClass(j: Json, path: string, sp: Span): Result<ClassDecl, string> {
+  const n = ident(dStr(j, "name", path)?, path + ".name", sp)?;
+  const e = dBool(j, "exported", path)?;
+  const tps = idents(dStrs(j, "typeParams", path)?, path + ".typeParams", sp)?;
+  let members: ClassMember[] = [];
+  const fs = dArr(j, "fields", path)?;
+  let i: usize = 0;
+  while (i < fs.length) {
+    const p = idx(path, "fields", i);
+    const fname = ident(dStr(fs[i], "name", p)?, p + ".name", sp)?;
+    const t = cType(member(fs[i], "ty", p)?, p + ".ty", sp)?;
+    const fe = dBool(fs[i], "exported", p)?;
+    members.push(MField(ClassField { priv: !fe, name: fname, ty: t, init: None, annotations: noAnnotations(), span: sp }));
+    i += 1;
+  }
+  const c = dOpt(j, "ctor", path)?;
+  match (c) {
+    Some(cj) => {
+      const cp = path + ".ctor";
+      const ps = cParams(cj, "params", cp, sp)?;
+      let cps: CtorParam[] = [];
+      for (const p of ps) {
+        cps.push(CtorParam { access: 0, name: p.name, ty: p.ty, span: sp });
+      }
+      const body = cBlock(cj, "body", cp, sp)?;
+      members.push(MCtor(CtorDecl { params: cps, body: body, contracts: noContracts(), span: sp }));
+    },
+    None => {},
+  }
+  const ms = dArr(j, "methods", path)?;
+  let m: usize = 0;
+  while (m < ms.length) {
+    const f = cFn(ms[m], idx(path, "methods", m), sp)?;
+    members.push(
+      MMethod(MethodDecl {
+        priv: !f.exported,
+        isStatic: false,
+        name: f.name,
+        typeParams: f.typeParams,
+        params: f.params,
+        ret: f.ret,
+        body: f.body,
+        contracts: noContracts(),
+        annotations: noAnnotations(),
+        span: sp,
+      }),
+    );
+    m += 1;
+  }
+  return Ok(ClassDecl {
+    exported: e,
+    name: n,
+    typeParams: tps,
+    bounds: noBounds(tps.length),
+    ext: None,
+    impls: [],
+    members: members,
+    contracts: noContracts(),
+    annotations: noAnnotations(),
+    span: sp,
+  });
+}
+
+function cDecl(j: Json, path: string, sp: Span): Result<Item, string> {
+  const k = dKind(j, path)?;
+  const body = member(j, "decl", path)?;
+  const p = path + ".decl";
+  if (k == "fn") {
+    return Ok(IFunction(cFn(body, p, sp)?));
+  }
+  if (k == "const") {
+    return Ok(IConst(cConst(body, p, sp)?));
+  }
+  if (k == "record") {
+    return Ok(IType(cRecord(body, p, sp)?));
+  }
+  if (k == "union") {
+    return Ok(IType(cUnion(body, p, sp)?));
+  }
+  if (k == "class") {
+    return Ok(IClass(cClass(body, p, sp)?));
+  }
+  return Err(badKind("declaration", k, path));
+}
+
+function checkEnvelope(j: Json): Result<void, string> {
+  const f = dStr(j, "format", "")?;
+  if (f != "orin.meta.output") {
+    return Err("format: expected \"orin.meta.output\", found \"" + f + "\"");
+  }
+  const v = dInt(j, "version", "")?;
+  if (v != 1) {
+    return Err("version: unsupported " + v.toString() + " (this compiler reads 1)");
+  }
+  return Ok();
+}
+
+// Decodes the text of a recorded `Output` into declarations whose nodes all carry `sp`.
+export function outputItems(text: string, sp: Span): Result<GenOutput, string> {
+  const parsed = parseJson(text);
+  if (parsed.isErr()) {
+    return Err("invalid JSON: " + parsed.unwrapErr());
+  }
+  const j = parsed.unwrap();
+  checkEnvelope(j)?;
+  let imports: ImportDecl[] = [];
+  const is = dArr(j, "imports", "")?;
+  let i: usize = 0;
+  while (i < is.length) {
+    const p = idx("", "imports", i);
+    const names = idents(dStrs(is[i], "names", p)?, p + ".names", sp)?;
+    const source = dStr(is[i], "source", p)?;
+    imports.push(ImportDecl { names: names, path: source, pathSpan: sp, span: sp, provider: false });
+    i += 1;
+  }
+  let items: Item[] = [];
+  let docs: string[] = [];
+  const ds = dArr(j, "decls", "")?;
+  let d: usize = 0;
+  while (d < ds.length) {
+    const p = idx("", "decls", d);
+    items.push(cDecl(ds[d], p, sp)?);
+    docs.push(dStr(member(ds[d], "decl", p)?, "doc", p + ".decl")?);
+    d += 1;
+  }
+  let diags: ProcDiag[] = [];
+  const gs = dArr(j, "diagnostics", "")?;
+  let g: usize = 0;
+  while (g < gs.length) {
+    const p = idx("", "diagnostics", g);
+    const sev = dStr(gs[g], "severity", p)?;
+    if (sev != "error" && sev != "warning") {
+      return Err(at(p + ".severity", "unknown severity \"" + sev + "\""));
+    }
+    diags.push(ProcDiag { error: sev == "error", message: dStr(gs[g], "message", p)?, at: dInt(gs[g], "at", p)? });
+    g += 1;
+  }
+  return Ok(GenOutput { imports: imports, items: items, docs: docs, diags: diags });
+}

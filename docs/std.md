@@ -2,7 +2,7 @@
 
 Status of the std modules of ADR-0016 (spec 08). Every public function has a doc comment in its
 source with signature, errors/absence, behaviour and complexity (the spec 08 validation rule); this
-page is the map. `orin mcp` `inspect` answers `std:path.join`, `std:json.parse`, ... from its built-in
+page is the map. `orin mcp` `inspect` answers `std:path.join`, `std:json/legacy.parse`, `std:json.parseDocument`, ... from its built-in
 API table (`compiler/mcp/apitable.or`).
 
 | Module | Implemented in | Status |
@@ -11,18 +11,18 @@ API table (`compiler/mcp/apitable.or`).
 | `std:fs` | Orin, `library/std/fs.or` (scope API) over C runtime primitives (`std:fsraw`, internal) | done; takes an `FsGrant` first (ADR-0027), **unstable** until the owner confirms the I/O freeze (ADR-0016); resources and streaming: ADR-0025 |
 | `std:process`, `std:io` | C runtime built-ins (`runtime/core/orin_runtime*.c/.h`) | done; `args`, `shell`, `readLine`, ... take a `ProcessGrant` / `StdioGrant` first (ADR-0027), **unstable** |
 | `std:path` | Orin, `library/std/path.or` | done (POSIX, lexical) |
-| `std:json` | Orin, `library/std/json.or` | done, **integers only** |
+| `std:json` | Orin, `library/std/json.or` (+ `json/number.or`, `json/decode.or`, `json/legacy.or`) | done (ADR-0048 section 7.1): exact bounded `JsonValue`, `std:json/number`, `std:json/decode`; the integer-only `Json` is `std:json/legacy` (deprecated) |
 | `std:time` | Orin, `library/std/time.or` + clock-read built-ins | wall/monotonic clocks, checked elapsed/deadline helpers, durations and UTC calendar; no `sleep`; **unstable** (ADR-0027); [monotonic API](std-time-monotonic.md) |
 | `std:graph` | Orin, `library/std/graph.or` | `class Graph<T>` with generational, tagged `GraphId<T>` (ADR-0026) |
 | `std:bytes` | Orin, `library/std/bytes.or` | `Bytes`, `ByteBuilder`, `ByteReader`; provable-std layer 1 (ADR-0030), contract standard |
-| `std:url` | Orin, `library/std/url.or` | percent encode/decode over bytes or strict UTF-8, ordered query pairs; explicit plus mode and structured byte offsets; [API and policies](std-url.md) |
+| `std:url` | Orin, `library/std/url.or` | percent encode/decode over bytes or strict UTF-8, ordered query pairs; explicit `FormSpace` mode (`PlusAsSpace` or `PercentSpace`) and structured byte offsets; [API and policies](std-url.md) |
 | `std:utf8` | Orin, `library/std/utf8.or` | validated decoding, encoding, `Utf8String` ("always valid UTF-8"), `CodePointCursor`; ADR-0030 |
-| `std:collections` | Orin, `library/std/collections.or` | `IntSet`, `StringSet`, `Deque<T>`, `SortedMap<V>`, `SortedStringMap<V>`, `PriorityQueue<T>`; ADR-0030 |
+| `std:collections` | Orin, `library/std/collections.or` | `Set<T extends Hash>`, `OrderedMap<K extends Ord, V>`, `MinHeap<T extends Ord>` (ADR-0034), `IntSet`, `StringSet`, `Deque<T>`, `SortedMap<V>`, `SortedStringMap<V>`, `PriorityQueue<T>`; ADR-0030 |
 | `std:http` | Orin, `library/std/http.or` | the **pure** part of HTTP/1.1: `Request`, `Response`, `Headers`, `Status`, an incremental request and response parser (smuggling-safe, limits as parameters) and a serializer with a round-trip contract; the sockets are `std:net` (ADR-0033); `examples/http_server.or` joins them; ADR-0030 |
 | `std:net` | Orin, `library/std/net.or` over the network primitives of `std:fsraw` (L0: ADR-0033) | blocking TCP: `Listener`, `Stream` (resources), `connect`, `resolve`, `readExact`, `readUntil`, deadlines, half-close; takes a `NetGrant` first, narrowed by `useListen` / `useConnect`; **unstable** (ADR-0033, below) |
 | `std:seq` | Orin, `library/std/seq.or` | `range(lo, hi)`, `sum(xs)`, `sumBy(xs, f)`: pure aggregates for contracts and code; `orin verify --contracts` reads them as bounded quantifiers and recursive sums (ADR-0036) |
 | `std:text` | Orin, `library/std/text.or` | `trimBlankLines`, `dedent` (common indentation *prefix*, as Python's `textwrap.dedent`), `indentLines`, `normalizeNewlines`, `isBlankLine`, `leadingIndent`: pure byte-oriented text layout for diagnostics, documentation and CLIs (UTF-8 bytes are preserved; code points belong to `std:utf8`) |
-| `std:html` | Orin, `library/std/html.or` | `Html` (`@Sealed`), `escape`, `safeUrl`, `escapeUrl`, `joinAll`, `trustHtml`, `text`, `fragment`, `render`, `document`: HTML escaping and the URL-scheme rule; the OX provider `ox()` (`import ox from "std:html";`, ADR-0044); below, "std:html" |
+| `std:html` | Orin, `library/std/html.or` | `Html` (`@Sealed`), `escape`, `safeUrl`, `escapeUrl`, `renderAll`, `trustHtml`, `fromText`, `fragment`, `render`, `renderDocument`: HTML escaping and the URL-scheme rule; the OX provider `ox()` (`import ox from "std:html";`, ADR-0044); below, "std:html" |
 | `std:ox` | Orin, `library/std/ox.or` (types only) | `Markup<R>`, `Components<R>`, `AttrRule`, `Escape`: the protocol an OX provider's `ox()` returns (ADR-0044, docs/ox.md); below, "std:ox" |
 | `std:meta` | Orin, `library/std/meta.or` (re-exports `metacore.or`, `metajson.or`) | **unstable, ADR-0046 slice S3:** the pure processor interface: `Input` (annotated declarations, types, constants), the `Output` builder tree (`MDecl`/`MStmt`/`MExpr`/`MType`), `fresh`/`NameGen` hygiene and the stable JSON encoding of both; not yet called by the compiler; [API](std-meta.md) |
 | `std:taskcore` | Orin, `library/std/taskcore.or` | the pure bookkeeping of `std:task` (`Ring` = one channel buffer, `Ledger` = one scope's task table), invariants and contracts, tested and mutated without threads; import `std:task` |
@@ -38,7 +38,7 @@ API table (`compiler/mcp/apitable.or`).
 `compiler/loader/embedded_stdlib.or`; run it after editing `library/std/`, `tools/bootstrap.sh` checks it).
 It is a *library root* (`PreludeRoot` with an empty `entry`): its files are served from memory under
 `$stdlib/<name>.or` but, unlike `library/core/` and `library/collections/`, **not** imported implicitly. The loader maps
-`import ... from "std:path"` (also `std:json`, `std:time`, `std:graph`, `std:test`, `std:bytes`, `std:utf8`, `std:url`, `std:collections`, `std:http`, `std:seq`, `std:net`, `std:text`, `std:html`, `std:meta`) to the unit `$stdlib/path`.
+`import ... from "std:path"` (also `std:json` and its submodules `std:json/number`, `std:json/decode`, `std:json/legacy`, which live in `library/std/json/`; `std:time`, `std:graph`, `std:test`, `std:bytes`, `std:utf8`, `std:url`, `std:collections`, `std:http`, `std:seq`, `std:net`, `std:text`, `std:html`, `std:meta`) to the unit `$stdlib/path`.
 Programs that do not import a module pay nothing for it, and the leading `$` makes unused functions of
 imported modules disappear in `compiler/opt/prune.or`. The sources use the full language (generics,
 records, closures); only the compiler itself has to stay Orin-B. Type names in diagnostics show the
@@ -129,7 +129,9 @@ leading `..` of relative paths kept, trailing `/` kept), `dirname(p)`, `basename
 (`".txt"`; `""` for `.bashrc`, `..`, no dot), `stem(p)`, `withExtension(p, ext)`, `isAbsolute(p)`,
 `resolveAgainst(base, p)`.
 
-## std:json (integers only)
+## std:json/legacy (integers only, deprecated)
+
+The integer-only model, moved from `std:json` by ADR-0048 section 7.1. New code uses `std:json` (below); `toValue(j): JsonValue` and `fromValue(v): Result<Json, NumberError>` cross between the two.
 
 ```
 type Json = JNull | JBool(bool) | JNum(int) | JStr(string) | JArr(Json[]) | JObj(JField[])
@@ -138,9 +140,9 @@ type JsonError = { message: string; offset: usize; line: usize; column: usize } 
 ```
 
 `parse(text): Result<Json, JsonError>`, `stringify(j): string` (compact), `pretty(j, indent: usize): string`,
-`quote(s)`, `formatError(e)` ("line L, column C: message"); builders `field(key, value)`; accessors (all
-total, `None` on a wrong kind/missing key): `get`, `at`, `path`, `keys`, `asString`, `asInt`, `asBool`,
-`asArray`, `asObject`, `isNull`, `getString`, `getInt`, `getBool`, `getArray`.
+`quote(s)`, `jsonErrorMessage(e)` ("line L, column C: message"; `formatError` is a deprecated alias); builders `field(key, value)`; accessors (all
+total, `None` on a wrong kind/missing key): `get`, `getIndex`, `getPath`, `keys`, `asString`, `asInt`, `asBool`,
+`asArray`, `asObject`, `isNull`, `getString`, `getInt`, `getBool`, `getArray` (`at` and `path` are deprecated aliases of `getIndex` and `getPath`).
 
 Rules: integers in -(2^63-1)..2^63-1 only; `1.5` / `1e3` are errors ("floats are not supported yet") until
 floats exist; nesting > 200 is an error; `\uXXXX` and surrogate pairs decode to UTF-8 (lone surrogate ->
@@ -167,7 +169,8 @@ ordinary programs. All functions return `void`; `msg` ("" allowed) is part of th
 `assertEqUsize`, `assertEqString` (values shown in quotes), `assertEqBool`
 ("assertEq failed: msg: expected 3, got 2"), `assertNear(actual: float, expected: float, tolerance: float,
 msg)` (|actual - expected| <= tolerance; NaN always fails), `fail(msg)`. One `assertEq*` per type because
-Orin has no generic equality or `toString`.
+Orin has no generic `toString`. For any `Eq` type (records, unions, `Option`, arrays, strings, classes with `equals`) there is
+`assertEqual<T extends Eq>(actual: T, expected: T, msg)` (ADR-0034): it traps with "assertEq failed: msg: values differ" and shows no values.
 
 ## std:graph (spec 06 cyclic graphs)
 
@@ -176,10 +179,11 @@ generic class (ADR-0026) and, like every class, a value: a copy is independent.
 
 ```
 type GraphId<T> = { tag: int; index: usize; gen: int }     // obtain only through add (T is phantom)
-type GraphError = StaleId | ForeignId
+type GraphErrorKind = StaleId | ForeignId
+type GraphError = { kind: GraphErrorKind }        // rule 3.1: every error record has a `kind`
 class Graph<T> {
   constructor(tag: int)
-  size(): usize                                   contains(id): bool
+  size(): usize    isEmpty(): bool                has(id): bool      // contains(id) is a deprecated wrapper of has
   add(value: T): GraphId<T>                       // mutating, never fails
   get(id): Result<T, GraphError>
   set(id, value): Result<void, GraphError>        // mutating
@@ -249,19 +253,23 @@ class Bytes                                           // new Bytes(data: u8[], s
   slice(lo, hi): Bytes       trySlice(lo, hi): Option<Bytes>   // O(1); slice: @Requires(lo <= hi && hi <= length())
   concat(o): Bytes           equals(o): bool          startsWith(p): bool     indexOf(b: u8): Option<usize>   // O(n)
   toArray(): u8[]            toRawString(): string    toHex(): string          // O(n)
-emptyBytes()  bytesFromArray(u8[])  bytesFromInts(int[]) @Requires(allBytes(xs))  bytesFromString(s)  bytesFromHex(s): Option<Bytes>
+  includes(b: u8): bool      indexOfBytes(needle: Bytes, begin: usize): Option<usize>   // O(n * needle.length()) worst case
+empty()  fromArray(u8[])  fromInts(int[]) @Requires(allBytes(xs))  fromString(s)       // ADR-0048: `import * as bytes`
 allBytes(xs: int[]): bool
+// hex has one home, std:encoding: hexEncode / hexDecode / hexDecodeText; Bytes.toHex() is what hexEncode calls.
+// Deprecated for one release: emptyBytes bytesFromArray bytesFromInts bytesFromString bytesFromHex(s): Option<Bytes>
 
 class ByteBuilder                                     // invariant: capacity >= length
-  length()  reserved()  byteAt(i)  reserve(extra)  clear()  build(): Bytes
-  appendU8(u8)  appendU16be/le(u16)  appendU32be/le(u32)  appendBytes(Bytes)  appendString(s)   // amortised O(1) per byte
+  length()  isEmpty()  capacity()  byteAt(i)  reserve(extra)  clear()  build(): Bytes      // reserved() is deprecated
+  appendU8(u8)  appendU16Be/Le(u16)  appendU32Be/Le(u32)  appendBytes(Bytes)  appendString(s)   // amortised O(1) per byte
+                                                      // appendU16be/le, appendU32be/le are deprecated spellings
 
-type ReadError = { position: usize; needed: usize; remaining: usize }
+type BytesError = { offset: usize; needed: usize; remaining: usize }    // alias ReadError; no `kind`: one cause only
 class ByteReader                                      // invariant: pos <= src.length(): the cursor never passes the end
   position()  remaining()  isAtEnd()  peekAt(offset): Option<u8>
-  readU8(): Result<u8, ReadError>      readU16be/le(): Result<u16, ReadError>     readU32be/le(): Result<u32, ReadError>
-  readExact(n): Result<Bytes, ReadError>   skip(n): Result<void, ReadError>   rest(): Bytes
-readErrorMessage(e)
+  readU8(): Result<u8, BytesError>      readU16Be/Le(): Result<u16, BytesError>     readU32Be/Le(): Result<u32, BytesError>
+  readExact(n): Result<Bytes, BytesError>   skip(n): Result<void, BytesError>   takeRest(): Bytes   // moves the cursor
+bytesErrorMessage(e)                                  // readErrorMessage, rest(), readU16be/le, readU32be/le: deprecated
 ```
 
 Contracts that matter: every `read*` is `Ok` **iff** at least that many bytes remain (`result.isOk() ==
@@ -271,7 +279,7 @@ grow the length by exactly the bytes appended and put the right bytes at the end
 byte; `concat` states length and both seams. There are no bitwise operators in Orin, so multi-byte values use `*`,
 `/` and `%` on `int`. `reserve` is bookkeeping (`capacity`): the runtime has no array reserve, arrays still grow
 geometrically on `push`. A `u8` array element costs 8 bytes at run time (ADR-0022); strings are the compact form
-(`toRawString` / `bytesFromString` are O(n) conversions, byte for byte, no validation).
+(`toRawString` / `fromString` are O(n) conversions, byte for byte, no validation).
 
 ### std:utf8
 
@@ -279,13 +287,15 @@ Orin strings are byte strings that are only *expected* to hold UTF-8; `Utf8Strin
 
 ```
 type Utf8ErrorKind = InvalidLead | TruncatedSequence | InvalidContinuation | Overlong | Surrogate | TooLarge
-type Utf8Error = { position: usize; length: usize; kind: Utf8ErrorKind }
-validate(b: Bytes): Result<Utf8String, Utf8Error>        validateString(s: string): Result<Utf8String, Utf8Error>   // O(n)
-checkUtf8(s): Result<void, Utf8Error>   isValidUtf8(s): bool   utf8ErrorMessage(e)  encode(s: Utf8String): Bytes
-isScalarValue(cp: int): bool   utf8Len(cp): int  @Requires(isScalarValue(cp))   encodeCodePoint(cp): Option<string>
+type Utf8Error = { kind: Utf8ErrorKind; offset: usize; length: usize }
+decode(b: Bytes): Result<Utf8String, Utf8Error>          Utf8String.tryFrom(s: string): Result<Utf8String, Utf8Error>   // O(n)
+validate(s): Result<void, Utf8Error>   isValid(s): bool   utf8ErrorMessage(e)  encode(s: Utf8String): Bytes
+isScalarValue(cp: int): bool   encodedLength(cp): int  @Requires(isScalarValue(cp))   encodeCodePoint(cp): Option<string>
 fromCodePoints(cps: int[]): Option<Utf8String>
+// deprecated for one release: checkUtf8 -> validate, isValidUtf8 -> isValid, validateString -> Utf8String.tryFrom, utf8Len -> encodedLength
+// (the old `validate(b: Bytes)` is now `decode(b)`: the same name with another parameter type has no wrapper)
 
-@Invariant(isValidUtf8(this.text))
+@Invariant(isValid(this.text))
 class Utf8String                                          // new Utf8String(text) validates and traps on invalid input
   asString()  byteLength()  isEmpty()  toBytes()  codePointCount()  codePoints(): int[]  codePointAt(i): Option<int>
   isCharBoundary(i)  concat(o): Utf8String  trySlice(lo, hi): Option<Utf8String>   // slices only at boundaries
@@ -337,25 +347,39 @@ itself; `sumBy` is generic and so outside the fragment. Tests: `tests/std/seq_te
 class IntSet / StringSet          // on Map; invariants: map size == key count, every stored flag true
   size() isEmpty() has(x) add(x): bool remove(x): bool clear() toArray()   // expected O(1); add/remove say whether the set changed
   isSubsetOf(o) union(o) intersection(o) difference(o)                       // O(n + m)
+class Set<T extends Hash>         // the generic set, same algorithm and operations as IntSet (Set<int>) / StringSet (Set<string>); any
+                                  // Hash element: records, unions, Option, arrays, classes with hash/equals. has/add/remove/size/
+                                  // isEmpty/clear/toArray/isSubsetOf/union/intersection/difference
 class Deque<T>                    // ring buffer, doubling from 4 slots, wrap by conditional subtraction; invariants:
                                   // len <= capacity, head in range, a filler value exists exactly when there is storage
   size() isEmpty() capacity() pushBack(x) pushFront(x) popFront() popBack() front() back() get(i) clear() toArray()   // amortised O(1)
 class SortedMap<V>                // int keys: a B-tree in an arena; new SortedMap<V>(minDegree) with minDegree >= 2, use 16
 class SortedStringMap<V>          // the same with string keys in compareStrings order (byte-wise lexicographic)
-  size() isEmpty() height() has(k) get(k): Option<V> put(k, v): bool remove(k): Option<V>   // all O(t log_t n) = O(log n)
-  firstKey() lastKey() floorKey(k) ceilKey(k)   popFirst() popLast(): Option<SortedEntry<V>>  keyArray() valueArray() clear()
+  size() isEmpty() height() has(k) get(k): Option<V> set(k, v): bool remove(k): Option<V>   // all O(t log_t n) = O(log n)
+  firstKey() lastKey() floorKey(k) ceilKey(k)   first() last() popFirst() popLast(): Option<SortedEntry<V>>
+  keys() values() entries(): SortedEntry<V>[]  clear()   // O(n); put -> set, keyArray -> keys, valueArray -> values are deprecated wrappers
+class OrderedMap<K extends Ord, V>  // the generic sorted map: the same B-tree as SortedMap / SortedStringMap (generated from the
+                                  // same template), keys in the order of their Ord instance (records field by field, Option None
+                                  // first, arrays lexicographic, classes by compare); new OrderedMap<K, V>(minDegree), use 16
+  // same methods as SortedMap (set, keys, values, entries, first, last; no deprecated wrappers); entries are OrderedEntry<K, V>.
+  // The contract helpers (isStrictlyIncreasingOrd, OrdNode, btreeOrd*, lowerBoundOrd) are in std:collections/internal
+class MinHeap<T extends Ord>      // the generic queue: the same 4-ary heap, ordered by the value itself, FIFO among equal values
+  size() isEmpty() peek(): Option<T> push(x) pop(): Option<T> allAtLeast(x) clear()   // push/pop O(log n)
 class PriorityQueue<T>            // 4-ary min-heap in three parallel arrays; invariants: equal lengths, heap property (strict,
                                   // on (priority, insertion number)), every insertion number < the counter, which never decreases
-  size() isEmpty() minPriority() peek() push(priority: int, value: T) pop(): Option<PQEntry<T>> allAtLeast(p) clear()   // push/pop O(log n)
+  size() isEmpty() minPriority() peek() push(priority: int, value: T) pop(): Option<PqEntry<T>> allAtLeast(p) clear()   // push/pop O(log n)
 ```
 
-Contracts: `add`/`put` return whether the key was new and the size grows by exactly 1 in that case (`result ==>
+Contracts: `add`/`set` return whether the key was new and the size grows by exactly 1 in that case (`result ==>
 size == old(size) + 1`, `!result ==> size == old(size)`), `has(k)` holds afterwards; `remove` makes `has(k)` false and
 shrinks the size by exactly 1 iff the key was present; `get` is `Some` iff `has`; `floorKey`/`ceilKey` return a present
 key on the right side of `k` and, on `None`, the first/last key proves there is none; `popFirst`/`popLast` return
 `old(firstKey())` / `old(lastKey())` and the remaining keys are strictly beyond it; `PriorityQueue.pop` returns the
 priority `old(minPriority())`, shrinks the size by 1 and every remaining priority is `>=` it (`allAtLeast`), `push`
-makes `minPriority` equal `min(priority, old(minPriority()))`; equal priorities leave first-in first-out. Deque pushes
+makes `minPriority` equal `min(priority, old(minPriority()))`; the generic classes state value equality: `Set.add(x)` makes `has(x)`
+true for any value equal to x, `OrderedMap.set(k, v)` makes `floorKey(k)` the key `k` (equal under `Ord`), `MinHeap.pop()` returns
+a value equal to `old(peek())` and `<=` every value left (`get` after `set` returning `v` itself is not in the contract because `V`
+is unbounded: it would need `V extends Eq`, so the tests check it on `int` and string values); equal priorities leave first-in first-out. Deque pushes
 grow the size by 1 and make the pushed end present, pops shrink it by 1 iff non-empty. Set operations state subset
 relations (`union` contains both operands, `intersection` is contained in both, `difference` is disjoint from the
 other and sizes add up).
@@ -368,26 +392,28 @@ other and sizes add up).
 | `PriorityQueue` | 4-ary implicit heap, struct of arrays (priorities, insertion numbers, values), hole-based sifting (one write per level), FIFO among equal priorities through the insertion number | equal array lengths; every entry leaves strictly before its up to four children (`isMinHeap4`); insertion numbers below a monotone counter | 200,000 random pushes + pops: boxed binary heap with swaps 300 ms, binary SoA hole 164 ms, **4-ary SoA hole 122 ms**, 8-ary 137 ms |
 | `Deque` | ring buffer with doubling growth, wrap by conditional subtraction, no per-element allocation | `len <= capacity`, head in range, filler exists iff there is storage | 500,000 push/pop rounds: `Option<T>` slots with `%` 128 ms, **plain slots 84 ms** (see the gap below) |
 | `IntSet`, `StringSet` | the prelude's open-addressing hash map (`Map<K, bool>`, expected O(1)); `union` copies the larger set and inserts the smaller, `intersection` walks the smaller and probes the larger | map size == key count, every flag true | reviewed: a hash set is the best known structure and the prelude map is already open addressing with an index table; no change |
-| `Bytes`, `ByteBuilder`, `ByteReader` | views over one shared `u8[]` (O(1) slices, cursor reads without copying), geometric `push` growth | `start + len <= data.length`; `pos <= length`; `capacity >= length` | reviewed: `concat` by `push` loop 108 ms vs built-in `slice` + `concat` 104 ms for 20 x 1 MB (no gain), `equals` 1.9 ms/MB, `bytesFromString` 1.2 ms/MB, `toRawString` 6 ms/MB (one 1-byte string per byte: see the gap below); no change |
-| `std:utf8` | Hoehrmann DFA + ASCII runs (see above) | `Utf8String`: `isValidUtf8(text)`; cursor: position on a code point boundary | 1 MB: DFA 0.6 / 1.0 / 1.2 ms (ASCII / mixed / CJK) vs decoder 22 / 16 / 9 ms |
+| `Bytes`, `ByteBuilder`, `ByteReader` | views over one shared `u8[]` (O(1) slices, cursor reads without copying), geometric `push` growth | `start + len <= data.length`; `pos <= length`; `capacity >= length` | reviewed: `concat` by `push` loop 108 ms vs built-in `slice` + `concat` 104 ms for 20 x 1 MB (no gain), `equals` 1.9 ms/MB, `fromString` 1.2 ms/MB, `toRawString` 6 ms/MB (one 1-byte string per byte: see the gap below); no change |
+| `std:utf8` | Hoehrmann DFA + ASCII runs (see above) | `Utf8String`: `isValid(text)`; cursor: position on a code point boundary | 1 MB: DFA 0.6 / 1.0 / 1.2 ms (ASCII / mixed / CJK) vs decoder 22 / 16 / 9 ms |
 
 ### Limitations of this layer (language friction, honest list)
 
-* `Map<K, V>` needs a *concrete* key type (`int`, `usize`, `bool`, `string`; E0400 for a type parameter) and a type
-  parameter has no `==`, `<` or hash (E0410). So there is no generic `Set<T>` or `SortedMap<K, V>`: the sets and maps are
-  specialised by key class (`IntSet`/`StringSet`, `SortedMap<V>`/`SortedStringMap<V>`); `Deque<T>`, the values `V` and the
-  queue elements `T` are generic.
-* The same missing `==` on type parameters means the contracts of the generic containers cannot say "the value that
-  comes back is the one that was put in" (`get` after `put`, the popped element is the pushed one); they state sizes,
-  membership, key/priority order and presence. The tests check the values on `int` and `string` instances and against
-  naive reference models on pseudo-random operation sequences.
+* `Map<K, V>` accepts any `Hash` key (ADR-0034, slice 1: integers, `bool`, `string`, records, unions, `Option`, `Result`, arrays and
+  classes with `hash`; a key type parameter is `K extends Hash`). The generic collections of slice 2 are `Set<T extends Hash>`,
+  `OrderedMap<K extends Ord, V>` and `MinHeap<T extends Ord>`. The names `SortedMap` and `PriorityQueue` of ADR-0034 §Consequences
+  are taken by the specialised classes (`SortedMap<V>` with int keys, `PriorityQueue<T>` with an explicit `int` priority), so the generic
+  ones have their own names until the std freeze decides which names stay. The specialised classes remain and are not aliases: they
+  keep their direct `int` / `string` comparisons, which skip the derived `compare` dispatch of the generic code. `Deque<T>`, the values `V` and the
+  queue elements of `PriorityQueue<T>` are generic.
+* A type parameter has one bound (ADR-0026): `V` of `OrderedMap` is unbounded, so its contracts cannot say "the value that comes back
+  is the one that was put in"; they state it for keys (`K extends Ord`), set elements and heap elements. The tests check values with
+  `assertEqual` and against reference models on pseudo-random operation sequences.
 * A contract cannot call a function value (E0416), so a comparator closure stored in a class could not appear in the heap
   invariant: `PriorityQueue<T>` takes an explicit `int` priority until the Eq/Ord ADR lands. A `T extends Ranked`
   interface would do for ordered classes, but cannot cover `int`/`string` without wrapper classes.
 * **Tooling gaps found while applying the algorithm rule** (feed ADR-0031 A and the Eq/Ord/Hash constraints ADR):
-  1. no equality/ordering/hash on type parameters (E0410, E0400 for `Map<K, _>`): no generic `Set<T>`, `SortedMap<K, V>`,
-     comparator queue; the B-tree needed a code generator to exist for two key types; contracts cannot say "the same
-     value comes back";
+  1. no equality/ordering/hash on type parameters (E0410, E0400 for `Map<K, _>`; **fixed by ADR-0034: slice 1 added
+     `T extends Eq/Ord/Hash`, slice 2 the generic `Set<T>`, `OrderedMap<K, V>` and `MinHeap<T>`**); the B-tree template is generated for
+     three key types (int, string, any `Ord`) because the specialised ones keep direct comparisons;
   2. no uninitialised or default value for a type parameter (a `MaybeUninit`/`default<T>()` or a `T[]` with capacity):
      the ring buffer must either box every slot in `Option<T>` (statable invariant "exactly the live slots are Some",
      but an allocation per element) or hold a filler value in dead slots (fast, the invariant cannot name the dead slots);
@@ -432,39 +458,50 @@ serializer can only write a `Headers`.
 // types
 type HttpVersion = Http10 | Http11
 type Method = Get | Head | Post | Put | Delete | Connect | Options | Trace | Patch | Ext(string)   // Ext: any other token
-type HttpError = { position: usize; reason: HttpReason; message: string }      // 34 reasons: BadMethod ... UnexpectedEof
+type HttpErrorKind = InvalidMethod | InvalidTarget | ... | UnexpectedEof | ParserFinished   // 38 kinds, bare `Invalid*` words
+type HttpError = { kind: HttpErrorKind; offset: usize }                          // text: httpErrorMessage(e); offset = byte offset
 type ParseResult<T> = NeedMore | Done(T, usize) | Failed(HttpError)             // Done(message, bytes of THIS chunk used)
+type ResponseTo = ToHead | ToOther                                               // does the response answer a HEAD request?
+type HttpLimits = { maxStartLine, maxHeaderCount, maxHeaderLine, maxHeaderBytes, maxChunkLine, maxBody: usize }
 class Headers      // invariants: names are tokens, values contain no CR/LF/NUL/other control, no leading/trailing blank
-  new Headers(names: string[], values: string[])      // validates in EVERY build (traps)
-  count()  nameAt(i)  valueAt(i)  countOf(n)  has(n)  get(n): Option<string>  getAll(n): string[]   // names case-insensitive
+  new Headers(names: string[], values: string[])      // validates in EVERY build (traps); tryHeaders(names, values) answers a Result
+  size()  isEmpty()  nameAt(i)  valueAt(i)  countOf(n)  has(n)  get(n): Option<string>  getAll(n): string[]   // names case-insensitive
   add(n, v): Result<void, HeaderError>  set(n, v)  remove(n): usize  equals(o)                       // add/set validate first
+type HeaderError = { kind: HeaderErrorKind }       // InvalidHeaderName | InvalidHeaderValue | MismatchedLists; headerErrorMessage(e)
 class Status       // invariant: 100 <= code <= 599, reason phrase has no CR/LF/NUL
-  new Status(code, reason)  code()  reason()  hasNoBody()  equals(o);   standardStatus(code)  makeStatus(code, reason)
-class Request      // invariant: requestProblem(...) == "" (valid method and target, one Host on HTTP/1.1, unambiguous
-  new Request(method, target, version, headers, body: Bytes, trailers)  // framing that matches the body); traps otherwise
-  method() target() version() headers() body() trailers() isChunked() equals(o);   makeRequest(...): Result<Request, string>
-class Response     // invariant: responseProblem(...) == "" ; forHead = response to a HEAD request
+  new Status(code, reason)  Status.tryNew(code, reason): Result<Status, HttpError>  code()  reason()  hasNoBody()  equals(o);
+  standardStatus(code)
+class Request      // invariant: valid method and target, one Host on HTTP/1.1, unambiguous framing that matches the body
+  new Request(method, target, version, headers, body: Bytes, trailers)                  // traps otherwise
+  Request.tryNew(parts: RequestParts): Result<Request, HttpError>                        // the twin: the violated rule as the error kind
+  method() target() version() headers() body() trailers() isChunked() equals(o)
+class Response     // invariant: the framing matches the body; forHead = response to a HEAD request
   new Response(status, version, headers, body, trailers, forHead)  status() version() headers() body() trailers()
-  isBodyless() isForHead() isChunked() equals(o);   makeResponse(...): Result<Response, string>
+  Response.tryNew(parts: ResponseParts): Result<Response, HttpError>
+  isBodyless() isForHead() isChunked() equals(o)
 // limits
-class Limits       // new Limits(maxStartLine, maxHeaderCount, maxHeaderLine, maxHeaderBytes, maxChunkLine, maxBody); defaultLimits()
+defaultLimits(): HttpLimits    isValidLimits(l): bool      // HttpLimits { ...defaultLimits(), maxBody: 65536 }; a parser traps on invalid limits
 // incremental parsers (state machine, see below)
 class RequestParser   { new RequestParser(limits)  feed(chunk: Bytes): ParseResult<Request>  atEof()  reset()
                         isIdle() isDone() isFailed() consumed() stateName() }
-class ResponseParser  { new ResponseParser(limits, forHead)   feed(chunk): ParseResult<Response>  atEof()  reset() ... }
-parseRequest(data, limits)  parseResponse(data, limits, forHead)  parseResponseToEof(data, limits, forHead)   // one-shot
+class ResponseParser  { new ResponseParser(limits, to: ResponseTo)   feed(chunk): ParseResult<Response>  atEof()  reset() ... }
+parseRequest(data, limits)  parseResponse(data, limits, to)  parseResponseToEof(data, limits, to)   // one-shot
 // serializer: parse(serialize(m)) == m
 serializeRequest(r): Bytes   serializeRequestChunked(r, chunkSize)   serializeResponse(r)   serializeResponseChunked(r, chunkSize)
-// helpers
+// errors
+httpErrorMessage(e)  httpErrorKindName(k)  httpErrorKindText(k)  headerErrorMessage(e)
+// helpers (INTERNAL, ADR-0048 7.3: they belong in `std:http/internal`; exported only until the loader has library submodules)
 methodName  methodFromToken  isToken  isFieldValue  isReasonPhrase  isHostValue  isValidTarget  parseContentLength  eqIgnoreCase
-requestProblem  responseProblem  headerErrorMessage  reasonName  reasonText  stateName  edgeAllowed  hexString
+standardReason  statusHasNoBody  httpError  toLowerAscii  charClass  stateName  edgeAllowed  hexString
+// deprecated for one release (ADR-0048 section 9)
+makeStatus  makeRequest  makeResponse  headersFromLists  reasonName  reasonText  HttpReason  Headers.count()
 ```
 
 ```ts
 import { RequestParser, Done, NeedMore, Failed, defaultLimits, methodName } from "std:http";
 let p = new RequestParser(defaultLimits());
-match (p.feed(bytesFromString("GET /a HTT"))) { NeedMore => ..., Done(q, used) => ..., Failed(e) => ... }  // NeedMore
-match (p.feed(bytesFromString("P/1.1\r\nHost: h\r\n\r\nGET /b"))) {
+match (p.feed(fromString("GET /a HTT"))) { NeedMore => ..., Done(q, used) => ..., Failed(e) => ... }  // NeedMore
+match (p.feed(fromString("P/1.1\r\nHost: h\r\n\r\nGET /b"))) {
   Done(q, used) => { /* q is GET /a; the chunk's remaining bytes (from `used`) start the next message */ p.reset(); }
   ...
 }
@@ -484,9 +521,9 @@ field, `Content-Length` syntax, `Host`) the first byte of that line; for rules o
 for a request-target shape error the first byte of the target. `atEof()` (the peer closed the connection): `Done` for a
 response whose body is delimited by the close (no `Content-Length`, no chunking, RFC 9112 §6.3 rule 8), otherwise
 `Failed(UnexpectedEof)` at the number of bytes received; `isIdle()` tells a clean close between messages from a cut-off
-one. A response to a HEAD request (`forHead`), and every 1xx, 204 and 304 response, has no body whatever its headers say.
+one. A response to a HEAD request (`ToHead`), and every 1xx, 204 and 304 response, has no body whatever its headers say.
 
-### Limits (parameters, `@Requires` and class invariants of `Limits`)
+### Limits (the fields of `HttpLimits`; `isValidLimits` is the `@Requires` of the parser constructors)
 
 | Parameter | Default | Range | Error at the first byte over it |
 |---|---|---|---|
@@ -506,21 +543,21 @@ checked digit by digit against the remaining body allowance, so `FFFFFFFFFFFFFFF
 |---|---|---|
 | bare LF or bare CR where CRLF is required (start line, header lines, chunk lines, chunk end, trailers) | `BareLf`, `BareCr` | 9112 §2.2 |
 | obs-fold (a header line starting with SP or HTAB), also after the request line | `ObsFold` | 9112 §5.2 |
-| whitespace between a field name and the colon; missing colon; empty or non-token name | `SpaceBeforeColon`, `MissingColon`, `BadHeaderName` | 9112 §5.1 |
-| NUL, DEL or any other control character in a field value, reason phrase, chunk extension | `BadHeaderValue`, `BadStatusLine`, `BadChunkExtension` | 9110 §5.5 |
-| invalid method token; a single SP between the three parts; `HTTP/1.0` and `HTTP/1.1` only | `BadMethod`, `BadTarget`, `BadVersion`, `UnsupportedVersion` | 9112 §3 |
-| request-target shape: origin-form, absolute-form, `*` only for OPTIONS, authority-form only for CONNECT; only 0x21..0x7E, no fragment | `BadTarget` | 9112 §3.2 |
-| status code: exactly three digits, 100..599 | `BadStatusCode`, `BadStatusLine` | 9112 §4 |
+| whitespace between a field name and the colon; missing colon; empty or non-token name | `SpaceBeforeColon`, `MissingColon`, `InvalidFieldName` | 9112 §5.1 |
+| NUL, DEL or any other control character in a field value, reason phrase, chunk extension | `InvalidFieldValue`, `InvalidStatusLine`, `InvalidChunkExtension` | 9110 §5.5 |
+| invalid method token; a single SP between the three parts; `HTTP/1.0` and `HTTP/1.1` only | `InvalidMethod`, `InvalidTarget`, `InvalidVersion`, `UnsupportedVersion` | 9112 §3 |
+| request-target shape: origin-form, absolute-form, `*` only for OPTIONS, authority-form only for CONNECT; only 0x21..0x7E, no fragment | `InvalidTarget` | 9112 §3.2 |
+| status code: exactly three digits, 100..599 | `InvalidStatusCode`, `InvalidStatusLine` | 9112 §4 |
 | `Content-Length` and `Transfer-Encoding` together | `ContentLengthWithTransferEncoding` | 9112 §6.3 |
-| duplicate `Content-Length` (even equal values), a list, a sign, hex, more than 18 digits | `DuplicateContentLength`, `BadContentLength` | 9112 §6.3 |
+| duplicate `Content-Length` (even equal values), a list, a sign, hex, more than 18 digits | `DuplicateContentLength`, `InvalidContentLength` | 9112 §6.3 |
 | `Transfer-Encoding` other than exactly `chunked`, a duplicate, on HTTP/1.0 | `UnsupportedTransferEncoding`, `DuplicateTransferEncoding` | 9112 §6.1 |
 | `Content-Length` / `Transfer-Encoding` in a 1xx or 204 response | `ForbiddenFraming` | 9110 §8.6 |
-| chunk size: empty, not hexadecimal (`-1`, `+5`, `0x5`), overflowing the body limit; chunk not followed by CRLF | `BadChunkSize`, `BodyTooLarge`, `BadChunkTerminator` | 9112 §7.1 |
+| chunk size: empty, not hexadecimal (`-1`, `+5`, `0x5`), overflowing the body limit; chunk not followed by CRLF | `InvalidChunkSize`, `BodyTooLarge`, `InvalidChunkTerminator` | 9112 §7.1 |
 | chunk extensions are skipped (control characters refused); trailers parsed with the same field rules, not merged into the headers, framing fields (`Content-Length`, `Transfer-Encoding`, `Trailer`, `Host`) refused | `ForbiddenTrailer` | 9110 §6.5.1 |
-| an HTTP/1.1 request needs exactly one valid `Host` | `MissingHost`, `DuplicateHost`, `BadHost` | 9112 §3.2 |
+| an HTTP/1.1 request needs exactly one valid `Host` | `MissingHost`, `DuplicateHost`, `InvalidHost` | 9112 §3.2 |
 
 Deliberately stricter than the RFC where leniency is only a smuggling risk: no leading empty lines before the request
-line (`BadMethod` at byte 0), no repeated `Content-Length` even if the values are equal, no transfer coding but
+line (`InvalidMethod` at byte 0), no repeated `Content-Length` even if the values are equal, no transfer coding but
 `chunked`, no raw non-ASCII bytes in the request-target.
 
 ### Serializer and the round-trip contract
@@ -529,7 +566,7 @@ line (`BadMethod` at byte 0), no repeated `Content-Length` even if the values ar
 fields in order, the empty line and the body (`Content-Length`/close-delimited bodies as they are, chunked bodies as
 chunks of at most `chunkSize` bytes with the trailers). They add or change nothing: the framing already is
 consistent with the body, because `Request` and `Response` enforce that in their constructor and invariant
-(`requestProblem`, `responseProblem`). **Round-trip contract** (an `@Ensures` of each serializer, checked by `orin
+(the private `requestProblem` / `responseProblem`, whose answer is the kind of `Request.tryNew` / `Response.tryNew` errors). **Round-trip contract** (an `@Ensures` of each serializer, checked by `orin
 test` on every call): the parser accepts the output, with limits that fit it, and returns a message equal to the
 input, `parse(serialize(m)) == m`. A bodyless response (HEAD, 1xx, 204, 304) is written without body bytes.
 `tests/std/http_prop_test.or` also checks the output byte for byte against a naive string-building reference
@@ -605,7 +642,7 @@ and the fuzz harness). **Fuzzing**: 20,000 random mutations of valid requests (f
 truncate, special bytes, CRLF to LF/CR, whitespace around the colon), 10,000 of responses and 10,000 random garbage inputs;
 none may trap, the parser and the specification must agree on accept and refuse, one-shot and random chunking must
 agree, and everything accepted survives parse, serialize, parse unchanged. Five more tests in `tests/std/expect_trap/`
-must trap in every build (constructors of `Headers`, `Status`, `Request`, `Response`, `Limits`).
+must trap in every build (constructors of `Headers`, `Status`, `Request`, `Response` and the parsers, which check `isValidLimits`).
 `tools/mutation.sh std --module http`: 41 mutants of the parser, rules, limits, serializer and constructors, all killed
 (`41 mutants, 41 killed with contracts on: 18 by a contract violation, 23 by tests; 34 of them are also killed without contracts by the first test file that kills them, 5 by the trap tests of the constructors (which run without contracts by design), and 2 (`reset` keeping its error, `consumed` counting the chunk) only show up in that file as contract violations`).
 
@@ -642,20 +679,21 @@ checked at run time and by tests; `orin verify --contracts` does not cover strin
 
 ```ts
 import { Host, useNet } from "std:host";
+import { milliseconds } from "std:time";
 import { useListener, useAccepted, useConnection, useListen, useConnect, recv, sendAll, StreamReader, resolve } from "std:net";
 
 function main(host: Host): void {
   useNet(host, net => {                                    // the root NetGrant (ORIN_DENY=net: every operation refused)
     useListen(net, "127.0.0.1", 8080, l => {               // narrowed: may listen on exactly 127.0.0.1:8080
       useListener(l, "127.0.0.1", 8080, 64, ln => {        // Err(NetError) if refused, in use, ...
-        useAccepted(ln, 1000, (s, peer) => {               // Err(timeout) if nobody came within 1 s
-          const r = recv(s, 4096, 1000);                   // RecvData(Bytes) | RecvEof | RecvTimeout | RecvReset | RecvError
-          sendAll(s, ..., 1000);                           // all bytes, whole-call deadline
+        useAccepted(ln, milliseconds(1000), (s, peer) => { // Err(Timeout) if nobody came within 1 s
+          const r = recv(s, 4096, milliseconds(1000));     // RecvData(Bytes) | RecvEof | RecvTimeout | RecvReset | RecvError
+          sendAll(s, ..., milliseconds(1000));             // all bytes, whole-call deadline
         });
       });
     });
     useConnect(net, "*.example.com", 443, 443, c => {      // narrowed: only names below example.com, port 443
-      useConnection(c, "api.example.com", 443, 2000, s => { ... });
+      useConnection(c, "api.example.com", 443, milliseconds(2000), s => { ... });
     });
   });
 }
@@ -667,16 +705,18 @@ function main(host: Host): void {
 | `useListen / withListen(net, addr, port, body)` | narrowed grant: listen on exactly `addr:port` (an address literal; port 0 = any) |
 | `useConnect / withConnect(net, hostPattern, portLo, portHi, body)` | narrowed grant: connect to / resolve names matching `"*"`, `"*.sfx"` or an exact text, on those ports |
 | `useListener / withListener(net, addr, port, backlog, body: (Listener) => ..)` | bind (SO_REUSEADDR), run body, close; `Err(NetError)` |
-| `useAccepted / withAccepted(ln, timeoutMs, body: (Stream, Peer) => ..)` | accept (TCP_NODELAY), run body, close the stream; `Err` on timeout (`isTimeout`) |
-| `useConnection / withConnection(net, host, port, timeoutMs, body: (Stream) => ..)` | connect, run body, close |
+| `useAccepted / withAccepted(ln, timeout: Duration, body: (Stream, Peer) => ..)` | accept (TCP_NODELAY), run body, close the stream; `Err(Timeout)` (`isTimeout`) |
+| `useConnection / withConnection(net, host, port, timeout: Duration, body: (Stream) => ..)` | connect, run body, close |
 | `useListenerNet`, `useConnectionBeside` | variants whose body also receives the `NetGrant` / the `Listener` again (a closure cannot capture a handle): client and server in one process |
-| `recv(s, maxBytes, timeoutMs): RecvResult` | one wait, 1..min(maxBytes, 64 KiB) bytes, one copy into a fresh `u8[]` (never one string per byte) |
-| `send(s, data, timeoutMs)` / `sendAll(s, data, timeoutMs)` | one attempt (partial write reported) / all bytes, deadline for the whole call |
+| `recv(s, maxBytes, timeout: Duration): RecvResult` | one wait, 1..min(maxBytes, 64 KiB) bytes, one copy into a fresh `u8[]` (never one string per byte) |
+| `send(s, data, timeout: Duration)` / `sendAll(s, data, timeout: Duration)` | one attempt (partial write reported) / all bytes, deadline for the whole call |
 | `shutdownWrite(s)` | half-close (FIN); a graceful close is this, a bounded drain with `recv`, then the scope ends |
 | `StreamReader(cap)`: `readExact(s, n, ms)`, `readUntil(s, delim, limit, ms)`, `readSome`, `buffered`, `unread`, `take` | read-ahead buffer next to the stream (a stream cannot be stored); results `Filled | FillClosed | FillLimit | FillTimeout | FillError`; at most `cap` bytes are ever buffered, `readUntil` receives at most `limit - buffered` bytes at a time; the ms is a deadline for the whole call |
-| `nowMillis(s)` | monotonic clock via a live stream (deadlines without a clock grant) |
+| `monotonicMillis(s)` | monotonic clock via a live stream (deadlines without a clock grant); not `time.nowMillis` (the wall clock) |
 | `resolve(net, name): Result<string[], NetError>` | numeric addresses; the grant's scope must cover `name` |
-| `Peer { host, port }`, `portOf(ln)`, `isDenied / isTimeout / isReset(e)` | values |
+| `parsePeer(text): Result<Peer, NetError>` | `"1.2.3.4:5"` / `"[::1]:5"`; `Err(InvalidPeer)` with the byte offset for anything else (no port-0 sentinel) |
+| `NetError { kind, code, offset }`, `netErrorMessage(e)`, `netErrorFromCode(code)`, `isDenied / isTimeout / isReset(e)` | `NetErrorKind = Denied \| Closed \| Timeout \| Reset \| InvalidArgument \| InvalidPeer \| Os` |
+| `Peer { host, port }`, `portOf(ln)` | values |
 
 **Security properties.** *Statically* (checker, MIR verifier): every network function needs a `NetGrant` / `Listener` /
 `Stream` first (E0470 missing, E0471 wrong family; this now holds for any function whose first parameter is a grant);
@@ -711,7 +751,7 @@ What ADR-0033 provides is enough to do that *correctly*; what it lacks to do it 
    be called on `Eof` only; a timeout is not an end of message (the server answers 408 or closes).
 3. **A monotonic clock and a deadline for the whole head.** Per-call timeouts do not stop a slowloris client that
    sends one byte per `timeout - 1` ms; the limits of `std:http` bound bytes, not time. The server needs a monotonic
-   clock (`std:time.nowMillis` is the wall clock) or a `recv` variant that takes an absolute deadline, to cut off a
+   clock (`std:time.nowMillis` is the wall clock; `std:net` has `monotonicMillis(stream)`) or a `recv` variant that takes an absolute deadline, to cut off a
    request whose head or body is not complete within a total budget; also an idle timeout between pipelined
    messages (`isIdle()` tells a clean close from a cut-off one).
 4. **Half-close.** `net_close` alone makes the OS send RST when unread request bytes remain, which can discard the
@@ -748,6 +788,10 @@ through them. `Html` is *rendered, trusted HTML* and `@Sealed`: only OX, `trustH
 compiler rejects the record literal `Html { .. }` and an assignment to `.html` outside the module), so text from the
 outside can reach the page only escaped, and raw markup is always a visible `trustHtml(...)` call.
 
+Names (ADR-0048): `text`, `document` and `joinAll` are now `fromText`, `renderDocument` and `renderAll` (`text` is also a std module
+name; markup to string is `render`), and `needsEscape` is `hasSpecialChars`. The old names stay for one release as `@Deprecated`
+wrappers. Write `import * as html from "std:html"` in examples: `empty`, `fragment`, `escape` and `document` are generic words.
+
 ### API
 
 | Function | Result |
@@ -756,14 +800,14 @@ outside can reach the page only escaped, and raw markup is always a visible `tru
 | `escape(s): string` | `& < > " '` become `&amp; &lt; &gt; &quot; &#39;`; every other byte is copied unchanged |
 | `safeUrl(s): string` | `s`, or `"about:invalid#orin-unsafe-url"` when `s` has a scheme other than `http`, `https`, `mailto`, `tel` |
 | `escapeUrl(s): string` | `escape(safeUrl(s))`: a URL as a quoted attribute value |
-| `joinAll(xs: Html[]): string` | the concatenation of `x.html` (children from `{items.map(..)}`), in one accumulating string |
+| `renderAll(xs: Html[]): string` | the concatenation of `x.html` (children from `{items.map(..)}`), in one accumulating string |
 | `trustHtml(raw): Html` | raw HTML, **not** escaped: the explicit, auditable escape hatch |
-| `text(s): Html` | `Html { html: escape(s) }` |
+| `fromText(s): Html` | `Html { html: escape(s) }` |
 | `empty(): Html`, `fragment(xs): Html` | no markup; several elements one after the other |
-| `render(h): string`, `document(h): string`, `isEmpty(h): bool` | `h.html`; `"<!DOCTYPE html>" + h.html`; `h.html == ""` |
-| `needsEscape(s)`, `hasSafeScheme(u)`, `isSafeUrl(u)` | predicates used by the contracts (exported so that they can be tested and used in other contracts) |
+| `render(h): string`, `renderDocument(h): string`, `isEmpty(h): bool` | `h.html`; `"<!DOCTYPE html>" + h.html`; `h.html == ""` |
+| `hasSpecialChars(s)`, `hasSafeScheme(u)`, `isSafeUrl(u)` | predicates used by the contracts (exported so that they can be tested and used in other contracts) |
 
-`ox()` names `trustHtml`, `render`, `joinAll`, `escape` and `escapeUrl` as the provider functions (`wrap`, `embed`,
+`ox()` names `trustHtml`, `render`, `renderAll`, `escape` and `escapeUrl` as the provider functions (`wrap`, `embed`,
 `embedAll`, `text` / `attr`, the URL rule); the first three are `@Inline`.
 
 ### Escaping
@@ -789,13 +833,13 @@ scheme `:x`. `safeUrl` does not escape: use `escapeUrl` for the attribute value.
 
 Every exported function has `@Ensures`; the executable ones (checked by `orin test`, trapping on violation):
 
-* `escape`: the result contains none of `<`, `>`, `"`, `'`; `result.length >= s.length`; `!needsEscape(s) ==> result == s`;
-  `needsEscape(s) ==> result.length > s.length`.
+* `escape`: the result contains none of `<`, `>`, `"`, `'`; `result.length >= s.length`; `!hasSpecialChars(s) ==> result == s`;
+  `hasSpecialChars(s) ==> result.length > s.length`.
 * `safeUrl`: `result == s || result == "about:invalid#orin-unsafe-url"`; `isSafeUrl(result)`;
   `hasSafeScheme(s) ==> result == s`; `!hasSafeScheme(s) ==> result` is the constant. `escapeUrl`: equals `escape(safeUrl(s))`,
   so it contains none of `<>"'` either.
-* `joinAll`: empty gives `""`, one element gives its `html`, and the result starts with the first and ends with the last
-  element (so no element is skipped at the ends). `text`, `trustHtml`, `fragment`, `render`, `document`, `isEmpty`: the
+* `renderAll`: empty gives `""`, one element gives its `html`, and the result starts with the first and ends with the last
+  element (so no element is skipped at the ends). `fromText`, `trustHtml`, `fragment`, `render`, `renderDocument`, `isEmpty`: the
   equation of the table above.
 
 ### Tests
@@ -809,8 +853,8 @@ pseudo-random mixes of the special characters, letters, entities and multi-byte 
 test checks that `safeUrl` is the identity or the constant and that `isSafeUrl` always holds for the result.
 `tools/mutation.sh std --module html`: 41 mutants (dropped or wrong entities, off-by-one in the run copying, `javascript` or
 `data` accepted, `tel`/`mailto` rejected, case-sensitive or length-agnostic scheme comparison, the `/`, `?`, `#` cut-offs,
-empty scheme accepted, `safeUrl` or `escapeUrl` skipping a step, `joinAll` skipping the first or last element, wrong
-`document`/`text`/`trustHtml`/`fragment`/`isEmpty`), all killed with and without contracts (23 by a contract violation).
+empty scheme accepted, `safeUrl` or `escapeUrl` skipping a step, `renderAll` skipping the first or last element, wrong
+`renderDocument`/`fromText`/`trustHtml`/`fragment`/`isEmpty`), all killed with and without contracts (23 by a contract violation).
 
 ### Not guaranteed
 
@@ -873,6 +917,7 @@ above; a pool lives for one call (worker threads are started per operation, abou
 * Generic methods do not exist (E0460); `Graph<T>` has no edge weights and needs a caller-supplied tag.
 * Diagnostics print std types with their unit name (`$stdlib/graph.GraphId<int>`).
 * `std:clock` is importable but internal; so is `std:fsraw` (the raw open/close and grant primitives behind `std:fs` and `std:host`; only library code may import it).
+* `std:collections/internal` and `std:bytes/internal` (files `collections_internal.or`, `bytes_internal.or`) hold the contract helpers (`allTrue`, `isStrictlyIncreasing`, `isMinHeap4`, the B-tree shape and order checks, `allBytes`, ...) and the generated B-tree node types behind the public modules (ADR-0048 rule 7.3). They are not API and can change in any release; user code does not import them.
 * `std:fs` streaming: text/byte-string API without seek, no directory operations, at most 256 open files.
 
 ## Bounded shell execution (unstable)
@@ -906,21 +951,19 @@ function main(host: Host): void {
 Strict byte-based Hex, Base64 and Base64URL codecs with explicit padding policy
 and structured errors containing byte offsets. See [API, errors and complexity](std-encoding.md).
 
-## std:jsonnumber
+## std:json
 
-Exact validated JSON numeric tokens and checked decimal/exponent-to-int conversion,
-with full i64 preservation and structured errors. Separate from legacy std:json;
-see [API, bounds and validation](std-jsonnumber.md).
+Bounded JSON documents (`JsonValue`, `parseDocument`, `writeDocument`, `defaultLimits`, `defaultReadOptions`,
+`jsonParseErrorMessage`, `jsonWriteErrorMessage`) with exact numbers, ordered members, an explicit duplicate
+policy, strict Unicode and per-call budgets. See [API, limits and errors](std-json.md).
 
-## std:jsonvalue
+## std:json/number
 
-Opt-in bounded JSON document parser and compact writer, with exact std:jsonnumber
-tokens, ordered members, explicit duplicate policy, strict Unicode and per-call
-budgets. Legacy std:json is unchanged. See [API, limits and errors](std-jsonvalue.md).
+Exact validated JSON numeric tokens and checked decimal/exponent-to-int conversion, with full i64
+preservation and structured errors. See [API, bounds and validation](std-json-number.md).
 
-## std:jsondecode
+## std:json/decode
 
-Pure field-path validation over bounded JsonValue trees: sealed cursors, exact
-integer ranges, absent/null distinction, explicit unknown-field policy, and
-structural JSON Pointer errors. See [API, ordering and complexity](std-jsondecode.md)
-and the [config example](../examples/json_config.or).
+Pure field-path validation over bounded `JsonValue` trees: sealed cursors, exact integer ranges, absent/null
+distinction, explicit unknown-field policy, structural JSON Pointer errors and `decodeErrorMessage`. See
+[API, ordering and complexity](std-json-decode.md) and the [config example](../examples/json_config.or).

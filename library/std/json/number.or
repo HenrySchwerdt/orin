@@ -1,0 +1,246 @@
+// std:json/number -- exact JSON numeric lexemes (ADR-0048 section 7.1; formerly std:jsonnumber).
+// Grammar, errors, precedence, allocation and bounds: docs/std-json-number.md.
+// Every JsonNumber is validated even when contracts are disabled.
+
+// JsonNumber -- the exact validated ASCII lexeme (`1`, `1.0`, `-0`, `1e999` stay distinct); only this
+// module can construct one.
+@Sealed
+export type JsonNumber = { token: string; };
+
+// NumberErrorKind -- why a number operation failed. The final three kinds are reserved by the approved JSON RFC for later float
+// utilities; none of the current functions emits them.
+export type NumberErrorKind =
+  InvalidNumber
+  | NumberLimit
+  | InvalidLimits
+  | NotIntegral
+  | IntegerRange
+  | NonFinite
+  | FloatOverflow
+  | FloatUnderflow;
+// NumberError -- `offset` is the byte offset of the first invalid byte (or the limit) when the input text is at
+// fault, None for conversion failures of a valid token.
+export type NumberError = { kind: NumberErrorKind; offset: Option<usize>; };
+
+function error(kind: NumberErrorKind, offset: Option<usize>): NumberError {
+  return NumberError { kind: kind, offset: offset };
+}
+
+// numberErrorMessage(e: NumberError): string -- the cause, plus " at byte N" when `offset` is present. O(1).
+@Ensures(result.length > 0)
+export function numberErrorMessage(e: NumberError): string {
+  const why = match (e.kind) {
+    InvalidNumber => "invalid JSON number",
+    NumberLimit => "JSON number exceeds byte limit",
+    InvalidLimits => "JSON number byte limit must be positive",
+    NotIntegral => "JSON number is not an integer",
+    IntegerRange => "JSON number is outside the int range",
+    NonFinite => "non-finite number",
+    FloatOverflow => "float overflow",
+    FloatUnderflow => "float underflow",
+  };
+  if (e.offset.isSome()) {
+    return why + " at byte " + e.offset.unwrap().toString();
+  }
+  return why;
+}
+
+function digit(c: int): bool {
+  return c >= 48 && c <= 57;
+}
+
+// Returns the first invalid byte/EOF, or None for a complete valid token.
+function invalidAt(s: string): Option<usize> {
+  const n = s.length;
+  let i: usize = 0;
+  if (i < n && s.charCodeAt(i) == 45) {
+    i += 1;
+  }
+  if (i == n) {
+    return Some(i);
+  }
+  if (s.charCodeAt(i) == 48) {
+    i += 1;
+  } else {
+    if (s.charCodeAt(i) < 49 || s.charCodeAt(i) > 57) {
+      return Some(i);
+    }
+    while (i < n && digit(s.charCodeAt(i))) {
+      i += 1;
+    }
+  }
+  if (i < n && s.charCodeAt(i) == 46) {
+    i += 1;
+    if (i == n || !digit(s.charCodeAt(i))) {
+      return Some(i);
+    }
+    while (i < n && digit(s.charCodeAt(i))) {
+      i += 1;
+    }
+  }
+  if (i < n && (s.charCodeAt(i) == 101 || s.charCodeAt(i) == 69)) {
+    i += 1;
+    if (i < n && (s.charCodeAt(i) == 43 || s.charCodeAt(i) == 45)) {
+      i += 1;
+    }
+    if (i == n || !digit(s.charCodeAt(i))) {
+      return Some(i);
+    }
+    while (i < n && digit(s.charCodeAt(i))) {
+      i += 1;
+    }
+  }
+  return i == n ? None : Some(i);
+}
+
+// jsonNumber(text, maxBytes): Result<JsonNumber, NumberError> -- validates `text` as one JSON number token.
+// Errors, in order: InvalidLimits (maxBytes == 0), NumberLimit (text longer than maxBytes, offset maxBytes),
+// InvalidNumber (offset of the first invalid byte or text.length). Retains the original immutable string (no
+// token copy); the lexeme spelling is preserved. Never traps. O(n) time, O(1) allocation.
+@Ensures(result.isOk() ==> result.unwrap().token == text && text.length <= maxBytes)
+@Ensures(result.isErr()
+    ==> result.unwrapErr().offset.isNone() || result.unwrapErr().offset.unwrap() <= text.length)
+export function jsonNumber(text: string, maxBytes: usize): Result<JsonNumber, NumberError> {
+  if (maxBytes == 0) {
+    return Err(error(InvalidLimits, None));
+  }
+  if (text.length > maxBytes) {
+    return Err(error(NumberLimit, Some(maxBytes)));
+  }
+  const bad = invalidAt(text);
+  if (bad.isSome()) {
+    return Err(error(InvalidNumber, bad));
+  }
+  return Ok(JsonNumber { token: text });
+}
+
+// numberFromInt(n: int): JsonNumber -- the token of `n`, exact including -9223372036854775808. Never fails.
+// O(1) (bounded by the int width).
+@Ensures(result.token == n.toString())
+export function numberFromInt(n: int): JsonNumber {
+  return JsonNumber { token: n.toString() };
+}
+
+// numberAsInt(n: JsonNumber): Result<int, NumberError> -- the integer value of the token when it is integral
+// (`1e3`, `10.0`) and fits the int range. Errors: NotIntegral, IntegerRange (a NotIntegral result wins for
+// fractional values); `offset` is always None because the token is valid. Never traps. O(token bytes), no
+// exponent expansion.
+@Ensures(result.isErr() ==> result.unwrapErr().offset.isNone())
+export function numberAsInt(n: JsonNumber): Result<int, NumberError> {
+  const s = n.token;
+  const len = s.length;
+  const negative = s.charCodeAt(0) == 45;
+  const start: usize = negative ? 1 : 0;
+  let i = start;
+  let fraction: usize = 0;
+  let afterPoint = false;
+  let significant: usize = 0;
+  let trailing: usize = 0;
+  let nonzero = false;
+  while (i < len && s.charCodeAt(i) != 101 && s.charCodeAt(i) != 69) {
+    const c = s.charCodeAt(i);
+    if (c == 46) {
+      afterPoint = true;
+    } else {
+      if (afterPoint) {
+        fraction += 1;
+      }
+      if (c != 48) {
+        nonzero = true;
+        trailing = 0;
+      } else {
+        if (nonzero) {
+          trailing += 1;
+        }
+      }
+      if (nonzero) {
+        significant += 1;
+      }
+    }
+    i += 1;
+  }
+  // Zero remains integral for any valid exponent, including enormous ones.
+  if (!nonzero) {
+    return Ok(0);
+  }
+  let exponent: usize = 0;
+  let exponentNegative = false;
+  let huge = false;
+  // Runtime strings have at most 2^48 bytes (str_alloc), so +20 cannot overflow
+  // usize. A magnitude > len+20 forces range/non-integrality for nonzero input.
+  const cap = len + 20;
+  if (i < len) {
+    i += 1;
+    if (s.charCodeAt(i) == 45 || s.charCodeAt(i) == 43) {
+      exponentNegative = s.charCodeAt(i) == 45;
+      i += 1;
+    }
+    while (i < len) {
+      const d = (s.charCodeAt(i) - 48).toUsize();
+      if (!huge) {
+        if (exponent > (cap - d) / 10) {
+          huge = true;
+        } else {
+          exponent = exponent * 10 + d;
+        }
+      }
+      i += 1;
+    }
+  }
+  if (huge) {
+    return Err(error(exponentNegative ? NotIntegral : IntegerRange, None));
+  }
+  let count: usize = 0;
+  if (exponentNegative) {
+    if (fraction > trailing || exponent > trailing - fraction) {
+      return Err(error(NotIntegral, None));
+    }
+    count = significant - fraction - exponent;
+  } else {
+    if (exponent < fraction) {
+      const discard = fraction - exponent;
+      if (discard > trailing) {
+        return Err(error(NotIntegral, None));
+      }
+      count = significant - discard;
+    } else {
+      const zeros = exponent - fraction;
+      if (zeros > 19 || significant > 19 - zeros) {
+        return Err(error(IntegerRange, None));
+      }
+      count = significant + zeros;
+    }
+  }
+  if (count > 19) {
+    return Err(error(IntegerRange, None));
+  }
+  const limit: int = negative ? -9223372036854775807 - 1 : -9223372036854775807;
+  const cutoff = limit / 10;
+  const last = 0 - limit % 10;
+  let value = 0;
+  let taken: usize = 0;
+  let began = false;
+  i = start;
+  while (taken < count) {
+    let d = 0;
+    if (i < len && s.charCodeAt(i) != 101 && s.charCodeAt(i) != 69) {
+      const c = s.charCodeAt(i);
+      i += 1;
+      if (c == 46) {
+        continue;
+      }
+      d = c - 48;
+      if (!began && d == 0) {
+        continue;
+      }
+      began = true;
+    }
+    // Accumulate negatively, preserving i64 minimum without abs/negation overflow.
+    if (value < cutoff || value == cutoff && d > last) {
+      return Err(error(IntegerRange, None));
+    }
+    value = value * 10 - d;
+    taken += 1;
+  }
+  return Ok(negative ? value : 0 - value);
+}

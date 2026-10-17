@@ -1,0 +1,780 @@
+// Expansion of companion modules (ADR-0046 §4, slice S4: expansion without running processors).
+//
+// The loader turns an import of `"./m.gen"` into a placeholder unit: an empty module placed right after the source module
+// `m`. This pass fills the placeholders. It runs only for a program that has such a placeholder (or for `orin expand`), so
+// every other program is returned unchanged and pays nothing.
+//
+//   1. The runs: every (annotation, source module) pair, where the module uses the annotation and a recorded output exists
+//      (the test hook: a sidecar file `<module>.gen.<Annotation>.json` next to the module, see docs/annotation-processors.md).
+//      Annotations without a recorded output are plain metadata.
+//   2. A module that has a run must not depend on any companion, directly or transitively (E0521).
+//   3. The sub-program of the units that do not depend on a companion is checked (it contains every source module).
+//   4. The snapshot (`std:meta` `Input`) of each run is built from the checked sources, with a distinct `freshBase`.
+//   5. The recorded `Output` is converted into syntax trees, directly (no printing and parsing), every node carrying the
+//      span of the annotation use that caused it; a processor diagnostic points at the span of the ref it names.
+//   6. Hygiene: the exported names of one companion are unique across its runs (E0449).
+//   7. The companion's placeholder gets the imports and declarations; the units are put in dependency order again if a
+//      generated import names a module that was loaded after the companion. The caller checks the complete program next.
+
+import { FsGrant, exists, readFile } from "std:fs";
+import { ProcessGrant } from "std:process";
+import { Diagnostic, SourceMap, Span, diag } from "../diag";
+import { Item, Module, ImportDecl, Ident } from "../syntax";
+import { LoadedProgram, Unit, ImportTarget, ImportUnit, ImportStd, ImportResolver, Sources, dirname, companionPath } from "../loader";
+import { edgeError } from "../package";
+import { check } from "../check";
+import { cmpStr } from "../analysis";
+import { ensureMain } from "../testing";
+import {
+  Run, Snapshot, findRuns, buildSnapshot, outputItems, GenOutput, ProcDiag, moduleLabel, isUserUnit, RunItems,
+  hygieneDiags,
+} from "../meta";
+import { Processor, findProcessors, processorFor, processorDiags, trusted, W_NOT_TRUSTED } from "./processors";
+import { ProcConfig, runProcessor, DECLARATION_LIMIT } from "./helper";
+
+// Where generated code points: the span of the annotation use, and what to tell the user about it.
+export type Cause = { span: Span; note: string; };
+
+// One processor run with its recorded output.
+export type RunResult = { run: Run; label: string; path: string; snap: Snapshot; out: GenOutput; text: string; };
+
+// All runs over one source module.
+export type Companion = { source: usize; name: string; runs: RunResult[]; };
+
+export type Expansion = {
+  program: LoadedProgram;
+  causes: Cause[];
+  warnings: Diagnostic[];
+  companions: Companion[];
+};
+
+// The distance between the `freshBase` of two runs (a processor makes far fewer fresh names than this).
+const FRESH_STRIDE: int = 10000;
+
+// The error code of an unusable recorded output or a failed processor run (S5), and of a diagnostic the processor reported
+// itself. W0490: the processors could not be run (`orin check` without a C compiler).
+const E_OUTPUT: string = "E0520";
+const W_NOT_RUN: string = "W0490";
+const E_PROCESSOR: string = "E0522";
+const W_PROCESSOR: string = "W0491";
+
+export function unchanged(prog: LoadedProgram): Expansion {
+  return Expansion { program: prog, causes: [], warnings: [], companions: [] };
+}
+
+function isGenUnit(prog: LoadedProgram, i: usize): bool {
+  const p = prog.units[i].path;
+  return !p.startsWith("$") && p.endsWith(".gen");
+}
+
+function hasGenUnit(prog: LoadedProgram): bool {
+  let i: usize = 0;
+  while (i < prog.units.length) {
+    if (isGenUnit(prog, i)) {
+      return true;
+    }
+    i += 1;
+  }
+  return false;
+}
+
+// For every unit: does it depend, directly or transitively, on a companion unit (is it one)?
+function dependsOnGen(prog: LoadedProgram): bool[] {
+  let dep: bool[] = [];
+  let i: usize = 0;
+  while (i < prog.units.length) {
+    let d = isGenUnit(prog, i);
+    for (const t of prog.units[i].imports) {
+      match (t) {
+        ImportUnit(j) => {
+          if (j < dep.length && dep[j]) {
+            d = true;
+          }
+        },
+        ImportStd(_) => {},
+      }
+    }
+    dep.push(d);
+    i += 1;
+  }
+  return dep;
+}
+
+// The import chain from unit `from` to a companion, as unit names.
+function chainToGen(prog: LoadedProgram, dep: bool[], start: usize): string[] {
+  let chain: string[] = [prog.units[start].name];
+  let cur = start;
+  let guard: usize = 0;
+  while (!isGenUnit(prog, cur) && guard <= prog.units.length) {
+    let next: Option<usize> = None;
+    for (const t of prog.units[cur].imports) {
+      match (t) {
+        ImportUnit(j) => {
+          if (next.isNone() && dep[j]) {
+            next = Some(j);
+          }
+        },
+        ImportStd(_) => {},
+      }
+    }
+    if (next.isNone()) {
+      break;
+    }
+    cur = next.unwrap();
+    chain.push(prog.units[cur].name);
+    guard += 1;
+  }
+  return chain;
+}
+
+// The sidecar file of the output recorded for `annotation` on the module in `unitPath`: `models.or` -> `models.gen.Json.json`.
+export function sidecarPath(unitPath: string, annotation: string): string {
+  const base = unitPath.endsWith(".or") ? unitPath.substring(0, unitPath.length - 3) : unitPath;
+  return base + ".gen." + annotation + ".json";
+}
+
+function annotationText(r: Run): string {
+  return "@" + r.annoName;
+}
+
+// "`@Json` on `User`", or "`@Json` on `User`, `Order` and 2 more declarations".
+function runLabel(r: Run): string {
+  let names = "";
+  let i: usize = 0;
+  while (i < r.names.length && i < 3) {
+    names += (i > 0 ? ", " : "") + "`" + r.names[i] + "`";
+    i += 1;
+  }
+  if (r.names.length > 3) {
+    names += " and " + (r.names.length - 3).toString() + " more";
+  }
+  return "`" + annotationText(r) + "` on " + names;
+}
+
+// `proc` is the processor to execute for the run; None when the output is the recorded one (the test hook, which wins over a
+// processor of the same annotation).
+type Planned = { run: Run; path: string; text: string; proc: Option<Processor>; };
+
+type Plan = { runs: Planned[]; warnings: Diagnostic[]; };
+
+// The runs of the program that have a recorded output, per unit in unit order, each unit's runs ordered by annotation
+// module path and annotation name (ADR-0046 §4: processor order).
+function plan(fs: FsGrant, prog: LoadedProgram): Result<Plan, Diagnostic[]> {
+  const procs = findProcessors(prog).procs;
+  let out: Planned[] = [];
+  let warnings: Diagnostic[] = [];
+  let ui: usize = 0;
+  while (ui < prog.units.length) {
+    if (isUserUnit(prog, ui)) {
+      let mine: Planned[] = [];
+      for (const r of findRuns(prog, ui)) {
+        const path = sidecarPath(prog.units[ui].path, r.annoName);
+        if (exists(fs, path)) {
+          const t = readFile(fs, path);
+          if (t.isErr()) {
+            return Err([diag(E_OUTPUT, r.cause, "cannot read the recorded output `" + path + "`: " + t.unwrapErr())]);
+          }
+          mine.push(Planned { run: r, path: path, text: t.unwrap(), proc: None });
+          continue;
+        }
+        const pr = processorFor(procs, r.annoUnit, r.annoName);
+        if (pr.isNone()) {
+          continue;
+        }
+        const tr = trusted(prog, pr.unwrap().unit);
+        if (tr.isErr()) {
+          warnings.push(
+            diag(
+              W_NOT_TRUSTED,
+              r.cause,
+              "the processor `" + pr.unwrap().name + "` of `" + annotationText(r) + "` was not run: " + tr.unwrapErr(),
+            ),
+          );
+          continue;
+        }
+        mine.push(Planned { run: r, path: "", text: "", proc: pr });
+      }
+      out = out.concat(sortPlanned(prog, mine));
+    }
+    ui += 1;
+  }
+  return Ok(Plan { runs: out, warnings: warnings });
+}
+
+function before(prog: LoadedProgram, a: Run, b: Run): bool {
+  const la = moduleLabel(prog, a.annoUnit);
+  const lb = moduleLabel(prog, b.annoUnit);
+  if (la != lb) {
+    return cmpStr(la, lb) < 0;
+  }
+  return cmpStr(a.annoName, b.annoName) < 0;
+}
+
+function sortPlanned(prog: LoadedProgram, xs: Planned[]): Planned[] {
+  let out = xs;
+  let i: usize = 1;
+  while (i < out.length) {
+    let j = i;
+    while (j > 0 && before(prog, out[j].run, out[j - 1].run)) {
+      const t = out[j];
+      out[j] = out[j - 1];
+      out[j - 1] = t;
+      j -= 1;
+    }
+    i += 1;
+  }
+  return out;
+}
+
+// The program without the units that depend on a companion, as a program of its own: indices renumbered, its last unit is
+// the entry (given an empty `main` when it has none, like `orin test`).
+function subProgram(prog: LoadedProgram, keep: bool[]): LoadedProgram {
+  let remap: usize[] = [];
+  let units: Unit[] = [];
+  let i: usize = 0;
+  while (i < prog.units.length) {
+    remap.push(units.length);
+    if (keep[i]) {
+      units.push(prog.units[i]);
+    }
+    i += 1;
+  }
+  let k: usize = 0;
+  while (k < units.length) {
+    units[k] = withTargets(units[k], remapTargets(units[k].imports, remap));
+    k += 1;
+  }
+  if (units.length == 0) {
+    return prog;
+  }
+  return ensureMain(LoadedProgram { units: units, entry: units.length - 1, manifest: prog.manifest });
+}
+
+function remapTargets(ts: ImportTarget[], remap: usize[]): ImportTarget[] {
+  let out: ImportTarget[] = [];
+  for (const t of ts) {
+    match (t) {
+      ImportUnit(j) => {
+        out.push(ImportUnit(remap[j]));
+      },
+      ImportStd(m) => {
+        out.push(ImportStd(m));
+      },
+    }
+  }
+  return out;
+}
+
+function withTargets(u: Unit, ts: ImportTarget[]): Unit {
+  return Unit { file: u.file, path: u.path, name: u.name, module: u.module, ast: u.ast, imports: ts };
+}
+
+function withAst(u: Unit, ast: Module, ts: ImportTarget[]): Unit {
+  return Unit { file: u.file, path: u.path, name: u.name, module: u.module, ast: ast, imports: ts };
+}
+
+// Resolves the import of generated code in the companion of unit `src` with the loader's rules (`ImportResolver`: std
+// modules, relative paths, module boundaries E0302) to a unit of the program or a runtime module, and applies the
+// manifest's module rules (E0501) to the edge from the module of `src`. Generated code can import only what the program
+// has loaded already (the loader ran before the outputs were known).
+function resolveImport(fs: FsGrant, prog: LoadedProgram, src: usize, d: ImportDecl): Result<ImportTarget, Diagnostic> {
+  if (d.path.startsWith(".") && d.path.endsWith(".gen")) {
+    return Err(
+      diag(
+        E_OUTPUT,
+        d.pathSpan,
+        "generated code cannot import another companion module (`" + d.path + "`): there is one round of expansion",
+      ),
+    );
+  }
+  const resolver = new ImportResolver(new Sources([]), dirname(prog.units[prog.entry].path));
+  const r = resolver.resolve(fs, prog.units[src].path, d.path, d.pathSpan)?;
+  if (r.std.isSome()) {
+    return Ok(ImportStd(r.std.unwrap()));
+  }
+  let i: usize = 0;
+  while (i < prog.units.length) {
+    if (prog.units[i].path == r.path) {
+      const fromMod = prog.units[src].module;
+      const toMod = prog.units[i].module;
+      if (prog.manifest.isSome() && fromMod != "" && toMod != "" && fromMod != toMod) {
+        const bad = edgeError(prog.manifest.unwrap(), fromMod, toMod);
+        if (bad.isSome()) {
+          return Err(diag("E0501", d.pathSpan, bad.unwrap()));
+        }
+      }
+      return Ok(ImportUnit(i));
+    }
+    i += 1;
+  }
+  return Err(
+    diag(
+      E_OUTPUT,
+      d.pathSpan,
+      "`" + d.path + "` is not loaded by the program: import it in a module of the program first",
+    ),
+  );
+}
+
+// Puts the units in dependency order again (a stable depth-first order: a unit follows the units it imports, otherwise the
+// order is kept). Needed when a companion imports a module that was loaded after it.
+function reordered(prog: LoadedProgram): LoadedProgram {
+  const n = prog.units.length;
+  let ordered = true;
+  let i: usize = 0;
+  while (i < n) {
+    for (const t of prog.units[i].imports) {
+      match (t) {
+        ImportUnit(j) => {
+          if (j >= i) {
+            ordered = false;
+          }
+        },
+        ImportStd(_) => {},
+      }
+    }
+    i += 1;
+  }
+  if (ordered) {
+    return prog;
+  }
+  let pos: usize[] = [];
+  let seen: bool[] = [];
+  i = 0;
+  while (i < n) {
+    pos.push(0);
+    seen.push(false);
+    i += 1;
+  }
+  let vis = Vis { done: seen, order: [] };
+  i = 0;
+  while (i < n) {
+    vis = visitUnit(prog, i, vis);
+    i += 1;
+  }
+  const order = vis.order;
+  let k: usize = 0;
+  while (k < order.length) {
+    pos[order[k]] = k;
+    k += 1;
+  }
+  let units: Unit[] = [];
+  for (const o of order) {
+    units.push(withTargets(prog.units[o], remapTargets(prog.units[o].imports, pos)));
+  }
+  return LoadedProgram { units: units, entry: pos[prog.entry], manifest: prog.manifest };
+}
+
+type Vis = { done: bool[]; order: usize[]; };
+
+function visitUnit(prog: LoadedProgram, i: usize, vis: Vis): Vis {
+  if (vis.done[i]) {
+    return vis;
+  }
+  let v = vis;
+  v.done[i] = true;
+  for (const t of prog.units[i].imports) {
+    match (t) {
+      ImportUnit(j) => {
+        v = visitUnit(prog, j, v);
+      },
+      ImportStd(_) => {},
+    }
+  }
+  v.order.push(i);
+  return v;
+}
+
+// The companions of the runs, and the warnings of runs that were not executed.
+type Ran = { companions: Companion[]; warnings: Diagnostic[]; };
+
+// The result of executing a processor: its encoded `Output`, or the W0490 warning when the run was skipped.
+type Exec = { text: string; skip: Option<Diagnostic>; };
+
+// Executes the processor of a run (S5).
+function execute(
+  fs: FsGrant,
+  proc: ProcessGrant,
+  prog: LoadedProgram,
+  sm: SourceMap,
+  p: Planned,
+  label: string,
+  input: string,
+  cfg: ProcConfig,
+): Result<Exec, Diagnostic> {
+  const pr = p.proc.unwrap();
+  const where = "module `" + moduleLabel(prog, p.run.unit) + "`";
+  const ex = runProcessor(fs, proc, prog, sm, pr, where, input, cfg);
+  if (ex.isErr()) {
+    const f = ex.unwrapErr();
+    let d = diag(E_OUTPUT, p.run.cause, "processor `" + pr.name + "` (" + label + ", " + where + ") failed: " + f.message);
+    if (f.stderr != "") {
+      d.notes.push("stderr: " + f.stderr);
+    }
+    return Err(d);
+  }
+  if (ex.unwrap().skipped) {
+    return Ok(
+      Exec {
+        text: "",
+        skip: Some(
+          diag(
+            W_NOT_RUN,
+            p.run.cause,
+            "processors not run: " + ex.unwrap().why + "; the companion module of " + where + " stays empty",
+          ),
+        ),
+      },
+    );
+  }
+  return Ok(Exec { text: ex.unwrap().text, skip: None });
+}
+
+// The runs of the program with their snapshots and converted outputs, grouped per source module. Errors: E0520 (output not
+// usable, processor failed, too many generated declarations), E0522 (the processor reported an error).
+function runAll(
+  fs: FsGrant,
+  proc: ProcessGrant,
+  prog: LoadedProgram,
+  sm: SourceMap,
+  planned: Planned[],
+  display: bool,
+  cfg: ProcConfig,
+): Result<Ran, Diagnostic[]> {
+  let companions: Companion[] = [];
+  let diags: Diagnostic[] = [];
+  let warns: Diagnostic[] = [];
+  let declared: usize = 0;
+  let k: usize = 0;
+  while (k < planned.length) {
+    const p = planned[k];
+    const label = runLabel(p.run);
+    const snap = buildSnapshot(prog, sm, p.run, (k.toInt() + 1) * FRESH_STRIDE);
+    if (snap.isErr()) {
+      return Err([diag(E_OUTPUT, p.run.cause, "cannot build the input for " + label + ": " + snap.unwrapErr())]);
+    }
+    let text = p.text;
+    let origin = "the recorded output `" + p.path + "`";
+    if (p.proc.isSome()) {
+      const ex = execute(fs, proc, prog, sm, p, label, snap.unwrap().text, cfg);
+      if (ex.isErr()) {
+        return Err([ex.unwrapErr()]);
+      }
+      if (ex.unwrap().skip.isSome()) {
+        warns.push(ex.unwrap().skip.unwrap());
+        k += 1;
+        continue;
+      }
+      text = ex.unwrap().text;
+      origin = "the output of the processor `" + p.proc.unwrap().name + "`";
+    }
+    const sp = display ? Span { file: 0, start: 0, end: 2 } : p.run.cause;
+    const out = outputItems(text, sp);
+    if (out.isErr()) {
+      return Err([
+        diag(E_OUTPUT, p.run.cause, origin + " for " + label + " is not usable: " + out.unwrapErr()),
+      ]);
+    }
+    declared += out.unwrap().items.length;
+    if (declared > DECLARATION_LIMIT) {
+      return Err([
+        diag(
+          E_OUTPUT,
+          p.run.cause,
+          origin + " for " + label + " exceeds the limit of " + DECLARATION_LIMIT.toString()
+              + " generated declarations per program",
+        ),
+      ]);
+    }
+    for (const d of out.unwrap().diags) {
+      let at = p.run.cause;
+      if (d.at >= 0 && d.at.toUsize() < snap.unwrap().refs.length) {
+        at = snap.unwrap().refs[d.at.toUsize()];
+      } else {
+        diags.push(diag(E_OUTPUT, p.run.cause, origin + " has a diagnostic with the unknown ref " + d.at.toString()));
+      }
+      if (d.error) {
+        let e = diag(E_PROCESSOR, at, d.message);
+        e.notes.push("reported by the processor of " + label);
+        diags.push(e);
+      }
+    }
+    let at: Option<usize> = None;
+    let c: usize = 0;
+    while (c < companions.length) {
+      if (companions[c].source == p.run.unit) {
+        at = Some(c);
+      }
+      c += 1;
+    }
+    const rr = RunResult { run: p.run, label: label, path: p.path, snap: snap.unwrap(), out: out.unwrap(), text: text };
+    if (at.isSome()) {
+      companions[at.unwrap()].runs.push(rr);
+    } else {
+      companions.push(Companion { source: p.run.unit, name: prog.units[p.run.unit].name + ".gen", runs: [rr] });
+    }
+    k += 1;
+  }
+  if (diags.length > 0) {
+    return Err(diags);
+  }
+  return Ok(Ran { companions: companions, warnings: warns });
+}
+
+// The warnings the processors reported (`MWarning`).
+function processorWarnings(companions: Companion[]): Diagnostic[] {
+  let out: Diagnostic[] = [];
+  for (const c of companions) {
+    for (const r of c.runs) {
+      for (const d of r.out.diags) {
+        if (!d.error) {
+          let at = r.run.cause;
+          if (d.at >= 0 && d.at.toUsize() < r.snap.refs.length) {
+            at = r.snap.refs[d.at.toUsize()];
+          }
+          let w = diag(W_PROCESSOR, at, d.message);
+          w.notes.push("reported by the processor of " + r.label);
+          out.push(w);
+        }
+      }
+    }
+  }
+  return out;
+}
+
+function runItems(c: Companion): RunItems[] {
+  let out: RunItems[] = [];
+  for (const r of c.runs) {
+    out.push(RunItems { label: r.label, cause: r.run.cause, items: r.out.items });
+  }
+  return out;
+}
+
+function hygiene(prog: LoadedProgram, companions: Companion[]): Diagnostic[] {
+  let out: Diagnostic[] = [];
+  for (const c of companions) {
+    out = out.concat(hygieneDiags(moduleLabel(prog, c.source) + ".gen", runItems(c)));
+  }
+  return out;
+}
+
+// E0521 for every module with a run that depends on a companion.
+function cycleDiags(prog: LoadedProgram, planned: Planned[], dep: bool[]): Diagnostic[] {
+  let out: Diagnostic[] = [];
+  let seen: usize[] = [];
+  for (const p of planned) {
+    let dup = false;
+    for (const s of seen) {
+      if (s == p.run.unit) {
+        dup = true;
+      }
+    }
+    if (dep[p.run.unit] && !dup) {
+      seen.push(p.run.unit);
+      const chain = chainToGen(prog, dep, p.run.unit);
+      out.push(
+        diag(
+          "E0521",
+          p.run.cause,
+          "module `" + moduleLabel(prog, p.run.unit) + "` uses the processor annotation `" + annotationText(p.run)
+              + "` but imports a generated module: " + chain.join(" -> "),
+        ),
+      );
+    }
+  }
+  return out;
+}
+
+// The merged `import { .. } from "src"` declarations of the runs of one companion, in order of first mention.
+function mergedImports(c: Companion): ImportDecl[] {
+  let out: ImportDecl[] = [];
+  for (const r of c.runs) {
+    for (const d of r.out.imports) {
+      let at: Option<usize> = None;
+      let k: usize = 0;
+      while (k < out.length) {
+        if (out[k].path == d.path) {
+          at = Some(k);
+        }
+        k += 1;
+      }
+      if (at.isNone()) {
+        out.push(ImportDecl { names: d.names, path: d.path, pathSpan: d.pathSpan, span: d.span, provider: false });
+      } else {
+        let names = out[at.unwrap()].names;
+        for (const n of d.names) {
+          let have = false;
+          for (const m of names) {
+            if (m.name == n.name) {
+              have = true;
+            }
+          }
+          if (!have) {
+            names.push(n);
+          }
+        }
+        out[at.unwrap()] = ImportDecl {
+          names: names,
+          path: d.path,
+          pathSpan: out[at.unwrap()].pathSpan,
+          span: out[at.unwrap()].span,
+          provider: false,
+        };
+      }
+    }
+  }
+  return out;
+}
+
+// The index of the companion unit of source unit `src`, if the program has one.
+function genUnitOf(prog: LoadedProgram, src: usize): Option<usize> {
+  const want = companionPath(prog.units[src].path);
+  let i: usize = 0;
+  while (i < prog.units.length) {
+    if (prog.units[i].path == want) {
+      return Some(i);
+    }
+    i += 1;
+  }
+  return None;
+}
+
+// The shared first part: runs, cycles, the sub-program check and the rules for processors. No runs when the program has none.
+function prepare(fs: FsGrant, prog: LoadedProgram, sm: SourceMap): Result<Plan, Diagnostic[]> {
+  const pl = plan(fs, prog)?;
+  const planned = pl.runs;
+  if (planned.length == 0) {
+    return Ok(pl);
+  }
+  const dep = dependsOnGen(prog);
+  const cyc = cycleDiags(prog, planned, dep);
+  if (cyc.length > 0) {
+    return Err(cyc);
+  }
+  let keep: bool[] = [];
+  for (const d of dep) {
+    keep.push(!d);
+  }
+  const subProg = subProgram(prog, keep);
+  const sub = check(subProg, sm);
+  if (sub.isErr()) {
+    return Err(sub.unwrapErr());
+  }
+  const pd = processorDiags(subProg, sm, sub.unwrap().functions);
+  if (pd.length > 0) {
+    return Err(pd);
+  }
+  return Ok(pl);
+}
+
+// Expands the companion modules of `prog`: the placeholders get the generated code of the recorded outputs. A program
+// without a placeholder is returned unchanged (nothing is read, nothing is checked).
+export function expandProgram(
+  fs: FsGrant,
+  proc: ProcessGrant,
+  prog: LoadedProgram,
+  sm: SourceMap,
+  cfg: ProcConfig,
+): Result<Expansion, Diagnostic[]> {
+  if (!hasGenUnit(prog)) {
+    return Ok(unchanged(prog));
+  }
+  const pl = prepare(fs, prog, sm)?;
+  const planned = pl.runs;
+  if (planned.length == 0) {
+    return Ok(Expansion { program: prog, causes: [], warnings: pl.warnings, companions: [] });
+  }
+  const ran = runAll(fs, proc, prog, sm, planned, false, cfg)?;
+  const companions = ran.companions;
+  const hy = hygiene(prog, companions);
+  if (hy.length > 0) {
+    return Err(hy);
+  }
+  let units = prog.units;
+  let causes: Cause[] = [];
+  for (const c of companions) {
+    const gi = genUnitOf(prog, c.source);
+    const where = moduleLabel(prog, c.source) + ".gen";
+    for (const r of c.runs) {
+      causes.push(Cause { span: r.run.cause, note: "in code generated for " + r.label + " (companion module `" + where + "`; `orin expand` prints it)" });
+    }
+    if (gi.isNone()) {
+      continue;
+    }
+    const imports = mergedImports(c);
+    let items: Item[] = [];
+    let targets: ImportTarget[] = [];
+    for (const d of imports) {
+      const t = resolveImport(fs, prog, c.source, d);
+      if (t.isErr()) {
+        let e = t.unwrapErr();
+        e.notes.push("in the imports of the code generated for " + labelsOf(c));
+        return Err([e]);
+      }
+      targets.push(t.unwrap());
+      items.push(IImport(d));
+    }
+    for (const r of c.runs) {
+      for (const it of r.out.items) {
+        items.push(it);
+      }
+    }
+    const u = units[gi.unwrap()];
+    units[gi.unwrap()] = withAst(u, Module { file: u.file, items: items }, targets);
+  }
+  return Ok(Expansion {
+    program: reordered(LoadedProgram { units: units, entry: prog.entry, manifest: prog.manifest }),
+    causes: causes,
+    warnings: pl.warnings.concat(ran.warnings).concat(processorWarnings(companions)),
+    companions: companions,
+  });
+}
+
+function labelsOf(c: Companion): string {
+  let ls: string[] = [];
+  for (const r of c.runs) {
+    ls.push(r.label);
+  }
+  return ls.join("; ");
+}
+
+// `orin expand`: the runs of every module that has a recorded output, without the second check of the program. Each
+// companion's runs are converted with empty spans for printing.
+export function expandCompanions(
+  fs: FsGrant,
+  proc: ProcessGrant,
+  prog: LoadedProgram,
+  sm: SourceMap,
+  cfg: ProcConfig,
+): Result<Companion[], Diagnostic[]> {
+  const pl = prepare(fs, prog, sm)?;
+  const planned = pl.runs;
+  if (planned.length == 0) {
+    return Ok([]);
+  }
+  const companions = runAll(fs, proc, prog, sm, planned, true, cfg)?.companions;
+  const hy = hygiene(prog, companions);
+  if (hy.length > 0) {
+    return Err(hy);
+  }
+  return Ok(companions);
+}
+
+// The note for a diagnostic located at a generated node: Some(note) when `d` points at the annotation use of a run.
+export function noteGenerated(causes: Cause[], ds: Diagnostic[]): Diagnostic[] {
+  if (causes.length == 0) {
+    return ds;
+  }
+  let out: Diagnostic[] = [];
+  for (const d of ds) {
+    let nd = d;
+    for (const c of causes) {
+      if (c.span.file == d.span.file && c.span.start == d.span.start && c.span.end == d.span.end) {
+        nd.notes.push(c.note);
+        break;
+      }
+    }
+    out.push(nd);
+  }
+  return out;
+}

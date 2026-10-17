@@ -8,6 +8,7 @@
 #   5. a program started with a listen grant for another port cannot be made to listen elsewhere (tests/next/run/net_loopback)
 set -eu
 cd "$(dirname "$0")/.."
+. tools/runtime_files.sh   # the runtime source list: tools/runtime-sources.txt
 ORIN2=${ORIN2:-build/bootstrap/orin2}
 CC=${CC:-cc}
 B=build/net
@@ -19,7 +20,7 @@ trap kill_server EXIT
 
 build() { # source name
   $ORIN2 compile $1 -o $B/$2.c
-  $CC -O2 -w -I runtime/core $B/$2.c runtime/core/orin_runtime.c runtime/platform/orin_platform.c -lm -o $B/$2
+  $CC -O2 -w $(rt_inc) $B/$2.c $(rt_src) -lm -o $B/$2
 }
 build examples/http_server.or http_server
 build tests/net/client.or client
