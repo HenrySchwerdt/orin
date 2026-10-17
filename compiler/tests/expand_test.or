@@ -3,10 +3,10 @@
 // Run: `orin test compiler/tests/expand_test.or`. The loader is driven through the overlay with virtual paths below /virt.
 
 import { Host, useFs } from "std:host";
-import { assert, assertEqString, assertEqUsize, assertEqBool } from "std:test";
+import { assert, assertEqString, assertEqUsize, assertEqBool, fail } from "std:test";
 import { SourceFile, SourceMap, Diagnostic, span, diag, render } from "../diag";
 import { loadWithOverlay, LoadOutcome, LoadedProgram } from "../loader";
-import { Item } from "../syntax";
+import { Item, IFunction } from "../syntax";
 import { findRuns, buildSnapshot, outputItems, hygieneDiags, RunItems, boundNames, isUserUnit } from "../meta";
 import { sidecarPath, noteGenerated, Cause } from "../expand";
 
@@ -211,6 +211,29 @@ function outputConversion(): void {
   assertEqBool(ok.unwrap().diags[0].error, false, "a warning");
   assert(ok.unwrap().diags[0].at == 3, "ref");
   assertEqUsize(ok.unwrap().docs.length, 1, "docs parallel to items");
+}
+
+function boundsFn(bounds: string): string {
+  return "{\"name\":\"f\",\"exported\":true,\"typeParams\":[\"T\",\"U\"],\"bounds\":" + bounds + ",\"params\":[],\"returns\":{\"k\":\"named\",\"name\":\"int\",\"args\":[]},\"body\":[{\"k\":\"return\",\"value\":{\"k\":\"int\",\"v\":1}}],\"doc\":\"\"}";
+}
+
+// A generated function may carry bounds, one array of interface names per type parameter (`T extends Ord & Hash`).
+@Test
+function outputBounds(): void {
+  const ok = outputItems(HEAD + "\"imports\":[],\"decls\":[" + decl("fn", boundsFn("[[\"Ord\",\"Hash\"],[]]")) + "],\"diagnostics\":[]}", span(0, 4, 9));
+  assert(ok.isOk(), "decodes");
+  match (ok.unwrap().items[0]) {
+    IFunction(f) => {
+      assertEqUsize(f.bounds.length, 2, "one list per type parameter");
+      assertEqUsize(f.bounds[0].length, 2, "two bounds");
+      assertEqString(f.bounds[0][1].name, "Hash", "second bound");
+      assertEqUsize(f.bounds[1].length, 0, "unbounded");
+    },
+    _ => {
+      fail("a function");
+    },
+  }
+  assert(errOf(HEAD + "\"imports\":[],\"decls\":[" + decl("fn", boundsFn("[[\"Ord\"]]")) + "],\"diagnostics\":[]}").includes("bounds"), "one array per parameter");
 }
 
 @Test

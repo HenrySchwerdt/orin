@@ -16,7 +16,7 @@ import {
   Item, Annotation, Expr, TypeExpr, ContractClause, Param, FieldDecl, VariantDecl, TypeDecl, ClassDecl, FunctionDecl,
   MethodDecl, InterfaceDecl, IfaceMethod, ConstDecl, Ident, scanComments, Comment,
 } from "../syntax";
-import { Json, stringifyJson } from "../json";
+import { Json, JField, stringifyJson } from "../json";
 import { LoadedProgram } from "../loader";
 import { documentationFrom } from "../analysis";
 import { Res, lookupDecl, moduleLabel, memberAnnotations, ownAnnotations, declName, declExported } from "./lookup";
@@ -355,7 +355,7 @@ class SnapBuilder {
     return jarr(out);
   }
 
-  methodJson(name: Ident, exported: bool, tps: Ident[], params: Param[], ret: Option<TypeExpr>, sp: Span, as: Annotation[], cs: ContractClause[]): Json {
+  methodJson(name: Ident, exported: bool, tps: Ident[], bds: Ident[][], params: Param[], ret: Option<TypeExpr>, sp: Span, as: Annotation[], cs: ContractClause[]): Json {
     const saved = this.tparams;
     for (const t of tps) {
       this.tparams.push(t.name);
@@ -370,7 +370,7 @@ class SnapBuilder {
       fld("doc", jstr(this.docOf(sp, as, cs))),
       fld("annotations", this.annotationsJson(as)),
       fld("contracts", this.contractsJson(cs)),
-    ]);
+    ].concat(boundsFields(bds)));
     this.tparams = saved;
     return r;
   }
@@ -381,6 +381,7 @@ class SnapBuilder {
     let name = "";
     let exported = false;
     let tps: Ident[] = [];
+    let bds: Ident[][] = [];
     let sp: Span = Span { file: 0, start: 0, end: 0 };
     let nameSp = sp;
     let as: Annotation[] = [];
@@ -423,6 +424,7 @@ class SnapBuilder {
         name = f.name.name;
         exported = f.exported;
         tps = f.typeParams;
+        bds = f.bounds;
         sp = f.span;
         nameSp = f.name.span;
         as = f.annotations;
@@ -448,6 +450,7 @@ class SnapBuilder {
         name = c.name.name;
         exported = c.exported;
         tps = c.typeParams;
+        bds = c.bounds;
         sp = c.span;
         nameSp = c.name.span;
         as = c.annotations;
@@ -476,7 +479,7 @@ class SnapBuilder {
               ctorParams = jarr(ps);
             },
             MMethod(md) => {
-              ms.push(this.methodJson(md.name, !md.priv, md.typeParams, md.params, md.ret, md.span, md.annotations, md.contracts));
+              ms.push(this.methodJson(md.name, !md.priv, md.typeParams, md.bounds, md.params, md.ret, md.span, md.annotations, md.contracts));
             },
           }
         }
@@ -493,7 +496,7 @@ class SnapBuilder {
         let ms: Json[] = [];
         for (const m of i.methods) {
           const noContracts: ContractClause[] = [];
-          ms.push(this.methodJson(m.name, true, [], m.params, m.ret, m.span, m.annotations, noContracts));
+          ms.push(this.methodJson(m.name, true, [], [], m.params, m.ret, m.span, m.annotations, noContracts));
         }
         methods = jarr(ms);
       },
@@ -516,7 +519,7 @@ class SnapBuilder {
       fld("variants", variants),
       fld("params", params),
       fld("ty", ty),
-    ]);
+    ].concat(boundsFields(bds)));
     this.tparams = [];
     return view;
   }
@@ -566,6 +569,21 @@ class SnapBuilder {
     this.tparams = [];
     return Some(out);
   }
+}
+
+// The optional `"bounds"` key of a view (`T extends Ord & Hash`: `[["Ord", "Hash"]]`, one array per type parameter);
+// written only when a parameter has a bound, so the view of a declaration without bounds is unchanged.
+function boundsFields(bds: Ident[][]): JField[] {
+  let any = false;
+  let rows: Json[] = [];
+  for (const bl of bds) {
+    if (bl.length > 0) {
+      any = true;
+    }
+    rows.push(strs(identNames(bl)));
+  }
+  const none: JField[] = [];
+  return any ? [fld("bounds", jarr(rows))] : none;
 }
 
 function identNames(ids: Ident[]): string[] {

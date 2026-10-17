@@ -1743,18 +1743,19 @@ static OrinObj *deep_copy(OrinObj *root) {
  * token travels only through a monitor or a thread start, both of which order the sender's release before the
  * receiver's take). Otherwise (a shared box, which std:task never passes) a fresh box is built as before. */
 uint64_t orin_rt_transfer_put(OrinObj *box) {
-    if (box->kind != ORIN_K_STRUCT || ((OrinStruct *)box)->nslots != 1) orin_trap_shape();
+    if (box->kind != ORIN_K_STRUCT || ((OrinStruct *)box)->nslots > 1) orin_trap_shape();
     OrinStruct *s = (OrinStruct *)box;
     OrinObj *out;
-    int scalar = !(s->refmask & 1) || !s->slots[0];
+    /* nslots == 0: the box of a void value (ADR-0040), nothing to move */
+    int scalar = s->nslots == 0 || !(s->refmask & 1) || !s->slots[0];
     if (box->rc == 1 && (scalar || graph_unique(box))) {
         orin_retain(box);
         if (!scalar) orin_stats.transfer_moves++;
         return tr_publish(box);
     }
     if (scalar) {
-        out = orin_struct_new(box->tag, 1, s->refmask);
-        ((OrinStruct *)out)->slots[0] = s->slots[0];
+        out = orin_struct_new(box->tag, s->nslots, s->refmask);
+        if (s->nslots) ((OrinStruct *)out)->slots[0] = s->slots[0];
     } else if (graph_unique(box)) {
         out = orin_struct_new(box->tag, 1, s->refmask);
         ((OrinStruct *)out)->slots[0] = s->slots[0];
