@@ -121,7 +121,7 @@ Census re-run 2026-10-16 (after lever 1 and T1/T3/T4) with the current lever ran
    below the C backend on 13 of 15 instruction rows; appends +0.8%, qsort_func +0.5%).
 5. **Parallel sockets (done, ADR-0017 Addendum C):** `spawnNet` / `scopeNet`, `acceptDetached` / `spawnAccepted` / `serveAccepted`
    (a `Stream` is moved into a task via the grant-token machinery), E0487, a per-task net buffer in place of the global
-   `g_netbuf`, `examples/http_server_concurrent.or` with limits, load and TSan tests in `tools/test_net.sh`.
+   `g_netbuf`, `examples/http_server.or` (concurrent since C5; the former `http_server_concurrent.or` was merged into it) with limits, load and TSan tests in `tools/test_net.sh`, and the C5 acceptance campaign `tools/test_server_campaign.sh`.
 6. **Rewrite:** `compiler/vc/` and the remaining checker files. Then the rule-7 stream-style sweep, and later
    `.parallel()` per compiler phase (ADR-0039 §6).
 7. **Follow-ups:**
