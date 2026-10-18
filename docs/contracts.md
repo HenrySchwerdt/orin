@@ -361,7 +361,8 @@ well-foundedness, without any quantified axiom:
   is read or passed in has a tag in range (a well-formedness fact, like a length that is not negative). A variant built
   with a payload is a fresh constant with its tag and payload as facts; a nullary variant is a constant with its tag.
   `match` and variant construction work as for any union (nested patterns are still unsupported).
-- no value of such a type can be built inside a quantifier body (UNKNOWN with the reason).
+- inside a quantifier body (a function argument of `map`, `every` ..) a built value is the application of an uninterpreted
+  function of its arguments, and its facts are stated inside the quantifier, per instance.
 
 What this does not say: that values are finite (no induction over the structure; a recursive function is proved by its own
 contract, A-CALL), and that two values with equal fields are equal (`==` on a record, class or union is unsupported anyway, so
