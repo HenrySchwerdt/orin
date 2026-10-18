@@ -8,7 +8,8 @@
 // design's gate of +1 %. This analysis follows only the locals it needs, in time linear in the instructions.)
 //
 // The state is the set U of locals that are Unique on every path. It mirrors the verifier's transfer as follows:
-//   - `structnew` / `arraynew` of a reference local define a Unique local (rules.or IStructNew, IArrayNew), `makeunique x`
+//   - `structnew` / `arraynew` of a reference local, a closure and an interface value define a Unique local (rules.or IStructNew,
+//     IArrayNew, IClosure, IIface), `makeunique x`
 //     makes x Unique (IMakeUnique);
 //   - an instruction that names a local in U in any other way takes it out of U: a copy, move, dup, borrow (demote), a
 //     call argument (the verifier demotes it for a reference result and consumes it in an owned position), a release,
@@ -18,13 +19,15 @@
 //     field or element of x (`project`), provided the instruction names x nowhere else, and an argument of a call in a
 //     borrowed position when the call has no reference result (`callOwned` demotes only for a reference result);
 //   - a join is the intersection (the verifier's join of Unique with anything else is not Unique).
+//   - v2.7 (T5, uniqflags.or): the result of a call of a `unique-out` function is Unique (rule U5), and so is the receiver
+//     an in/out call of such a function hands back; the receiver of a `unique-in` function is Unique at its entry (rule U2);
 // An instruction that does not name a local cannot change its kind, so nothing else is tracked.
 
 import { MProgram, MFunction, MBlock, Instr, Operand } from "../mir";
 import { successors } from "../mir";
 import { RewritePlan, withBody } from "./rewrite";
 import { passKept, fnShapeOk, fnWellFormed, instrCount } from "./wellformed";
-import { instrUses, instrDef, isRefTy } from "./analysis";
+import { instrUses, instrDef, isRefTy, UseBuf } from "./analysis";
 
 function isMakeUnique(i: Instr): bool {
   return match (i) {
@@ -147,20 +150,61 @@ function freshDef(f: MFunction, ins: Instr): Option<usize> {
   return match (ins) {
     IStructNew(d, _, _) => isRefTy(f.locals[d].ty) ? Some(d) : None,
     IArrayNew(d, _, _) => Some(d),
+    IClosure(d, _, _) => Some(d),
+    IIface(d, _, _) => Some(d),
     _ => None,
   };
 }
 
 // The set U of locals that are certainly Unique, one flag per local.
-class UniqueSet {
+export class UniqueSet {
   u: bool[];
+  private buf: UseBuf;
 
   constructor(u: bool[]) {
     this.u = u;
+    this.buf = new UseBuf();
+  }
+
+  // Can `ins` change U? Only an instruction that creates or keeps a Unique object, or that names a local of U or defines one.
+  private inert(ins: Instr): bool {
+    const special = match (ins) {
+      ICall(_, _, _) => true,
+      IMakeUnique(_) => true,
+      IMove(_, _) => true,
+      IStructNew(_, _, _) => true,
+      IArrayNew(_, _, _) => true,
+      IClosure(_, _, _) => true,
+      IIface(_, _, _) => true,
+      _ => false,
+    };
+    if (special) {
+      return false;
+    }
+    match (instrDef(ins)) {
+      Some(d) => {
+        if (this.u[d]) {
+          return false;
+        }
+      },
+      None => {},
+    }
+    this.buf.ofInstr(ins);
+    let k: usize = 0;
+    while (k < this.buf.n) {
+      if (this.u[this.buf.xs[k]]) {
+        return false;
+      }
+      k += 1;
+    }
+    return true;
   }
 
   // U after `ins`, updated in place.
   step(prog: MProgram, f: MFunction, ins: Instr): void {
+    if (this.inert(ins)) {
+      return;
+    }
     const keep = keptObject(ins);
     const kept = callKept(prog, f, ins);
     const moved = match (ins) {
@@ -193,6 +237,26 @@ class UniqueSet {
           this.u[d] = true;
         }
       },
+      ICall(dst, g, args) => {
+        const callee = prog.functions[g];
+        if (callee.uniqueOut) {
+          if (callee.inout) {
+            match (args[0]) {
+              OLocal(x) => {
+                this.u[x] = true;
+              },
+              _ => {},
+            }
+          } else {
+            match (dst) {
+              Some(d) => {
+                this.u[d] = true;
+              },
+              None => {},
+            }
+          }
+        }
+      },
       _ => {},
     }
   }
@@ -201,9 +265,13 @@ class UniqueSet {
 // The set U at the entry of every block (None: not reached), by a worklist to the greatest fixpoint.
 @Requires(fnShapeOk(f))
 @Ensures(result.length == f.blocks.length)
-function uniqueIn(prog: MProgram, f: MFunction): Option<bool[]>[] {
+export function uniqueEntry(prog: MProgram, f: MFunction): Option<bool[]>[] {
   let ins: Option<bool[]>[] = f.blocks.map(b => None);
-  ins[0] = Some(f.locals.map(l => false));
+  let entry = f.locals.map(l => false);
+  if (f.uniqueIn) {
+    entry[0] = true; // rule U2: the receiver of a unique-in function
+  }
+  ins[0] = Some(entry);
   let work: usize[] = [0];
   while (work.length > 0) {
     const b = work.pop().unwrap();
@@ -269,7 +337,7 @@ export function dropUniqueChecks(prog: MProgram, f: MFunction): MFunction {
   if (makeUniqueCount(f) == 0) {
     return f;
   }
-  const states = uniqueIn(prog, f);
+  const states = uniqueEntry(prog, f);
   let blocks: MBlock[] = [];
   let b: usize = 0;
   while (b < f.blocks.length) {

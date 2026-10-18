@@ -22,7 +22,7 @@ import {
   usedFlags, borrowReads, readInfo, callsOf, inplaceSlots, takePutChains, pairReturns, ancestors, ancestorsClosed, BlockSink,
   RewritePlan, fnShapeOk, fnWellFormed, progWellFormed, passKept, effects, instrCount, dupCount,
   releaseCount, concatCount, extendCount, getterCount, onlyEdgeBlocksAdded, indices, tablesAgree,
-  instrUses, usesAffecting, forwardLoads, forwardProgram, forwardCount, uncheckAccesses, uncheckProgram, uncheckedCount, uncheckFields, uncheckFieldsProgram, uncheckedFieldCount, shapeCheckCount, dropUniqueChecks, dropUniqueProgram, makeUniqueCount,
+  instrUses, usesAffecting, forwardLoads, forwardProgram, forwardCount, uncheckAccesses, uncheckProgram, uncheckedCount, uncheckFields, uncheckFieldsProgram, uncheckedFieldCount, shapeCheckCount, dropUniqueChecks, dropUniqueProgram, makeUniqueCount, setUniqueFlags,
 } from "../opt";
 
 // ---------------------------------------------------------------- builders
@@ -58,7 +58,7 @@ function fn(name: string, params: usize, locals: MLocal[], blocks: MBlock[]): MF
     name: name,
     paramCount: params,
     paramOwned: borrowed(params),
-    inout: false,
+    inout: false, uniqueIn: false, uniqueOut: false,
     locals: locals,
     ret: MVoid,
     blocks: blocks,
@@ -350,7 +350,7 @@ function anOwnedParameterIsReleasedOnTheEdgeWhereItDies(): void {
     name: "f",
     paramCount: 2,
     paramOwned: [true, false],
-    inout: false,
+    inout: false, uniqueIn: false, uniqueOut: false,
     locals: [lr("p"), lb("c"), li("n")],
     ret: MVoid,
     blocks: [
@@ -849,7 +849,7 @@ function aCallArgumentDemotesTheLocalBeforeTheNextMakeUnique(): void {
     name: "id",
     paramCount: 1,
     paramOwned: [false],
-    inout: false,
+    inout: false, uniqueIn: false, uniqueOut: false,
     locals: [lr("a"), lr("r")],
     ret: MRef,
     blocks: [bk([IDup(1, OLocal(0))], TReturn(Some(OLocal(1))))],
@@ -886,7 +886,7 @@ function aCallWithAScalarResultAndAMoveKeepUniqueness(): void {
     name: "len",
     paramCount: 1,
     paramOwned: [false],
-    inout: false,
+    inout: false, uniqueIn: false, uniqueOut: false,
     locals: [lr("a"), li("n")],
     ret: MInt,
     blocks: [bk([ICopy(1, OInt(0))], TReturn(Some(OLocal(1))))],
@@ -1121,7 +1121,7 @@ function withArrays(n: usize, locals: MLocal[], instrs: Instr[]): MFunction {
     name: "f",
     paramCount: n,
     paramOwned: owned,
-    inout: false,
+    inout: false, uniqueIn: false, uniqueOut: false,
     locals: locals,
     ret: MVoid,
     blocks: [bk(instrs, TReturn(None))],
@@ -1412,7 +1412,7 @@ function aRedefinitionOfTheStructEndsTheScan(): void {
   assertEqUsize(uncheckedFieldCount(uncheckFields(prog([moved]), moved)), 0, "o names another object after the move");
   const callee = fn("g", 1, [lr("p")], [bk([], TReturn(None))]);
   const io = MFunction {
-    name: "h", paramCount: 1, paramOwned: [true], inout: true, locals: [lr("p")], ret: MVoid, blocks: [bk([], TReturn(None))],
+    name: "h", paramCount: 1, paramOwned: [true], inout: true, uniqueIn: false, uniqueOut: false, locals: [lr("p")], ret: MVoid, blocks: [bk([], TReturn(None))],
   };
   const viaCall = withArrays(1, [lr("o"), li("s"), li("d")], [
     IGetField(1, OLocal(0), 1),
@@ -1436,7 +1436,7 @@ function aLoadThatOverwritesItsOwnObjectIsNotASource(): void {
 @Test
 function anUncheckedFieldAccessOfAnUnboxedAggregateNeverHappens(): void {
   const f = MFunction {
-    name: "f", paramCount: 0, paramOwned: [], inout: false,
+    name: "f", paramCount: 0, paramOwned: [], inout: false, uniqueIn: false, uniqueOut: false,
     locals: [MLocal { name: "a", ty: MAgg(2) }, li("s"), li("d")], ret: MVoid,
     blocks: [bk([IStructNew(0, 0, [OInt(1), OInt(2)]), IGetField(1, OLocal(0), 0), IGetField(2, OLocal(0), 0)], TReturn(None))],
   };
@@ -1497,7 +1497,7 @@ function aPushInTheLoopBodyKeepsTheChecks(): void {
 @Test
 function anArrayParameterHasNoShapeFact(): void {
   const f = MFunction {
-    name: "f", paramCount: 1, paramOwned: [false], inout: false,
+    name: "f", paramCount: 1, paramOwned: [false], inout: false, uniqueIn: false, uniqueOut: false,
     locals: [lr("a"), lu("i"), lb("c"), li("d")], ret: MVoid,
     blocks: [
       bk([ICopy(1, OUsize(0))], TGoto(1)),
@@ -1507,4 +1507,171 @@ function anArrayParameterHasNoShapeFact(): void {
     ],
   };
   assertEqUsize(uncheckedCount(uncheckAccesses(prog([f]), f)), 0, "nothing says the parameter has four elements");
+}
+
+// ---------------------------------------------------------------- unique receivers and results across calls (T5, docs/mir.md v2.7)
+
+// bump(owned this): int, in/out: t = move this; makeunique t; t.0 = 1; this = move t; return 7.
+function bumpFn(): MFunction {
+  return MFunction {
+    name: "bump",
+    paramCount: 1,
+    paramOwned: [true],
+    inout: true, uniqueIn: false, uniqueOut: false,
+    locals: [lr("this"), lr("t"), li("v")],
+    ret: MInt,
+    blocks: [bk([IMove(1, 0), IMakeUnique(1), ISetField(1, 0, OInt(1)), IMove(0, 1), ICopy(2, OInt(7))], TReturn(Some(OLocal(2))))],
+  };
+}
+
+// mk(): a function with a reference result that builds a fresh record, or a shared one when `shared`.
+function mkFn(name: string, shared: bool): MFunction {
+  const body: Instr[] = shared
+    ? [IStructNew(0, 0, [OInt(1)]), IDup(1, OLocal(0)), IRelease(0)]
+    : [IStructNew(0, 0, [OInt(1)])];
+  return MFunction {
+    name: name,
+    paramCount: 0,
+    paramOwned: [],
+    inout: false, uniqueIn: false, uniqueOut: false,
+    locals: [lr("s"), lr("d")],
+    ret: MRef,
+    blocks: [bk(body, TReturn(Some(OLocal(shared ? 1 : 0))))],
+  };
+}
+
+function noPins(p: MProgram): bool[] {
+  return p.functions.map(f => false);
+}
+
+@Test
+function aFreshReceiverMakesTheCalleeUniqueIn(): void {
+  // f: x = struct; r = bump(x); x.0 = 2; release x
+  const f = fn("f", 0, [lr("x"), li("r")], [
+    bk([IStructNew(0, 0, [OInt(1)]), ICall(Some(1), 1, [OLocal(0)]), IMakeUnique(0), ISetField(0, 0, OInt(2)), IRelease(0)], TReturn(None)),
+  ]);
+  const p = prog([f, bumpFn()]);
+  assert(verifies(p), "the input verifies");
+  const q = setUniqueFlags(p, noPins(p));
+  assert(q.functions[1].uniqueIn && q.functions[1].uniqueOut, "bump is unique-in and unique-out");
+  assertEqUsize(q.functions[0].blocks[0].instrs.length, 6, "f has no loop: a makeunique is put before the call without analysis");
+  assert(verifies(q), "the verifier accepts the flags");
+  const r = dropUniqueProgram(q);
+  assertEqUsize(makeUniqueCount(r.functions[0]), 0, "the receiver is Unique before the call and after it (rules U4, U5): every makeunique goes");
+  assertEqUsize(makeUniqueCount(r.functions[1]), 0, "the callee's makeunique goes (rule U2)");
+  assert(verifies(r), "the verifier accepts the result");
+}
+
+@Test
+function anOwnedReceiverOutsideALoopGetsAMakeUnique(): void {
+  // f: x = mkShared(); r = bump(x); release x: x is Owned at the call, the call is not in a loop
+  const f = fn("f", 0, [lr("x"), li("r")], [
+    bk([ICall(Some(0), 2, []), ICall(Some(1), 1, [OLocal(0)]), IRelease(0)], TReturn(None)),
+  ]);
+  const p = prog([f, bumpFn(), mkFn("mk", true)]);
+  assert(verifies(p), "the input verifies");
+  const q = setUniqueFlags(p, noPins(p));
+  assert(q.functions[1].uniqueIn, "the callee starts with makeunique of its receiver: a copy before the call is the copy it makes");
+  assertEqUsize(makeUniqueCount(q.functions[0]), 1, "one makeunique inserted before the call");
+  assert(!q.functions[2].uniqueOut, "mk returns a shared record: no unique-out");
+  assert(verifies(q), "the verifier accepts the result");
+  const r = dropUniqueProgram(q);
+  assertEqUsize(makeUniqueCount(r.functions[0]), 1, "the inserted one stays");
+  assertEqUsize(makeUniqueCount(r.functions[1]), 0, "the callee's goes");
+  assert(verifies(r), "the verifier accepts the result");
+}
+
+@Test
+function anOwnedReceiverInALoopRetractsTheFlag(): void {
+  // b0: goto b1.  b1: x = mkShared(); r = bump(x); release x; branch c b1 b2.  b2: return
+  const f = fn("f", 1, [lb("c"), lr("x"), li("r")], [
+    bk([], TGoto(1)),
+    bk([ICall(Some(1), 2, []), ICall(Some(2), 1, [OLocal(1)]), IRelease(1)], TBranch(OLocal(0), 1, 2)),
+    bk([], TReturn(None)),
+  ]);
+  const p = prog([f, bumpFn(), mkFn("mk", true)]);
+  assert(verifies(p), "the input verifies");
+  const q = setUniqueFlags(p, noPins(p));
+  assert(!q.functions[1].uniqueIn, "the site in the loop cannot be satisfied without a copy per iteration: the flag goes");
+  assert(q.functions[1].uniqueOut, "unique-out does not depend on the call sites");
+  assertEqUsize(makeUniqueCount(q.functions[0]), 0, "nothing inserted in the loop");
+  assert(verifies(q), "the verifier accepts the result");
+}
+
+@Test
+function aReceiverThatStaysUniqueAroundALoopKeepsTheFlags(): void {
+  // b0: x = struct; goto b1.  b1: r = bump(x); branch c b1 b2.  b2: release x. The call hands the receiver back Unique (U5),
+  // so the next iteration passes a Unique receiver (U4), and no makeunique is needed anywhere.
+  const f = fn("f", 1, [lb("c"), lr("x"), li("r")], [
+    bk([IStructNew(1, 0, [OInt(1)])], TGoto(1)),
+    bk([ICall(Some(2), 1, [OLocal(1)])], TBranch(OLocal(0), 1, 2)),
+    bk([IRelease(1)], TReturn(None)),
+  ]);
+  const p = prog([f, bumpFn()]);
+  assert(verifies(p), "the input verifies");
+  const q = setUniqueFlags(p, noPins(p));
+  assert(q.functions[1].uniqueIn && q.functions[1].uniqueOut, "both flags hold");
+  assertEqUsize(makeUniqueCount(q.functions[0]), 0, "nothing inserted");
+  assert(verifies(q), "the verifier accepts the flags");
+  assertEqUsize(makeUniqueCount(dropUniqueProgram(q).functions[1]), 0, "the callee's makeunique goes");
+}
+
+@Test
+function aSharedResultRetractsUniqueOutAndItsCallersFacts(): void {
+  // bump2 returns its receiver after a dup (not Unique); f stores through the receiver after the call
+  const bump2 = MFunction {
+    name: "bump2",
+    paramCount: 1,
+    paramOwned: [true],
+    inout: true, uniqueIn: false, uniqueOut: false,
+    locals: [lr("this"), lr("t"), lr("d")],
+    ret: MVoid,
+    blocks: [bk([IMove(1, 0), IMakeUnique(1), IDup(2, OLocal(1)), IMove(0, 1), IRelease(2)], TReturn(None))],
+  };
+  const f = fn("f", 0, [lr("x")], [
+    bk([IStructNew(0, 0, [OInt(1)]), ICall(None, 1, [OLocal(0)]), IMakeUnique(0), ISetField(0, 0, OInt(2)), IRelease(0)], TReturn(None)),
+  ]);
+  const p = prog([f, bump2]);
+  assert(verifies(p), "the input verifies");
+  const q = setUniqueFlags(p, noPins(p));
+  assert(!q.functions[1].uniqueOut, "the receiver is shared at the return");
+  assert(q.functions[1].uniqueIn, "the receiver can still be required Unique on entry");
+  const r = dropUniqueProgram(q);
+  assertEqUsize(makeUniqueCount(r.functions[0]), 1, "the caller's makeunique after the call stays");
+  assert(verifies(r), "the verifier accepts the result");
+}
+
+@Test
+function aFreshResultIsUniqueForTheCaller(): void {
+  const f = fn("f", 0, [lr("x")], [
+    bk([ICall(Some(0), 1, []), IMakeUnique(0), ISetField(0, 0, OInt(2)), IRelease(0)], TReturn(None)),
+  ]);
+  const p = prog([f, mkFn("mk", false)]);
+  const q = setUniqueFlags(p, noPins(p));
+  assert(q.functions[1].uniqueOut, "mk returns a fresh record");
+  const r = dropUniqueProgram(q);
+  assertEqUsize(makeUniqueCount(r.functions[0]), 0, "the result is Unique (rule U5): no makeunique");
+  assert(verifies(r), "the verifier accepts the result");
+}
+
+@Test
+function aPinnedFunctionGetsNoFlag(): void {
+  const f = fn("f", 0, [lr("x")], [bk([ICall(Some(0), 1, []), IMakeUnique(0), ISetField(0, 0, OInt(2)), IRelease(0)], TReturn(None))]);
+  const p = prog([f, mkFn("mk", false)]);
+  assert(setUniqueFlags(p, [false, false]).functions[1].uniqueOut, "the same program without the pin gets the flag");
+  const q = setUniqueFlags(p, [false, true]);
+  assert(!q.functions[1].uniqueOut, "called through a function value: no flag");
+}
+
+@Test
+function optimizeSetsUniqueFlagsAndTheVerifierAcceptsThem(host: Host): void {
+  useFs(
+    host,
+    fs => {
+      const p = optimized(fs, sampleSource()).unwrap();
+      const q = optimize(p);
+      assertEqUsize(verify(q).errors.length, 0, "the verifier accepts the optimised program");
+      assert(q.functions.some(f => f.uniqueOut), "some function hands back a Unique value");
+    },
+  );
 }
