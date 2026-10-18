@@ -12,15 +12,24 @@
 #include <string.h>
 
 #ifdef ORIN_TRANSFER_IN_ORIN
-/* The transfer, lend and thread-count operations of runtime/core/{transfer,lend,task}.or (the functions std:task calls) instead of the C
- * ones, through the test wrappers of `--rt-wrappers` (tools/rt_stub.sh; ADR-0052 Addendum B, R3e.2 and R3e.3). The C task code works on
- * the same slot table. */
+/* The transfer, lend, thread-count and task operations of runtime/core/{transfer,lend,task}.or (the functions std:task calls) instead of the
+ * C ones, through the test wrappers of `--rt-wrappers` (tools/rt_stub.sh; ADR-0052 Addendum B, R3e.2 to R3e.4). The C code of the lend and
+ * the grants works on the same slot table. `orin_trap` is the Orin function in every build (the stub defines it), so a task started by the
+ * C `orin_rt_task_spawn` also ends on a trap through task.or (it finds its record in the heap block). */
 uint64_t orin_t_transfer_put(OrinObj *box);
 OrinObj *orin_t_transfer_take(uint64_t token);
 void orin_t_transfer_drop(uint64_t token);
 uint64_t orin_t_transfer_count(uint64_t which);
 uint64_t orin_t_lend(OrinObj *box);
 uint64_t orin_t_par_threads(void);
+uint64_t orin_t_task_spawn(uint64_t token);
+uint64_t orin_t_task_join(uint64_t thread);
+OrinObj *orin_t_task_message(void);
+void orin_t_task_watch(uint64_t monitor);
+#define orin_rt_task_spawn orin_t_task_spawn
+#define orin_rt_task_join orin_t_task_join
+#define orin_rt_task_message orin_t_task_message
+#define orin_rt_task_watch orin_t_task_watch
 #define orin_rt_lend orin_t_lend
 #define orin_rt_par_threads orin_t_par_threads
 #define orin_rt_transfer_put orin_t_transfer_put

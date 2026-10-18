@@ -245,6 +245,10 @@ static void stats_add(OrinStats *d, const OrinStats *s) {
     d->transfer_moves += s->transfer_moves, d->transfer_copies += s->transfer_copies, d->tasks_spawned += s->tasks_spawned;
 }
 
+static void files_at_exit(void);
+static void revoke_all_grants(void);
+static void free_netbuf(void);
+
 /* The C services that Orin runtime code reaches through the core operation `hook` (hir/coreops.or, number 27; the numbers are the HK_*
  * constants of runtime/core/heap.or): the process-wide totals of finished tasks (g_fold, g_fold_live, written by
  * orin_rt_heap_exit) for the report of runtime/core/stats.or, and the allocation-site census. The environment, the runtime lock and
@@ -257,18 +261,20 @@ uint64_t orin_core_hook(uint64_t k, uint64_t a, uint64_t b, uint64_t c) {
     case 4: return (uint64_t)(uintptr_t)&g_fold;                                        /* HK_FOLD_STATS */
     case 5: return (uint64_t)(uintptr_t)&g_fold_live;                                   /* HK_FOLD_LIVE */
     case 6: return ORIN_STAT_ON;                                                        /* HK_STATS_ON */
+    case 12: revoke_all_grants(); return 0;                                             /* HK_REVOKE_GRANTS */
+    case 13: files_at_exit(); return 0;                                                 /* HK_CLOSE_FILES */
+    case 14: free_netbuf(); return 0;                                                   /* HK_FREE_NETBUF */
 #ifdef ORIN_SITE_STATS
     case 7: site_alloc((OrinObj *)(uintptr_t)a, (int)b, c); return 0;                   /* HK_SITE_ALLOC */
     case 8: site_grow((OrinObj *)(uintptr_t)a, b); return 0;                            /* HK_SITE_GROW */
     case 9: site_free((OrinObj *)(uintptr_t)a); return 0;                               /* HK_SITE_FREE */
     case 10: orin_site_rc((OrinObj *)(uintptr_t)a, (int)b); return 0;                   /* HK_SITE_RC */
     case 11: site_report(); return 0;                                                   /* HK_SITE_REPORT */
+    case 15: site_fold(); return 0;                                                     /* HK_SITE_FOLD */
 #endif
     default: orin_trap("unknown runtime hook"); return 0;
     }
 }
-
-static void files_at_exit(void);
 
 void orin_init(int argc, char **argv) {
     orin_platform_init(argc, argv);
@@ -278,21 +284,8 @@ void orin_init(int argc, char **argv) {
 
 void orin_flush(void) { orin_platform_flush(); }
 
-static int task_active(void);
-static void task_trap(const char *msg) __attribute__((noreturn));
-
-void orin_trap(const char *msg) {
-    if (task_active()) task_trap(msg); /* a trap on a task thread ends that task only; the joiner traps (ADR-0017) */
-    size_t n = 0;
-    while (msg[n]) n++;
-    enum { MAX = 480 };
-    char buf[MAX + 8];
-    if (n > MAX) n = MAX;
-    orin_platform_mem_copy(buf, "trap: ", 6);
-    orin_platform_mem_copy(buf + 6, msg, n);
-    orin_platform_write_line(ORIN_PLATFORM_STDERR, buf, 6 + n);
-    orin_platform_exit(101);
-}
+/* `orin_trap` is an Orin function now (runtime/core/task.or `trap`, ADR-0052 R3e.4): the code a program is compiled to defines it under
+ * this name (a wrapper, mir/rt.or `rtWraps`), like the allocator entries. A trap on a task thread ends that task only; the joiner traps. */
 
 /* Size-class freelists for small struct objects (by slot count) and array headers. Objects are
  * recycled, never returned to malloc. Disabled under ASan (so use-after-free is still detected)
@@ -1818,22 +1811,34 @@ uint64_t orin_rt_par_threads(void) { return par_threads(); }
 /* ---------------------------------------------------------------- tasks */
 
 enum { TASK_MSG = 480 };
+/* The task record (512 bytes), shared with runtime/core/task.or: tok@0, trapped@8, done_mon@16, message@24 (480 bytes and a NUL). The trap
+ * (an Orin function now) writes it through the heap block word `task` (orin_heap.task, @336), which is how it finds the task of a thread. */
 typedef struct {
     uint64_t tok;       /* the transfer token of the task body (a closure) */
-    int trapped;        /* written by the task thread, read after the join */
+    uint64_t trapped;   /* written by the task thread, read after the join */
     uint64_t done_mon;  /* monitor whose word 1 becomes 1 when the task ends, by return or trap (orin_rt_task_watch); 0 = none */
-    char msg[TASK_MSG]; /* the trap message */
+    char msg[TASK_MSG + 1]; /* the trap message */
 } RtTask;
-static __thread RtTask *t_task;                        /* the task this thread runs, NULL on the main thread */
+_Static_assert(offsetof(RtTask, trapped) == 8 && offsetof(RtTask, done_mon) == 16 && offsetof(RtTask, msg) == 24 && sizeof(RtTask) == 512,
+               "RtTask: tok @0, trapped @8, done_mon @16, message @24, 512 bytes (runtime/core/task.or)");
+#define t_task (*(RtTask **)&orin_heap.task) /* the task this thread runs, NULL on the main thread */
 static __thread char t_joined_msg[TASK_MSG + 1];       /* message of the task joined last by this thread */
 
-/* A task's heap ends: close what it left open, return its free lists to the allocator, fold its counters. */
-void orin_rt_heap_exit(void) {
+static void revoke_all_grants(void) {
     for (int i = 0; i < GR_SLOTS; i++)
         if (g_grants[i].live) orin_cap_revoke(grant_handle(&g_grants[i]));
-    files_at_exit();
+}
+static void free_netbuf(void) {
     orin_platform_free(t_netbuf);
     t_netbuf = NULL;
+}
+
+/* A task's heap ends: close what it left open, return its free lists to the allocator, fold its counters. The Orin version
+ * (runtime/core/task.or `heapRetire`) is what generated code runs; this one ends the tasks that the C `orin_rt_task_spawn` starts. */
+void orin_rt_heap_exit(void) {
+    revoke_all_grants();
+    files_at_exit();
+    free_netbuf();
     orin_platform_free(t_dstack);
     t_dstack = NULL;
     orin_heap.dcap = 0;
@@ -1862,8 +1867,6 @@ void orin_rt_heap_exit(void) {
     orin_platform_runtime_unlock();
 }
 
-static int task_active(void) { return t_task != NULL; }
-
 /* The task is over (its heap is gone): publish it for a timed join. Only L0 calls; the joiner frees the monitor after the join. */
 static void task_signal_done(void) {
     uint64_t m = t_task->done_mon;
@@ -1872,18 +1875,6 @@ static void task_signal_done(void) {
     orin_platform_monitor_set((int64_t)m, 1, 1);
     orin_platform_monitor_notify((int64_t)m, 0, 1);
     orin_platform_monitor_unlock((int64_t)m);
-}
-
-/* Called by orin_trap on a task thread: record the message, end the task, never return. */
-static void task_trap(const char *msg) {
-    size_t n = 0;
-    while (msg[n] && n < TASK_MSG - 1) n++;
-    orin_platform_mem_copy(t_task->msg, msg, n);
-    t_task->msg[n] = 0;
-    t_task->trapped = 1;
-    orin_rt_heap_exit();
-    task_signal_done();
-    orin_platform_thread_exit();
 }
 
 static void task_main(void *p) {
@@ -1918,7 +1909,7 @@ uint64_t orin_rt_task_join(uint64_t h) {
     void *arg = NULL;
     if (orin_platform_thread_join((int64_t)h, &arg) != 0) orin_trap("invalid task handle (joined twice, or forged)");
     RtTask *t = (RtTask *)arg;
-    uint64_t st = (uint64_t)t->trapped;
+    uint64_t st = t->trapped;
     orin_platform_mem_copy(t_joined_msg, t->msg, TASK_MSG);
     t_joined_msg[TASK_MSG] = 0;
     orin_platform_free(t);
