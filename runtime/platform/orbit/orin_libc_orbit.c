@@ -1,5 +1,5 @@
 /* The minimal C library of the WebAssembly platform layer (ADR-0055): exactly what runtime/platform/orin_platform.h and
- * runtime/core/orin_runtime.c need from libc on a freestanding wasm64 target (include/stdlib.h, include/string.h).
+ * runtime/core/orin_runtime.c need from libc on a freestanding wasm32 or wasm64 target (include/stdlib.h, include/string.h).
  * No imports: memory comes from memory.grow.
  *
  * Allocator: every block is a 16-byte header {size, size of the physically previous block} and a payload, so every payload
@@ -18,7 +18,9 @@
 #include "include/stdlib.h"
 #include "include/string.h"
 
-enum { HDR = 16, MIN_CLASS = 5, SMALL = 65536, MAX_SIZE = (size_t)1 << 47 };
+/* MAX_SIZE must fit size_t with room for the header and the 16-byte rounding: 2 GiB on wasm32, 128 TiB on wasm64. */
+enum { HDR = 16, MIN_CLASS = 5, SMALL = 65536 };
+#define MAX_SIZE ((size_t)1 << (sizeof(size_t) == 4 ? 31 : 47))
 
 typedef size_t word;
 extern unsigned char __heap_base; /* provided by wasm-ld: the first byte after the stack and the data */
@@ -38,15 +40,13 @@ static void set_size(unsigned char *b, word s) {
     else W(b + s)[1] = s;
 }
 
-/* Make room for `size` more bytes at g_top; 0 when the host refuses to grow. */
+/* Make room for `size` more bytes at g_top; 0 when the host refuses to grow. The arithmetic is 64-bit: on wasm32 the memory
+ * size in bytes (up to 4 GiB) does not fit size_t, and the last 16 bytes stay unused so that no pointer wraps to 0. */
 static int heap_room(size_t size) {
     if (!g_top) g_top = (unsigned char *)(((uintptr_t)&__heap_base + HDR - 1) & ~(uintptr_t)(HDR - 1));
-    size_t have = __builtin_wasm_memory_size(0) * 65536;
-    if ((uintptr_t)g_top > have || size > have - (uintptr_t)g_top) {
-        size_t need = size - (have - (uintptr_t)g_top);
-        if ((uintptr_t)g_top > have) need = size + ((uintptr_t)g_top - have);
-        if (__builtin_wasm_memory_grow(0, (need + 65535) / 65536) == (size_t)-1) return 0;
-    }
+    uint64_t have = (uint64_t)__builtin_wasm_memory_size(0) * 65536, top = (uintptr_t)g_top, end = top + size;
+    if (sizeof(void *) == 4 && end > 0xfffffff0u) return 0;
+    if (end > have && __builtin_wasm_memory_grow(0, (size_t)((end - have + 65535) / 65536)) == (size_t)-1) return 0;
     return 1;
 }
 
