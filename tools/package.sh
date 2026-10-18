@@ -13,7 +13,7 @@ cp dist/llvm.pin "$OUT/lib/orin/llvm.pin"   # the pinned LLVM for orin toolchain
 cp build/bootstrap/orin2 "$OUT/libexec/orin"
 cp runtime/core/*.h runtime/core/*.c "$OUT/lib/orin/runtime/"   # the release layout keeps lib/orin/{runtime,platform} (docs/architecture.md, Repository layout)
 mkdir -p "$OUT/lib/orin/platform" && cp runtime/platform/*.h runtime/platform/*.c "$OUT/lib/orin/platform/"
-cp -R runtime/platform/orbit "$OUT/lib/orin/platform/orbit" && rm -rf "$OUT/lib/orin/platform/orbit/tests" # ADR-0055: the wasm64-orbit L0
+cp -R runtime/platform/orbit "$OUT/lib/orin/platform/orbit" && rm -rf "$OUT/lib/orin/platform/orbit/tests" # ADR-0055: the wasm64-orbit and wasm32-orbit L0
 test -f "$OUT/lib/orin/platform/orin_platform.c" || { echo "package lacks platform/" >&2; exit 1; }
 cp -r examples "$OUT/examples"
 mkdir -p "$OUT/examples/osig" && cp -r tests/osig/accept/base tests/osig/accept/head "$OUT/examples/osig/"   # orin diff demo (README)

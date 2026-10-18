@@ -5,6 +5,7 @@ Design and measurements: [ADR-0055](decisions/0055-webassembly-target-orbit.md).
 
 ```sh
 orin build --target=wasm64-orbit                   # -> build/dev/<name>.wasm (build/release/ with --release)
+orin build --target=wasm32-orbit                   # the same program with a 32-bit memory
 orbit inspect build/dev/hello.wasm                 # imports, exports, the capability manifest
 orbit run build/dev/hello.wasm --grant log/v1 --invoke orin_main
 ```
@@ -14,7 +15,7 @@ system `clang` plus the `lld` package also works (`CC=clang`).
 
 ## What the module looks like
 
-- **wasm64** (Memory64), freestanding: no WASI, no libc imports. The only imports are Orbit capabilities the program reaches:
+- **wasm64** (Memory64) or **wasm32**, freestanding: no WASI, no libc imports. The only imports are Orbit capabilities the program reaches:
   `orbit:log/v1` (console output, trap messages) and `orbit:clock/v1` (time).
 - **Exports:** `memory`; `orin_main() -> i32` runs `main` and returns the exit status; `orin_exit_status() -> i32` gives the
   status passed to `exit` after a trap (101 for an Orin trap such as an out-of-bounds index), or -1 for any other trap.
@@ -23,7 +24,7 @@ system `clang` plus the `lld` package also works (`CC=clang`).
 
 ## What works, and what does not
 
-| Feature | On `wasm64-orbit` |
+| Feature | On `wasm64-orbit` and `wasm32-orbit` |
 |---|---|
 | the language, std collections, strings, floats, closures, generics, traps | as native (the conformance suites pass as modules) |
 | `console.log`, stderr | one log record per line (stdout = info, stderr = error) |
@@ -41,7 +42,7 @@ joined run before `main` ends. So these work as natively: spawn-and-join, `scope
 whose sender never waits for the receiver (the capacity is large enough, or the producer is joined before the consumer
 reads), fan-out and fan-in.
 
-Two things do not work, and both end the module with a line that starts with `wasm64-orbit: ` on stderr instead of
+Two things do not work, and both end the module with a line that starts with `wasm64-orbit: ` (`wasm32-orbit: ` for the 32-bit target) on stderr instead of
 hanging or giving a wrong answer:
 
 - **Interleaving.** A task that waits for something only a task suspended below it can produce (ping-pong over bounded
@@ -57,8 +58,22 @@ build turns each into an ordinary object of the section `orin_tls` (`-D__thread=
 they form one block, and the L0 saves that block, installs its pristine image, runs the task and restores the block. No
 atomics or WebAssembly threads are involved (the module needs no extra WebAssembly feature).
 
+## wasm32-orbit or wasm64-orbit?
+
+Same language, same behaviour, same manifest, same imports; only the width of the C pointers differs. In `wasm32-orbit`
+Orin values stay 64-bit (`usize`, `int`, every slot), so arithmetic and memory per object are the same as on wasm64; only
+addresses are 4 bytes. Choose by where the module runs:
+
+- **wasm32-orbit** runs everywhere (every engine and every Orbit version) and avoids the bounds-check cost of Memory64
+  (ADR-0055 "Measurements" has the numbers). Limits: the memory is at most 4 GiB (an allocation that does not fit fails with
+  `out of memory`, a size above 4 GiB traps with the same message, never wraps), and the module's own 1 MiB stack and data
+  count against that.
+- **wasm64-orbit** has no 4 GiB limit but needs an engine with Memory64 (Node >= 24, Wasmtime, Orbit).
+
+The host contract is identical: every pointer and length that crosses the Orbit ABI is an `i64`, zero-extended for the 32-bit memory.
+
 ## Testing
 
-`tools/test_wasm.sh` runs the conformance suites as WebAssembly modules under Node >= 24 (`tools/wasm_run.mjs` serves the same
+`tools/test_wasm.sh` runs the conformance suites as WebAssembly modules (once per width) under Node >= 24 (`tools/wasm_run.mjs` serves the same
 two capabilities with Orbit's load-time checks), plus the differential tests of the WebAssembly L0 and its size budget. One
-suite only: `NODE=node python3 tools/run_tests.py --orinc build/bootstrap/orin2 --target wasm64-orbit --suite all`.
+suite only: `NODE=node python3 tools/run_tests.py --orinc build/bootstrap/orin2 --target wasm64-orbit --suite all` (or `--target wasm32-orbit`).

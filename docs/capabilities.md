@@ -265,9 +265,9 @@ purity agreement, not-typed program, policy matching; `tools/test_tooling.sh`), 
 sections, the policy cases), the LSP hover tests in `compiler/tests/lsp_test.or` and `tools/protocol.sh lsp`, the MCP `inspect`
 tests in `tools/protocol.sh mcp`, and `tools/test_capabilities.sh` (the inferred effects cover what the runtime denies).
 
-## The Orbit capability manifest (`--target=wasm64-orbit`)
+## The Orbit capability manifest (`--target=wasm64-orbit`, `--target=wasm32-orbit`)
 
-`orin compile <entry.or> -o out.c --target=wasm64-orbit` (C backend only; with `--backend=llvm`, `--stats-sites` or `--split` it is a
+`orin compile <entry.or> -o out.c --target=wasm64-orbit` (or `wasm32-orbit`: the same C and the same manifest; C backend only; with `--backend=llvm`, `--stats-sites` or `--split` it is a
 usage error, exit 2; `--target=native` is the default and changes nothing) appends a manifest for the Orbit WebAssembly runtime to
 the generated C, as the very last lines: a custom section `orbit.manifest` whose payload is the UTF-8 JSON
 `{"abi":1,"requires":[...],"producer":"orin"}` (host ABI section 6). It describes requirements and never authorises.
@@ -285,5 +285,5 @@ the generated C, as the very last lines: a custom section `orbit.manifest` whose
 
 `log/v1` is always required (a runtime trap prints its message to stderr, which maps to the log capability); the list is sorted
 without duplicates. E0523 is reported once per unavailable effect, located at the evidence the analysis has
-(``error[E0523]: `main` needs Fs.ReadFile, which the wasm64-orbit target does not provide``). Implementation:
+(``error[E0523]: `main` needs Fs.ReadFile, which the wasm64-orbit target does not provide`` — the message names the target that was asked for, `wasm32-orbit` likewise). Implementation:
 `compiler/analysis/orbit.or`; tests: `tools/test_effects.py` (section 5).

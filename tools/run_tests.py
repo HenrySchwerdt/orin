@@ -3,13 +3,13 @@
 
 Usage: python3 tools/run_tests.py --orinc <compiler> [--cc cc] [--filter substr]
                                   [-j/--jobs N] [--sanitize] [--suite default|next|all]
-                                  [--backend c|llvm] [--assert-facts] [--target native|wasm64-orbit]
+                                  [--backend c|llvm] [--assert-facts] [--target native|wasm64-orbit|wasm32-orbit]
 
 Suites: `default` = tests/run + tests/errors (the Orin-B contract, every compiler stage);
 `next` = tests/next/run + tests/next/errors (language beyond Orin-B, self-hosted compiler only);
 `all` = both.
 
-`--target wasm64-orbit` (ADR-0055) builds every test as a WebAssembly module (C backend, clang with the WebAssembly backend
+`--target wasm64-orbit|wasm32-orbit` (ADR-0055) builds every test as a WebAssembly module (C backend, clang with the WebAssembly backend
 as --cc, default clang) and runs it with tools/wasm_run.mjs under Node >= 24 ($NODE, default node). A test whose program
 needs an effect the target does not provide fails to compile (that diagnostic) and is counted as SKIP, not as a failure.
 
@@ -30,15 +30,17 @@ from runtime_files import rt_inc, rt_src, rt_llvm  # the runtime source list: to
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = os.path.join("build", "tests")
 RUN_TIMEOUT = 10
-WASM = "wasm64-orbit"
+WASM64 = "wasm64-orbit"
+WASM32 = "wasm32-orbit"
+WASM_TARGETS = (WASM64, WASM32)
 # `-D__thread=...`: the runtime keeps per-task state in __thread objects; one WebAssembly thread runs every task, so the L0 switches
 # that state by copying one block. Putting every __thread object into the section orin_tls makes it one contiguous block with the
 # linker symbols __start_orin_tls / __stop_orin_tls (ADR-0055; no atomics, no wasm-ld TLS, which is broken for non-shared memory).
 WASM_TLS = '-D__thread=__attribute__((section("orin_tls")))'
-WASM_CFLAGS = ["--target=wasm64-unknown-unknown", "-mbulk-memory", "-ffreestanding", "-nostdlib", WASM_TLS]
+WASM_CFLAGS = ["-mbulk-memory", "-ffreestanding", "-nostdlib", WASM_TLS]  # plus --target=wasm{32,64}-unknown-unknown (wasm_triple)
 WASM_LINK = ["-Wl,--no-entry", "-Wl,--stack-first", "-Wl,-z,stack-size=1048576"]
-WASM_LIMIT = "wasm64-orbit: "  # prefix of the line the WebAssembly L0 prints when it hits a limit of running tasks one at a time
-WASM_UNAVAILABLE = "which the wasm64-orbit target does not provide"  # the compile error for such an effect
+WASM_LIMIT = re.compile(r"^wasm(?:32|64)-orbit: ")  # prefix of the line the WebAssembly L0 prints when it hits a limit of running tasks one at a time
+WASM_UNAVAILABLE = "target does not provide"  # the compile error for such an effect: "which the <target> target does not provide"
 COMPILE_TIMEOUT = 120
 
 HEADER_EXIT = re.compile(r"^//\s*exit:\s*(-?\d+)\s*$")
@@ -107,14 +109,18 @@ def compile_orin(args, entry, c_out, flags=()):
     rel = os.path.relpath(entry, ROOT)
     extra = ["--backend=llvm"] if args.backend == "llvm" else []
     extra += ["--assert-facts"] if args.assert_facts else []
-    extra += ["--target=" + WASM] if args.target == WASM else []
+    extra += ["--target=" + args.target] if args.target in WASM_TARGETS else []
     extra += list(flags)
     return run_cmd([args.orinc, "compile", rel, "-o", c_out] + extra, COMPILE_TIMEOUT)
 
 
+def wasm_triple(target):
+    return "--target=" + target[:6] + "-unknown-unknown"
+
+
 def runtime_sources(backend, target="native"):
     """C runtime sources to link; the LLVM backend also needs the out-of-line shim."""
-    if target == WASM:
+    if target in WASM_TARGETS:
         return rt_src("orbit")
     srcs = rt_src()
     if backend == "llvm":
@@ -124,8 +130,8 @@ def runtime_sources(backend, target="native"):
 
 def cc_base(args):
     """The C compiler command and flags a test executable is built with (without the inputs)."""
-    if args.target == WASM:
-        return [args.cc if args.cc != "cc" else "clang", "-O2", "-w", *WASM_CFLAGS, *rt_inc("orbit")]
+    if args.target in WASM_TARGETS:
+        return [args.cc if args.cc != "cc" else "clang", "-O2", "-w", wasm_triple(args.target), *WASM_CFLAGS, *rt_inc("orbit")]
     if args.backend == "llvm":
         cc = [args.cc if args.cc != "cc" else "clang", "-O2", "-w", *rt_inc()]
     else:
@@ -175,7 +181,7 @@ def run_test(args, label, test):
     outdir = os.path.join(BUILD, label)
     os.makedirs(os.path.join(ROOT, outdir), exist_ok=True)
     c_out = os.path.join(outdir, safe + (".ll" if args.backend == "llvm" else ".c"))
-    exe = os.path.join(outdir, safe + (".wasm" if args.target == WASM else ".exe"))
+    exe = os.path.join(outdir, safe + (".wasm" if args.target in WASM_TARGETS else ".exe"))
     hdr = first_line(entry)
     hdrs = header_lines(entry)
     flags = []          # `// flags: --check-contracts` (any header line): extra compiler flags
@@ -223,8 +229,8 @@ def run_test(args, label, test):
     rc, _, err = compile_orin(args, entry, c_out, flags)
     if rc is None:
         return tag, False, "compiler timed out"
-    if rc != 0 and args.target == WASM and WASM_UNAVAILABLE in err:
-        return tag, None, "needs an effect %s does not provide" % WASM
+    if rc != 0 and args.target in WASM_TARGETS and WASM_UNAVAILABLE in err:
+        return tag, None, "needs an effect %s does not provide" % args.target
     if rc != 0:
         return tag, False, "compile failed (exit %s); stderr head:\n%s" % (rc, head(err))
     if want_warns is not None:
@@ -232,7 +238,7 @@ def run_test(args, label, test):
         if got_warns != want_warns:
             return tag, False, "warnings differ: expected %s, got %s; stderr head:\n%s" % (want_warns, got_warns, head(err))
 
-    link = WASM_LINK if args.target == WASM else ["-lm"]
+    link = WASM_LINK if args.target in WASM_TARGETS else ["-lm"]
     cc = cc_base(args) + [c_out] + (args.rt_objs or runtime_sources(args.backend, args.target)) + link + ["-o", exe]
     rc, _, err = run_cmd(cc, COMPILE_TIMEOUT)
     if rc != 0:
@@ -247,9 +253,9 @@ def run_test(args, label, test):
     if os.path.isfile(in_path):
         with open(in_path, "rb") as f:
             stdin_data = f.read()
-    if args.target == WASM and stdin_data is not None:
-        return tag, None, "reads stdin, which %s does not provide" % WASM
-    run = [os.environ.get("NODE", "node"), os.path.join(ROOT, "tools", "wasm_run.mjs")] if args.target == WASM else []
+    if args.target in WASM_TARGETS and stdin_data is not None:
+        return tag, None, "reads stdin, which %s does not provide" % args.target
+    run = [os.environ.get("NODE", "node"), os.path.join(ROOT, "tools", "wasm_run.mjs")] if args.target in WASM_TARGETS else []
     rc, out, err = run_cmd(run + [os.path.join(ROOT, exe)], RUN_TIMEOUT, env=env, stdin_data=stdin_data)
     if rc is None:
         return tag, False, "executable timed out after %d s" % RUN_TIMEOUT
@@ -263,13 +269,14 @@ def run_test(args, label, test):
     for w in want_stderr:
         if w not in err:
             problems.append("stderr does not contain %r" % w)
-    if problems and args.target == WASM:
-        # The L0 ends the module with a line `wasm64-orbit: <reason>` when the program needs something one WebAssembly thread
+    if problems and args.target in WASM_TARGETS:
+        # The L0 ends the module with a line `wasm{32,64}-orbit: <reason>` when the program needs something one WebAssembly thread
         # cannot do: two tasks running at once (a wait nobody queued can satisfy), a task that traps (no unwinding to its join).
         # A test that then differs from its expectation is SKIP with that reason; a test that still matches passes for real.
         for line in err.splitlines():
-            if line.startswith(WASM_LIMIT):
-                return tag, None, line[len(WASM_LIMIT):]
+            m = WASM_LIMIT.match(line)
+            if m:
+                return tag, None, line[m.end():]
     if problems:
         if err.strip():
             problems.append("stderr head:\n" + head(err, 8))
@@ -288,8 +295,8 @@ def main():
                     help="default: tests/run + tests/errors; next: tests/next/*; all: both")
     ap.add_argument("--backend", choices=["c", "llvm"], default="c",
                     help="c: emit C (default); llvm: emit LLVM IR and build with clang")
-    ap.add_argument("--target", choices=["native", WASM], default="native",
-                    help="native (default) or wasm64-orbit: WebAssembly modules run with tools/wasm_run.mjs (ADR-0055)")
+    ap.add_argument("--target", choices=["native", *WASM_TARGETS], default="native",
+                    help="native (default), wasm64-orbit or wasm32-orbit: WebAssembly modules run with tools/wasm_run.mjs (ADR-0055)")
     ap.add_argument("--assert-facts", action="store_true",
                     help="compile with `--assert-facts`: every forwarded load is checked against its slot at run time (exit 70)")
     args = ap.parse_args()
@@ -322,7 +329,7 @@ def main():
     results = list(ordered_map(work, jobs, args.jobs))
 
     failed = [r for r in results if r[1] is False]
-    skipped = [r for r in results if r[1] is None]  # only with --target wasm64-orbit: the target lacks what the test needs
+    skipped = [r for r in results if r[1] is None]  # only with a wasm target: the target lacks what the test needs
     for tag, ok, detail in skipped:
         print("SKIP %s: %s" % (tag, detail))
     for tag, ok, detail in failed:

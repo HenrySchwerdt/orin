@@ -1484,9 +1484,9 @@ void orin_process_exit(int64_t code) { orin_platform_exit((int)code); }
  * (put, take, drop) and these C functions (the task code below, the lend, the unit tests) work on one table. A slot with `pins` != NULL is
  * a LEND (see "lending" below). */
 typedef struct {
-    OrinObj *box; /* NULL = free */
+    ORIN_PTR64(OrinObj *, box); /* NULL = free */
     uint32_t gen, next;
-    OrinObj **pins; /* a LEND: the objects this lend pinned; NULL for a value in flight */
+    ORIN_PTR64(OrinObj **, pins); /* a LEND: the objects this lend pinned; NULL for a value in flight */
     uint64_t npins;
 } TrSlot;
 _Static_assert(sizeof(TrSlot) == 32 && offsetof(TrSlot, gen) == 8 && offsetof(TrSlot, next) == 12 && offsetof(TrSlot, pins) == 16 &&
@@ -1517,8 +1517,8 @@ static uint64_t tr_publish(OrinObj *box) {
         i = g_tr_n++;
         g_tr[i].gen = 0;
     }
-    g_tr[i].box = box;
-    g_tr[i].pins = NULL;
+    g_tr[i].box_w = (uint64_t)(uintptr_t)box; /* whole word: the table is not zeroed, and transfer.or reads 64 bits */
+    g_tr[i].pins_w = 0;
     g_tr[i].npins = 0;
     g_tr[i].gen++;
     uint64_t tok = ((uint64_t)g_tr[i].gen << 32) | (i + 1);
@@ -1542,10 +1542,10 @@ static OrinObj *tr_claim_kind(uint64_t tok, int lend, OrinObj ***pins, uint64_t 
         *pins = g_tr[i].pins;
         *npins = g_tr[i].npins;
     }
-    g_tr[i].pins = NULL;
+    g_tr[i].pins_w = 0;
     g_tr[i].npins = 0;
     OrinObj *b = g_tr[i].box;
-    g_tr[i].box = NULL;
+    g_tr[i].box_w = 0;
     g_tr[i].next = (uint32_t)g_tr_free;
     g_tr_free = i + 1;
     orin_platform_runtime_unlock();
@@ -1618,7 +1618,7 @@ static uint64_t lend_put(OrinObj *box) {
     uint64_t tok = tr_publish(box);
     uint32_t i = (uint32_t)(tok & 0xffffffffu) - 1u;
     orin_platform_runtime_lock();
-    g_tr[i].pins = pins;
+    g_tr[i].pins_w = (uint64_t)(uintptr_t)pins;
     g_tr[i].npins = n;
     orin_platform_runtime_unlock();
     return tok;
