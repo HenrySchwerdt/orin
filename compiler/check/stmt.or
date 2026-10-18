@@ -35,6 +35,29 @@ type ElseRes = { block: Option<HBlock>; div: bool; };
 // One match arm: the arm, whether it diverges, the (possibly inferred) target type and what the pattern covers.
 type ArmRes = { arm: HArm; div: bool; target: Option<Type>; covered: bool[]; wild: bool; };
 
+// The pseudo-variable of an `@Invariant` on a `for (const x of xs)` loop (docs/contracts.md, Loops).
+const LOOP_INDEX: string = "loopIndex";
+
+// For every statement of a block: it is a loop clause and the loop it belongs to is a `for .. of`.
+@Ensures(result.length == stmts.length)
+function clausesBeforeForOf(stmts: Stmt[]): bool[] {
+  let out: bool[] = [];
+  for (const _s of stmts) {
+    out.push(false);
+  }
+  let ahead = false;
+  let i = stmts.length;
+  while (i > 0) {
+    i -= 1;
+    match (stmts[i].kind) {
+      SContract(_) => { out[i] = ahead; },
+      SForOf(_, _, _) => { ahead = true; },
+      _ => { ahead = false; },
+    }
+  }
+  return out;
+}
+
 // The number of arms of a checked `match` expression (0 for any other expression).
 function armCount(e: HExpr): usize {
   return match (e.kind) {
@@ -80,7 +103,14 @@ export class StmtChecker {
     this.open += 1;
     let stmts: HStmt[] = [];
     let div = false;
+    const forOfClause = clausesBeforeForOf(b.stmts);
+    let si: usize = 0;
     for (const s of b.stmts) {
+      let onForOf = false;
+      if (si < forOfClause.length) {
+        onForOf = forOfClause[si];
+      }
+      si += 1;
       // Loop contract clauses (ADR-0012) are checked in the current scope and erased.
       const isClause = match (s.kind) {
         SContract(_) => true,
@@ -89,7 +119,12 @@ export class StmtChecker {
       if (isClause) {
         match (s.kind) {
           SContract(c) => {
-            const x = this.clause(c, CmContract)?;
+            let x: Option<HExpr> = None;
+            if (onForOf) {
+              x = this.clauseForOf(c)?;
+            } else {
+              x = this.clause(c, CmContract)?;
+            }
             match (x) {
               Some(h) => {
                 this.ex.fx.cexprs.push(h);
@@ -227,6 +262,32 @@ export class StmtChecker {
         return Ok(Some(r));
       },
     }
+  }
+
+  // A clause in front of `for (const x of xs)`: besides the visible variables it sees the read-only `usize` local
+  // `loopIndex`, the position in `xs` of the iteration the invariant speaks about (the verifier gives it its
+  // meaning; there is no counter in a `for .. of`). Like `result`, a variable of that name hides it (E0415).
+  @Ensures(result.isOk() ==> this.ex.fx.locals.length == old(this.ex.fx.locals.length))
+  @Ensures(result.isOk() ==> this.ex.fx.scope.depth() == old(this.ex.fx.scope.depth()))
+  @Ensures(this.ex.fx.env.funcs.length >= old(this.ex.fx.env.funcs.length))
+  private clauseForOf(c: ContractClause): Result<Option<HExpr>, Diagnostic> {
+    if (this.ex.fx.isVisibleVar(LOOP_INDEX)) {
+      return Err(diag("E0415", c.span, "a variable named `loopIndex` hides the loop index of the `for .. of` invariant; rename the variable"));
+    }
+    const saved = this.ex.fx;
+    this.ex.fx.pushScope();
+    this.open += 1; // the class invariant counts the scope opened here while `clause` runs
+    const id = this.ex.fx.newLocal(LOOP_INDEX, TyUsize, false);
+    const d = this.ex.fx.declare(Ident { name: LOOP_INDEX, span: c.span }, id);
+    if (d.isErr()) {
+      return Err(d.unwrapErr());
+    }
+    const r = this.clause(c, CmContract);
+    const env = this.ex.fx.env;
+    this.ex.fx = saved;
+    this.open -= 1;
+    this.ex.fx.adopt(env);
+    return r;
   }
 
   @Ensures(result.isOk() ==> this.ex.fx.declaredInScope(name.name) && !result.unwrap().div)

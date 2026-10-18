@@ -234,7 +234,7 @@ Format: `path:line:col: error[CODE]: message` on stderr, exit status 1. Codes:
 | E0412 | invalid or missing `main` |
 | E0413 | generic instantiation limit exceeded (self-hosted compiler only, ADR-0007) |
 | E0414 | contract expression is not `bool` (`@Decreases`: not `int`/`usize`) — beyond Orin-B (ADR-0012, `docs/contracts.md`) |
-| E0415 | invalid use of `result`-scope features in a contract: `old(..)` outside `@Ensures` or nested, `==>` outside a contract expression, `?` in a contract, a parameter named `result` hiding it — beyond Orin-B (ADR-0012) |
+| E0415 | invalid use of `result`-scope features in a contract: `old(..)` outside `@Ensures` or nested, `==>` outside a contract expression, `?` in a contract, a parameter named `result` (or a variable `loopIndex` in a `for .. of` invariant) hiding it — beyond Orin-B (ADR-0012) |
 | E0416 | impure contract expression: I/O or other effect, mutating call, call of a function that is not provably pure (inferred over the call graph; pure closures are allowed, ADR-0031 A4) — beyond Orin-B (ADR-0012) |
 | E0417 | class does not implement an interface method / type does not satisfy a bound (self-hosted compiler only, ADR-0019) |
 | E0418 | method implementing an interface method mutates its receiver (self-hosted compiler only, ADR-0019) |
