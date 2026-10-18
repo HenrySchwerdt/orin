@@ -26,7 +26,7 @@
 //
 // Cancellation (ADR-0017 Addendum D). A task that is cancelled (`Scope.cancel()` / `CancelToken.cancel()` of std:task, also from
 // another task) stops waiting at once: a call blocked in accept, connect, recv or send returns `Err(NetError { kind: Cancelled })`
-// (`RecvError(..)` for recv, `FillError(..)` for the readers) within milliseconds, and every later network call of that task
+// within milliseconds, and every later network call of that task
 // returns it without touching the socket (a pending connection or the bytes in the kernel stay where they are). Pure computation
 // is not interrupted: check `isCancelled()` of std:task. Name resolution is the exception: `getaddrinfo` runs to the OS
 // resolver's own end (see `resolve`), in `resolve` and in the lookup that `connect` does for a name; a literal address
@@ -47,6 +47,7 @@
 import { Bytes, fromArray, empty } from "std:bytes";
 import { Scope, TaskHandle, spawn } from "std:task";
 import { Deadline, Duration, MonotonicInstant } from "std:time";
+import { MAX_MS, clampMs, waitUntilMs, portDigits, splitLines } from "std:net/internal";
 import {
   NetGrant, Listener, Stream, grantListen, grantConnect, grantRevoke, grantMove, grantAdoptStream, netListen, netAccept, netConnect, netStatus, netClose,
   netPort, netNow, netRecv, netSend, netShutdown, netPeer, netResolve, netErrorText
@@ -58,7 +59,7 @@ export { NetGrant, Listener, Stream } from "std:fsraw";
 
 // Why an operation of this module failed (rule 3.1.4: bare words describing the cause).
 //   Denied           refused by the grant's scope or by the host policy (`ORIN_DENY=net`)
-//   Closed           the peer closed the connection (L0 code 1001)
+//   Closed           the peer closed the connection (L0 code 1001); from `recv` it is the end of the stream
 //   Timeout          nothing happened within the time given (1002)
 //   Cancelled        the cancellation token of the task's scope was set (1004); see "Cancellation" above
 //   Reset            the connection was reset or broke (1003)
@@ -79,7 +80,6 @@ const CODE_TIMEOUT: int = 1002;
 const CODE_RESET: int = 1003;
 const CODE_CANCELLED: int = 1004;
 const CODE_INVALID: int = 22;
-const MAX_MS: int = 3600000;
 const CHUNK: usize = 65536;
 
 // kindOfCode(code): the kind of an L0 code. O(1).
@@ -124,31 +124,32 @@ export function netErrorMessage(e: NetError): string {
 
 // isDenied(e): bool -- refused by the grant's scope or by the host policy (`e.kind` is Denied). O(1).
 export function isDenied(e: NetError): bool {
-  return e.code == CODE_DENIED;
+  return e.kind == Denied;
 }
 
 // isTimeout(e): bool -- nothing happened within the time given (Timeout). O(1).
 export function isTimeout(e: NetError): bool {
-  return e.code == CODE_TIMEOUT;
+  return e.kind == Timeout;
 }
 
 // isReset(e): bool -- the connection was reset or broke (Reset). O(1).
 export function isReset(e: NetError): bool {
-  return e.code == CODE_RESET;
+  return e.kind == Reset;
 }
 
-@Ensures(result >= 0 && result <= MAX_MS)
-@Ensures(ms >= 0 && ms <= MAX_MS ==> result == ms)
-function clampMs(ms: int): int {
-  if (ms < 0) {
-    return 0;
-  }
-  return ms > MAX_MS ? MAX_MS : ms;
+// isClosed(e): bool -- the peer closed the connection (Closed): from `recv` the end of the stream. O(1).
+export function isClosed(e: NetError): bool {
+  return e.kind == Closed;
+}
+
+// isCancelled(e): bool -- the cancellation token of the task's scope was set (Cancelled). O(1).
+export function isCancelled(e: NetError): bool {
+  return e.kind == Cancelled;
 }
 
 // ------------------------------------------------------------------------------------------------ peers
 
-// The address of the other end of a stream: `host` is the numeric address, `port` its port.
+// Peer = { host: string; port: int } -- the address of the other end of a stream: `host` is the numeric address, `port` its port.
 export type Peer = { host: string; port: int; };
 
 function invalidPeer(offset: usize): NetError {
@@ -162,27 +163,6 @@ function isInvalidPeer(e: NetError): bool {
   };
 }
 
-// The decimal port in text[start, end): 1 to 5 digits, 0 .. 65535. Err(InvalidPeer) at the offending byte.
-function parsePort(text: string, start: usize): Result<int, NetError> {
-  if (start >= text.length) {
-    return Err(invalidPeer(start));
-  }
-  let v: int = 0;
-  let i = start;
-  while (i < text.length) {
-    const c = text.charCodeAt(i);
-    if (c < 48 || c > 57) {
-      return Err(invalidPeer(i));
-    }
-    v = v * 10 + (c - 48);
-    if (v > 65535) {
-      return Err(invalidPeer(start));
-    }
-    i += 1;
-  }
-  return Ok(v);
-}
-
 // parsePeer(text): Result<Peer, NetError> -- "1.2.3.4:5" or "[::1]:5" to a Peer (the brackets of an IPv6 literal are
 // dropped). Err(InvalidPeer) with the byte offset of the problem when there is no port, the port is not 0 .. 65535, the
 // host is empty, or an IPv6 literal is not in brackets. O(n).
@@ -193,9 +173,9 @@ export function parsePeer(text: string): Result<Peer, NetError> {
   while (i > 0) {
     i -= 1;
     if (text.charCodeAt(i) == 58) {
-      const port = parsePort(text, i + 1);
+      const port = portDigits(text, i + 1);
       if (port.isErr()) {
-        return Err(port.unwrapErr());
+        return Err(invalidPeer(port.unwrapErr()));
       }
       let h = text.substring(0, i);
       if (h.length >= 2 && h.charCodeAt(0) == 91 && h.charCodeAt(h.length - 1) == 93) {
@@ -371,11 +351,6 @@ export function useAccepted(ln: Listener, timeout: Duration, body: (s: Stream, p
   return Ok();
 }
 
-// The wait left at `now` until the absolute deadline `end` (both monotonic millis): 0 when it has passed, at most one hour.
-function waitUntilMs(now: int, end: int): int {
-  return clampMs(end - now);
-}
-
 // withAcceptedUntil<T>(ln, deadline, body): Result<T, NetError> -- `withAccepted` that waits until the absolute `deadline` (a single
 // wait is capped at one hour like every wait of this module: a later deadline behaves as one hour from now). The deadline of the
 // whole exchange is typically shared with the body's own `...Until` calls. Cancellable. Err(Timeout) if none came.
@@ -400,13 +375,15 @@ export function withAcceptedUntil<T>(ln: Listener, deadline: Deadline, body: (s:
 
 // An accepted connection on its way to another task (ADR-0017 Addendum C): the Stream has left the accepting task's grant
 // table (`acceptDetached`) and waits as a one-shot token until a task adopts it (`serveAccepted`). It is a plain value, so
-// it can travel through a channel (`channel<Accepted>`) to a pool of workers. Exactly one `serveAccepted` / `dropAccepted`
+// it can travel through a channel (`channel<Accepted>`) to a pool of workers. It is `@Sealed` (the token is private to this
+// module: only `acceptDetached` makes one); `peer` is readable. Exactly one `serveAccepted` / `dropAccepted`
 // per `Accepted`: a second one traps ("invalid grant token"), and a token nobody takes keeps its socket open until the
 // process ends, so a producer that cannot hand one over calls `dropAccepted`.
-export type Accepted = { token: usize; peer: Peer; };
+@Sealed
+export type Accepted = { _token: usize; peer: Peer; };
 
-// acceptDetached(ln, timeout): waits up to `timeout` for a connection and MOVES it out of this task: Ok(Accepted), or
-// `Err(Timeout)` (isTimeout: normal in a server loop) / another Err. TCP_NODELAY is on.
+// acceptDetached(ln, timeout): Result<Accepted, NetError> -- waits up to `timeout` for a connection and MOVES it out of this
+// task: Ok(Accepted), or `Err(Timeout)` (isTimeout: normal in a server loop) / another Err. TCP_NODELAY is on.
 export function acceptDetached(ln: Listener, timeout: Duration): Result<Accepted, NetError> {
   const s = netAccept(ln, clampMs(timeout.millis), 1);
   const code = netStatus(s);
@@ -420,10 +397,10 @@ export function acceptDetached(ln: Listener, timeout: Duration): Result<Accepted
     return Err(peer.unwrapErr());
   }
   const tok = grantMove(s);
-  return Ok(Accepted { token: tok, peer: peer.unwrap() });
+  return Ok(Accepted { _token: tok, peer: peer.unwrap() });
 }
 
-// acceptDetachedUntil(ln, deadline): `acceptDetached` that waits until the absolute `deadline`. Cancellable.
+// acceptDetachedUntil(ln, deadline): Result<Accepted, NetError> -- `acceptDetached` that waits until the absolute `deadline`. Cancellable.
 export function acceptDetachedUntil(ln: Listener, deadline: Deadline): Result<Accepted, NetError> {
   const s = netAccept(ln, waitUntilMs(netNow(ln), deadline.at.millis), 1);
   const code = netStatus(s);
@@ -437,32 +414,32 @@ export function acceptDetachedUntil(ln: Listener, deadline: Deadline): Result<Ac
     return Err(peer.unwrapErr());
   }
   const tok = grantMove(s);
-  return Ok(Accepted { token: tok, peer: peer.unwrap() });
+  return Ok(Accepted { _token: tok, peer: peer.unwrap() });
 }
 
-// serveAccepted(a, body): in the task that serves it: adopts the connection, runs body(stream, peer) and closes the stream.
+// serveAccepted<T>(a, body): T -- in the task that serves it: adopts the connection, runs body(stream, peer) and closes the stream.
 export function serveAccepted<T>(a: Accepted, body: (s: Stream, peer: Peer) => T): T {
-  const s = grantAdoptStream(a.token);
+  const s = grantAdoptStream(a._token);
   const r = body(s, a.peer);
   netClose(s);
   return r;
 }
 
-// serveAcceptedDo: `serveAccepted` for a body that returns nothing.
+// serveAcceptedDo(a, body): void -- `serveAccepted` for a body that returns nothing.
 export function serveAcceptedDo(a: Accepted, body: (s: Stream, peer: Peer) => void): void {
-  const s = grantAdoptStream(a.token);
+  const s = grantAdoptStream(a._token);
   body(s, a.peer);
   netClose(s);
 }
 
-// dropAccepted(a): closes a connection that will not be served (the pool is shutting down, the queue is full).
+// dropAccepted(a): void -- closes a connection that will not be served (the pool is shutting down, the queue is full).
 export function dropAccepted(a: Accepted): void {
-  const s = grantAdoptStream(a.token);
+  const s = grantAdoptStream(a._token);
   netClose(s);
 }
 
-// spawnAccepted(s, ln, timeout, body): accepts one connection (as `acceptDetached`) and starts a task of the scope `s`
-// that serves it: body(stream, peer), then the stream is closed. The task owns the connection; this task keeps the listener.
+// spawnAccepted<T>(sc, ln, timeout, body): Result<TaskHandle<T>, NetError> -- accepts one connection (as `acceptDetached`) and
+// starts a task of the scope `sc` that serves it: body(stream, peer), then the stream is closed. The task owns the connection; this task keeps the listener.
 // Unbounded: a task per connection; bound the number in flight yourself (see the example server) or use a worker pool.
 export function spawnAccepted<T>(
   sc: Scope, ln: Listener, timeout: Duration, body: (s: Stream, peer: Peer) => T
@@ -474,7 +451,8 @@ export function spawnAccepted<T>(
   };
 }
 
-// spawnAcceptedDo: `spawnAccepted` for a body that returns nothing; join() then returns true.
+// spawnAcceptedDo(sc, ln, timeout, body): Result<TaskHandle<bool>, NetError> -- `spawnAccepted` for a body that returns nothing;
+// join() then returns true.
 export function spawnAcceptedDo(
   sc: Scope, ln: Listener, timeout: Duration, body: (s: Stream, peer: Peer) => void
 ): Result<TaskHandle<bool>, NetError> {
@@ -533,7 +511,7 @@ export function withConnectionUntil<T>(net: NetGrant, host: string, port: int, d
   return Ok(r);
 }
 
-// useConnectionUntil(net, host, port, deadline, body): `withConnectionUntil` for a body that returns nothing.
+// useConnectionUntil(net, host, port, deadline, body): Result<void, NetError> -- `withConnectionUntil` for a body that returns nothing.
 export function useConnectionUntil(net: NetGrant, host: string, port: int, deadline: Deadline, body: (s: Stream) => void): Result<void, NetError> {
   const s = netConnect(net, host, port, waitUntilMs(netNow(net), deadline.at.millis), 1);
   const code = netStatus(s);
@@ -593,103 +571,47 @@ export function resolve(net: NetGrant, name: string): Result<string[], NetError>
   };
 }
 
-function splitLines(text: string): string[] {
-  let out: string[] = [];
-  let start: usize = 0;
-  let i: usize = 0;
-  while (i < text.length) {
-    if (text.charCodeAt(i) == 10) {
-      if (i > start) {
-        out.push(text.substring(start, i));
-      }
-      start = i + 1;
-    }
-    i += 1;
-  }
-  return out;
-}
-
 // ------------------------------------------------------------------------------------------------ stream operations
 
-// The result of one `recv`.
-export type RecvResult = RecvData(Bytes) | RecvEof | RecvTimeout | RecvReset | RecvError(NetError);
-
-// recvWithin(r, max): a RecvData holds between 1 and `max` bytes (a recv never returns more than it was asked for, and
-// never an empty chunk: that is RecvEof). Other results hold no bytes. Used in contracts.
-function recvWithin(r: RecvResult, max: usize): bool {
-  return match (r) {
-    RecvData(b) => b.length() >= 1 && b.length() <= max,
-    _ => true
-  };
-}
-
-// recvIsError(r): the result is RecvError. Used in contracts.
-function recvIsError(r: RecvResult): bool {
-  return match (r) {
-    RecvError(e) => true,
-    _ => false
-  };
-}
-
-// recv(s, maxBytes, timeout): RecvResult -- waits up to `timeout` for bytes and returns 1..min(maxBytes, 65536) of them
-// (RecvData), or RecvEof (the peer closed: no more data ever), RecvTimeout (nothing arrived), RecvReset, or RecvError.
-// maxBytes 0 is a RecvError(InvalidArgument). Never traps. One system call; the bytes are copied once from the L0
-// buffer into the result.
-@Ensures(recvWithin(result, maxBytes))
-@Ensures(maxBytes == 0 ==> recvIsError(result))
-export function recv(s: Stream, maxBytes: usize, timeout: Duration): RecvResult {
+// recv(s, maxBytes, timeout): Result<Bytes, NetError> -- waits up to `timeout` for bytes and returns 1..min(maxBytes, 65536) of
+// them. `Err` otherwise: kind Closed when the peer closed (the end of the stream: no more data ever), Timeout when nothing
+// arrived, Reset, Cancelled, or InvalidArgument for maxBytes 0. Never traps. One system call; the bytes are copied once from
+// the L0 buffer into the result.
+@Ensures(result.isOk() ==> result.unwrap().length() >= 1 && result.unwrap().length() <= maxBytes)
+@Ensures(maxBytes == 0 ==> result.isErr())
+export function recv(s: Stream, maxBytes: usize, timeout: Duration): Result<Bytes, NetError> {
   return recvMs(s, maxBytes, clampMs(timeout.millis));
 }
 
 // recv with the wait in milliseconds, already clamped.
 @Requires(ms >= 0 && ms <= MAX_MS)
-@Ensures(recvWithin(result, maxBytes))
-@Ensures(maxBytes == 0 ==> recvIsError(result))
-function recvMs(s: Stream, maxBytes: usize, ms: int): RecvResult {
+@Ensures(result.isOk() ==> result.unwrap().length() >= 1 && result.unwrap().length() <= maxBytes)
+@Ensures(maxBytes == 0 ==> result.isErr())
+function recvMs(s: Stream, maxBytes: usize, ms: int): Result<Bytes, NetError> {
   if (maxBytes == 0) {
-    return RecvError(netErrorFromCode(CODE_INVALID));
+    return Err(netErrorFromCode(CODE_INVALID));
   }
   const r = netRecv(s, maxBytes, ms);
   return match (r) {
-    Ok(arr) => RecvData(fromArray(arr)),
-    Err(code) => recvFailure(code)
+    Ok(arr) => Ok(fromArray(arr)),
+    Err(code) => Err(netErrorFromCode(code))
   };
 }
 
-// recvUntil(s, maxBytes, deadline): RecvResult -- `recv` that waits until the absolute `deadline`: bytes that are ready are returned
-// even when it has passed (a zero wait), RecvTimeout when none came by then. Unlike a wait of `recv`, it is not cut at one hour.
-// Cancellable: RecvError(Cancelled). maxBytes 0 is a RecvError(InvalidArgument). Never traps.
-@Ensures(recvWithin(result, maxBytes))
-@Ensures(maxBytes == 0 ==> recvIsError(result))
-export function recvUntil(s: Stream, maxBytes: usize, deadline: Deadline): RecvResult {
+// recvUntil(s, maxBytes, deadline): Result<Bytes, NetError> -- `recv` that waits until the absolute `deadline`: bytes that are
+// ready are returned even when it has passed (a zero wait), Err(Timeout) when none came by then. Unlike a wait of `recv`, it is
+// not cut at one hour. Cancellable: Err(Cancelled). maxBytes 0 is Err(InvalidArgument). Never traps.
+@Ensures(result.isOk() ==> result.unwrap().length() >= 1 && result.unwrap().length() <= maxBytes)
+@Ensures(maxBytes == 0 ==> result.isErr())
+export function recvUntil(s: Stream, maxBytes: usize, deadline: Deadline): Result<Bytes, NetError> {
   const end = deadline.at.millis;
   while (true) {
     const r = recvMs(s, maxBytes, waitUntilMs(netNow(s), end));
-    match (r) {
-      RecvTimeout => {
-        if (end - netNow(s) <= 0) {
-          return RecvTimeout;
-        }
-      },
-      _ => {
-        return r;
-      }
+    if (r.isOk() || r.unwrapErr().kind != Timeout || end - netNow(s) <= 0) {
+      return r;
     }
   }
-  return RecvTimeout;
-}
-
-function recvFailure(code: int): RecvResult {
-  if (code == CODE_EOF) {
-    return RecvEof;
-  }
-  if (code == CODE_TIMEOUT) {
-    return RecvTimeout;
-  }
-  if (code == CODE_RESET) {
-    return RecvReset;
-  }
-  return RecvError(netErrorFromCode(code));
+  return Err(netErrorFromCode(CODE_TIMEOUT));
 }
 
 // send(s, data, timeout): Result<usize, NetError> -- one attempt: waits up to `timeout` until the socket is writable and
@@ -710,7 +632,7 @@ function sendFrom(s: Stream, arr: u8[], off: usize, end: usize, ms: int): Result
   };
 }
 
-// sendUntil(s, data, deadline): `send` that waits until the absolute `deadline` for the socket to be writable. Err(Timeout) when it
+// sendUntil(s, data, deadline): Result<usize, NetError> -- `send` that waits until the absolute `deadline` for the socket to be writable. Err(Timeout) when it
 // stayed full until then; Err(Cancelled) when cancelled. Not cut at one hour.
 export function sendUntil(s: Stream, data: Bytes, deadline: Deadline): Result<usize, NetError> {
   const start = data.storageStart();
@@ -731,7 +653,7 @@ export function sendAll(s: Stream, data: Bytes, timeout: Duration): Result<void,
   return sendAllEnd(s, data, netNow(s) + clampMs(timeout.millis));
 }
 
-// sendAllUntil(s, data, deadline): `sendAll` with an absolute deadline for the whole call (several calls can share one). The
+// sendAllUntil(s, data, deadline): Result<void, NetError> -- `sendAll` with an absolute deadline for the whole call (several calls can share one). The
 // check of the clock happens before every write, so a peer that reads one byte at a time cannot stretch it. Err(Timeout),
 // Err(Reset), Err(Cancelled) (also between two writes).
 export function sendAllUntil(s: Stream, data: Bytes, deadline: Deadline): Result<void, NetError> {
@@ -786,10 +708,11 @@ export function monotonicMillis(s: Stream): int {
 
 // ------------------------------------------------------------------------------------------------ reading with a buffer
 
-// The result of `readExact` / `readUntil`: Filled(bytes), FillClosed(bytes read before the peer closed), FillLimit
-// (the limit was reached without the delimiter), FillTimeout (the deadline passed; bytes read so far stay buffered),
-// FillError.
-export type Fill = Filled(Bytes) | FillClosed(Bytes) | FillLimit | FillTimeout | FillError(NetError);
+// What `readExact` / `readUntil` produced when the read itself worked: Filled(bytes), FillClosed(the bytes read before the peer
+// closed: a short read, not an error because the bytes are data), FillLimit (the limit was reached without the delimiter; the
+// bytes stay buffered). A deadline that passed, a reset or a cancellation is the `Err(NetError)` of the call (Timeout: the bytes
+// read so far stay buffered).
+export type Fill = Filled(Bytes) | FillClosed(Bytes) | FillLimit;
 
 // A read buffer for one stream: the bytes read ahead of what the caller consumed. A normal value (a Stream cannot be
 // stored). `cap` bounds the buffered bytes: no operation ever holds more, so a hostile peer cannot grow it.
@@ -835,121 +758,109 @@ export class StreamReader {
     return head;
   }
 
-  // readSome(s, maxBytes, timeout): RecvResult -- buffered bytes if there are any (at most maxBytes, no system call),
-  // else one `recv`. Traps if maxBytes is 0.
+  // readSome(s, maxBytes, timeout): Result<Bytes, NetError> -- buffered bytes if there are any (at most maxBytes, no system
+  // call), else one `recv` (its errors, Closed at the end of the stream). Traps if maxBytes is 0.
   @Requires(maxBytes >= 1)
-  readSome(s: Stream, maxBytes: usize, timeout: Duration): RecvResult {
+  readSome(s: Stream, maxBytes: usize, timeout: Duration): Result<Bytes, NetError> {
     if (this.pending.length() > 0) {
       const n = this.pending.length() < maxBytes ? this.pending.length() : maxBytes;
-      return RecvData(this.take(n));
+      return Ok(this.take(n));
     }
     return recv(s, maxBytes < this.cap ? maxBytes : this.cap, timeout);
   }
 
-  // readExact(s, n, timeout): Fill -- exactly n bytes (Filled), or what arrived before the peer closed (FillClosed), or
-  // FillTimeout when the DEADLINE `timeout` (for the whole call) passed, or FillError (also Cancelled). Never reads past n bytes:
-  // further bytes stay in the stream. Traps if n exceeds the capacity.
+  // readExact(s, n, timeout): Result<Fill, NetError> -- exactly n bytes (Ok(Filled)), or what arrived before the peer closed
+  // (Ok(FillClosed)); Err(Timeout) when the DEADLINE `timeout` (for the whole call) passed, Err(Reset) or Err(Cancelled). Never
+  // reads past n bytes: further bytes stay in the stream. Traps if n exceeds the capacity.
   @Requires(n <= this.cap)
-  @Ensures(match (result) { Filled(b) => b.length() == n, _ => true })
+  @Ensures(result.isOk() ==> match (result.unwrap()) { Filled(b) => b.length() == n, _ => true })
   @Ensures(this.pending.length() <= this.cap)
-  readExact(s: Stream, n: usize, timeout: Duration): Fill {
+  readExact(s: Stream, n: usize, timeout: Duration): Result<Fill, NetError> {
     return this.readExactUntil(s, n, Deadline { at: MonotonicInstant { millis: netNow(s) + clampMs(timeout.millis) } });
   }
 
-  // readExactUntil(s, n, deadline): `readExact` with an absolute deadline for the whole call, however many small reads it takes
-  // (a peer that sends one byte at a time cannot stretch it, and several calls can share one deadline).
+  // readExactUntil(s, n, deadline): Result<Fill, NetError> -- `readExact` with an absolute deadline for the whole call, however many
+  // small reads it takes (a peer that sends one byte at a time cannot stretch it, and several calls can share one deadline).
   @Requires(n <= this.cap)
-  @Ensures(match (result) { Filled(b) => b.length() == n, _ => true })
+  @Ensures(result.isOk() ==> match (result.unwrap()) { Filled(b) => b.length() == n, _ => true })
   @Ensures(this.pending.length() <= this.cap)
-  readExactUntil(s: Stream, n: usize, deadline: Deadline): Fill {
+  readExactUntil(s: Stream, n: usize, deadline: Deadline): Result<Fill, NetError> {
     const end = deadline.at.millis;
     while (this.pending.length() < n) {
       const left = end - netNow(s);
       if (left < 0) {
-        return FillTimeout;
+        return Err(netErrorFromCode(CODE_TIMEOUT));
       }
       const want = n - this.pending.length();
       const r = recvMs(s, want, clampMs(left));
       match (r) {
-        RecvData(b) => {
+        Ok(b) => {
           this.pending = this.pending.concat(b);
         },
-        RecvEof => {
-          return FillClosed(this.take(this.pending.length()));
-        },
-        RecvTimeout => {
-          if (end - netNow(s) <= 0) {
-            return FillTimeout;
+        Err(e) => {
+          if (e.kind == Closed) {
+            return Ok(FillClosed(this.take(this.pending.length())));
           }
-        },
-        RecvReset => {
-          return FillError(netErrorFromCode(CODE_RESET));
-        },
-        RecvError(e) => {
-          return FillError(e);
+          if (e.kind != Timeout || end - netNow(s) <= 0) {
+            return Err(e);
+          }
         }
       }
     }
-    return Filled(this.take(n));
+    return Ok(Filled(this.take(n)));
   }
 
-  // readUntil(s, delim, limit, timeout): Fill -- the bytes up to and including the first occurrence of `delim` (Filled),
-  // with at most `limit` bytes examined: FillLimit if `limit` bytes contain no delimiter (the buffer then keeps them),
-  // FillClosed (the bytes so far) if the peer closed first, FillTimeout at the DEADLINE `timeout` for the whole call,
-  // FillError (also Cancelled). Receives at most limit - buffered bytes each time, so at most `limit` bytes are buffered by
+  // readUntil(s, delim, limit, timeout): Result<Fill, NetError> -- the bytes up to and including the first occurrence of `delim`
+  // (Ok(Filled)), with at most `limit` bytes examined: Ok(FillLimit) if `limit` bytes contain no delimiter (the buffer then keeps
+  // them), Ok(FillClosed) (the bytes so far) if the peer closed first, Err(Timeout) at the DEADLINE `timeout` for the whole call,
+  // Err(Reset) or Err(Cancelled). Receives at most limit - buffered bytes each time, so at most `limit` bytes are buffered by
   // the call. Traps if delim is empty, limit is shorter than delim or limit exceeds the capacity.
   @Requires(delim.length() >= 1 && limit >= delim.length() && limit <= this.cap)
-  @Ensures(match (result) { Filled(b) => b.length() <= limit && b.length() >= delim.length(), _ => true })
+  @Ensures(result.isOk() ==> match (result.unwrap()) { Filled(b) => b.length() <= limit && b.length() >= delim.length(), _ => true })
   @Ensures(this.pending.length() <= this.cap)
-  readUntil(s: Stream, delim: Bytes, limit: usize, timeout: Duration): Fill {
+  readUntil(s: Stream, delim: Bytes, limit: usize, timeout: Duration): Result<Fill, NetError> {
     return this.readDelimitedUntil(s, delim, limit, Deadline { at: MonotonicInstant { millis: netNow(s) + clampMs(timeout.millis) } });
   }
 
-  // readDelimitedUntil(s, delim, limit, deadline): `readUntil` with an absolute deadline for the whole call.
+  // readDelimitedUntil(s, delim, limit, deadline): Result<Fill, NetError> -- `readUntil` with an absolute deadline for the whole call.
   @Requires(delim.length() >= 1 && limit >= delim.length() && limit <= this.cap)
-  @Ensures(match (result) { Filled(b) => b.length() <= limit && b.length() >= delim.length(), _ => true })
+  @Ensures(result.isOk() ==> match (result.unwrap()) { Filled(b) => b.length() <= limit && b.length() >= delim.length(), _ => true })
   @Ensures(this.pending.length() <= this.cap)
-  readDelimitedUntil(s: Stream, delim: Bytes, limit: usize, deadline: Deadline): Fill {
+  readDelimitedUntil(s: Stream, delim: Bytes, limit: usize, deadline: Deadline): Result<Fill, NetError> {
     const end = deadline.at.millis;
     let begin: usize = 0;
     while (true) {
       const at = delimiterEnd(this.pending, delim, begin, limit);
       match (at) {
         Some(stop) => {
-          return Filled(this.take(stop));
+          return Ok(Filled(this.take(stop)));
         },
         None => {}
       }
       if (this.pending.length() >= limit) {
-        return FillLimit;
+        return Ok(FillLimit);
       }
       begin = this.pending.length() >= delim.length() ? this.pending.length() - delim.length() + 1 : 0;
       const left = end - netNow(s);
       if (left < 0) {
-        return FillTimeout;
+        return Err(netErrorFromCode(CODE_TIMEOUT));
       }
       const r = recvMs(s, limit - this.pending.length(), clampMs(left));
       match (r) {
-        RecvData(b) => {
+        Ok(b) => {
           this.pending = this.pending.concat(b);
         },
-        RecvEof => {
-          return FillClosed(this.take(this.pending.length()));
-        },
-        RecvTimeout => {
-          if (end - netNow(s) <= 0) {
-            return FillTimeout;
+        Err(e) => {
+          if (e.kind == Closed) {
+            return Ok(FillClosed(this.take(this.pending.length())));
           }
-        },
-        RecvReset => {
-          return FillError(netErrorFromCode(CODE_RESET));
-        },
-        RecvError(e) => {
-          return FillError(e);
+          if (e.kind != Timeout || end - netNow(s) <= 0) {
+            return Err(e);
+          }
         }
       }
     }
-    return FillLimit;
+    return Ok(FillLimit);
   }
 }
 

@@ -30,5 +30,5 @@ developer writes, the current message, the hint we want. Not implemented yet (ro
 - `type Id = int | string;` is **accepted silently** and only fails at a use site; it is not a union of
   `int` and `string` (tagged unions only, ADR-0004). Should be an error at the declaration.
 - Spec 01 still lists `enum` in the grammar, spec 02 lists "finite unions", and spec 01's "Not decided"
-  still has string interpolation and generic methods (decided: ADR-0022, E0460). The `==` rules (E0410 where a type has no
+  still has string interpolation and generic methods (decided: ADR-0022 and ADR-0040; generic methods exist, E0460 only rejects them in interfaces). The `==` rules (E0410 where a type has no
   `Eq`) are in ADR-0018/0019/0034, spec 03 and the compiler; they belong in spec 02.

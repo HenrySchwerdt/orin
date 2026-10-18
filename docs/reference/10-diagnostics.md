@@ -72,6 +72,7 @@ Codes whose tests column says "none" are listed again in the Gaps section.
 | E0484 | a function given to a `parallel()` operation is impure or not an arrow/named function | tests/next/errors/e0484_parallel_function_value.or, tests/next/errors/e0484_parallel_impure.or, tests/next/errors/e0484_parallel_impure_callee.or |
 | E0485 | the reducer of a parallel `reduce` is not a built-in associative operator | tests/next/errors/e0485_parallel_reducer.or, tests/next/errors/e0485_parallel_reducer_function.or |
 | E0486 | the input element type of `parallel()` is not a scalar or a flat record of scalars | tests/next/errors/e0486_parallel_element_type.or, tests/next/errors/e0486_parallel_nested_record.or |
+| E0487 | (library code, the primitives of `std:fsraw`) `grantMove` of a `Listener`, or `grantClone` of a `Stream`: a listener stays in the task that bound it, a socket is moved into a task, never duplicated | tests/net/libcheck/$e0487_listener_move.or, tests/net/libcheck/$e0487_stream_clone.or |
 | E0490 | markup without `import ox from "M"`, or the provider `ox()` is not a single `Markup`/`Components` literal | tests/next/errors/ox_no_provider.or, tests/next/errors/ox_provider_not_literal |
 | E0491 | component or member tag error: unknown, not a function, unknown/missing attribute, bad slot, spread field without parameter | tests/next/errors/ox_attr_and_slot.or, tests/next/errors/ox_member_unknown.or, tests/next/errors/ox_unknown_attr.or +11 |
 | E0492 | a value of a type that cannot be used there in markup (slot child type, `bool` without presence attributes, spread of a non-record) | tests/next/errors/ox_bool_child.or, tests/next/errors/ox_slot_child_type, tests/next/errors/ox_spread_presence +5 |
@@ -104,17 +105,18 @@ Codes whose tests column says "none" are listed again in the Gaps section.
 | W0480 | **warning**: a parallel float `reduce` may differ from the sequential fold in the last bits | tests/next/run/par_float_reduce.or |
 | W0481 | **warning**: a parallel integer `reduce` with signed `+` or with `*` can overflow in a chunk where the sequential fold does not | tests/next/run/par_ops.or |
 | W0490 | **warning**: processors not run: `orin check` has no C compiler and no cached output for a processor; the companion module stays empty (ADR-0046 S5) | tools/test_processors.py |
-| W0491 | **warning**: a processor reported a warning (ADR-0046 S4) | tools/test_processors.py |
+| W0491 | **warning**: a processor reported a warning (ADR-0046 S4) | none |
 | W0492 | **warning**: the processor of an annotation from a dependency was not run because `[annotations] processors` of orin.toml does not list it (ADR-0046 S5) | tests/processors/dep_untrusted, tools/test_processors.py |
 
-93 codes: 79 errors, 14 warnings.
+95 codes: 81 errors, 14 warnings. `python3 tools/check_reference.py` compares this table with the codes in `compiler/` (ADR-0056 C10).
 
 ## Gaps: rules without a test
 
 Codes with no test in `tests/errors`, `tests/next/errors`, `tests/next/run` (`// warns:`) or the other suites cited above:
 
 - E0480: internal task primitive given a resource handle; not reachable from user code
+- W0491: a processor reported a warning (no test runs a processor that warns)
 
-Codes pinned only by a tool script (not by the conformance runner): E0473, E0474, E0523 (`tools/test_effects.py`), E0448 and W0490-W0492
+Codes pinned only by a tool script (not by the conformance runner): E0473, E0474, E0523 (`tools/test_effects.py`), E0448, W0490 and W0492
 (`tools/test_processors.py`), W0440 (text and JSON: `tools/test_annotations.py`), W0460-W0462 (`tests/contracts/quality_vc.or`,
 `tools/test_verify_contracts.py`), E0504-E0509 (`tests/workspace/fail`, run by `tools/test_packages.sh`).

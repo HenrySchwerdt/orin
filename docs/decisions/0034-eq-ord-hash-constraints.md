@@ -130,3 +130,18 @@ Slice 1 (language and compiler, 2026-10-17) delivers decisions 1, 2 (tiers 1 and
 - **Multiple bounds (implemented with ADR-0040).** `T extends Ord & Hash` works on functions, classes and methods; the
   derivation and the explicit instances are unchanged (each bound is tested on its own). See ADR-0040, "Multiple bounds".
 - `Map` instances with a key class whose `hash` is slow or weak are the class author's responsibility (no law check yet).
+
+## Decision 2026-10-18: the frozen collection set (owner delegated; criterion C2 of ADR-0056)
+
+The collections that the 1.0 std freezes are exactly these, under these names, and none is renamed before 1.0:
+
+- Generic: `Set<T extends Hash>`, `OrderedMap<K extends Ord, V>` (entries `OrderedEntry<K, V>`) and `MinHeap<T extends Ord>`.
+- Specialised, kept as convenience types: `SortedMap<V>` (int keys), `SortedStringMap<V>` (string keys), `PriorityQueue<T>` (explicit `int`
+  priority, FIFO among equal priorities), `IntSet` and `StringSet`.
+
+`IntSet` and `StringSet` are classes of their own (not `type` aliases) and stay so: they keep their direct scalar comparisons and
+hashing. The names `SortedMap<K, V>` and `PriorityQueue<T extends Ord>` written in "Consequences" above are **not** used for the generic
+types; the generic ones are `OrderedMap` and `MinHeap`, permanently. This resolves the "final names" item of "What remains" and the
+"aliases or removed" sentence of "Consequences": nothing is aliased and nothing is removed. Aliasing a specialised type to a generic one
+later is allowed only if it is source-compatible, and would be a minor-version change. Generic `SortedMap<K, V>` / `PriorityQueue` names
+stay reserved and are not reused for a different shape.

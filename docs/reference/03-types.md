@@ -164,9 +164,16 @@ same `E`; on an `Option`, outside such a function, or with a different error typ
 - Tests: `tests/run/result_propagation.or`, `tests/errors/e0406_question_on_option.or`, `tests/errors/e0406_question_in_non_result_fn.or`,
   `tests/errors/e0406_mismatched_error_type.or`, `tests/next/run/closure_result_question.or`.
 
-**TYP-20.** `void` is the type of a function with no result type. It is allowed only as a function's result type and as `T` in
-`Result<T, E>`; elsewhere (a variable, a field, `Option<void>`, an array element, a type argument) it is E0400. Generic methods and `void`
-as a type argument (ADR-0040) are **landing in PR (pending)** and are not part of this reference yet.
+**TYP-20.** `void` is the type of a function with no result type, and `T` in `Result<T, E>`. It is also accepted as a type argument of
+a generic function, method or class (ADR-0040): a closure with no result instantiates `T = void` (`run(() => { ... })`, `s.spawn(f)`),
+and inside such an instance `Option<void>`, `void[]` and class fields of type `T` are allowed; `void` has no run-time representation
+there. Written directly as a value, a variable, a parameter type, an array element or the payload of `Some` outside a generic instance
+it is E0400.
+**TYP-20a.** A method of a class may declare its own type parameters, with bounds (`m<U extends Eq>(x: U): U`); they are inferred or
+given explicitly (`obj.m<int>(x)`), and the method is monomorphised per instance. A method of an **interface** may not be generic: a
+virtual call cannot pick a monomorphised instance, and declaring one is E0460 (the only remaining use of E0460).
+- Tests (TYP-20a): `tests/next/run/generic_methods.or`, `tests/next/run/generic_methods_contracts.or`,
+  `tests/next/run/void_type_args_basic.or`, `tests/next/run/void_type_args_class.or`, `tests/next/errors/e0460_interface_generic_method.or`.
 - Tests: `tests/run/void_early_return.or`, `tests/run/match_option_result.or` (`Ok()` with `Result<void, E>`).
 
 ## 3.5 Map

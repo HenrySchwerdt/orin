@@ -12,6 +12,22 @@ Status: accepted (2026-10-13). After the core is complete the language surface i
    library API, not syntax. Any syntax capabilities need goes through an ADR, like every
    post-freeze change.
 
+**Amendment (2026-10-18): the 1.0 scope as of the syntax and std freeze** (decided with the project owner, roadmap D2 and D5; one amendment
+for everything below, and the rows of the tables that it changes point back here).
+1. **Collections (ADR-0034):** `Eq`/`Ord`/`Hash` constraints are in the 1.0 core, with the frozen std collections `Set<T extends Hash>`,
+   `OrderedMap<K extends Ord, V>`, `MinHeap<T extends Ord>` plus `IntSet`, `StringSet`, `SortedMap<V>`, `SortedStringMap<V>` and
+   `PriorityQueue<T>` under their current names (ADR-0034, Decision 2026-10-18).
+2. **Generic methods and `void` as a type argument (ADR-0040) are in the 1.0 core and implemented**, not post-1.0. The only generic-method
+   restriction left is that an *interface* method cannot be generic (E0460). Multiple bounds `T extends A & B` are accepted.
+3. **User annotations and pure processors** (ADR-0046) are in scope and implemented (see the Annotations row).
+4. **`std:task` is in the core at the Gate 1 surface** (roadmap D1): `scope`, `s.spawn`, `join`, channels, timed waits, `select`,
+   `sleep`, cancellation and `spawnNet`. Additions beyond it are experimental ([stability](../stability.md)).
+5. **HTTP is not post-1.0:** `std:http` (the pure HTTP/1.1 message layer, ADR-0030) is in the std and frozen; the sockets are `std:net`
+   (ADR-0033). What stays post-1.0 is TLS/HTTPS and an HTTP client or server framework.
+6. **"Core complete" is relaxed (roadmap D5):** 1.0 requires a self-hosted, reproducible, behaviour-stable compiler with the rows above
+   implemented and tested; finishing the compiler rewrite of ADR-0015 (`compiler/vc/` and the remaining `check/` files) is **not** a 1.0
+   condition. The "Definition of core complete" below is read with this clause.
+
 ## In the 1.0 core
 | Area | Decision |
 |---|---|
@@ -24,14 +40,14 @@ Status: accepted (2026-10-13). After the core is complete the language surface i
 | **Resources** (spec 06) — **done, ADR-0025** | resource types are non-copyable handles: may be passed to functions (borrowed) but not stored in values, returned, captured by closures or put in collections; scope API `File.open(path, f => ...)` releases deterministically, also on `Err`/trap paths. `std:fs` streaming file API built on it (spelled `withFile(path, mode, f => ...)`, ADR-0025; since ADR-0027 `withFile(fs, path, mode, f => ...)` takes the file grant; `std:fs` is unstable until the owner confirms the I/O freeze). |
 | **Graph<T>/GraphId<T>** | std library type (Orin) with generational, graph-tagged IDs; stale/foreign IDs → `Err` (spec 06 cycle rule). |
 | **Packages** (spec 04) | `orin.toml` manifest: package name, module architecture rules (`allowed_dependencies`), entry point; `orin build`/`check` from a package root. No registry/versions in 1.0 core (post-1.0). |
-| **std** | `std:fs`, `std:process`, `std:io`, `std:math`, `std:path`, `std:time`, `std:json` (`parse` into a `Json` union + typed helpers; codegen-based `parse<T>` needs annotations → post-1.0), `std:map`. HTTP is post-1.0. |
+| **std** | `std:fs`, `std:process`, `std:io`, `std:math`, `std:path`, `std:time`, `std:json` (`parse` into a `Json` union + typed helpers; codegen-based `parse<T>` needs annotations → post-1.0), `std:map`. HTTP: `std:http` exists and is frozen, TLS is post-1.0 (amendment 2026-10-18). |
 | **Capabilities** (ADR-0020 D4) | language part only: unforgeable capability handles granted at the program root, boundary declarations in `orin.toml`, enforcement in the L0 platform layer; std I/O APIs take handles. Designed in ADR-0021 (pending) — the **std I/O freeze** (stage 2) waits for it, the language freeze does not. Effect inference/policy checking come after the freeze. |
-| **Generic classes** | `class Box<T> { ... }`, monomorphised like generic functions (ADR-0007), with bounds `T extends I` (ADR-0019). Needed for `Graph<T>`/`GraphId<T>`. **Implemented (ADR-0026)**: bounds, `implements`, nesting, contracts, cross-module; generic methods are E0460 (post-1.0); `std:graph` is rewritten on `class Graph<T>`. |
+| **Generic classes** | `class Box<T> { ... }`, monomorphised like generic functions (ADR-0007), with bounds `T extends I` (ADR-0019). Needed for `Graph<T>`/`GraphId<T>`. **Implemented (ADR-0026)**: bounds, `implements`, nesting, contracts, cross-module; generic methods were E0460 at the time and are in the core since ADR-0040 (amendment 2026-10-18; only interface methods stay E0460); `std:graph` is rewritten on `class Graph<T>`. |
 | **Concurrency** | **designed now** (ADR-0017), implemented after the core freeze but before 1.0 final. |
 
 ## Explicitly post-1.0
-~~User annotation processors/codegen~~ (moved into 1.0 scope by ADR-0046), generic interfaces & bounds beyond single interfaces, default
-methods, `Shared<T>` (atomic RC) values, async/await syntax, package registry/versioning, HTTP,
+~~User annotation processors/codegen~~ (moved into 1.0 scope by ADR-0046), generic interfaces, default
+methods, `Shared<T>` (atomic RC) values, async/await syntax, package registry/versioning, TLS/HTTPS,
 incremental analysis engine, `i128`/`u128` (additive; E0431 until then), inheritance (never planned).
 
 **Bit operators — post-1.0, reserved now** (decided with the project owner, 2026-10-13). `&`, `|`,
@@ -48,4 +64,4 @@ program can change meaning). Reserved semantics so nothing else claims these tok
 ## Definition of "core complete"
 All rows above implemented with conformance tests (default + `tests/next`), formatter/LSP/MCP
 support, both backends, verifier-clean, documented in `docs/` and reflected in the spec files;
-and the compiler itself rewritten per ADR-0015.
+and the compiler itself rewritten per ADR-0015 (relaxed by the amendment of 2026-10-18: the rewrite is not a 1.0 condition).

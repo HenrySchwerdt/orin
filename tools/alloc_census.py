@@ -722,7 +722,7 @@ RULES = [
      "header lines collected into a string[] and then joined: append to one string / the ByteBuilder directly"),
     (r"^\$stdlib/http\.emptyHeaders$", r"arraynew ref", "a", "array<ref> (empty)", "shared immortal empty arrays"),
     (r"^\$stdlib/net\.recv$", r"net\.recv", "-", "Result<u8[], int> + array<u8>", "the received bytes are real data"),
-    (r"^\$stdlib/net\.recv$", r"struct", "a", "variant RecvData(bytes)", "RecvResult matched at once"),
+    (r"^\$stdlib/net\.recv$", r"struct", "a", "variant Ok(bytes)", "Result<Bytes, NetError> matched at once"),
     (r"^\$stdlib/net\.sendFrom$", r"", "a", None, "Result<usize, int> matched at once"),
     (r"^\$stdlib/collections\.(PriorityQueue|SortedMap)\.", r"arraypop", "a", None, "`pop().unwrap()`: the Option dies at once"),
     (r"^\$stdlib/collections\.PriorityQueue\.pop", r"struct tag0 \{l\d+, l\d+\}", "a", "record Entry {priority, value}",
