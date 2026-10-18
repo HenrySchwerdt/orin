@@ -931,7 +931,7 @@ above; a pool lives for one call (worker threads are started per operation, abou
 * Generic methods do not exist (E0460); `Graph<T>` has no edge weights and needs a caller-supplied tag.
 * Diagnostics print std types with their unit name (`$stdlib/graph.GraphId<int>`).
 * `std:clock` is importable but internal; so is `std:fsraw` (the raw open/close and grant primitives behind `std:fs` and `std:host`; only library code may import it).
-* `std:collections/internal` and `std:bytes/internal` (files `collections_internal.or`, `bytes_internal.or`) hold the contract helpers (`allTrue`, `isStrictlyIncreasing`, `isMinHeap4`, the B-tree shape and order checks, `allBytes`, ...) and the generated B-tree node types behind the public modules (ADR-0048 rule 7.3). They are not API and can change in any release; user code does not import them.
+* `std:collections/internal` and `std:bytes/internal` (files `collections_internal.or`, `bytes_internal.or`) hold the contract helpers (`allTrue`, `isStrictlyIncreasing`, `isMinHeap4`, the B-tree shape and order checks, `allBytes`, ...) and the generated B-tree node types behind the public modules (ADR-0048 rule 7.3). They are not API and can change in any release; user code does not import them. `std:taskcore`, `std:metacore` and `std:metajson` are internal in the same way (use `std:task` and `std:meta`). Importing any of them from a file outside the std library is warning W0493 (the std library itself imports them without a warning).
 * `std:fs` streaming: text/byte-string API without seek, no directory operations, at most 256 open files.
 
 ## Bounded shell execution (unstable)

@@ -2,7 +2,8 @@
 // boundary rule.
 
 import { Span, Diagnostic, diag } from "../diag";
-import { StdModule } from "./program";
+import { StdModule, LoadedProgram } from "./program";
+import { IImport } from "../syntax";
 import { parseManifest } from "../package";
 import { Sources } from "./sources";
 import { FsGrant } from "std:fs";
@@ -58,6 +59,52 @@ function isStdlibModule(p: string): bool {
     "std:metajson" => true,
     _ => false,
   };
+}
+
+// The public module to use instead of the internal std module `p` (ADR-0048 rule 7.3, ADR-0056), or None when `p` is not internal.
+// Internal: `std:taskcore`, `std:metacore`, `std:metajson` and every `std:x/internal`.
+function publicModuleFor(p: string): Option<string> {
+  if (p == "std:taskcore") {
+    return Some("std:task");
+  }
+  if (p == "std:metacore" || p == "std:metajson") {
+    return Some("std:meta");
+  }
+  if (p.startsWith("std:") && p.endsWith("/internal")) {
+    return Some(p.substring(0, p.length - 9));
+  }
+  return None;
+}
+
+// W0493: a source file outside the std library imports an internal std module. Files whose path starts with `$` (the
+// embedded `$stdlib`, `$rt` and `$array` roots) are library code and do not warn; so does no file of the compiler itself,
+// which imports none of these modules.
+export function internalImportWarnings(prog: LoadedProgram): Diagnostic[] {
+  let out: Diagnostic[] = [];
+  for (const u of prog.units) {
+    if (u.path.startsWith("$")) {
+      continue;
+    }
+    for (const it of u.ast.items) {
+      match (it) {
+        IImport(d) => {
+          const alt = publicModuleFor(d.path);
+          if (alt.isSome()) {
+            out.push(
+              Diagnostic {
+                code: "W0493",
+                message: `\`${d.path}\` is an internal module; its API may change without notice`,
+                span: d.pathSpan,
+                notes: [`use \`${alt.unwrap()}\` instead`],
+              },
+            );
+          }
+        },
+        _ => {},
+      }
+    }
+  }
+  return out;
 }
 
 // Std modules backed by the C runtime. `std:fsraw` is internal: the file primitives behind `std:fs`

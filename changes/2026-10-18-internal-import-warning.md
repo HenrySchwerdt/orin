@@ -1,0 +1,1 @@
+- **Warning for internal std imports (ADR-0048 7.3, ADR-0056).** Importing `std:taskcore`, `std:metacore`, `std:metajson` or a `std:*/internal` module from user code is now warning W0493 (the message names the public module to use instead); the std library itself is unaffected.

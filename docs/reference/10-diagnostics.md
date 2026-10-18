@@ -107,8 +107,9 @@ Codes whose tests column says "none" are listed again in the Gaps section.
 | W0490 | **warning**: processors not run: `orin check` has no C compiler and no cached output for a processor; the companion module stays empty (ADR-0046 S5) | tools/test_processors.py |
 | W0491 | **warning**: a processor reported a warning (ADR-0046 S4) | none |
 | W0492 | **warning**: the processor of an annotation from a dependency was not run because `[annotations] processors` of orin.toml does not list it (ADR-0046 S5) | tests/processors/dep_untrusted, tools/test_processors.py |
+| W0493 | **warning**: a source file outside the std library imports an internal std module (`std:taskcore`, `std:metacore`, `std:metajson`, `std:x/internal`); its API may change without notice (ADR-0048 rule 7.3, ADR-0056) | tests/next/run/internal_import_warning.or |
 
-95 codes: 81 errors, 14 warnings. `python3 tools/check_reference.py` compares this table with the codes in `compiler/` (ADR-0056 C10).
+96 codes: 81 errors, 15 warnings. `python3 tools/check_reference.py` compares this table with the codes in `compiler/` (ADR-0056 C10).
 
 ## Gaps: rules without a test
 
