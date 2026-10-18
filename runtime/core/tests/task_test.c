@@ -12,12 +12,17 @@
 #include <string.h>
 
 #ifdef ORIN_TRANSFER_IN_ORIN
-/* The transfer operations of runtime/core/transfer.or (the functions std:task calls) instead of the C ones, through the test
- * wrappers of `--rt-wrappers` (tools/rt_stub.sh; ADR-0052 Addendum B, R3e.2). The C task code works on the same slot table. */
+/* The transfer, lend and thread-count operations of runtime/core/{transfer,lend,task}.or (the functions std:task calls) instead of the C
+ * ones, through the test wrappers of `--rt-wrappers` (tools/rt_stub.sh; ADR-0052 Addendum B, R3e.2 and R3e.3). The C task code works on
+ * the same slot table. */
 uint64_t orin_t_transfer_put(OrinObj *box);
 OrinObj *orin_t_transfer_take(uint64_t token);
 void orin_t_transfer_drop(uint64_t token);
 uint64_t orin_t_transfer_count(uint64_t which);
+uint64_t orin_t_lend(OrinObj *box);
+uint64_t orin_t_par_threads(void);
+#define orin_rt_lend orin_t_lend
+#define orin_rt_par_threads orin_t_par_threads
 #define orin_rt_transfer_put orin_t_transfer_put
 #define orin_rt_transfer_take orin_t_transfer_take
 #define orin_rt_transfer_drop orin_t_transfer_drop
