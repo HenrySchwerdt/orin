@@ -77,9 +77,8 @@ library code can import; user code importing them gets E0301 (unknown module).
 
 ## 5.3 Capabilities (grants)
 
-**CAP-1.** A program that performs I/O declares `function main(host: Host): void`. `function main(): void` has **no authority**. `main`
-may take no parameter or exactly one parameter `host: Host`; `main(fs: FsGrant)` is E0472 (grants never come from the caller) and any other
-signature is E0412. Only the runtime creates a `Host`, for `main`.
+**CAP-1.** A program that performs I/O declares `function main(host: Host): void`. `function main(): void` has **no authority**. The
+accepted forms of `main` and their errors (E0472, E0412) are listed once, in EXP-19 (chapter 4). Only the runtime creates a `Host`, for `main`.
 - Tests: `tests/next/errors/e0472_main_fs_param.or`, `tests/next/errors/e0412_main_host_and_more.or`, `tests/errors/e0412_main_with_params.or`,
   `tests/next/errors/e0470_main_without_host.or`, `tests/next/run/cap_pure_no_grants.or`.
 

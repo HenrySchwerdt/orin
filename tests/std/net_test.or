@@ -9,7 +9,7 @@ import {
   NetGrant, Listener, Stream, Peer, NetError, NetErrorKind, parsePeer, netErrorFromCode, netErrorMessage, isDenied, isTimeout, isReset,
   useListenerNet, useConnectionBeside, useAccepted, portOf, recv, send, sendAll, shutdownWrite, monotonicMillis, StreamReader,
   recvUntil, sendUntil, sendAllUntil, withListenerNet, withConnectionBeside, withAccepted, withAcceptedUntil, withConnectionUntil, acceptDetachedUntil, dropAccepted,
-  RecvResult, RecvData, RecvEof, RecvTimeout, RecvReset, RecvError, Fill, Filled, FillClosed, FillLimit, FillTimeout, FillError,
+  Fill, Filled, FillClosed, FillLimit, isClosed, isCancelled,
   Denied, Closed, Timeout, Cancelled, Reset, InvalidArgument, InvalidPeer, Os
 } from "std:net";
 
@@ -65,6 +65,8 @@ function errorClassification(): void {
   assert(isTimeout(netErrorFromCode(1002)), "timeout");
   assert(isReset(netErrorFromCode(1003)), "reset");
   assert(!isDenied(netErrorFromCode(1002)), "a timeout is not a denial");
+  assert(isClosed(netErrorFromCode(1001)) && !isClosed(netErrorFromCode(1002)), "closed by the peer");
+  assert(isCancelled(netErrorFromCode(1004)) && !isCancelled(netErrorFromCode(1003)), "cancelled");
   assertEqString(kindName(netErrorFromCode(1).kind), "Denied", "kind of 1");
   assertEqString(kindName(netErrorFromCode(1001).kind), "Closed", "kind of 1001");
   assertEqString(kindName(netErrorFromCode(1002).kind), "Timeout", "kind of 1002");
@@ -109,23 +111,21 @@ function delimiterSearchThroughReadUntil(host: Host): void {
   });
 }
 
-function kind(r: RecvResult): string {
+function kind(r: Result<Bytes, NetError>): string {
   return match (r) {
-    RecvData(b) => "data " + b.length().toString(),
-    RecvEof => "eof",
-    RecvTimeout => "timeout",
-    RecvReset => "reset",
-    RecvError(e) => "error"
+    Ok(b) => "data " + b.length().toString(),
+    Err(e) => isClosed(e) ? "eof" : isTimeout(e) ? "timeout" : isReset(e) ? "reset" : "error"
   };
 }
 
-function fillKind(f: Fill): string {
-  return match (f) {
-    Filled(b) => "filled " + b.toRawString(),
-    FillClosed(b) => "closed " + b.toRawString(),
-    FillLimit => "limit",
-    FillTimeout => "timeout",
-    FillError(e) => "error"
+function fillKind(r: Result<Fill, NetError>): string {
+  return match (r) {
+    Ok(f) => match (f) {
+      Filled(b) => "filled " + b.toRawString(),
+      FillClosed(b) => "closed " + b.toRawString(),
+      FillLimit => "limit"
+    },
+    Err(e) => isTimeout(e) ? "timeout" : "error"
   };
 }
 
@@ -199,12 +199,12 @@ function recvAndSend(host: Host): void {
         assertEqString(kind(recv(s, 2, milliseconds(1000))), "data 2", "recv is capped by maxBytes");
         const r = recv(s, 100, milliseconds(1000));
         match (r) {
-          RecvData(b) => {
+          Ok(b) => {
             assertEqUsize(b.length(), 3, "the rest");
             assertEq(b.at(0).toInt(), 3, "byte values survive");
             assertEq(b.at(2).toInt(), 251, "high byte values survive");
           },
-          _ => { fail("expected data"); }
+          Err(e) => { fail("expected data"); }
         }
         assertEqString(kind(recv(s, 0, milliseconds(10))), "error", "maxBytes 0");
         sendAll(s, fromString("x"), milliseconds(1000));

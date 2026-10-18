@@ -1,0 +1,1 @@
+- **Every diagnostic code is inventoried and checked in CI (ADR-0056 C10).** `tools/check_reference.py` now compares the codes the compiler can emit with chapter 10 of the reference (95 codes; the missing E0487 is added) and fails on an undocumented code, a stale row, or an untested code that is not listed under "Gaps"; CI runs it.

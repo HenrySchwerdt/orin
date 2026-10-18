@@ -283,7 +283,7 @@ timeout. Names were resolved by a blocking `getaddrinfo`.
    `Scope.cancel()`, `Scope.isCancelled()`, `CancelToken.isCancelled()` and the free `isCancelled()` (the calling task's own chain) complete the
    API. These are ordinary functions: no syntax, no checker rule, no MIR instruction.
 5. **`std:net` surface (ADR-0048).** `NetErrorKind` gains `Cancelled` (bare word describing the cause, rule 3.1.4; L0 code 1004; `Timeout` stays
-   the kind of a deadline). `recv` reports it as `RecvError(e)`, the readers as `FillError(e)`. Every operation has an absolute form on a `Deadline`
+   the kind of a deadline). `recv` and the readers report it as `Err(e)` (ADR-0048: `recv` and `readExact` return `Result`, the end of the stream is `Err(Closed)`). Every operation has an absolute form on a `Deadline`
    of std:time, the naming of C1: `recvUntil`, `sendUntil`, `sendAllUntil`, `StreamReader.readExactUntil`, `StreamReader.readDelimitedUntil`,
    `withAcceptedUntil`, `acceptDetachedUntil`, `withConnectionUntil`, `useConnectionUntil`; the relative forms are unchanged and implemented on them.
    The loops of the reading and writing forms check the clock before every system call, so one deadline spans any number of small reads and
