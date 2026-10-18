@@ -238,14 +238,14 @@ as `rules`. JSON: `{"results":[{"function","file","line","kind","clause","rules"
 |---|---|---|---|
 | `int`/`i64`, `i8 i16 i32 u8 u16 u32 u64 isize usize` | `Int` with the exact range of the type | arithmetic results and conversions are in range on returning paths (A-INT); `usize` subtraction below 0 traps | floats, `i128` |
 | `bool`, `+ - * / %`, comparisons, `&& \|\| !`, `==>`, `?:` | Bool / Int; `/` and `%` truncate toward zero as in Orin | divisor non-zero on returning paths (A-DIV) | `wrapping*`, `checked*`, `saturating*` |
-| arrays `T[]` | datatype (data `Array Int T`, length); `length`, `xs[i]`, `xs[i] = v`, `push`, `pop`, `get`, `slice`, `concat`, `includes` | index / slice range in bounds (obligation `bounds`) | `join`, `indexOf`, `sort`, `reduce`, `find` |
+| arrays `T[]` | datatype (data `Array Int T`, length); `length`, `xs[i]`, `xs[i] = v`, `push`, `pop`, `get`, `slice`, `concat`, `includes`, `indexOf`, `join`; `find` / `findIndex` exactly (the first match); `sort` and `reduce` partially (see "Method axioms") | index / slice range in bounds (obligation `bounds`) | `reduce` / `sort` results beyond the facts of "Method axioms" |
 | `every`, `some`, `map`, `filter` (pure lambda with an expression body) | quantifier over the indices; `map` / `filter` by their defining facts | well-definedness of the lambda body is part of a contract's goal | block-bodied lambdas; in code (not contracts) a lambda body with an index or call precondition |
 | `range(a, b).every(i => ..)` / `.some(..)`, `sum(xs)`, `sumBy(xs, f)` (`std:seq`) | bounded quantifier; recursive sum with the store lemma | | `sumBy` summands that need a block |
 | records, classes | datatype with one constructor; field read, write through nested places (`a.b.f = v`, `a[i].f = v`), `{ ...r, f: v }`; record `@Invariant`s of parameters and results are assumed (A3) | | generic records |
 | recursive records, classes, unions (a type that reaches itself) | uninterpreted sort with accessor functions (a union: a variant tag and payload accessors); a built value is a fresh constant with its fields as facts; no quantifier; see "Recursive types" | same as records / unions; a counterexample is never reported | generic recursive types; `==` on them |
 | `Option<T>`, `Result<T, E>`, user unions | datatypes; `isSome`, `isNone`, `isOk`, `isErr`, `unwrap`, `unwrapOr`, `unwrapErr`, `Some`, `None`, `Ok`, `Err`, variant constructors, `match` (expression and statement) | `unwrap` needs the right variant (obligation `unwrap`) | nested patterns, `?` where the operand is not always evaluated (see "Effects inside an expression"), `==` on these types |
 | `Map<K, V>` | presence array, value array, size; `has`, `get`, `set`, `delete`, `keys`, `values`, `size`, `new Map` | | `entries`; map equality |
-| `string` | datatype (length, id); `length`, `+`, `==`, literals, `charCodeAt`, `charAt`, `substring`, `trim`, `startsWith`, `endsWith`, `includes`, `toString`, template literals | index / range in bounds | contents (see "Strings") |
+| `string` | datatype (length, id); `length`, `+`, `==`, literals, `charCodeAt`, `charAt`, `substring`, `trim`, `startsWith`, `endsWith`, `includes`, `toString`, template literals; `split`, `indexOf` partially (see "Method axioms") | index / range in bounds; `split` needs a non-empty separator | contents (see "Strings") |
 | calls | modular: callee `@Requires` obligation, `@Ensures` assumed; pure function = uninterpreted function; recursion assumes the callee contract | A-CALL, A-PURE | calls of generic functions from outside their class, function values, interface calls |
 | methods and constructors | receiver as a datatype value; a mutating method returns the new receiver; `new C(..)`; static methods | class invariants (B8), frames (B9) | `new C<T>(..)` of a generic class |
 | generic functions and classes | checked once, abstractly: a type parameter `T` is an opaque value (nothing can be done with it but pass it around and store it), the class applied to its own parameters is the class | | `==` on a `T`; a call of a generic function from code that is not in the same class |
@@ -272,6 +272,23 @@ Where the order of evaluation cannot be kept the function is UNKNOWN with a reas
 `&&` / `||` / `==>`, in a branch of `?:`, in an arm of a `match` that is not a `return match`, in a `while` condition, in the receiver of a mutating call,
 in the arguments of a mutating call on a receiver that is not a plain variable or field path, in the right-hand side of
 `x += ..` or of an assignment to an element (`xs[i] = ..`), or after a function value that is evaluated before it.
+
+### Method axioms (`compiler/vc/methods.or`)
+
+Methods the core translation does not model exactly get **axioms**: the result is a fresh constant constrained by facts that
+every real execution satisfies. A partial description (`sort`, `reduce`, `split`, `indexOf`) taints the constant: a model that
+depends on it is not a counterexample, so a claim the axioms do not prove is UNKNOWN, never REFUTED. Each fact follows from the
+runtime (`runtime/core/orin_runtime.c`) or the prelude (`library/collections/array.or`).
+
+| Method | Facts |
+|---|---|
+| `xs.sort(cmp)` | same length; every element of the result is an element of `xs` and vice versa. The order is not stated |
+| `xs.findIndex(p)` / `xs.find(p)` | exact: `Some(i)` with `i` in bounds, `p(xs[i])` and `p` false before `i` (`find`: the value is `xs[i]`); `None` when `p` is false everywhere. Facts about calls inside `p` are hypotheses, so a call whose contract does not hold weakens the result, never strengthens it |
+| `xs.reduce(f, init)` | an empty `xs` gives `init`; nothing else |
+| `s.split(sep)` | obligation `bounds`: `sep` is not empty (the runtime traps). At least one piece, at most `s.length + 1`; every piece is a well-formed string no longer than `s` (than `s.length - sep.length` when there are two or more); one piece is `s` (always the case when `s` is shorter than `sep`); with two or three pieces the lengths and the separators add up to `s.length` |
+| `s.startsWith(t)`, `s.endsWith(t)`, `s.includes(t)` | one uninterpreted function each of the two strings, so the same call has the same answer in the body and in a contract (also inside a quantifier body). For well-formed strings: true implies `s.length >= t.length`; an empty `t` or `t == s` gives true; true with equal lengths implies `s == t`; `startsWith` / `endsWith` imply `includes` |
+| string literals | the bytes of a literal of at most 16 bytes are facts about `charCodeAt` (a literal's id stands for its contents, and distinct literals have distinct ids), so `"E0412".charCodeAt(0) == 69` and a precondition such as `c.length == 5 && c.charCodeAt(0) == 69` are provable on a literal argument |
+| `s.indexOf(x)` | an empty `x` is found at 0; an `x` longer than `s` is not found; a position `p` has `p + x.length <= s.length` |
 
 ### Semantics (honest limits)
 
