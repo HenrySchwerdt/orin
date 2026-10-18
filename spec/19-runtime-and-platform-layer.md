@@ -141,6 +141,9 @@ separator is raised through `process.exit(101)` after printing the same message.
     | `memMove(dst, src, n)` (R3d.0) | `orin_platform_mem_move` (ranges may overlap) |
     | `memCmp(a, b, n) -> int` (R3d.0) | `orin_platform_mem_cmp` normalised to -1, 0 or 1 (unsigned bytes) |
     | `hook(k, a, b, c: usize) -> usize` (R3d.5) | a call of the C runtime function `orin_core_hook(k, a, b, c)` (`runtime/core/orin_runtime.c`; the numbers are the `HK_*` constants of `runtime/core/heap.or`): the services that are still C when the Orin runtime needs them, namely `getenv`, one line on stderr, the runtime lock, the address of the totals of finished tasks (`g_fold`, `g_fold_live`), whether the hot counters are built in, and the allocation-site census hooks. Not pure; reachable like the other core operations only from `$rt/` |
+    | `plat(k, a, b, c: usize) -> usize` (R3e.0) | a direct call of the L0 function `orin_platform_<name>` that the closed table of 20 functions (`platOpName` in `compiler/hir/coreops.or`; threads 0..3, monitors 4..13, process 14..19; named `PL_*` in `runtime/core/plat.or`) lists at index `k`, which must be a literal or a named constant below 20 (else E0404). Arguments are words (pointers are addresses; `thread_create` takes the `fnAddr` of a `void(void *)` entry), the result is the `int` / `int64_t` / pointer of L0 as a word (a C `int` sign-extended), 0 for a void function. Not pure, may write any memory, may not return (`thread_exit`, `exit`). The LLVM declarations carry no `readnone` / `readonly` / `argmemonly` / `nounwind`, and `tools/check_platform_boundary.sh` lints that and `orin_platform.h`; it replaces the L0-shaped hooks (R3e.1) |
+    | `fnAddr(k: usize) -> usize` (R3e.0) | the address of the C-ABI wrapper (`orin_probe_entry`, later the task thread entry) of the L1 entry number `k` of `compiler/mir/rt.or`, a literal naming an entry of `fnAddrEntries()` (wrapper type `void(void *)`); pure |
+    | `sharedBase() -> usize` (R3e.0) | address of the process-wide zero-initialised block `orin_shared` (`OrinShared`, 128 words, a plain global; layout "R3e.0" below); executables only; pure |
 
   - **R3d.0 preparation (done, ADR-0052 Addendum A; each item is a working assumption of its section 6 until the owner
     confirms it).** (1) *The `$rt` root* (question 1): `runtime/core/*.or` is the fourth embedded prelude root
@@ -246,7 +249,13 @@ separator is raised through `process.exit(101)` after printing the same message.
     | 176 | 8 | `dcap` (u64) | `t_dcap` | its capacity in entries |
     | 184 | 8 | reserved | | |
     | 192 | 144 | `stats` (`OrinStats`, 18 u64) | `orin_stats` | `alloc_string` +0, `alloc_array` +8, `alloc_struct` +16, `frees` +24, `retains` +32, `releases` +40, `cow_copies` +48, `cow_inplace` +56, `array_grows` +64, `string_grows` +72, `peak_live_objs` +80, `peak_live_bytes` +88, `live_bytes` +96, `file_opens` +104, `file_closes` +112, `transfer_moves` +120, `transfer_copies` +128, `tasks_spawned` +136 |
-    | 336 | 168 | reserved | | task pointer, grant and file tables (R3e) |
+    | 336 | 8 | `task` | `t_task` (R3e.4) | address of the `RtTask` record of this thread, 0 on a thread that is not a task (`H_TASK`) |
+    | 344 | 8 | `joined` | `t_joined_msg` (R3e.4) | the record of the task joined last by this thread (`H_JOINED`) |
+    | 352 | 8 | `grants` | `g_grants` (R3c) | reserved for the grant table (`H_GRANTS`) |
+    | 360 | 8 | `files` | `g_files` (R3c) | reserved for the open-file table (`H_FILES`) |
+    | 368 | 8 | `netbuf` | `t_netbuf` (C4) | the per-task network buffer (`H_NETBUF`) |
+    | 376 | 8 | `scratch` | | the out parameter of L0 calls (`thread_join`, `monitor_get`; `H_SCRATCH`) |
+    | 384 | 120 | reserved | | up to 504 |
     | 504 | 8 | `probe` | | scratch word of `std:coreprobe` |
     | 512 | 272 | `sb[17]` (`{head, n}` pairs, 16 bytes each) | `sb_list`, `sb_cnt` (u32) | small-block cache by 16-byte class 0..16 (`SB_MAX` 256): list head @+0, length @+8, cap `SB_CAP` = 2^15 |
     | 784 | 240 | reserved | | up to 1024 bytes (128 words) |
@@ -254,6 +263,17 @@ separator is raised through `process.exit(101)` after printing the same message.
     **Not moved (they stay `static __thread` in C until R3e; the census tables stay C, R3d.5):** `t_sites`, `t_pairs`, `t_calls` (census), `g_grants`, `g_files`, `t_task`, `t_joined_msg`, `orin_site_cur`, `orin_site_par`.
     Offsets do not depend on the build configuration (the lists and counters exist unused under `-DORIN_NO_FREELIST` or without `ORIN_STATS_ENABLED`) and are pinned by `_Static_assert`s in `runtime/core/orin_runtime.h`.
     `orin_stats` is now `#define orin_stats (orin_heap.stats)`, so inline code and generated C are unchanged; the block is `extern __thread OrinHeap orin_heap` (local-exec as before), `heapBase()` is its address (the C backend emits `&orin_heap`, the LLVM declaration is `[128 x i64]`).
+
+  - **R3e.0 / R3e.1 the task interface starts (done, ADR-0052 Addendum B).** Three core operations (`plat`, `fnAddr`, `sharedBase`, table above) and
+    the shared block `orin_shared`, a plain global defined in `orin_runtime.c` and listed in `bootstrap/seed/runtime/core-only-symbols.txt`
+    (the legacy world never references it). Layout, pinned by `_Static_assert`s on `OrinShared` in `orin_runtime.h`: words 0..3 the transfer
+    slot table (pointer, `n`, `cap`, free head), 4..7 the grant flight table (R3e.5), 8..63 reserved, 64..127 (byte 512) the line buffer of
+    the process trap (the main thread only). Everything but the trap line is read and written only between `plat(RUNTIME_LOCK)` and
+    `plat(RUNTIME_UNLOCK)`. `runtime/core/sync.or` holds the eleven monitor operations of `std:task` (`monNew` .. `monWaitUntil`, one `plat`
+    call plus the failure test each); the backends call them in place of the C forwarders `orin_mon_*` through `l1Task` in `compiler/mir/rt.or`
+    (entries 30 to 55 are numbered for all of R3e; a missing entry falls back to the C function of the same operation, so the C stays in the live
+    runtime until R3e.6). `--rt-wrappers` (a `compile` flag, used by `tools/rt_stub.sh`) defines the C-named test wrappers of the entries
+    (`rtTestWraps`, empty until R3e.6).
 
 
   - **R3b strings and numbers (partly done).** `parseI8` .. `parseUsize` moved (`strParseIntK`, one more slot in
