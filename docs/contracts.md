@@ -249,9 +249,15 @@ as `rules`. JSON: `{"results":[{"function","file","line","kind","clause","rules"
 | calls | modular: callee `@Requires` obligation, `@Ensures` assumed; pure function = uninterpreted function; recursion assumes the callee contract | A-CALL, A-PURE | calls of generic functions from outside their class, function values, interface calls |
 | methods and constructors | receiver as a datatype value; a mutating method returns the new receiver; `new C(..)`; static methods | class invariants (B8), frames (B9) | `new C<T>(..)` of a generic class |
 | generic functions and classes | checked once, abstractly: a type parameter `T` is an opaque value (nothing can be done with it but pass it around and store it), the class applied to its own parameters is the class | | `==` on a `T`; a call of a generic function from code that is not in the same class |
+| interface types (`interface Sink { .. }`) | an opaque sort per interface (`If_Sink`): a parameter, field, result or local of the type is some object that implements it; a class-typed argument converts to it at a call (ADR-0019) as a fresh value of the sort | | a method call on the value (an interface call has unknown effects), `==`, a conversion other than an argument of a call |
 | `if`, `match`, blocks, `return`, `let`, assignment, `+=` etc. | symbolic execution with merged states | | `break` / `continue` effects (the loop is havoc'd); an effect (`?`, a mutating call) in a `while` condition or in the right operand of `&&` / `||` / `==>`, in a branch of `?:` or in an arm of a `match` that is not a `return match` |
 | `while`, `for .. of` | loop `@Invariant`, inferred counter bound, or havoc; also unrolled 3 iterations exactly | A-LOOP | nested loop invariants inside a loop with `break` |
 | `console.log` / `console.error`, `exit` | no effect on the values; `exit` ends the path | | any other I/O |
+
+A `match` statement is exhaustive (the checker rejects the others), so the path on which no arm matches is impossible and nothing
+leaves it: a function whose arms all `return` has no path that falls off its end, whatever its result type. (Until 2026-10-18 that
+path was modelled as a fall-through with the path condition `false`, and the function was UNKNOWN with "return statements do not
+match the declared result type".) Regression test: `tests/contracts/verify_gaps.or`.
 
 ### Effects inside an expression (`?`, mutating calls)
 
@@ -383,9 +389,34 @@ For every public method that changes `this` (the mutation analysis of the checke
 verifier proves the class `@Invariant`s at every return, assuming them (and the `@Requires`) on entry: result kind `invariant`.
 A method that can break an invariant is REFUTED with the values of `this` and the arguments, `action: NEEDS_DECISION`, and the
 three options (fix the method, add a precondition, weaken the invariant). A private method has no invariant obligation (it may be
-called in the middle of an update) and the invariant is not assumed on entry. Class-typed parameters are assumed to satisfy their
+called in the middle of an update) and the invariant is not assumed on entry, unless every call of it proves it (next paragraph). Class-typed parameters are assumed to satisfy their
 invariants (**A-INV**: constructors establish them, public methods maintain them; a write to a public field from outside the
 class is not covered, and neither is it by the run-time check).
+
+**Invariants in private methods.** A private helper often needs the invariant (the bound of an index, say), but it may be called in the
+middle of an update, so assuming it on entry would be unsound. The verifier assumes it only for a helper whose calls all prove it:
+
+1. A private instance method of a class with `@Invariant`s whose contracts are not all proved is a *candidate* when its name occurs in
+   the class only as `.name(` besides its declaration. It is proved a second time with the invariants of `this` assumed on entry
+   (A-INV). If that proves something the first run did not, the rest is checked; otherwise nothing changes.
+2. At every call of the candidate in the class, the verifier proves the invariants of the receiver in the state at the call (a hidden
+   obligation of kind `invariant-site`: not reported, not assumed afterwards, so a call at a broken state does not stop the path). The
+   candidate is *eligible* only if every occurrence of its name in the class text is such a call that the verifier saw and proved. A
+   mention that is not a call it analysed (in a contract, in a field initialiser, a call in a function outside the fragment or in a
+   position that is not translated) makes it not eligible: the helper keeps the results of the first run.
+3. A call in a caller that itself assumes the invariants (an eligible helper) counts only while that caller stays eligible: the set of
+   eligible helpers is the greatest set closed under this. The chain of calls starts in a public method (which assumes the invariants
+   on entry) or a constructor (which has to prove them at the call), so by induction on the depth of the call stack every call
+   of an eligible helper is made in a state where the invariants hold. A helper that nothing calls is never run and is eligible.
+4. For an eligible helper, each result that was not VERIFIED is replaced by the result of the run with the invariants assumed (VERIFIED,
+   or a counterexample that now is a real one: the entry state satisfies the invariants). A result that was VERIFIED stays; the helper's
+   `@Ensures` is what callers assume as before.
+
+A helper called in the middle of an update (`this.pos = this.xs.length; this.at();`) fails step 2 and is not eligible, so a wrong
+claim cannot be proved through it. The cost is one more run of the candidates that fail, and, for those that gain a proof, of the
+functions of the class that mention them (only the call-site obligations are solved there). Regression test:
+`tests/contracts/verify_private_inv.or`. To make a helper depend on the invariant without this inference, state it as the helper's
+`@Requires`: the callers must then prove it, and the verifier takes it as a precondition.
 
 A method's **frame** is the set of fields its body writes (assignments to `this.f..`, mutating calls on `this.f`, the frames
 of the `this` methods it calls, to a fixed point); no annotation. After a call of a mutating method the receiver is a fresh

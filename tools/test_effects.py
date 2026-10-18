@@ -330,13 +330,13 @@ def main():
     rc, out, err = run(orin, ["effects", pv])
     check(rc == 1 and "error[E0473]" in err and "module store:" in out, "orin effects prints the policy violations (%s)" % err)
 
-    # ---- 5. --target=wasm64-orbit: the Orbit capability manifest (analysis/orbit.or, E0523) -----------------------
+    # ---- 5. --target=wasm64-orbit / wasm32-orbit: the Orbit capability manifest (analysis/orbit.or, E0523) -----------------------
     wdir = os.path.join(ROOT, "tests", "wasm_target")
     marker = "/* Orbit capability manifest (ADR-0055): describes requirements, never authorises */"
 
-    def manifest_of(name):
+    def manifest_of(name, target="wasm64-orbit"):
         out_c = os.path.join(tmp, name + ".c")
-        rc, out, err = run(orin, ["compile", os.path.join(wdir, name + ".or"), "-o", out_c, "--target=wasm64-orbit"])
+        rc, out, err = run(orin, ["compile", os.path.join(wdir, name + ".or"), "-o", out_c, "--target=" + target])
         text = open(out_c).read() if os.path.exists(out_c) else ""
         return rc, err, text
 
@@ -362,6 +362,8 @@ def main():
         rc, err, text = manifest_of(name)
         check(rc == 0 and text.endswith(expected_tail(req)), "wasm64-orbit %s: manifest %s ends the C file (%s)" % (name, req, err + text[-300:]))
         check(text.count("orbit.manifest") == 1, "wasm64-orbit %s: exactly one manifest section" % name)
+        rc32, err32, text32 = manifest_of(name, "wasm32-orbit")
+        check(rc32 == 0 and text32 == text, "wasm32-orbit %s: the same C and the same manifest as wasm64-orbit (%s)" % (name, err32))
     # the literal shape from the specification, for one case
     rc, err, text = manifest_of("clock")
     check(text.endswith(marker + '\n__asm__(".section .custom_section.orbit.manifest,\\"\\",@\\n.ascii \\"{\\\\\\"abi\\\\\\":1,\\\\\\"requires\\\\\\":'
@@ -369,6 +371,9 @@ def main():
     rc, err, text = manifest_of("fs")
     check(rc == 1 and "error[E0523]" in err and "`main` needs Fs.ReadFile, which the wasm64-orbit target does not provide" in err
           and "fs.or:4:" in err and text == "", "wasm64-orbit: an Fs program is rejected with E0523 and evidence (%s)" % err)
+    rc, err, text = manifest_of("fs", "wasm32-orbit")
+    check(rc == 1 and "error[E0523]" in err and "`main` needs Fs.ReadFile, which the wasm32-orbit target does not provide" in err
+          and text == "", "wasm32-orbit: an Fs program is rejected with E0523 naming wasm32-orbit (%s)" % err)
     plain = os.path.join(tmp, "plain.c")
     rc, out, err = run(orin, ["compile", os.path.join(wdir, "clock.or"), "-o", plain])
     check(rc == 0 and "orbit.manifest" not in open(plain).read(), "without --target the C has no manifest (%s)" % err)
@@ -379,6 +384,8 @@ def main():
     check(rc == 2 and "needs the C backend" in err, "usage error: wasm64-orbit with --backend=llvm (%s)" % err)
     rc, out, err = run(orin, ["compile", os.path.join(wdir, "hello.or"), "-o", os.path.join(tmp, "l.c"), "--target=wasm64-orbit", "--split", "2"])
     check(rc == 2 and "needs the C backend" in err, "usage error: wasm64-orbit with --split (%s)" % err)
+    rc, out, err = run(orin, ["compile", os.path.join(wdir, "hello.or"), "-o", os.path.join(tmp, "l.c"), "--target=wasm32-orbit", "--split", "2"])
+    check(rc == 2 and "--target=wasm32-orbit needs the C backend" in err, "usage error: wasm32-orbit with --split names its target (%s)" % err)
     rc, out, err = run(orin, ["compile", os.path.join(wdir, "hello.or"), "-o", os.path.join(tmp, "l.c"), "--target=arm"])
     check(rc == 2 and "unknown target `arm`" in err, "usage error: unknown target (%s)" % err)
 

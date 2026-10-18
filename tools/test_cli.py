@@ -409,10 +409,10 @@ class CliTests(unittest.TestCase):
         self.assertEqual(before, binary.stat().st_mtime_ns)
         self.run_cli("fmt", "--check", cwd=project)
 
-    def test_wasm64_orbit_build(self):
-        # ADR-0055: `orin build --target=wasm64-orbit` makes a freestanding WebAssembly module with an Orbit manifest.
-        probe = subprocess.run(["clang", "--target=wasm64-unknown-unknown", "-print-targets"], capture_output=True, text=True)
-        if probe.returncode != 0 or "wasm64" not in probe.stdout or not shutil.which("wasm-ld"):
+    def test_wasm_orbit_build(self):
+        # ADR-0055: `orin build --target=wasm64-orbit` and `--target=wasm32-orbit` make a freestanding WebAssembly module with an Orbit manifest.
+        probe = subprocess.run(["clang", "--print-targets"], capture_output=True, text=True)
+        if probe.returncode != 0 or "wasm64" not in probe.stdout or "wasm32" not in probe.stdout or not shutil.which("wasm-ld"):
             self.skipTest("no clang with the WebAssembly backend and wasm-ld")
         self.run_cli("init", "hello")
         project = self.cwd / "hello"
@@ -421,11 +421,22 @@ class CliTests(unittest.TestCase):
         self.assertEqual(module[:4], b"\0asm")
         self.assertIn(b'orbit.manifest{"abi":1,"requires":["log/v1"],"producer":"orin"}', module)
         self.assertNotIn(b"wasi_snapshot_preview1", module)
+        # wasm32-orbit: the same manifest in a module of its own (32-bit memory)
+        self.run_cli("build", "--target=wasm32-orbit", cwd=project, env={"CC": "clang"})
+        module32 = (project / "build/dev/hello.wasm").read_bytes()
+        self.assertEqual(module32[:4], b"\0asm")
+        self.assertIn(b'orbit.manifest{"abi":1,"requires":["log/v1"],"producer":"orin"}', module32)
+        self.assertNotIn(b"wasi_snapshot_preview1", module32)
+        self.assertNotEqual(module, module32)
         # tasks run one at a time inside the one WebAssembly thread: the program builds (no E0523) and keeps the orin_tls section
         (project / "src/main.or").write_text('import { scope, spawn } from "std:task";\n'
                                               'function main(): void { console.log(scope(s => spawn(s, () => 6 * 7).join()).toString()); }\n')
         self.run_cli("build", "--target=wasm64-orbit", cwd=project, env={"CC": "clang"})
         self.assertIn(b"orin_tls", (project / "build/dev/hello.wasm").read_bytes())
+        self.run_cli("build", "--target=wasm32-orbit", cwd=project, env={"CC": "clang"})
+        self.assertIn(b"orin_tls", (project / "build/dev/hello.wasm").read_bytes())
+        self.assertIn("does not support --target=wasm32-orbit", self.run_cli("run", "--target=wasm32-orbit", cwd=project, code=2).stderr)
+        self.assertIn("--target=wasm32-orbit uses the C backend", self.run_cli("build", "--target=wasm32-orbit", "--backend=llvm", cwd=project, code=2).stderr)
         self.assertIn("does not support --target=wasm64-orbit", self.run_cli("run", "--target=wasm64-orbit", cwd=project, code=2).stderr)
         self.assertIn("C backend", self.run_cli("build", "--target=wasm64-orbit", "--backend=llvm", cwd=project, code=2).stderr)
         self.assertIn("Unknown target", self.run_cli("build", "--target=arm", cwd=project, code=2).stderr)

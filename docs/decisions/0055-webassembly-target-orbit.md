@@ -1,4 +1,4 @@
-# ADR-0055: The WebAssembly target `wasm64-orbit`
+# ADR-0055: The WebAssembly targets `wasm64-orbit` and `wasm32-orbit`
 
 Status: accepted (2026-10-17; decided by Claude under the owner's standing instruction to decide design questions with a
 recommendation and document them; Henry can overturn it). Implements roadmap item 8 ([roadmap.md](../roadmap.md)) for the
@@ -28,7 +28,7 @@ What does the compiler emit, which memory width, which C library and which host 
    Orin-written runtime (owned by the runtime-in-Orin work, ADR-0052); wasm64 needs neither. Orbit accepts both widths and its
    ABI passes every pointer as `i64` anyway. The cost, measured (section "Measurements"): Memory64 loses Wasmtime's
    guard-page bounds-check elision (explicit checks per access) and is less widely supported in browsers (Node needs >= 24).
-   A later wasm32 path is open (see "Later").
+   wasm32 followed on 2026-10-18 as a second target with 64-bit Orin values and 32-bit pointers (decision 8).
 
 3. **No libc, no WASI: an own freestanding L0.** `runtime/platform/orbit/` replaces `runtime/platform/orin_platform.c`:
    - `orin_platform_orbit.c` implements every function of `orin_platform.h` over two Orbit imports,
@@ -106,6 +106,30 @@ What does the compiler emit, which memory width, which C library and which host 
    Evidence instead of CBMC for now: the shared pure primitives keep their harnesses; the rest is covered by the conformance
    suite under WebAssembly and the three tests (float, builtins, allocator).
 
+8. **`wasm32-orbit` (2026-10-18): 64-bit Orin values, 32-bit C pointers** (the "cheap" variant of "Later", now built).
+   `--target=wasm32-orbit` accepts everything `wasm64-orbit` does and produces the same C, the same manifest and the same
+   imports; only clang's triple (`wasm32-unknown-unknown`) differs. Slots, `usize` (ADR-0022) and the IR stay 64-bit, so
+   an object is as large as on wasm64 and only addresses are 4 bytes. What it took:
+   - *Runtime ABI* (done before, PR 35): the pointer-holding fields the Orin-written runtime reads with `load64`/`store64`
+     are 8-byte words on every target (`ORIN_PTR64`, high half zero on 32-bit). One field was missed by that change because
+     it arrived with R3e.2 (`TrSlot.box`/`.pins`, the transfer table); it is the same union now, and the C writers store the
+     whole word, because the table is `realloc`'d, not zeroed (a stale high half made the first `spawn` fail).
+   - *Generated C*: two macros in the preamble. `ORIN_WORD(x)` replaces the `(uint64_t)(uintptr_t)(x)` the backend wrote for
+     the arguments of task and monitor calls: on a 32-bit target that cast dropped the high half of a `uint64_t` (a monitor
+     handle is `generation << 32 | index`), which only showed as "invalid monitor operation" in the 12 task tests.
+     `ORIN_SIZE(x)` replaces `(size_t)(x)` for allocation and `mem*` sizes: a size that does not fit a 32-bit `size_t` traps
+     with `out of memory` instead of being truncated into a small allocation. The L0 cannot do this check, because the
+     truncation happens at the call site before `orin_platform_alloc` runs. On 64-bit targets both are the old plain casts.
+   - *L0*: the allocator works in 64-bit for the memory size (4 GiB does not fit a 32-bit `size_t`), refuses requests above
+     2 GiB per block and never lets the heap top reach the last 16 bytes of the address space (no wrap to 0); monitor word
+     counts are checked against `size_t`; the fatal-line prefix is `wasm32-orbit: ` or `wasm64-orbit: ` by pointer width
+     (`tools/run_tests.py` matches both). The imports keep `i64` pointers and lengths (Orbit host ABI), zero-extended.
+   - *Tests*: `tools/test_wasm.sh` runs everything for both widths (conformance, the `orin_tls` section check, the
+     allocator on its real target with real `memory.grow`: `alloc_test_wasm.c`; native `alloc_test.c` also builds with
+     `-m32` where a 32-bit C toolchain exists).
+   Limits: a wasm32 memory is at most 4 GiB (module stack and data included); an allocation that does not fit fails with
+   `out of memory`. State: 1043 passed, 0 failed, 23 skipped for each width (the same tests skip on both).
+
 ## Measurements (2026-10-17, one Linux x86_64 container, best of 3, wall time)
 
 Orin benchmarks (`bench/*/main.or`), native C backend `-O2` vs the same program as `wasm64-orbit`:
@@ -138,9 +162,34 @@ as wasm64 with the same clang flags, run by `wasmtime run` (29.0.1, no fuel):
 
 So Memory64 costs roughly 15-40 % on pointer-heavy code today; fuel metering costs more than that.
 
+### wasm32-orbit vs wasm64-orbit, real Orin programs (2026-10-18)
+
+The missing number of the section above: the same `bench/*/main.or` as `wasm32-orbit` and `wasm64-orbit`, wall time best of 5
+(one Linux x86_64 container, 4 cores, Node 24.11.1, Orbit with wasmtime 49), peak RSS in MB. "Orbit" is the stock `orbit run
+--max-memory 2 GiB` (fuel metering on); "Orbit, no fuel" is the same Orbit built with `consume_fuel(false)` (a scratch copy,
+not committed there). Ratio = wasm64 / wasm32.
+
+| program | native | Node 32 | Node 64 | ratio | Orbit 32 | Orbit 64 | ratio | Orbit no fuel 32 | Orbit no fuel 64 | ratio |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| fib | 0.357 s | 0.640 s | 0.610 s | 0.95 | 1.426 s | 1.332 s | 0.93 | 0.795 s | 0.811 s | 1.02 |
+| bintrees | 0.429 s | 0.632 s | 0.683 s | 1.08 | 1.068 s | 1.219 s | 1.14 | 0.893 s | 1.138 s | 1.27 |
+| sieve | 0.111 s | 0.253 s | 0.248 s | 0.98 | 0.226 s | 0.251 s | 1.11 | 0.198 s | 0.243 s | 1.22 |
+| nbody | 0.058 s | 0.156 s | 0.218 s | 1.40 | 0.139 s | 0.241 s | 1.73 | 0.128 s | 0.230 s | 1.80 |
+
+Peak RSS (MB), identical within 1 % for the two widths: fib 49.6 (Node) / 17.0 (Orbit) / 11.2 (native); bintrees 66.8 / 32.9 / 17.5;
+sieve 126.7 / 93.4 / 77.8; nbody 50.8 / 17.5 / 11.2. Startup (hello): 0.039 s Node, 0.046 s Orbit for both widths; the module is
+101 KB as wasm32 and 110 KB as wasm64.
+
+Reading: Memory64 costs nothing measurable on Node for call-heavy code (fib, sieve), 8-14 % on the
+allocation-heavy bintrees under Orbit with fuel and 27 % without, and 40-80 % on nbody (float code over small objects, where
+every field access is a checked load). The earlier C-only measurement (+17 / +30 / -13 / +39 %) pointed the same way. wasm32 does not
+save memory (slots stay 8 bytes: RSS equal). The remaining gap to native is the WebAssembly engine, not the width: fib 1.8x on
+Node and 2.2x on Orbit without fuel. A 64-bit Orin value in a 32-bit memory costs nothing visible: the compiler-generated
+64-bit arithmetic is the same on both modules.
+
 ## Later
 
-- **wasm32** would remove the Memory64 cost and open older browsers. Two variants were costed (2026-10-17):
+- **wasm32** (built, decision 8). Two variants were costed (2026-10-17):
   - *Cheap: 64-bit Orin values, 32-bit C pointers.* Slots, `usize` (ADR-0022) and the IR stay 64-bit; the C backend already
     casts every pointer through `uint64_t`/`uintptr_t`. What breaks is only the runtime's pointer-holding ABI fields
     (`OrinArray.items`, `FreeNode.next`, `SbClass.head`, the `OrinHeap` free-list heads, `dstack` in
@@ -149,7 +198,7 @@ So Memory64 costs roughly 15-40 % on pointer-heavy code today; fuel metering cos
     `_Static_assert`s at `orin_runtime.h:264-277` follow (they are the only errors when `orin_runtime.c` is compiled for
     wasm32). About 120-180 lines: ~80 in `runtime/core` plus the copy in `bootstrap/seed`, ~25 in the compiler (target
     name), the rest in this L0, the tools and docs. It saves the bounds checks, not memory (slots stay 8 bytes).
-    **Planned**: the runtime change after R3e of the runtime-in-Orin work (ADR-0052), then `wasm32-orbit` here.
+    **Done** (2026-10-18): the runtime change (PR 35) and `wasm32-orbit` (decision 8).
   - *Full: 32-bit `usize` and 4-byte slots.* A 4-byte slot cannot hold `i64`/`f64`, which breaks the IR's "slot = 64-bit
     scalar or reference"; about 60-100 files and 3-6k lines across compiler, runtime and std plus a new seed. Rejected.
 - **Tasks**: done sequentially (decision 4). Left: tasks that need interleaving and tasks that trap need either stack switching

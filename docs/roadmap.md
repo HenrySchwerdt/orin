@@ -91,14 +91,14 @@ Path to 1.0 (milestones, gaps, owner decisions): [roadmaps/orin-1.0.md](roadmaps
    - **Status 2026-10-17: first target built,** [ADR-0055](decisions/0055-webassembly-target-orbit.md), [wasm.md](wasm.md):
      `--target=wasm64-orbit` for the Orbit runtime (C backend, own freestanding L0 over `orbit:log/v1` / `orbit:clock/v1`
      instead of wasi-libc, manifest from the effect analysis, E0523 for unavailable effects); the conformance suites run as
-     modules in CI (1002 passed, 32 skipped). The plan below was the starting point; where it differs, ADR-0055 decides.
+     modules in CI (1002 passed, 32 skipped); 2026-10-18: `--target=wasm32-orbit` (64-bit Orin values, 32-bit C pointers, ADR-0055 decision 8). The plan below was the starting point; where it differs, ADR-0055 decides.
    - **Toolchain:** the LLVM backend's `.ll` goes through `clang --target=wasm64-wasip1` (or `wasm32`) with
      wasi-libc.
    - **Prerequisite:** R3/R4 are done, so L0 is the only C and only L0 needs a second implementation.
    - **Capabilities:** WASI is capability-based itself. `host.fs()` maps to the host's preopened directories, and
      `useUnder` / `useReadOnly` map to subtrees of them.
-   - **Pointer width:** `usize` is i64 in the IR today, so wasm64 (Memory64) is the first target. wasm32 needs a
-     target-dependent `usize`.
+   - **Pointer width:** `usize` is i64 in the IR, so wasm64 (Memory64) was the first target; `wasm32-orbit` keeps 64-bit
+     Orin values and uses 32-bit C pointers (ADR-0055 decision 8), so no target-dependent `usize` was needed.
    - **Limits:** sockets need WASI preview 2, and threads need wasi-threads. Until then `std:net` and `.parallel()`
      are limited or sequential there, and this is documented.
    - **Browser:** a browser target uses an L0 over imported JS host functions, which pairs with JSX.

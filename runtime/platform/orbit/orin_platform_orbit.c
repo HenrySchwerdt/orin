@@ -1,7 +1,7 @@
 /* Orin L0 platform layer for WebAssembly under the Orbit host ABI v1 (ADR-0055). Contracts: ../orin_platform.h.
  *
- * Target: wasm32, compiled by clang --target=wasm32-wasip1 -mexec-model=reactor against wasi-libc, but the linked module
- * imports NO WASI function: libc is used only for its pure parts (malloc, string, snprintf/strtod). Every privileged
+ * Target: wasm32 or wasm64 (Memory64), compiled freestanding by clang with the own libc of orin_libc_orbit.c (no WASI function is
+ * imported). Every privileged
  * operation goes through an `orbit:<capability>/v1` import (orbit docs/host-abi.md); pointers and lengths are passed as
  * zero-extended i64. A capability the program never reaches is not imported (wasm-ld drops dead imports), so the module's
  * import list is exactly what it may ask the host for, and the host's grant decides (deny by default).
@@ -16,7 +16,7 @@
  *                     the task; it runs when a context would block (join of it, monitor wait) or when main returns. The
  *                     runtime's per-task state is __thread data, which the build (-D__thread=...section("orin_tls")) gathers
  *                     into one block; a switch saves that block, installs its pristine image and restores it afterwards.
- *                     A wait with no queued task, and a trapping task, end the module with a "wasm64-orbit:" message;
+ *                     A wait with no queued task, and a trapping task, end the module with a "wasm32-orbit: " / "wasm64-orbit: " message;
  *   exit              flushes, records the status (export orin_exit_status) and traps: WebAssembly has no unwinding here.
  * Entry point: the export `orin_main` runs the program's main and returns its exit status. */
 #include "../orin_platform.h"
@@ -265,11 +265,11 @@ static void tls_prime(void) {
     if (tls_size() && (g_tls_pristine = (char *)orin_platform_alloc(tls_size()))) orin_platform_mem_copy(g_tls_pristine, __start_orin_tls, tls_size());
 }
 
-/* Ends the module with a message the test runner recognises (the prefix "wasm64-orbit: "). */
+/* Ends the module with a message the test runner recognises (the prefix "wasm32-orbit: " or "wasm64-orbit: ", by pointer width). */
 __attribute__((noreturn)) static void fatal(const char *what, const char *detail, int status) {
     static char buf[1100];
     size_t n = 0;
-    const char *parts[] = {"wasm64-orbit: ", what, detail};
+    const char *parts[] = {sizeof(void *) == 4 ? "wasm32-orbit: " : "wasm64-orbit: ", what, detail};
     for (int k = 0; k < 3; k++)
         for (const char *p = parts[k]; *p && n < sizeof buf - 1; p++) buf[n++] = *p;
     orin_platform_flush();
@@ -379,6 +379,7 @@ static Mon *mon_held(int64_t h) { /* the monitor, locked by the running context 
 }
 
 int64_t orin_platform_monitor_new(size_t nwords) {
+    if (nwords > (size_t)-1 / sizeof(uint64_t)) return 0; /* the byte count must fit a 32-bit size_t */
     uint64_t *w = (uint64_t *)orin_platform_alloc(nwords * sizeof(uint64_t));
     if (!w) return 0;
     orin_platform_mem_set(w, 0, nwords * sizeof(uint64_t));
@@ -459,6 +460,7 @@ int orin_platform_monitor_set(int64_t h, size_t i, uint64_t v) {
 int orin_platform_monitor_grow(int64_t h, size_t nwords) {
     Mon *m = mon_held(h);
     if (!m || nwords < m->n) return ORIN_PLATFORM_EINVAL;
+    if (nwords > (size_t)-1 / sizeof(uint64_t)) return ORIN_PLATFORM_ENOMEM;
     uint64_t *w = (uint64_t *)orin_platform_realloc(m->w, nwords * sizeof(uint64_t));
     if (!w) return ORIN_PLATFORM_ENOMEM;
     orin_platform_mem_set(w + m->n, 0, (nwords - m->n) * sizeof(uint64_t));

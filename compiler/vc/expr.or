@@ -12,7 +12,7 @@ import {
 } from "../syntax";
 import {
   VT, VInt, VBool, VStr, VUnit, VArr, VOpt, VRes, VMap, VRec, VUni, VBad,
-  isIntKind, intLo, intHi, joinKinds, vtName, vtKey, isBad, badReason, vtEq, isIntTy, intKindOf, concrete, resolveTy, resolveTyP, fieldTyOf, fieldIndex, isMapKey
+  isIntKind, intLo, intHi, joinKinds, vtName, vtKey, isBad, badReason, vtEq, isIfaceTy, isIntTy, intKindOf, concrete, resolveTy, resolveTyP, fieldTyOf, fieldIndex, isMapKey
 } from "./vt";
 import { Gen, SortR, sortOf, opaqueSort, variantIndex } from "./gen";
 import { bareOf } from "./scope";
@@ -1140,6 +1140,14 @@ function trMapMethod(g0: Gen, vars: Var[], cx: Cx, r: TR, k: VT, v: VT, name: st
 
 // ----------------------------------------------------------------------------------- calls of user code
 
+// Is `t` a class of the program (not a record: only classes implement interfaces)?
+function isClassTy(cx: Cx, t: VT): bool {
+  return match (t) {
+    VRec(k) => cx.p.clsIx.has(k),
+    _ => false
+  };
+}
+
 // Translate the arguments of a call against the parameter types.
 type Args = { g: Gen; terms: string[]; chks: Chk[]; };
 
@@ -1150,6 +1158,17 @@ function trArgs(g0: Gen, vars: Var[], cx: Cx, f: Fn, ptys: VT[], args: Expr[]): 
   let i: usize = 0;
   while (i < args.length) {
     const a = tr(g, vars, cx, args[i], ptys[i])?;
+    if (isIfaceTy(ptys[i]) && isClassTy(cx, a.vt)) {
+      // The one implicit conversion of the language (ADR-0019): an object of a class converts to an interface type.
+      // The result is some object of the interface; what the class guarantees about the argument is not carried over
+      // (an arbitrary value of the sort over-approximates every conversion; the checker has proved `implements`).
+      const o = freshFree(a.g, cx, ptys[i])?;
+      g = o.g;
+      chks = concatChk(chks, a.chks);
+      terms.push(o.name);
+      i += 1;
+      continue;
+    }
     if (!vtEq(a.vt, ptys[i])) {
       return Err("call of `" + f.disp + "`: argument " + (i + 1).toString() + " has type `" + vtName(a.vt) + "`, expected `" + vtName(ptys[i]) + "`");
     }
@@ -1251,6 +1270,31 @@ function invTermsFor(g0: Gen, cx: Cx, unit: string, text: string, clauses: Contr
   return Invs { g: g, terms: out };
 }
 
+// The class invariants of `cls` as goals about the object `thisTerm` (the conjunction), "" when there is none. A clause outside the
+// fragment is left out, exactly as `invTerms` leaves it out of the hypotheses of a method.
+function invGoals(g0: Gen, cx: Cx, cls: Cls, thisTerm: string): Result<InvGoal, string> {
+  let g = g0;
+  let out: string[] = [];
+  const cc = Cx { p: cx.p, unit: cls.unit, f: cx.f, res: None, ens: false, body: false, olds: [], ret: VUnit, inQ: false, text: cls.text };
+  const vars: Var[] = [Var { name: "this", term: thisTerm, vt: VRec(cls.name) }];
+  for (const c of cls.invs) {
+    const ex = exprOf(c);
+    if (ex.isSome()) {
+      const r = trClause(g, vars, cc, ex.unwrap());
+      match (r) {
+        Ok(x) => {
+          g = x.g;
+          out.push(clGoal(x));
+        },
+        Err(_) => {}
+      }
+    }
+  }
+  return Ok(InvGoal { g: g, goal: out.length == 0 ? "" : andAll(out) });
+}
+
+type InvGoal = { g: Gen; goal: string; };
+
 // The result of a call: the value and, for a mutating method, the receiver after the call.
 export type CallR = { g: Gen; t: string; vt: VT; chks: Chk[]; newThis: string; };
 
@@ -1303,6 +1347,18 @@ export function callFnX(g0: Gen, vars: Var[], cx: Cx, f: Fn, recv: Option<TR>, a
         Err(m) => {
           return Err("the @Requires of `" + f.disp + "` is outside the fragment: " + m);
         }
+      }
+    }
+  }
+  // A private method whose proofs assume the class invariants on entry (`privateInvariants`, vc.or): every call proves
+  // them. The obligation is not reported and not assumed afterwards (a call at a state that breaks them goes on).
+  if (recv.isSome() && f.priv && f.kind == 1 && cx.body && !cx.inQ && !cx.ens && cx.p.sites.has(f.key)) {
+    const co = cx.p.clsIx.get(f.cls);
+    if (co.isSome()) {
+      const ig = invGoals(g, cx, cx.p.classes[co.unwrap()], recv.unwrap().t)?;
+      g = ig.g;
+      if (ig.goal != "") {
+        chks = concatChk(chks, [oblChk("invariant-site", f.key, line, e.span.start.toString(), ig.goal)]);
       }
     }
   }

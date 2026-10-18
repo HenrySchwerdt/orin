@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// A minimal Orbit host for tests (ADR-0055): runs an Orin program built with `--target=wasm64-orbit` under Node (>= 24, for
+// A minimal Orbit host for tests (ADR-0055): runs an Orin program built with `--target=wasm64-orbit` or `--target=wasm32-orbit` under Node (>= 24, for
 // memory64 and table64) with the same import contract as Orbit (orin-lang/orbit, docs/host-abi.md), so the conformance
 // suite can run in CI without building Orbit. It is NOT a sandbox and NOT Orbit: Orbit is the runtime; this only serves
 // the two capabilities the target uses.
