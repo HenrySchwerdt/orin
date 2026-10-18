@@ -151,7 +151,8 @@ between two records), are not proposed: they stay `@Requires` / `@Ensures`.
 2. *After every operation that can change it.* After a write through a place that passes through the record; at every return of a public
    method that changes `this`. Inside a method body (and any private method) the invariant may be broken; it is neither assumed on entry to
    a private method nor required before it returns (ADR-0031 B8). A call to another method of the same object in the middle of an update
-   goes through a private method.
+   goes through a private method. Exception (Addendum A): a private method assumes them on entry when every call of it proves them
+   (docs/contracts.md, "Invariants in private methods").
 3. *At the module boundary.* Everything exported or public is observed only in states where the invariant holds. A public field of an
    invariant-bearing class is not an exception: a write to it from outside the class is an obligation at the write (the same as for records),
    or a compile error when it is not provable. This closes the A-INV hole (M3).
