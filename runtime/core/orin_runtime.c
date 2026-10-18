@@ -1835,9 +1835,9 @@ void orin_rt_heap_exit(void) {
     orin_heap.dcap = 0;
 #ifndef ORIN_NO_FREELIST
     for (int c = 0; c < FL_STRUCT_CLASSES; c++)
-        while (fl_struct[c]) {
-            FreeNode *n = fl_struct[c];
-            fl_struct[c] = n->next;
+        while (fl_struct[c].p) {
+            FreeNode *n = fl_struct[c].p;
+            fl_struct[c].p = n->next;
             fl_n[c]--;
             orin_platform_free(n);
         }
