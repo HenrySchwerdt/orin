@@ -64,9 +64,8 @@ Benchmarks are workload evidence, not proof of asymptotic behavior, peak-memory 
 
 - `i128`/`u128` remain E0431; integer bitwise/shift operators are deferred by ADR-0016.
   Narrow integer arrays still use 8-byte slots. Strings hold bytes; text validity is explicit.
-- Generic methods are **approved design, not implemented here**: [ADR-0040](decisions/0040-generic-methods-and-void-type-arguments.md)
-  does not override [the E0460 checker rule](../compiler/check/classes.or) or
-  [its regression](../tests/next/errors/e0460_class_generic_method.or). Generic interfaces,
+- Generic methods on classes are implemented ([ADR-0040](decisions/0040-generic-methods-and-void-type-arguments.md)); an interface
+  method may not be generic ([E0460](../tests/next/errors/e0460_interface_generic_method.or)). Generic interfaces,
   inheritance, default/rest arguments and registry publishing are not promised by this baseline.
 - [Concurrency](concurrency.md) is stage 0: OS-thread tasks, explicit channel closure, no M:N scheduler,
   general cancellation/select or deadlock detection. Traps do not unwind task heaps; expression early

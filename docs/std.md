@@ -27,11 +27,11 @@ The examples below use the namespace form for bytes, encoding, html, path, json,
 | `std:net` | Orin, `library/std/net.or` over the network primitives of `std:fsraw` (L0: ADR-0033) | blocking TCP: `Listener`, `Stream` (resources), `connect`, `resolve`, `readExact`, `readUntil`, deadlines, half-close; takes a `NetGrant` first, narrowed by `useListen` / `useConnect`; **unstable** (ADR-0033, below) |
 | `std:seq` | Orin, `library/std/seq.or` | `range(lo, hi)`, `sum(xs)`, `sumBy(xs, f)`: pure aggregates for contracts and code; `orin verify --contracts` reads them as bounded quantifiers and recursive sums (ADR-0036) |
 | `std:text` | Orin, `library/std/text.or` | `trimBlankLines`, `dedent` (common indentation *prefix*, as Python's `textwrap.dedent`), `indentLines`, `normalizeNewlines`, `isBlankLine`, `leadingIndent`: pure byte-oriented text layout for diagnostics, documentation and CLIs (UTF-8 bytes are preserved; code points belong to `std:utf8`) |
-| `std:html` | Orin, `library/std/html.or` | `Html` (`@Sealed`), `escape`, `safeUrl`, `escapeUrl`, `renderAll`, `trustHtml`, `fromText`, `fragment`, `render`, `renderDocument`: HTML escaping and the URL-scheme rule; the OX provider `ox()` (`import ox from "std:html";`, ADR-0044); below, "std:html" |
-| `std:ox` | Orin, `library/std/ox.or` (types only) | `Markup<R>`, `Components<R>`, `AttrRule`, `Escape`: the protocol an OX provider's `ox()` returns (ADR-0044, docs/ox.md); below, "std:ox" |
-| `std:meta` | Orin, `library/std/meta.or` (re-exports `metacore.or`, `metajson.or`) | **unstable, ADR-0046 slice S3:** the pure processor interface: `Input` (annotated declarations, types, constants), the `Output` builder tree (`MDecl`/`MStmt`/`MExpr`/`MType`), `fresh`/`NameGen` hygiene and the stable JSON encoding of both; not yet called by the compiler; [API](std-meta.md) |
+| `std:html` | Orin, `library/std/html.or` | `Html` (`@Sealed`), `escape`, `safeUrl`, `escapeUrl`, `renderAll`, `trustHtml`, `fromText`, `fragment`, `render`, `renderDocument`: HTML escaping and the URL-scheme rule; the OX provider `ox()` (`import ox from "std:html";`, ADR-0044; **experimental**, with OX, see stability.md); below, "std:html" |
+| `std:ox` | Orin, `library/std/ox.or` (types only) | `Markup<R>`, `Components<R>`, `AttrRule`, `Escape`: the protocol an OX provider's `ox()` returns (ADR-0044, docs/ox.md; **experimental**); below, "std:ox" |
+| `std:meta` | Orin, `library/std/meta.or` (re-exports `metacore.or`, `metajson.or`) | **experimental, ADR-0046 slice S3:** the pure processor interface: `Input` (annotated declarations, types, constants), the `Output` builder tree (`MDecl`/`MStmt`/`MExpr`/`MType`), `fresh`/`NameGen` hygiene and the stable JSON encoding of both; **experimental** (listed in [stability.md](stability.md)); the compiler already runs processors written against it (`orin expand`, `.gen` companion modules, ADR-0046 S4-S6); [API](std-meta.md) |
 | `std:taskcore` | Orin, `library/std/taskcore.or` | the pure bookkeeping of `std:task` (`Ring` = one channel buffer, `Ledger` = one scope's task table), invariants and contracts, tested and mutated without threads; import `std:task` |
-| `std:task` | Orin, `library/std/task.or` over L0 thread / monitor primitives and a small temporary C interface (`std:fsraw`, internal) | **stage 0, unstable** (ADR-0017 Addendum A): `scope`, `spawn`, `TaskHandle.join`, bounded channels, grant delegation, `parallelMap`, the work-stealing fork/join pool `forkJoin` / `forkJoinUntil` / `parallelism`; see docs/concurrency.md |
+| `std:task` | Orin, `library/std/task.or` over L0 thread / monitor primitives and a small temporary C interface (`std:fsraw`, internal) | **Gate 1 API frozen at the std freeze, anything beyond it experimental** (stability.md; today still stage 0, ADR-0017 Addendum A): `scope`, `spawn`, `TaskHandle.join`, bounded channels, grant delegation, `parallelMap`, the work-stealing fork/join pool `forkJoin` / `forkJoinUntil` / `parallelism`; see docs/concurrency.md |
 | `parallel()` on arrays | Orin prelude (`library/collections/parallel.or`, loaded only for a file that calls it) over `std:task`'s pool | parallel array pipelines (ADR-0039): `map`, `filter`, `reduce`, `some`, `every`, `find`, `findIndex`, `toArray`; below, "Parallel pipelines" |
 | `std:test` | Orin, `library/std/test.or` | done (assertions for `@Test`, ADR-0024) |
 | `std:math` | Orin, `library/collections/math.or` (to move to `library/std/`) | done (ADR-0018) |
@@ -412,7 +412,9 @@ other and sizes add up).
   classes with `hash`; a key type parameter is `K extends Hash`). The generic collections of slice 2 are `Set<T extends Hash>`,
   `OrderedMap<K extends Ord, V>` and `MinHeap<T extends Ord>`. The names `SortedMap` and `PriorityQueue` of ADR-0034 §Consequences
   are taken by the specialised classes (`SortedMap<V>` with int keys, `PriorityQueue<T>` with an explicit `int` priority), so the generic
-  ones have their own names until the std freeze decides which names stay. The specialised classes remain and are not aliases: they
+  ones have their own names, and **these names are the frozen ones** (ADR-0034, Decision 2026-10-18: no renames before 1.0). The
+  frozen collection set is `Set<T extends Hash>`, `OrderedMap<K extends Ord, V>`, `MinHeap<T extends Ord>` plus the convenience types
+  `IntSet`, `StringSet`, `SortedMap<V>` (int keys), `SortedStringMap<V>` and `PriorityQueue<T>`. The specialised classes remain and are not aliases: they
   keep their direct `int` / `string` comparisons, which skip the derived `compare` dispatch of the generic code. `Deque<T>`, the values `V` and the
   queue elements of `PriorityQueue<T>` are generic.
 * A type parameter has one bound (ADR-0026): `V` of `OrderedMap` is unbounded, so its contracts cannot say "the value that comes back
@@ -931,7 +933,7 @@ above; a pool lives for one call (worker threads are started per operation, abou
 ## Limitations
 
 * No floats/`Map`: `JNum` is `int`, no `std:math`, `std:map`, edge weights, `sleep`, fractional seconds.
-* Generic methods do not exist (E0460); `Graph<T>` has no edge weights and needs a caller-supplied tag.
+* `Graph<T>` has no edge weights and needs a caller-supplied tag.
 * Diagnostics print std types with their unit name (`$stdlib/graph.GraphId<int>`).
 * `std:clock` is importable but internal; so is `std:fsraw` (the raw open/close and grant primitives behind `std:fs` and `std:host`; only library code may import it).
 * `std:collections/internal` and `std:bytes/internal` (files `collections_internal.or`, `bytes_internal.or`) hold the contract helpers (`allTrue`, `isStrictlyIncreasing`, `isMinHeap4`, the B-tree shape and order checks, `allBytes`, ...) and the generated B-tree node types behind the public modules (ADR-0048 rule 7.3). They are not API and can change in any release; user code does not import them.
