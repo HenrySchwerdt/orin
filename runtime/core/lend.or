@@ -1,0 +1,93 @@
+// $rt/lend -- the lend of `.parallel()` (ADR-0039 section 4), written in Orin (ADR-0052 Addendum B, step R3e.3).
+//
+// A LEND lets other tasks READ a value of the lending task for a bounded time without copying it. Reference counts are not atomic,
+// so a lent graph is PINNED: every object in it with a positive count gets the count PIN | owner << 32 | count, which is negative,
+// so retain / release (inline in the generated code of both backends) treat the object as immortal: a reader never writes the shared
+// count, and nothing in the graph is freed or changed in place (`makeUniqueSlow` copies an object whose count is not 1). Ending the
+// lend restores every count it pinned (`transfer.drop`: the lend token is a slot of the transfer table with `pins` set, so the one
+// `drop` of std:task ends both a value in flight and a lend).
+//   * Sharing: a transfer (transfer.put) by the OWNER of a pin shares the pinned object instead of copying it: this is how the closure
+//     of a worker task reaches the lent array. A transfer by any OTHER task copies pinned objects, so a result sent back to the owner
+//     never refers into the lent graph (after the end that reference would be uncounted).
+//   * The owner's obligation (std:task `forkJoin` keeps it): between lend and end it only spawns the tasks that read the value and
+//     joins them, so every reference to a pinned object made meanwhile is gone before the end (a retain or a release of a pinned object
+//     is a no-op, so a reference that outlived the lend would be uncounted).
+//   * Not pinned (left to the copying transfer): an object with a count of 2^32 or more, and everything when the owner's thread id does
+//     not fit in 30 bits. Immortal objects (count -1) and objects pinned by another lend are skipped.
+// The lend token is a transfer slot whose box is a TWO-slot record { value, unused } (a value in flight has one slot). The walk over the
+// graph is iterative (a work stack from `memAlloc`), so a list 200,000 deep is pinned without recursion.
+
+import { load32, load64, store64, memAlloc, memFree, memRealloc, plat, wadd, wsub, shl, shr, and, or } from "std:core";
+import { PL_THREAD_ID } from "./plat";
+import { isLive } from "./heap";
+import { retain } from "./rc";
+import { trapShape } from "./leaf";
+import { publish, PIN_TAG, TID_LIMIT } from "./transfer";
+
+const NOT_PINNED_FROM: usize = 4294967296;   // a count of 2^32 or more is left to the copying transfer
+
+// Lend the value of the two-slot record `box` { value, _ } that the caller has just built; returns the lend token (end it with
+// transfer.drop). The owner's own references stay valid; every object of the graph with a count below 2^32 is pinned.
+export function put(box: usize): usize {
+  if (load32(wadd(box, 8)) != 3 || load32(wadd(box, 16)) != 2) {
+    trapShape();
+  }
+  const tid = plat(PL_THREAD_ID, 0, 0, 0);
+  let cap: usize = 16;
+  let n: usize = 0;
+  let pins = memAlloc(shl(cap, 3));
+  let scap: usize = 64;
+  let sp: usize = 0;
+  let st = memAlloc(shl(scap, 3));
+  const v = load64(wadd(box, 32));
+  if (and(load64(wadd(box, 24)), 1) == 1 && v != 0 && tid < TID_LIMIT) {
+    store64(st, v);
+    sp = 1;
+  }
+  while (sp != 0) {
+    sp = wsub(sp, 1);
+    const x = load64(wadd(st, shl(sp, 3)));
+    const rc = load64(x);
+    if (isLive(rc) && rc < NOT_PINNED_FROM) {
+      store64(x, or(or(PIN_TAG, shl(tid, 32)), rc));
+      if (n == cap) {
+        cap = shl(cap, 1);
+        pins = memRealloc(pins, shl(cap, 3));
+      }
+      store64(wadd(pins, shl(n, 3)), x);
+      n = wadd(n, 1);
+      const kind = load32(wadd(x, 8));
+      let items: usize = 0;
+      let len: usize = 0;
+      let mask: usize = 0;
+      let all = false;
+      if (kind == 3) {
+        items = wadd(x, 32);
+        len = load32(wadd(x, 16));
+        mask = load64(wadd(x, 24));
+      } else if (kind == 2 && load64(wadd(x, 32)) != 0) {
+        items = load64(wadd(x, 40));
+        len = load64(wadd(x, 16));
+        all = true;
+      }
+      let i: usize = 0;
+      while (i < len) {
+        if (all || and(shr(mask, i), 1) == 1) {
+          const c = load64(wadd(items, shl(i, 3)));
+          if (c != 0 && isLive(load64(c))) {
+            if (sp == scap) {
+              scap = shl(scap, 1);
+              st = memRealloc(st, shl(scap, 3));
+            }
+            store64(wadd(st, shl(sp, 3)), c);
+            sp = wadd(sp, 1);
+          }
+        }
+        i = wadd(i, 1);
+      }
+    }
+  }
+  memFree(st);
+  retain(box);   // the slot keeps the box, and so the value, alive until the lend ends
+  return publish(box, pins, n);
+}

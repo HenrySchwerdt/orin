@@ -1,0 +1,156 @@
+// Transfer of large and deep values (ADR-0052 Addendum B, R3e.2): the walks that decide move or copy and the deep copy itself are iterative,
+// so a chain of 200,000 records neither overflows the stack nor leaks, moved or copied; and the copy of a million integers or a hundred
+// thousand strings is correct. Counters are pinned like in move_counts.or (the default build).
+import { scope, spawn, channel, movedCount, copiedCount } from "std:task";
+
+type Chain = End | Link(int, Chain);
+
+function build(n: int): Chain {
+  let c: Chain = End;
+  let i = 0;
+  while (i < n) {
+    c = Link(i, c);
+    i += 1;
+  }
+  return c;
+}
+
+// The number of links and the sum of their values, walked without recursion.
+function walk(c: Chain): string {
+  let cur = c;
+  let n = 0;
+  let sum = 0;
+  let more = true;
+  while (more) {
+    match (cur) {
+      Link(v, rest) => {
+        n += 1;
+        sum += v;
+        cur = rest;
+      },
+      End => {
+        more = false;
+      },
+    }
+  }
+  return n.toString() + " links, sum " + sum.toString();
+}
+
+function ints(n: int): int[] {
+  let xs: int[] = [];
+  let i = 0;
+  while (i < n) {
+    xs.push(i * 3);
+    i += 1;
+  }
+  return xs;
+}
+
+function strs(n: int): string[] {
+  let xs: string[] = [];
+  let i = 0;
+  while (i < n) {
+    xs.push("string number " + i.toString());
+    i += 1;
+  }
+  return xs;
+}
+
+function report(what: string, m0: usize, c0: usize): void {
+  console.log(what + ": moved " + (movedCount() - m0).toString() + ", copied " + (copiedCount() - c0).toString());
+}
+
+function main(): void {
+  const ch = channel<Chain>(4);
+  let m0 = movedCount();
+  let c0 = copiedCount();
+  ch.tx.send(build(200000));
+  report("a fresh chain", m0, c0);
+  const kept = build(200000);
+  m0 = movedCount();
+  c0 = copiedCount();
+  ch.tx.send(kept);
+  report("a chain the sender keeps", m0, c0);
+  console.log("kept: " + walk(kept));
+  ch.tx.close();
+  match (ch.rx.recv()) {
+    Some(c) => {
+      console.log("moved: " + walk(c));
+    },
+    None => {
+      console.log("missing");
+    },
+  }
+  match (ch.rx.recv()) {
+    Some(c) => {
+      console.log("copied: " + walk(c));
+    },
+    None => {
+      console.log("missing");
+    },
+  }
+  ch.rx.close();
+
+  // a task gets a chain it captured (copied: the spawner keeps it) and returns another (moved)
+  const cap = build(200000);
+  const back = scope(s => spawn(s, () => walk(cap)).join());
+  console.log("task read: " + back);
+  const made = scope(s => spawn(s, () => build(200000)).join());
+  console.log("task built: " + walk(made));
+
+  // a million integers and a hundred thousand strings, copied because the sender keeps them
+  const big = ints(1000000);
+  const ch2 = channel<int[]>(2);
+  m0 = movedCount();
+  c0 = copiedCount();
+  ch2.tx.send(big);
+  report("a million integers", m0, c0);
+  const words = strs(100000);
+  const ch3 = channel<string[]>(2);
+  m0 = movedCount();
+  c0 = copiedCount();
+  ch3.tx.send(words);
+  report("a hundred thousand strings", m0, c0);
+  match (ch2.rx.recv()) {
+    Some(xs) => {
+      console.log("ints: " + xs.length.toString() + ", first " + xs[0].toString() + ", last " + xs[999999].toString());
+    },
+    None => {
+      console.log("missing");
+    },
+  }
+  match (ch3.rx.recv()) {
+    Some(ws) => {
+      console.log("strings: " + ws.length.toString() + ", last " + ws[99999]);
+    },
+    None => {
+      console.log("missing");
+    },
+  }
+  console.log("sender still has " + big.length.toString() + " and " + words.length.toString());
+
+  // immortal objects (string literals, the nullary End) are shared by a move and by a copy, never counted
+  const lits = ["alpha", "beta", "gamma"];
+  const ch4 = channel<string[]>(2);
+  m0 = movedCount();
+  c0 = copiedCount();
+  ch4.tx.send(lits);
+  ch4.tx.send(["delta", "epsilon"]);
+  report("two arrays of literals", m0, c0);
+  match (ch4.rx.recv()) {
+    Some(xs) => {
+      console.log(xs.join(","));
+    },
+    None => {
+      console.log("missing");
+    },
+  }
+  match (ch4.rx.recv()) {
+    Some(xs) => {
+      console.log(xs.join(","));
+    },
+    None => {
+      console.log("missing");
+    },
+  }
+}
