@@ -45,6 +45,13 @@ extern "C" {
 
 enum { ORIN_K_STRING = 1, ORIN_K_ARRAY = 2, ORIN_K_STRUCT = 3 };
 
+/* A pointer-holding field of the runtime ABI that heap.or / object.or / array.or read and write as one 64-bit word at a fixed byte
+ * offset (load64 / store64): 8 bytes of storage on every target (ADR-0055 "Later", wasm32). On a 32-bit little-endian target the
+ * pointer is the low half of the union and the high half stays zero, because the Orin side always stores a zero-extended 64-bit
+ * value and every C writer only replaces the low half. On 64-bit targets the union is exactly the pointer (same size, offset and
+ * code). `ORIN_PTR64(T, name)` declares the member `name` of type T (used as a plain pointer) and the word `name##_w`. */
+#define ORIN_PTR64(T, name) union { T name; uint64_t name##_w; }
+
 typedef struct OrinObj {
     int64_t rc;    /* >0 live count, <0 immortal */
     uint32_t kind; /* ORIN_K_* */
@@ -63,7 +70,7 @@ typedef struct OrinArray {
     uint64_t len;
     uint64_t cap;
     uint64_t is_ref; /* 1 if elements are references (retained/released), else raw scalars */
-    uint64_t *items;
+    ORIN_PTR64(uint64_t *, items); /* 8 bytes @40 on every target */
 } OrinArray;
 
 typedef struct OrinStruct {
@@ -239,15 +246,17 @@ typedef struct OrinStats {
  * are for later fields (task pointer, grant and file tables) and stay zero. A block is plain malloc memory, so a free-list node may
  * come from another thread's heap and joins this one's (capped by FL_CAP / SB_CAP). */
 enum { FL_STRUCT_CLASSES = 9, SB_MAX = 256, SB_CLASSES = SB_MAX / 16, ORIN_HEAP_WORDS = 128 };
-typedef struct FreeNode { struct FreeNode *next; } FreeNode;
+typedef struct FreeNode { ORIN_PTR64(struct FreeNode *, next); } FreeNode;
+/* A free-list head that is an array element: `.p` is the pointer, `.w` the 64-bit word. */
+typedef union FreeHead { FreeNode *p; uint64_t w; } FreeHead;
 /* A small-block cache class: list head and length side by side, so one scaled index reaches both. */
-typedef struct SbClass { FreeNode *head; uint64_t n; } SbClass;
+typedef struct SbClass { ORIN_PTR64(FreeNode *, head); uint64_t n; } SbClass;
 typedef struct OrinHeap {
-    FreeNode *fl_struct[FL_STRUCT_CLASSES]; /* @0    free struct objects by nslots 0..8 */
-    FreeNode *fl_array;                     /* @72   free array headers */
+    FreeHead fl_struct[FL_STRUCT_CLASSES];   /* @0    free struct objects by nslots 0..8 */
+    ORIN_PTR64(FreeNode *, fl_array);       /* @72   free array headers */
     uint64_t fl_n[FL_STRUCT_CLASSES + 1];   /* @80   list lengths: structs by nslots, [9] the array headers */
     int64_t live;                           /* @160  live objects of this heap (signed: a task can free more than it allocated) */
-    OrinObj **dstack;                       /* @168  the work stack of orin_destroy (NULL until first use) */
+    ORIN_PTR64(OrinObj **, dstack);         /* @168  the work stack of orin_destroy (NULL until first use) */
     uint64_t dcap;                          /* @176  its capacity in entries */
     uint64_t reserved0;                     /* @184 */
     OrinStats stats;                        /* @192  the counters (OrinStats, 18 words) */
@@ -282,7 +291,9 @@ _Static_assert(offsetof(OrinShared, transfer) == 0 && offsetof(OrinShared, fligh
 #define orin_stats (orin_heap.stats)
 #define ORIN_HEAP_OFF(f) offsetof(OrinHeap, f)
 _Static_assert(sizeof(OrinStats) == 144, "OrinStats is 18 words");
-_Static_assert(sizeof(FreeNode *) == 8 && sizeof(size_t) == 8, "the heap block assumes 64-bit pointers");
+_Static_assert(sizeof(FreeNode) == 8 && sizeof(FreeHead) == 8 && sizeof(OrinArray) == 48 && sizeof(void *) <= 8 &&
+                   __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__,
+               "the pointer fields of the heap block and of OrinArray are 8-byte words, the pointer in the low half");
 _Static_assert(ORIN_HEAP_OFF(fl_struct) == 0, "orin_heap.fl_struct @0");
 _Static_assert(ORIN_HEAP_OFF(fl_array) == 72, "orin_heap.fl_array @72");
 _Static_assert(ORIN_HEAP_OFF(fl_n) == 80, "orin_heap.fl_n @80");
