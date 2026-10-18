@@ -116,7 +116,7 @@ The standalone compiler retains compact diagnostics by default; use `--diagnosti
 to request the terminal renderer directly.
 
 The current renderer does not invent related locations or assertion values from strings. Structured
-related labels, richer assertion diffs, animated progress, and a complete `explain` catalog remain
+related labels, richer assertion diffs and animated progress remain
 follow-ups to the design in [developer-experience-design.md](developer-experience-design.md).
 
 ## Dependencies
@@ -162,3 +162,154 @@ Each package resolves its own direct dependencies. Conflicting sources for the s
 package name are rejected during fetch. Local paths are not reproducible snapshots. Resource
 capabilities and effect policies retain their existing guarantees and limitations; dependencies
 are source code, not a runtime sandbox.
+
+## Command reference
+
+`orin <command> [options]`. Global options may stand before or after the command: `--color=auto|always|never`, `--ascii`,
+`--quiet`, `--verbose`, `--format=json` (only for the commands that list it), `--max-errors N` (diagnostics shown, compiler
+commands), `--diagnostic-style=rich|compact`. `orin --help` lists the commands, `orin help <command>` or `orin <command> --help`
+prints one usage line, `orin --version` the release.
+
+Exit codes are the same everywhere unless a section says otherwise: `0` success, `1` the command ran and found a problem (a
+diagnostic, a failing test, a changed API, a failed build), `2` wrong usage (unknown command or option, missing value). `run`
+returns the status of your program. A path argument is an entry `.or` file or a package directory; commands that take an
+optional path use the nearest `orin.toml` upward from the current directory when it is omitted.
+
+### init
+
+`orin init [name] [--lib | --template http]`. Creates `orin.toml`, `src/main.or` (or `src/module.or` with `--lib`),
+`tests/main_test.or` and `README.md`. `--template console|http` selects the template (`http` cannot be combined with `--lib`).
+Never overwrites; exits 1 when a file exists, 2 for a bad option or name.
+
+### build
+
+`orin build [path] [--release] [--backend=c|llvm] [--target=native|wasm64-orbit|wasm32-orbit] [-o path] [--format=json]`
+
+| Flag | Meaning |
+|---|---|
+| `--release` | optimised profile, output in `build/release/`; defaults to the LLVM backend (see above) |
+| `--backend=c\|llvm` | native code generator; dev builds default to `c` |
+| `--target=` | `native` (default), `wasm64-orbit` or `wasm32-orbit`: a freestanding WebAssembly module for [Orbit](wasm.md), written to `build/<profile>/NAME.wasm`; needs the C backend; only `build` accepts it |
+| `-o path` | output path instead of `build/<profile>/NAME` |
+| `--format=json` | machine result (`schemaVersion`, `command`, `ok`, `artifact`) |
+
+Environment: `CC` selects the C compiler, `ORIN_HOME` the toolchain directory. Exit 1 on a compile or native build failure.
+```sh
+orin build --release --backend=c
+orin build --target=wasm32-orbit -o out/app.wasm
+```
+
+### run
+
+`orin run [path] [--release] [--backend=c|llvm] [-o path] [-- program-arguments]`. Builds like `build`, then executes. Stdout and
+stderr belong to the program, its exit status is returned, and `--format=json` and `--target=wasm*` are rejected (exit 2).
+
+### dev
+
+`orin dev [path] [-- program-arguments]`. Watches sources and dependencies, rebuilds with the dev profile and the C backend, and
+restarts the program after a successful build. Runs until Ctrl+C (exit 130).
+
+### check
+
+`orin check [path] [--format=json] [--deps] [--strict-contracts] [--workspace] [-p name] [--locked]`. Type-checks and runs the
+ownership and project-policy checks without generating code; annotation processors run (`--processor-timeout`,
+`--processor-cache`, `--cc`, `--runtime` as for `expand`). `--deps` prints the module dependency graph (also as JSON),
+`--strict-contracts` turns the contract warnings into errors. Exit 1 when there are errors.
+```sh
+orin check --format=json src/main.or
+```
+
+### test
+
+`orin test [path] [--filter text] [--watch] [--allow-empty] [--format=json] [--timeout seconds] [--keep] [--no-contracts] [--out-dir dir] [--runtime dir] [--cc cmd]`.
+Runs `@Test` functions and `tests/**/*_test.or` ([testing.md](testing.md)). `--filter` keeps tests whose name contains the text;
+`--allow-empty` accepts an empty suite; `--watch` reruns on change (not with a workspace); `--keep` keeps the generated files;
+`--no-contracts` builds without runtime contract checks. Exit 1 when a test fails or none matched.
+
+### fmt
+
+`orin fmt [paths...] [--check | --stdout]`. Formats files or directories (the whole project without arguments) in place.
+`--check` only reports files that would change (exit 1), `--stdout` prints the result instead of writing.
+
+### doctor, toolchain, clean
+
+`orin doctor` checks the installation (version, layout, C compiler, PATH, pinned LLVM). `orin toolchain install [--force]` and
+`orin toolchain status` manage the pinned LLVM. `orin clean` removes `build/` of the project. These take no other options.
+
+### add, remove, deps, fetch, update
+
+`orin add --path <dir> [--dev]`, `orin add --git <url> [--tag tag | --rev commit] [--name alias] [--dev]`, `orin remove <name>`,
+`orin deps [--tree]`, `orin fetch [--locked] [--offline]`, `orin update [name] [--offline]`. All but `deps` accept `--format=json`.
+`--locked` fails (E0509) when `orin.lock` would change; `--offline` forbids Git downloads. Semantics are under Dependencies above.
+
+### workspace
+
+`orin workspace list [--default] | lock | check [--root dir]`: member list in dependency order, writing `orin.lock`, and
+validating the manifest and lock (E0509 on drift). See [workspace.md](workspace.md). `build`, `check`, `test` and `fmt`
+accept `--workspace`, `-p|--package name`, `--locked|--unlocked`, `--keep-going` and `--fail-fast`.
+
+### api
+
+`orin api [path] [--check snapshot]`. Prints the public API snapshot of the package (text). With `--check FILE` it compares the
+current API with a stored snapshot: prints `api unchanged` (exit 0), or lists the differences on stderr (exit 1); an unreadable
+snapshot exits 2. Use it to guard a library against accidental breaking changes ([stability.md](stability.md)).
+```sh
+orin api > api.snapshot
+orin api --check api.snapshot
+```
+
+### graph
+
+`orin graph [path] [-o out.json]`. Writes the OSIG snapshot (symbols, types, calls; [osig.md](osig.md)) as JSON to stdout or to
+the file. Exit 1 when the program does not check.
+
+### diff
+
+`orin diff --base <dir|file.or|snapshot.json> --head <dir|file.or|snapshot.json> [--format=text|json|html] [--link-base url] [-o out] [--exit-code]`.
+Compares two programs or snapshots and reports the changes (default `text`). `--link-base` prefixes the links of the HTML report,
+`-o` writes the report to a file. Exit 0 normally; with `--exit-code` exit 1 when there are differences. Exit 1 also when an
+input cannot be loaded, 2 for bad usage.
+
+### effects
+
+`orin effects [path] [--format=text|json] [--summary] [--module id] [--function name] [--no-paths] [--tests] [--check-purity]`.
+Transitive effect summaries (I/O, time, randomness, memory, network...) per function, module, package and `main`, with the
+call chain that explains each ([capabilities.md](capabilities.md)). `--summary` stops at modules, `--module` and `--function`
+filter, `--no-paths` drops the chains, `--tests` includes `@Test` functions. `--check-purity` cross-checks the result with the
+purity analysis and exits 1 when a function marked pure has an effect.
+
+### verify
+
+`orin verify [path]` runs the MIR ownership verifier and exits 1 on errors. `orin verify --contracts [--format=json] [--z3 path] [--timeout-ms N] [--retry-ms N] [--rlimit N] [--strict]`
+proves `@Requires`/`@Ensures`/`@Invariant` contracts with Z3 ([contracts.md](contracts.md)); `--strict` treats unproved
+obligations as failures. `--no-opt`, `--no-fuse` and `--check-contracts` apply as for `compile`.
+
+### mir
+
+`orin mir [path]` prints the optimised MIR ([mir.md](mir.md)). Debug aid; the text is not a stable format
+([stability.md](stability.md)). Accepts `--no-opt` and `--no-fuse`.
+
+### expand
+
+`orin expand [path] [--input] [--processor-timeout seconds] [--processor-cache dir] [--cc cmd] [--runtime dir]`. Runs the annotation
+processors ([annotation-processors.md](annotation-processors.md)) and prints the generated companion modules (`m.gen`) through
+the formatter; `--input` prints the `std:meta` input of every processor run instead. `--processor-timeout 0` means unlimited.
+
+### compile
+
+`orin compile <entry.or> -o <out.c> [--backend=c|llvm] [--target=native|wasm64-orbit|wasm32-orbit] [--format=json] [--no-verify] [--no-opt] [--no-fuse] [--fuse-report] [--c-builtins] [--rt-wrappers] [--check-contracts] [--strict-contracts] [--stats-sites] [--assert-facts] [--split n] [--timings file.json]`.
+Low-level: writes C (or LLVM IR with `--backend=llvm`, `-o x.ll`) without invoking a C compiler. `orin build` is the normal way.
+`--split n` writes n translation units (1 to 1024), `--timings` writes per-phase times (schema `orin-timings/0.1`); a wasm
+`--target` needs the C backend and rejects `--stats-sites` and `--split`. The `--target` and `--timings` options need `compile`.
+
+### lsp, mcp
+
+`orin lsp` is the language server on stdio. `orin mcp [--root dir] [--allow-exec] [--repo dir]` is the MCP server ([mcp.md](mcp.md)).
+
+### explain
+
+`orin explain <code>` prints the explanation of a diagnostic code. The release package ships no documentation, so the explanations are
+built into the launcher, which covers exactly 14 codes: E0200, E0201, E0300, E0301, E0400, E0401, E0402, E0403, E0404, E0405, E0406,
+E0407, E0408 and E0410. For any other code it exits 2 and says which codes it covers and points to the full index of all codes,
+[reference/10-diagnostics.md](reference/10-diagnostics.md)
+(<https://github.com/orin-lang/orin-lang/blob/main/docs/reference/10-diagnostics.md>). Diagnostics themselves always carry the code and a message.

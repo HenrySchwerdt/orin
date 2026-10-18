@@ -254,7 +254,7 @@ Manage
 Inspect and integrate
   workspace list|lock|check  Inspect the nearest workspace (build|check|test|fmt accept --workspace, -p <name>, --locked)
   explain <code>       Explain a diagnostic
-  api, effects, graph, diff, verify, compile, mir, lsp, mcp
+  api, effects, graph, diff, verify, compile, mir, expand, lsp, mcp
 
 Options: --color=auto|always|never  --ascii  --quiet  --verbose
 Use `orin help <command>` for command help.
@@ -290,6 +290,7 @@ help_command() {
     fetch|deps|update|remove|clean) echo "Usage: orin $1 $([ "$1" = remove ] && echo '<name>' || true) [--locked] [--offline]" ;;
     explain) echo 'Usage: orin explain <diagnostic-code>   e.g. orin explain E0401' ;;
     doctor) echo 'Usage: orin doctor'; echo 'Checks the installation: version, layout, C compiler, PATH.' ;;
+    expand) echo 'Usage: orin expand [path] [--input] [--processor-timeout seconds] [--processor-cache dir]'; echo 'Prints the generated companion modules (m.gen) of a program; --input prints the std:meta inputs instead.' ;;
     api|effects|graph|diff|verify|compile|mir|lsp|mcp) echo "Usage: orin $1 [path] [options] — see docs/cli.md" ;;
     *) unknown_command "$1" ;;
   esac
@@ -808,8 +809,8 @@ case $command in
         E0407) printf 'E0407: Cannot infer a type\n\nAdd a type annotation, for example a parameter type in an arrow function or the element type of an empty array.\n' ;;
         E0408) printf 'E0408: Construct not supported\n\nThe language deliberately has no class inheritance, interface fields, generic methods or similar constructs; the message names the alternative.\n' ;;
         E0410) printf 'E0410: Invalid operand types\n\nThe operator is not defined for these types. Operands must have the same type; convert explicitly and use template literals to build strings.\n' ;;
-        *) fail "No extended explanation is available for ${args[0]} yet." 2;; esac ;;
-      check|verify|api|effects|graph|mir)
+        *) fail "No built-in explanation for ${args[0]}. 'orin explain' covers E0200 E0201 E0300 E0301 E0400 E0401 E0402 E0403 E0404 E0405 E0406 E0407 E0408 E0410. Every code is listed in https://github.com/orin-lang/orin-lang/blob/main/docs/reference/10-diagnostics.md" 2;; esac ;;
+      check|verify|api|effects|graph|mir|expand)
         # Commands with no explicit path target the nearest project.
         haspath=false; expect=false; validation_path=
         for arg in "${args[@]}"; do
@@ -821,7 +822,7 @@ case $command in
         validate_locked_dependencies "$project" || exit 1
         if $json && [ "$command" != graph ]; then args+=(--format=json); fi
         # `check` may run annotation processors (ADR-0046): they need the C runtime and a C compiler.
-        if [ "$command" = check ]; then args+=(--runtime "$RT" --cc "$CC"); fi
+        if [ "$command" = check ] || [ "$command" = expand ]; then args+=(--runtime "$RT" --cc "$CC"); fi
         compiler "$command" "${args[@]}" ;;
       compile)
         validation_path=''; expect=false

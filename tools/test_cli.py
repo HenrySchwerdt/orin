@@ -392,6 +392,12 @@ class CliTests(unittest.TestCase):
         self.assertIn("Unknown command", self.run_cli("help", "wat", code=2).stderr)
         self.assertIn("File not found: nope.or", self.run_cli("run", "nope.or", code=1).stderr)
         self.assertIn("E0401", self.run_cli("explain", "E0401").stdout)
+        unknown = self.run_cli("explain", "E9999", code=2).stderr
+        self.assertIn("covers E0200 E0201", unknown)
+        self.assertIn("docs/reference/10-diagnostics.md", unknown)
+        self.assertIn("orin expand", self.run_cli("help", "expand").stdout)
+        self.run_cli("init", "expd")
+        self.run_cli("expand", cwd=self.cwd / "expd")  # routed to the compiler: no processors, no companions, success
         self.run_cli("build", "--unknown", code=2)
 
     def test_application_journey_and_cache(self):
