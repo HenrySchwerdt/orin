@@ -1,0 +1,1 @@
+- ADR-0056 entry-criteria table shows C1, C2, C8, C9, C14 and C15 as done.
