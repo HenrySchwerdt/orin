@@ -1,0 +1,1 @@
+- A record with more than 64 fields or a variant with more than 64 payload values is now compile error E0305 instead of a run-time trap, and an exported declaration whose signature mentions a non-exported type of its own file is E0306 (ADR-0056 6.9); the compiler sources export `Bind`, `Shadowed`, `RetSite`, `PairShape` and `Api` accordingly.

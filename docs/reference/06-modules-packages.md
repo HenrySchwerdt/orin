@@ -52,8 +52,8 @@ or an import that collides with a local declaration, is E0304. A union type's va
 - Tests: `tests/errors/e0304_duplicate_function.or`, `tests/errors/e0304_duplicate_variant.or`, `tests/parse_edge/ok_unions.or`.
 
 **MOD-7.** `export { a, B } from "path";` re-exports names without importing them into the file's own scope. Importing or re-exporting a union type also brings all its
-variants into scope (ADR-0004). An exported declaration that mentions a private type is accepted; an importer cannot name that type but can use values of it (passing them on and reading their fields).
-- Tests: `tests/run/modules_reexport_union`, `tests/next/run/generic_reexport`, `tests/next/run/iface_reexport`, `tests/parse_edge/ok_reexport_export_forms.or`.
+variants into scope (ADR-0004). An exported function, type, constant or interface whose signature or field types mention a type declared in the same file without `export` is rejected with E0306 on the private name (ADR-0056 6.9); export the type or keep the declaration private. Private fields of a class, private methods and the fields of an `@Sealed` type are exempt (importers cannot construct or change a sealed value).
+- Tests: `tests/errors/e0306_private_type_in_signature.or`, `tests/errors/e0306_private_type_in_exported_type.or`, `tests/run/modules_reexport_union`, `tests/next/run/generic_reexport`, `tests/next/run/iface_reexport`, `tests/parse_edge/ok_reexport_export_forms.or`.
 
 **MOD-8.** Generic functions, generic types, interfaces and classes are imported and exported like any declaration; a generic function is instantiated in the importing program
 (monomorphisation, chapter 3), so the importer sees the instantiation's errors, not the definition's. An interface is exported by name and conformance is nominal across modules.
@@ -154,7 +154,6 @@ workspace CLI, library/runtime moves) are in the tree.
 - MOD-2: no test shows an import of a name that is exported by `export { x } from` of a third module (only the union case, `modules_reexport_union`). MOD-2a/2b: a union type exported through a namespace is covered only for a local module.
 - MOD-3: the `$`-path rejection has no test.
 - MOD-6: no test for an import colliding with a local declaration or with another import (E0304 probed with `orin2`).
-- MOD-7: that an exported declaration may mention a private type, and that an importer can then read its fields, has no test (see the README discrepancies).
 - MOD-11: the exact list of prelude names is the union of the prelude sources; no test pins it, and "a user declaration may reuse a prelude name" has no test.
 - MOD-12: `version` and `entry` defaults have no direct test (`tests/next/packages/shop` uses the default entry).
 - MOD-14: bare-name dependency imports are exercised only through `tests/processors/` and the workspace CLI journeys (`tools/test_cli.py`), not through the conformance runner; there is no negative test for a dependency's private file.

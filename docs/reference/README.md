@@ -54,8 +54,8 @@ Places where a guide, ADR or spec text disagrees with what the compiler does. Th
    annotations, `@Sealed` and `@Processor` are implemented (ADR-0046, ADR-0044); E0408 remains for an unknown name.
 5. **ADR-0047 status.** The ADR is marked proposed, but its phases 1 to 3 (workspace manifest, CLI, library and runtime moves) are
    in the tree. Chapter 6 describes what is implemented.
-6. **Privacy.** `private_by_default` does not stop a private type from appearing in an exported signature: an importer can read
-   its fields through the exported function's result.
+6. **Privacy.** Resolved (ADR-0056 6.9): an exported declaration whose signature mentions a type of the same file that is not
+   exported is E0306 (chapter 6 MOD-7).
 7. **Orin-B wording in messages.** The E0402 message no longer says "in Orin-B"; the diagnostic table in
    `docs/bootstrap-subset.md` still describes E0408 as "feature not supported in Orin-B".
 8. **`tests/parse_edge`** names (`err0100_bad_float`, `err0200_fn_arrow_expr`) are historical; the files no longer produce

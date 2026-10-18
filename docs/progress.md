@@ -131,4 +131,4 @@ Census re-run 2026-10-16 (after lever 1 and T1/T3/T4) with the current lever ran
    - ADR-0040 (generic methods);
    - ADR-0037 D5;
    - ADR-0042 stage 1 (complexity summaries);
-   - decide whether a struct with more than 64 slots is a compile-time error (it currently traps at run time).
+   - done (ADR-0056 C9): a record or variant with more than 64 slots is compile error E0305.

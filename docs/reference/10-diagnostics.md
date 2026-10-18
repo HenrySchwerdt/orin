@@ -20,6 +20,8 @@ Codes whose tests column says "none" are listed again in the Gaps section.
 | E0302 | import of a private file inside another module | tests/errors/e0302_private_import |
 | E0303 | import cycle | tests/errors/e0303_cycle |
 | E0304 | duplicate definition | tests/errors/e0304_duplicate_function.or, tests/next/errors/e0304_duplicate_type_param.or, tests/next/errors/e0304_interface_duplicate_method.or +6 |
+| E0305 | record with more than 64 fields, or variant with more than 64 payload values | tests/errors/e0305_record_too_many_fields.or, tests/errors/e0305_variant_too_many_payload.or |
+| E0306 | exported declaration mentions a private type of the same file | tests/errors/e0306_private_type_in_signature.or, tests/errors/e0306_private_type_in_exported_type.or |
 | E0400 | type mismatch | tests/errors/e0400_arg_type.or, tests/next/errors/e0400_int_mix_i32_float.or, tests/next/errors/ts_dev_e0400_union_alias.or +79 |
 | E0401 | assignment/mutation of an immutable binding | tests/errors/e0401_assign_const.or, tests/next/errors/e0401_closure_nested_assign_captured.or, tests/next/errors/ts_dev_e0401_param_push.or +19 |
 | E0402 | non-exhaustive or invalid match | tests/errors/e0402_int_no_wildcard.or, tests/next/errors/e0402_match_float.or, tests/next/errors/ts_dev_e0402_nonexhaustive.or +6 |
