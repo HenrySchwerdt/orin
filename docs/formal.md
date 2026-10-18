@@ -132,7 +132,7 @@ Load forwarding (`Forward.lean`, ADR-0038 lever 2 T4, the facts behind verifier 
 * `store_frame_other_slot`, `store_frame_other_local` - a store into another slot of the same object, or through another local
   (which needs count 1, so it cannot be `x`'s object in a well-formed state), leaves every slot of `x` unchanged.
 * `makeUnique_frame` - `makeUnique x` keeps every slot value of `x` (shallow copy).
-Calls and array length are outside the model; F1 ends its scan at any call that receives the object.
+Calls and array length are outside the model; F1 ends its scan at any call that receives the object. The verifier rules U2-U5 of MIR v2.7 (`unique-in` / `unique-out` across calls, ADR-0038 T5) are likewise outside the model: they need calls, which `Machine.lean` does not have. They are listed with the other rules not yet in the model (docs/tcb.md) and are not claimed as proved.
 
 Unchecked array access (rule U1, MIR v2.6, ADR-0038 lever 2 T2) has **no lemma**: what it needs is "the kind and the length of the object a live
 local holds are unchanged between two instructions unless the object is pushed to, popped, extended or the local redefined", and the model has no

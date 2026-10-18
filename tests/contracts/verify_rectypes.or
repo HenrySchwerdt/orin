@@ -1,0 +1,331 @@
+// Inputs for tools/test_verify_contracts.py: recursive records, classes and unions (ADR-0053 Addendum A, group U3).
+// A type that reaches itself through its fields has no finite SMT datatype. Its sort is uninterpreted with one accessor
+// function per field (a union: a variant tag and payload accessors); a value built in the code is a fresh constant with
+// its fields (tag and payload) as facts, so the queries have no quantifier for these types.
+// Field reads, field writes, record literals, variant construction and `match` are then reasoned about. A model of the
+// solver need not be a finite value, so a function that uses such a type never gets a counterexample: a wrong claim is
+// UNKNOWN, never VERIFIED and never REFUTED (soundness first). `// expect:` lines are `function kind status`.
+//
+// expect: pushTy ensures VERIFIED
+// expect: arity ensures VERIFIED
+// expect: fnArity ensures VERIFIED
+// expect: fnArityWrong ensures UNKNOWN
+// expect: wrapAll ensures VERIFIED
+// expect: rootValue ensures VERIFIED
+// expect: rootValueWrong ensures UNKNOWN
+// expect: setValue ensures VERIFIED
+// expect: setValue ensures VERIFIED
+// expect: setValueWrong ensures UNKNOWN
+// expect: setValueWrongFrame ensures UNKNOWN
+// expect: makeLeaf ensures VERIFIED
+// expect: makeLeaf ensures VERIFIED
+// expect: makeLeafWrong ensures UNKNOWN
+// expect: firstKidValue bounds VERIFIED
+// expect: firstKidValue ensures VERIFIED
+// expect: sameValue ensures UNKNOWN
+// expect: twoSetsLast ensures VERIFIED
+// expect: aliasFree ensures UNKNOWN
+// expect: mutualSwap ensures VERIFIED
+// expect: mutualSwap ensures VERIFIED
+// expect: mutualWrong ensures UNKNOWN
+// expect: depth ensures VERIFIED
+// expect: depthWrong ensures UNKNOWN
+// expect: negIsNeg ensures VERIFIED
+// expect: negIsNotLit ensures VERIFIED
+// expect: negIsLitWrong ensures UNKNOWN
+// expect: litRoundTrip ensures VERIFIED
+// expect: litRoundTripWrong ensures UNKNOWN
+// expect: addLeft ensures VERIFIED
+// expect: unconstrained ensures UNKNOWN
+// expect: Scope.constructor invariant VERIFIED
+// expect: Scope.bump ensures VERIFIED
+// expect: Scope.bump ensures VERIFIED
+// expect: Scope.bump invariant VERIFIED
+// expect: Scope.drop invariant UNKNOWN
+// expect: Scope.setParent ensures VERIFIED
+// expect: Scope.setParent ensures VERIFIED
+// expect: Scope.setParent invariant VERIFIED
+// expect: Scope.setParentWrong ensures UNKNOWN
+// expect: Scope.setParentWrong invariant VERIFIED
+// expect: Scope.level ensures VERIFIED
+// expect: useScope ensures VERIFIED
+// expect: useScopeWrong ensures UNKNOWN
+
+// A tree: a record that contains an array of itself.
+type Tree = { value: int; kids: Tree[]; };
+
+@Ensures(result == t.value)
+function rootValue(t: Tree): int {
+  return t.value;
+}
+
+// Wrong: the value is not shifted.
+@Ensures(result == t.value + 1)
+function rootValueWrong(t: Tree): int {
+  return t.value;
+}
+
+// A write rebuilds the value: the written field changes, the others keep theirs.
+@Ensures(result.value == v)
+@Ensures(result.kids.length == t.kids.length)
+function setValue(t: Tree, v: int): Tree {
+  let u = t;
+  u.value = v;
+  return u;
+}
+
+@Ensures(result.value == v + 1)
+function setValueWrong(t: Tree, v: int): Tree {
+  let u = t;
+  u.value = v;
+  return u;
+}
+
+// Wrong: writing `value` does not add a kid.
+@Ensures(result.kids.length == t.kids.length + 1)
+function setValueWrongFrame(t: Tree, v: int): Tree {
+  let u = t;
+  u.value = v;
+  return u;
+}
+
+@Ensures(result.value == v)
+@Ensures(result.kids.length == 0)
+function makeLeaf(v: int): Tree {
+  return Tree { value: v, kids: [] };
+}
+
+@Ensures(result.kids.length == 1)
+function makeLeafWrong(v: int): Tree {
+  return Tree { value: v, kids: [] };
+}
+
+@Requires(t.kids.length > 0)
+@Ensures(result == t.kids[0].value)
+function firstKidValue(t: Tree): int {
+  return t.kids[0].value;
+}
+
+// No contract: nothing is reported.
+function firstKidUnchecked(t: Tree): int {
+  return t.kids[0].value;
+}
+
+// Wrong: two trees are not the same tree.
+@Ensures(result == b.value)
+function sameValue(a: Tree, b: Tree): int {
+  return a.value;
+}
+
+// Two writes in a row: the second wins.
+@Ensures(result.value == 2)
+function twoSetsLast(t: Tree): Tree {
+  let u = t;
+  u.value = 1;
+  u.value = 2;
+  return u;
+}
+
+// Wrong: `a` is a copy, the write to `b` does not change it (value semantics).
+@Ensures(result == a.value + 1)
+function aliasFree(a: Tree): int {
+  let b = a;
+  b.value = a.value + 1;
+  return a.value;
+}
+
+// Two record types that contain each other.
+type Left = { n: int; right: Right[]; };
+type Right = { m: int; left: Left[]; };
+
+@Ensures(result.n == l.n)
+@Ensures(result.right.length == l.right.length)
+function mutualSwap(l: Left): Left {
+  let r = l;
+  r.n = l.n;
+  return r;
+}
+
+@Ensures(result.n == l.n + 1)
+function mutualWrong(l: Left): Left {
+  let r = l;
+  r.n = l.n;
+  return r;
+}
+
+// A recursive union.
+type Expr = Lit(int) | Add(Expr, Expr) | Neg(Expr);
+
+@Ensures(result >= 1)
+function depth(e: Expr): int {
+  return match (e) {
+    Lit(_) => 1,
+    Add(a, b) => depth(a) + depth(b),
+    Neg(a) => depth(a) + 1
+  };
+}
+
+// Wrong: a literal has depth 1.
+@Ensures(result >= 2)
+function depthWrong(e: Expr): int {
+  return match (e) {
+    Lit(_) => 1,
+    Add(a, b) => depth(a) + depth(b),
+    Neg(a) => depth(a) + 1
+  };
+}
+
+// A built variant has its own tag and no other.
+@Ensures(result)
+function negIsNeg(e: Expr): bool {
+  return match (Neg(e)) {
+    Neg(_) => true,
+    _ => false
+  };
+}
+
+@Ensures(!result)
+function negIsNotLit(e: Expr): bool {
+  return match (Neg(e)) {
+    Lit(_) => true,
+    _ => false
+  };
+}
+
+@Ensures(result)
+function negIsLitWrong(e: Expr): bool {
+  return match (Neg(e)) {
+    Lit(_) => true,
+    _ => false
+  };
+}
+
+// The payload is what the constructor was given.
+@Ensures(result == n)
+function litRoundTrip(n: int): int {
+  return match (Lit(n)) {
+    Lit(k) => k,
+    _ => 0
+  };
+}
+
+@Ensures(result == n + 1)
+function litRoundTripWrong(n: int): int {
+  return match (Lit(n)) {
+    Lit(k) => k,
+    _ => 0
+  };
+}
+
+@Ensures(result == 7)
+function addLeft(e: Expr): int {
+  const s = Add(Lit(7), e);
+  return match (s) {
+    Add(a, _) => match (a) {
+      Lit(k) => k,
+      _ => 0
+    },
+    _ => 0
+  };
+}
+
+// Nothing is known about which variant a parameter is.
+@Ensures(result)
+function unconstrained(e: Expr): bool {
+  return match (e) {
+    Lit(_) => true,
+    _ => false
+  };
+}
+
+// A union whose payload is an array of itself: the sort of `Ty[]` is made while the sort of `Ty` is (re-entrancy), and
+// arrays of it are used by value elsewhere.
+type Ty = Con(int) | Fn(Ty[], Ty);
+
+@Ensures(result.length == xs.length + 1)
+function pushTy(xs: Ty[], t: Ty): Ty[] {
+  let r = xs;
+  r.push(t);
+  return r;
+}
+
+@Ensures(result >= 0)
+function arity(t: Ty): usize {
+  return match (t) {
+    Con(_) => 0,
+    Fn(ps, _) => ps.length
+  };
+}
+
+@Ensures(result == ps.length)
+function fnArity(ps: Ty[], r: Ty): usize {
+  const f = Fn(ps, r);
+  return match (f) {
+    Fn(q, _) => q.length,
+    _ => 0
+  };
+}
+
+@Ensures(result == ps.length + 1)
+function fnArityWrong(ps: Ty[], r: Ty): usize {
+  const f = Fn(ps, r);
+  return match (f) {
+    Fn(q, _) => q.length,
+    _ => 0
+  };
+}
+
+// A variant built inside a function argument (the facts about it are stated per element, inside the quantifier).
+@Ensures(result.length == xs.length)
+function wrapAll(xs: int[]): Expr[] {
+  return xs.map(x => Lit(x));
+}
+
+// A recursive class: the parent is a scope again.
+@Invariant(this.depth >= 0)
+class Scope {
+  private depth: int = 0;
+  private parent: Option<Scope> = None;
+
+  constructor() {
+  }
+
+  @Ensures(this.depth == old(this.depth) + 1)
+  @Ensures(this.parent.isSome() == old(this.parent.isSome()))
+  bump(): void {
+    this.depth += 1;
+  }
+
+  // Wrong: nothing stops the depth going below zero.
+  drop(): void {
+    this.depth -= 1;
+  }
+
+  @Ensures(this.parent.isSome())
+  @Ensures(this.depth == old(this.depth))
+  setParent(p: Scope): void {
+    this.parent = Some(p);
+  }
+
+  @Ensures(this.depth == old(this.depth) + 1)
+  setParentWrong(p: Scope): void {
+    this.parent = Some(p);
+  }
+
+  @Ensures(result == this.depth)
+  level(): int {
+    return this.depth;
+  }
+}
+
+@Ensures(result == s.level())
+function useScope(s: Scope): int {
+  return s.level();
+}
+
+@Ensures(result == s.level() + 1)
+function useScopeWrong(s: Scope): int {
+  return s.level();
+}
+
+function main(): void {}

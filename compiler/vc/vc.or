@@ -42,7 +42,7 @@ import {
 import { Gen, Obl, SortR, sortOf, opaqueSort } from "./gen";
 import { qualKey, bareOf, buildScopes } from "./scope";
 import {
-  Var, Chk, TR, St, Ret, Ex, Fn, Cls, ConstInfo, Prog, Cx, I64_MIN, I64_MAX, lineOf, clauseText, lit, inRange, inKind, concat, unionUsize, andAll,
+  cyclicMk, Var, Chk, TR, St, Ret, Ex, Fn, Cls, ConstInfo, Prog, Cx, I64_MIN, I64_MAX, lineOf, clauseText, lit, inRange, inKind, concat, unionUsize, andAll,
   noChks, noExp, lookupVar, sortS, tyOf, fresh, freshFree, wfOf, recField, arrLen, arrSel, clausesOfList, exprOf, rulesOfList, hasClauses,
   Writes, writesStmts
 } from "./ctx";
@@ -756,7 +756,9 @@ function rawProve(fs: FsGrant, proc: ProcessGrant, or: Oracle, fi: usize, qn: us
   if (r.status == PENDING) {
     return Raw { status: "error", reason: PENDING, values: [], miss: r.values };
   }
-  if (r.status == "unknown" && probes.length > 0 && or.lim.retryMs > 0) {
+  // The retry can only find a model, and a model of a function with an abstraction everywhere (a recursive type:
+  // `noteApprox` when its sort is made) is never a counterexample: no retry there.
+  if (r.status == "unknown" && probes.length > 0 && or.lim.retryMs > 0 && g.approxReason() == "") {
     let bounds: string[] = [];
     for (const pr of probes) {
       if (pr.label.endsWith(".length") && pr.kind == 0) {
@@ -902,6 +904,10 @@ function proveRets(fs: FsGrant, proc: ProcessGrant, or: Oracle, fi: usize, qn0: 
   if (allExact) {
     return Proved { v: judge(g, raw, "", probes), used: used, miss: miss };
   }
+  if (g.approxReason() != "") {
+    // No path's model can be a counterexample (judge): solving the paths alone cannot change the answer.
+    return Proved { v: unknownV(g.approxReason() + " (a counterexample is not trusted)"), used: used, miss: miss };
+  }
   for (const r of goals) {
     if (pathApprox(g, base, r) == "") {
       const one = rawProve(fs, proc, or, fi, qn0 + used, g, base, [], "(=> " + andAll(r.pc) + " " + r.goal + ")", probes);
@@ -996,7 +1002,8 @@ function ctorEntry(en0: Entry, f: Fn, cls: Cls): Result<Entry, string> {
     args.push(term);
     i += 1;
   }
-  const th = fresh(g, en.cx, ct, "(mk" + so.s + (args.length > 0 ? " " + args.join(" ") : "") + ")")?;
+  const thr = en.cx.p.tab.isCyclic("r:" + cls.name) ? cyclicMk(g, en.cx, ct, so.s, cls.fields, args) : fresh(g, en.cx, ct, "(mk" + so.s + (args.length > 0 ? " " + args.join(" ") : "") + ")");
+  const th = thr?;
   g = th.g;
   en.g = g;
   en.vars.push(Var { name: "this", term: th.name, vt: ct });
@@ -1112,7 +1119,9 @@ function verifyFn(fs: FsGrant, proc: ProcessGrant, rt0: Rt, f: Fn): Rt {
         }
         j += 1;
       }
-      if (covered) {
+      // The unrolled paths only serve to find a real counterexample; with an abstraction on every path of the
+      // function (g.approxReason) none can be one, so they are not solved.
+      if (covered || g.approxReason() != "") {
         statuses[id] = "COVERED";
       } else {
         const raw = rawProve(fs, proc, rt.or, rt.fi, rt.qn, g, base, o.pc, o.goal, en.probes);

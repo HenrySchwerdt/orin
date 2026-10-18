@@ -14,11 +14,11 @@ import {
   VT, VInt, VBool, VStr, VUnit, VArr, VOpt, VRes, VMap, VRec, VUni, VBad,
   isIntKind, intLo, intHi, joinKinds, vtName, vtKey, isBad, badReason, vtEq, isIntTy, intKindOf, concrete, resolveTy, resolveTyP, fieldTyOf, fieldIndex, isMapKey
 } from "./vt";
-import { Gen, SortR, sortOf, opaqueSort } from "./gen";
+import { Gen, SortR, sortOf, opaqueSort, variantIndex } from "./gen";
 import { bareOf } from "./scope";
 import { trArrayMethodX, trStringMethodX, strPredTerm, litChrFacts, allLitChrFacts } from "./methods";
 import {
-  Var, Chk, TR, Fn, Cls, Prog, Cx, I64_MIN, I64_MAX, lineOf, clauseText, srcText, lit, inRange, inKind, guarded, guardChks, concat, concatChk,
+  cyclicMk, cyclicVariant, Var, Chk, TR, Fn, Cls, Prog, Cx, I64_MIN, I64_MAX, lineOf, clauseText, srcText, lit, inRange, inKind, guarded, guardChks, concat, concatChk,
   andAll, noChks, noExp, lookupVar, mk, sortS, tyOf, tyIn, symName, fresh, freshFree, wfOf, arrLen, arrData, arrMk, arrSel, inBounds,
   isSomeT, isOkT, recField, mapHas, mapSize, mapFact, tfOf, tfChk, clausesOfList, exprOf, isThisExpr, Fresh, valKey, typeKey
 } from "./ctx";
@@ -193,9 +193,6 @@ function trVariant(g0: Gen, vars: Var[], cx: Cx, uni: string, vname: string, arg
     return Err("unknown union `" + bareOf(uni) + "`");
   }
   const t = VUni(uni);
-  if (cx.p.tab.isCyclic("u:" + uni)) {
-    return Err("the variants of the recursive union `" + bareOf(uni) + "` are not modelled");
-  }
   const so = sortS(g, cx, t)?;
   g = so.g;
   for (const v of u.unwrap().variants) {
@@ -221,6 +218,11 @@ function trVariant(g0: Gen, vars: Var[], cx: Cx, uni: string, vname: string, arg
         i += 1;
       }
       const ctor = so.s + "." + vname;
+      if (terms.length > 0 && cx.p.tab.isCyclic("u:" + uni)) {
+        const vi = variantIndex(u.unwrap(), vname);
+        const cv = cyclicVariant(g, cx, t, so.s, vi.unwrapOr(0), vname, terms)?;
+        return mk(cv.g, cv.name, t, chks);
+      }
       return mk(g, terms.length == 0 ? ctor : "(" + ctor + " " + terms.join(" ") + ")", t, chks);
     }
   }
@@ -460,9 +462,6 @@ function trMember(g: Gen, vars: Var[], cx: Cx, base: Expr, name: string, e: Expr
         return Err("field `" + bareOf(rn) + "." + name + "` has an unsupported type (" + badReason(ft) + ")");
       }
       const so = sortS(b.g, cx, b.vt)?;
-      if (cx.p.tab.isCyclic("r:" + rn)) {
-        return Err("the fields of the recursive type `" + bareOf(rn) + "` are not modelled");
-      }
       const fterm = recField(so.s, name, b.t);
       const tf = tfOf(so.g, cx, ft, fterm)?;
       return mk(tf.g, fterm, ft, concatChk(b.chks, tf.chks));
@@ -556,9 +555,6 @@ function trRecordLit(g0: Gen, vars: Var[], cx: Cx, srcName: string, spread: Opti
     }
   }
   const t = VRec(name);
-  if (cx.p.tab.isCyclic("r:" + name)) {
-    return Err("record literal of the recursive type `" + srcName + "`");
-  }
   const so = sortS(g, cx, t)?;
   g = so.g;
   let chks: Chk[] = [];
@@ -602,6 +598,10 @@ function trRecordLit(g0: Gen, vars: Var[], cx: Cx, srcName: string, spread: Opti
       return Err("field `" + d.fields[i] + "` is missing in the record literal");
     }
     i += 1;
+  }
+  if (cx.p.tab.isCyclic("r:" + name)) {
+    const cm = cyclicMk(g, cx, t, so.s, d.fields, args)?;
+    return mk(cm.g, cm.name, t, chks);
   }
   return mk(g, "(mk" + so.s + (args.length > 0 ? " " + args.join(" ") : "") + ")", t, chks);
 }
@@ -1721,14 +1721,6 @@ export type MatchPat = { g: Gen; test: string; binds: Var[]; };
 export function matchPattern(g0: Gen, cx: Cx, s: TR, sn: string, p: Pattern): Result<MatchPat, string> {
   let g = g0;
   let binds: Var[] = [];
-  match (s.vt) {
-    VUni(un) => {
-      if (cx.p.tab.isCyclic("u:" + un)) {
-        return Err("`match` on the recursive union `" + bareOf(un) + "` is not modelled");
-      }
-    },
-    _ => {}
-  }
   return match (p.kind) {
     PWildcard => Ok(MatchPat { g: g, test: "true", binds: binds }),
     PBool(b) => Ok(MatchPat { g: g, test: b ? s.t : "(not " + s.t + ")", binds: binds }),
@@ -1780,6 +1772,9 @@ function variantTest(cx: Cx, s: TR, sn: string, name: string, arity: usize): Opt
       }
       for (const v of u.unwrap().variants) {
         if (v.name == name) {
+          if (cx.p.tab.isCyclic("u:" + un)) {
+            return Some("(= (" + sn + ".tag " + s.t + ") " + variantIndex(u.unwrap(), name).unwrapOr(0).toString() + ")");
+          }
           return Some("((_ is " + sn + "." + name + ") " + s.t + ")");
         }
       }
