@@ -409,6 +409,10 @@ analysis cannot read (a call it cannot resolve) has the whole object as its fram
   (`range(0, loopIndex).every(j => xs[j] >= 0)`, `loopIndex > 0 ==> last == xs[loopIndex - 1]`). Inside the body the verifier
   assumes `0 <= i < xs.length` and `x == xs[i]` for the position `i` of that iteration (`xs` is the value evaluated before the
   loop). Like every loop invariant it is not a run-time check (rtcheck.or), and it is ignored with `break` / `continue`.
+  A counter the program keeps itself needs no `loopIndex`: with `let k = 0` earlier in the same block and `k += 1` as the last
+  statement of the body (nothing else writes `k`), the verifier adds the hidden invariant `k == loopIndex`, so an invariant may
+  speak about `k` (`range(0, k).every(j => xs[j] != v)`). This is what sources use that an older compiler (the bootstrap seed)
+  still has to compile: `loopIndex` is unresolved there.
 
 ### Quantifiers and sums (C11, C12)
 
