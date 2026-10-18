@@ -16,6 +16,7 @@ import {
 } from "./vt";
 import { Gen, SortR, sortOf, opaqueSort } from "./gen";
 import { bareOf } from "./scope";
+import { trArrayMethodX, trStringMethodX, strPredTerm, litChrFacts, allLitChrFacts } from "./methods";
 import {
   Var, Chk, TR, Fn, Cls, Prog, Cx, I64_MIN, I64_MAX, lineOf, clauseText, srcText, lit, inRange, inKind, guarded, guardChks, concat, concatChk,
   andAll, noChks, noExp, lookupVar, mk, sortS, tyOf, tyIn, symName, fresh, freshFree, wfOf, arrLen, arrData, arrMk, arrSel, inBounds,
@@ -139,6 +140,7 @@ function trStr(g0: Gen, cx: Cx, s: string): Result<TR, string> {
   const id = s.length == 0 ? 0 : g.litConsts().length + 1;
   const name = "(mkStr " + s.length.toString() + " " + id.toString() + ")";
   g.registerLit(s, name);
+  g = litChrFacts(g, s, name);
   return mk(g, name, VStr, noChks());
 }
 
@@ -923,7 +925,7 @@ function trArrayMethod(g0: Gen, vars: Var[], cx: Cx, r: TR, el: VT, name: string
     g.assert("(=> (= " + arrLen(so.s, r.t) + " 0) (= (slen " + out.name + ") 0))");
     return mk(g, out.name, VStr, concatChk(r.chks, sep.chks));
   }
-  return Err("array method `" + name + "` is not supported");
+  return trArrayMethodX(g, vars, cx, r, el, name, args, e, tr);
 }
 
 function trStrOf(g0: Gen, cx: Cx, arg: string, chks: Chk[]): Result<TR, string> {
@@ -953,6 +955,7 @@ function trStringMethod(g0: Gen, vars: Var[], cx: Cx, r: TR, name: string, args:
     if (!g.hasFun("chr")) {
       g.registerFun("chr");
       g.declare("(declare-fun chr (Int Int) Int)");
+      g = allLitChrFacts(g);
       // the byte at a position depends on contents the model does not know (a table literal, say): not trusted
       g.taint("chr");
     }
@@ -990,14 +993,10 @@ function trStringMethod(g0: Gen, vars: Var[], cx: Cx, r: TR, name: string, args:
   if ((name == "startsWith" || name == "endsWith" || name == "includes") && args.length == 1) {
     const x = tr(g, vars, cx, args[0], VStr)?;
     g = x.g;
-    if (cx.inQ) {
-      return Err("`" + name + "` inside a quantifier body");
-    }
     g.noteStr("derive");
-    const f = freshFree(g, cx, VBool)?;
-    g = f.g;
-    g.assert("(=> " + f.name + " (>= " + len + " (slen " + x.t + ")))");
-    return mk(g, f.name, VBool, concatChk(r.chks, x.chks));
+    // a deterministic function of the two strings, with the axioms of methods.or
+    const sp = strPredTerm(g, name, r.t, x.t);
+    return mk(sp.g, sp.name, VBool, concatChk(r.chks, x.chks));
   }
   if (name == "trim" && args.length == 0) {
     if (cx.inQ) {
@@ -1009,7 +1008,7 @@ function trStringMethod(g0: Gen, vars: Var[], cx: Cx, r: TR, name: string, args:
     g.assert("(<= (slen " + f.name + ") " + len + ")");
     return mk(g, f.name, VStr, r.chks);
   }
-  return Err("string method `" + name + "` is not supported");
+  return trStringMethodX(g, vars, cx, r, name, args, e, tr);
 }
 
 function trIntMethod(g0: Gen, cx: Cx, r: TR, k: string, name: string, args: Expr[]): Result<TR, string> {

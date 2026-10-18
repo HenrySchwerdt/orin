@@ -11,7 +11,7 @@ human-readable output works. Without z3 the test is skipped unless --require-z3 
 
 The files cover one construct each, with VERIFIED, REFUTED (with counterexample) and UNKNOWN (with reason) cases:
 verify_basic (int / bool, modular calls), verify_int_widths (exact ranges), verify_arrays (sequences, bounds),
-verify_data (records, Option, Result, unions, Map, strings), verify_classes (invariants per method, constructors,
+verify_data (records, Option, Result, unions, Map, strings), verify_methods (axioms for `sort`, `find`, `findIndex`, `reduce`, `split`, `indexOf`: compiler/vc/methods.or), verify_classes (invariants per method, constructors,
 frames, modular method calls), verify_loops (inferred bounds, user invariants, havoc, unrolling), verify_quantifiers
 (every / some / range, sorted, no duplicates, conservation, totals), verify_generics, verify_try (`?` as an early return and
 mutating calls inside expressions, hoisted in evaluation order), verify_soundness (places where a
@@ -131,6 +131,10 @@ def check_extras(orinc):
     """Rule ids, candidate preconditions and a missing solver."""
     out = []
     check = lambda cond, what: out.append((bool(cond), what))  # noqa: E731
+    # The methods of compiler/vc/methods.or are modelled: no result gives up with "is not supported" (ADR-0053 Addendum A, U8).
+    rep = json.loads(run(orinc, "--format=json", "tests/contracts/verify_methods.or", case="_extras").stdout.decode())
+    check(len(rep["results"]) > 0 and not any("is not supported" in x["reason"] for x in rep["results"]),
+          "verify_methods: a method is reported as not supported")
     # Rule ids are attached to the results.
     rep = json.loads(run(orinc, "--format=json", "tests/contracts/verify_basic.or", case="_extras").stdout.decode())
     check(any(x["function"] == "discount" and x["rules"] == ["SHOP-001"] for x in rep["results"]), "rule ids in results")
