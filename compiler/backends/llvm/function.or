@@ -6,12 +6,12 @@
 // counter: the IR of a function depends only on the function, the read-only `LlvmSymbols` and the callees' signatures
 // (rule 8; `emitLlvmFunction`).
 
-import { BinOp, UnOp, Builtin, taskOpC, taskOpRet } from "../../hir";
+import { BinOp, UnOp, Builtin, taskOpC, taskOpRet, platOpCount, platOpName, platOpParams, platOpResult } from "../../hir";
 import {
   MType, MLocal, Operand, Instr, SwitchCase, Terminator, MBlock, MFunction, MProgram, isInlineFn,
   slotWords, RT_OPT_UNWRAP, RT_RES_UNWRAP, RT_RES_UNWRAP_ERR, RT_V_UNWRAP, RT_ASSERT_FACT, RT_ASSERT_ARRAY,
   RT_STRUCT_NEW, RT_ARRAY_NEW, RT_STR_APPEND, RT_STR_APPEND_SUB, RT_STR_APPEND_USIZE, RT_STR_APPEND_INT, RT_STR_PREPEND,
-  RT_ARRAY_EXTEND, rtSig, rtCold, l1Builtin,
+  RT_ARRAY_EXTEND, RtWrap, rtSig, rtCold, l1Builtin, l1Task,
 } from "../../mir";
 import { refMask, inoutArgOk, targetsBelow, linesOfBlocks } from "../c";
 import { u, isRefT, isUsizeT, isFloatT, isAggT, zeroOf, lty, attrTy, paramTy } from "./text";
@@ -22,6 +22,15 @@ import { LlvmSymbols, llvmRefsDeclared, trapsIndexed } from "./symbols";
 type R = { text: string; val: string; };
 
 // ---------------------------------------------------------------- operands
+
+// The literal value of operand `o` (the `k` of `plat` / `fnAddr`, which the checker guarantees to be a literal), -1 for anything else.
+function litOf(o: Operand): int {
+  return match (o) {
+    OUsize(v) => v,
+    OInt(v) => v,
+    _ => -1,
+  };
+}
 
 // SSA value of operand `n` of the instruction named `p` (a load result for locals).
 function ov(p: string, n: usize, o: Operand): string {
@@ -835,6 +844,19 @@ export class LlvmFunctionEmitter {
       },
       None => {},
     }
+    match (b) {
+      BTask(k) => {
+        match (l1Task(k)) {
+          Some(e) => {
+            if (this.syms.l1(e) != "") {
+              return this.taskL1R(p, k, this.syms.l1(e), args);
+            }
+          },
+          None => {},
+        }
+      },
+      _ => {},
+    }
     const name = bname(b);
     if (name != "") {
       const ret = bret(b);
@@ -1024,6 +1046,21 @@ export class LlvmFunctionEmitter {
         val: r,
       };
     }
+    if (k == 28) {
+      return this.platR(p, args);
+    }
+    if (k == 29) {
+      // the address of the C-ABI wrapper of the L1 entry (mir/rt.or `RtWrap`; the module defines it, rtwrap.or)
+      const e = litOf(args[0]);
+      const sig: Option<RtWrap> = e < 0 ? None : rtSig(e.toUsize());
+      return match (sig) {
+        Some(w) => R { text: "  " + r + " = ptrtoint ptr @" + w.name + " to i64\n", val: r },
+        None => R { text: "  call void @orin_trap(ptr null)\n  unreachable\n", val: "0" },
+      };
+    }
+    if (k == 30) {
+      return R { text: "  " + r + " = ptrtoint ptr @orin_shared to i64\n", val: r };
+    }
     if (k == 27) {
       // the C runtime hook (orin_core_hook in runtime/core/orin_runtime.c)
       return R {
@@ -1078,6 +1115,73 @@ export class LlvmFunctionEmitter {
           + p + "l to i64\n  " + r + " = sub i64 " + p + "gz, " + p + "lz\n",
       val: r,
     };
+  }
+
+  // `plat(k, a, b, c)` (hir/coreops.or 28): the direct call of the L0 function `orin_platform_<name>` (declared by `coreDeclares`, runtime.or)
+  // with the arguments converted to its parameter types; the result is a word (a C int sign-extended, a pointer as its address, 0 for
+  // a void function).
+  private platR(p: string, args: Operand[]): R {
+    const k = litOf(args[0]);
+    if (k < 0 || k.toUsize() >= platOpCount()) {
+      return R { text: "  call void @orin_trap(ptr null)\n  unreachable\n", val: "0" };
+    }
+    const ps = platOpParams(k.toUsize());
+    let pre = "";
+    let as: string[] = [];
+    let i: usize = 0;
+    while (i < ps.length) {
+      const c = ps.substring(i, i + 1);
+      const v = ov(p, i + 1, args[i + 1]);
+      if (c == "p" || c == "f") {
+        pre += "  " + p + "a" + u(i) + " = inttoptr i64 " + v + " to ptr\n";
+        as.push("ptr " + p + "a" + u(i));
+      } else if (c == "n") {
+        pre += "  " + p + "a" + u(i) + " = trunc i64 " + v + " to i32\n";
+        as.push("i32 " + p + "a" + u(i));
+      } else {
+        as.push("i64 " + v);
+      }
+      i += 1;
+    }
+    const callee = "@orin_platform_" + platOpName(k.toUsize()) + "(" + as.join(", ") + ")";
+    const rr = platOpResult(k.toUsize());
+    const r = p + "r";
+    if (rr == "v") {
+      return R { text: pre + "  call void " + callee + "\n", val: "0" };
+    }
+    if (rr == "n") {
+      return R { text: pre + "  " + p + "w = call i32 " + callee + "\n  " + r + " = sext i32 " + p + "w to i64\n", val: r };
+    }
+    if (rr == "p") {
+      return R { text: pre + "  " + p + "w = call ptr " + callee + "\n  " + r + " = ptrtoint ptr " + p + "w to i64\n", val: r };
+    }
+    return R { text: pre + "  " + r + " = call i64 " + callee + "\n", val: r };
+  }
+
+  // The call of the Orin function of `$rt` (mir/rt.or `l1Task`) that replaces the C function of the task or monitor operation `k`:
+  // every argument is a word (an object is ptrtoint'ed), an object result is converted back. `sym` is the function's symbol.
+  private taskL1R(p: string, k: usize, sym: string, args: Operand[]): R {
+    let pre = "";
+    let as: string[] = [];
+    let i: usize = 0;
+    while (i < args.length) {
+      if (isRefT(this.opTy(args[i]))) {
+        pre += "  " + p + "tw" + u(i) + " = ptrtoint ptr " + ov(p, i, args[i]) + " to i64\n";
+        as.push("i64 " + p + "tw" + u(i));
+      } else {
+        as.push("i64 " + ov(p, i, args[i]));
+      }
+      i += 1;
+    }
+    const callee = "@" + sym + "(" + as.join(", ") + ")";
+    const kind = taskOpRet(k);
+    if (kind == 0) {
+      return R { text: pre + "  call void " + callee + "\n", val: "" };
+    }
+    if (kind == 2) {
+      return R { text: pre + "  " + p + "rw = call i64 " + callee + "\n  " + p + "r = inttoptr i64 " + p + "rw to ptr\n", val: p + "r" };
+    }
+    return R { text: pre + "  " + p + "r = call i64 " + callee + "\n", val: p + "r" };
   }
 
   private unwrapOrR(p: string, a0: string, dflt: Operand, rt: MType): R {

@@ -1096,7 +1096,7 @@ export function execStmts(g0: Gen, st0: St, cx: Cx, stmts: Stmt[], top: bool): R
           st = r.st;
         } else {
           const stBefore = st;
-          const r = execLoop(g, st, cx, true, Some(c), None, None, b, pending, s.span)?;
+          const r = execLoop(g, st, cx, true, Some(c), None, None, b, pending, s.span, stmts, k - 1)?;
           g = r.g;
           for (const x of r.rets) {
             rets.push(x);
@@ -1150,7 +1150,7 @@ export function execStmts(g0: Gen, st0: St, cx: Cx, stmts: Stmt[], top: bool): R
           st = r.st;
         } else {
           const stBefore = st;
-          const r = execLoop(g, st, cx, false, None, Some(id), Some(e), b, pending, s.span)?;
+          const r = execLoop(g, st, cx, false, None, Some(id), Some(e), b, pending, s.span, stmts, k - 1)?;
           g = r.g;
           for (const x of r.rets) {
             rets.push(x);
@@ -1554,6 +1554,15 @@ function inferCounter(st: St, cond: Expr, body: Block, mods: string[]): Option<C
 
 // An invariant at the variables `vars`: the term and the well-definedness of its clause.
 function invAt(g: Gen, cx: Cx, vars: Var[], inv: LInv): Result<Cl, string> {
+  if (inv.clause.isNone() && inv.ctr.unwrap().i0 == "=") {
+    // the counter of a `for .. of` loop equals the position of the iteration
+    const cv = lookupVar(vars, inv.ctr.unwrap().name);
+    const ix = lookupVar(vars, "loopIndex");
+    if (cv.isNone() || ix.isNone()) {
+      return Err("counter not in scope");
+    }
+    return Ok(Cl { g: g, t: "(= " + cv.unwrap().term + " " + ix.unwrap().term + ")", wd: wdOf(noChks()), tf: "true" });
+  }
   const pc = cxPlain(cx);
   if (inv.clause.isSome()) {
     const ex = exprOf(inv.clause.unwrap());
@@ -1571,6 +1580,73 @@ function invAt(g: Gen, cx: Cx, vars: Var[], inv: LInv): Result<Cl, string> {
   const nb = ctr.incl ? "(+ " + n.t + " 1)" : n.t;
   const t = "(and (<= " + ctr.i0 + " " + v.unwrap().term + ") (<= " + v.unwrap().term + " (ite (<= " + ctr.i0 + " " + nb + ") " + nb + " " + ctr.i0 + ")))";
   return Ok(Cl { g: n.g, t: t, wd: wdOf(n.chks), tf: "true" });
+}
+
+// `for (const x of xs)`: an `@Invariant` before the loop may use `loopIndex`, the position in `xs` of the iteration it is
+// about (docs/contracts.md, Loops). `at` is its term; "" for a `while` loop, which has no such variable.
+function withIndex(vars: Var[], at: string): Var[] {
+  if (at == "") {
+    return vars;
+  }
+  return vars.concat([Var { name: "loopIndex", term: at, vt: VInt("usize") }]);
+}
+
+// `for (const x of xs) { ..; k += 1; }` with `let k = 0` before the loop: a counter the body only increments, once, as its
+// last statement. The verifier proposes `k == position` (a hidden invariant, proved like a user invariant) so that the
+// loop invariants can speak about `k` (sources that may not use `loopIndex` yet).
+function forOfCounter(outer: Stmt[], at: usize, body: Block, name: string, elem: string): bool {
+  if (name.startsWith("this.") || name == elem || body.stmts.length == 0) {
+    return false;
+  }
+  // `let name = 0` earlier in the same block, with nothing writing `name` between it and the loop
+  let zero = false;
+  let j = at < outer.length ? at : outer.length;
+  while (j > 0) {
+    j -= 1;
+    let done = false;
+    match (outer[j].kind) {
+      SLet(_, id, _, init) => {
+        if (id.name == name) {
+          done = true;
+          match (init.kind) {
+            EInt(z) => { zero = z == 0; },
+            _ => {}
+          }
+        }
+      },
+      _ => {
+        const w = incrementsStmt(outer[j], name);
+        if (!(w.isSome() && w.unwrap() == 0)) {
+          done = true;
+        }
+      }
+    }
+    if (done) {
+      break;
+    }
+  }
+  if (!zero) {
+    return false;
+  }
+  const n = body.stmts.length;
+  const isInc = match (body.stmts[n - 1].kind) {
+    SAssign(target, op, value) => isIdentNamed(target, name) && match (op) {
+      OpAddAssign => isOne(value),
+      _ => false
+    },
+    _ => false
+  };
+  if (!isInc) {
+    return false;
+  }
+  let pre: Stmt[] = [];
+  let i: usize = 0;
+  while (i + 1 < n) {
+    pre.push(body.stmts[i]);
+    i += 1;
+  }
+  const r = incrementsOf(pre, name);
+  return r.isSome() && r.unwrap() == 0;
 }
 
 type HV = { g: Gen; vars: Var[]; touched: string[]; };
@@ -1661,7 +1737,7 @@ function modifiedNames(cx: Cx, st: St, body: Block): string[] {
   return out;
 }
 
-function execLoop(g0: Gen, st0: St, cx: Cx, isWhile: bool, cond: Option<Expr>, iterVar: Option<Ident>, iterExpr: Option<Expr>, body: Block, pending: ContractClause[], span: Span): Result<Ex, string> {
+function execLoop(g0: Gen, st0: St, cx: Cx, isWhile: bool, cond: Option<Expr>, iterVar: Option<Ident>, iterExpr: Option<Expr>, body: Block, pending: ContractClause[], span: Span, outer: Stmt[], at: usize): Result<Ex, string> {
   let g = g0;
   let st = st0;
   const line = lineOf(cx.text, span.start);
@@ -1699,6 +1775,13 @@ function execLoop(g0: Gen, st0: St, cx: Cx, isWhile: bool, cond: Option<Expr>, i
         _ => {}
       }
     }
+    if (!isWhile) {
+      for (const nm of mods) {
+        if (forOfCounter(outer, at, body, nm, iterVar.unwrap().name)) {
+          invs.push(LInv { label: "inferred position counter `" + nm + "`", clause: None, ctr: Some(Ctr { name: nm, bound: iterExpr.unwrap(), incl: false, i0: "=" }), line: line });
+        }
+      }
+    }
     if (isWhile) {
       const ctr = inferCounter(st, cond.unwrap(), body, mods);
       if (ctr.isSome()) {
@@ -1711,7 +1794,7 @@ function execLoop(g0: Gen, st0: St, cx: Cx, isWhile: bool, cond: Option<Expr>, i
   const lid = g.newLoop();
   let userCount: usize = 0;
   for (const inv of invs) {
-    const t = invAt(g, cx, st.vars, inv);
+    const t = invAt(g, cx, withIndex(st.vars, isWhile ? "" : "0"), inv);
     match (t) {
       Ok(x) => {
         g = x.g;
@@ -1738,8 +1821,21 @@ function execLoop(g0: Gen, st0: St, cx: Cx, isWhile: bool, cond: Option<Expr>, i
   const hv1 = havocVars(g, cx, st.vars, mods)?;
   g = hv1.g;
   let pc1 = st.pc;
+  // `for .. of`: this iteration is at the position `iv`, and its element is `arr[iv]`.
+  let iv = "";
+  let xvName = "";
+  if (!isWhile) {
+    const ix = freshFree(g, cx, VInt("usize"))?;
+    g = ix.g;
+    iv = ix.name;
+    pc1.push(inBounds(arrSortName, arrTerm, iv));
+    const xv = freshFree(g, cx, elemTy)?;
+    g = xv.g;
+    xvName = xv.name;
+    pc1.push("(= " + xvName + " " + arrSel(arrSortName, arrTerm, iv) + ")");
+  }
   for (const inv of kept) {
-    const t = invAt(g, cx, hv1.vars, inv);
+    const t = invAt(g, cx, withIndex(hv1.vars, iv), inv);
     match (t) {
       Ok(x) => {
         g = x.g;
@@ -1750,12 +1846,7 @@ function execLoop(g0: Gen, st0: St, cx: Cx, isWhile: bool, cond: Option<Expr>, i
   }
   let s1 = St { vars: hv1.vars, pc: pc1, deps: unionUsize(st.deps, [lid]), approx: reasonIn };
   if (!isWhile) {
-    // the element of this iteration is some element of the array
-    const xv = freshFree(g, cx, elemTy)?;
-    g = xv.g;
-    const q = g.next("q");
-    s1.pc.push("(exists ((" + q + " Int)) (and " + inBounds(arrSortName, arrTerm, q) + " (= " + xv.name + " " + arrSel(arrSortName, arrTerm, q) + ")))");
-    s1.vars.push(Var { name: iterVar.unwrap().name, term: xv.name, vt: elemTy });
+    s1.vars.push(Var { name: iterVar.unwrap().name, term: xvName, vt: elemTy });
   } else {
     const c = trEmit(g, s1, cx, cond.unwrap(), VBool)?;
     if (!vtEq(c.vt, VBool)) {
@@ -1770,7 +1861,7 @@ function execLoop(g0: Gen, st0: St, cx: Cx, isWhile: bool, cond: Option<Expr>, i
   // The invariants are preserved by one iteration.
   if (bodyR.fall && !jump) {
     for (const inv of kept) {
-      const t = invAt(g, cx, bodyR.st.vars, inv);
+      const t = invAt(g, cx, withIndex(bodyR.st.vars, isWhile ? "" : "(+ " + iv + " 1)"), inv);
       match (t) {
         Ok(x) => {
           g = x.g;
@@ -1791,7 +1882,7 @@ function execLoop(g0: Gen, st0: St, cx: Cx, isWhile: bool, cond: Option<Expr>, i
   g = hv3.g;
   let pc3 = st.pc;
   for (const inv of kept) {
-    const t = invAt(g, cx, hv3.vars, inv);
+    const t = invAt(g, cx, withIndex(hv3.vars, isWhile ? "" : arrLen(arrSortName, arrTerm)), inv);
     match (t) {
       Ok(x) => {
         g = x.g;
