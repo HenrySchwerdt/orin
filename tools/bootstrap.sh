@@ -57,7 +57,10 @@ echo "[stage0] cc $STAGE01_CFLAGS seed -> orin0"
 cc_link "$STAGE01_CFLAGS" legacy $B/seed.c $B/orin0
 if [ -n "$SEED_ONLY" ]; then echo "[seed-only] built $B/orin0"; exit 0; fi
 echo "[stage1] orin0 compiles compiler/main.or --c-builtins (the C runtime path the frozen snapshot implements); cc $STAGE01_CFLAGS -> orin1 ($(elapsed))"
-$B/orin0 compile --c-builtins compiler/main.or -o $B/stage1.c && cc_link "$STAGE01_CFLAGS" legacy $B/stage1.c $B/orin1
+# Two commands, not `a && b`: under `set -e` a failure on the left of `&&` does not stop the script, and a stale orin1
+# from an earlier run would then be used for stage 2.
+$B/orin0 compile --c-builtins compiler/main.or -o $B/stage1.c
+cc_link "$STAGE01_CFLAGS" legacy $B/stage1.c $B/orin1
 if [ "$SPLIT" -gt 1 ]; then
   echo "[stage2] orin1 compiles compiler/main.or (--split $SPLIT); cc $CFLAGS in parallel -> orin2 ($(elapsed))"
   $B/orin1 compile compiler/main.or -o $B/stage2.c --split "$SPLIT"
@@ -66,7 +69,8 @@ if [ "$SPLIT" -gt 1 ]; then
   rm -f $B/stage2.h $B/stage2.data.c $B/stage2.[0-9]*.c
 else
   echo "[stage2] orin1 compiles compiler/main.or; cc $CFLAGS -> orin2 ($(elapsed))"
-  $B/orin1 compile compiler/main.or -o $B/stage2.c && cc_link "$CFLAGS" core $B/stage2.c $B/orin2
+  $B/orin1 compile compiler/main.or -o $B/stage2.c
+  cc_link "$CFLAGS" core $B/stage2.c $B/orin2
 fi
 echo "[stage3] orin2 compiles compiler/main.or ($(elapsed))"
 $B/orin2 compile compiler/main.or -o $B/stage3.c

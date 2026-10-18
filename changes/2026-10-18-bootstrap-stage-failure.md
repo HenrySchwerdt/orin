@@ -1,0 +1,1 @@
+- **`tools/bootstrap.sh` stops when stage 1 or stage 2 fails to compile.** The compile and the link were joined with `&&`, which `set -e` does not stop on, so a failing stage could silently fall back to a stale binary from an earlier run.
