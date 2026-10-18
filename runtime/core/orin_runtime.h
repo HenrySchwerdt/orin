@@ -260,12 +260,33 @@ typedef struct OrinHeap {
     uint64_t dcap;                          /* @176  its capacity in entries */
     uint64_t reserved0;                     /* @184 */
     OrinStats stats;                        /* @192  the counters (OrinStats, 18 words) */
-    uint64_t reserved1[21];                 /* @336  task pointer, grant and file tables, ... */
+    uint64_t task;                          /* @336  address of the RtTask record of this thread, 0 on a thread that is not a task (R3e.4) */
+    uint64_t joined;                        /* @344  the record of the task this thread joined last (its message; R3e.4) */
+    uint64_t grants;                        /* @352  the grant table of this task (R3c) */
+    uint64_t files;                         /* @360  the open-file table of this task (R3c) */
+    uint64_t netbuf;                        /* @368  the per-task network buffer (C4) */
+    uint64_t scratch;                       /* @376  scratch word: the out parameter of L0 calls (thread_join, monitor_get) */
+    uint64_t reserved1[15];                 /* @384  up to 504 */
     uint64_t probe;                         /* @504  std:coreprobe scratch word */
     SbClass sb[SB_CLASSES + 1];             /* @512  small-block cache by 16-byte class 0..16: list head, length */
     uint64_t reserved2[30];                 /* @784  up to 1024 */
 } OrinHeap;
 extern __thread OrinHeap orin_heap ORIN_TLS_MODEL;
+
+/* The process-wide shared block (core operation `sharedBase`, hir/coreops.or 30; ADR-0052 Addendum B section 2.3): 128 zero-initialised
+ * words, read and written by Orin code only between the runtime lock and its release (`plat` 14 and 15), except the trap line buffer.
+ * The offsets are part of the runtime ABI like those of OrinHeap (spec 19 "R3e.0"). */
+enum { ORIN_SHARED_WORDS = 128 };
+typedef struct OrinShared {
+    uint64_t transfer[4];   /* @0    transfer slot table: pointer, n, cap, free head */
+    uint64_t flight[4];     /* @32   grant flight table: pointer, n, cap, free head (R3e.5) */
+    uint64_t reserved[56];  /* @64   up to 512 */
+    char trapline[512];     /* @512  line buffer of the process trap (the main thread only, which is about to exit) */
+} OrinShared;
+extern OrinShared orin_shared;
+_Static_assert(offsetof(OrinShared, transfer) == 0 && offsetof(OrinShared, flight) == 32 && offsetof(OrinShared, reserved) == 64 &&
+                   offsetof(OrinShared, trapline) == 512 && sizeof(OrinShared) == ORIN_SHARED_WORDS * 8,
+               "orin_shared: transfer @0, flight @32, trap line @512, 128 words");
 /* The counters keep their name: `orin_stats.retains++` in the inline functions below and in generated code. */
 #define orin_stats (orin_heap.stats)
 #define ORIN_HEAP_OFF(f) offsetof(OrinHeap, f)
@@ -281,7 +302,13 @@ _Static_assert(ORIN_HEAP_OFF(dstack) == 168, "orin_heap.dstack @168");
 _Static_assert(ORIN_HEAP_OFF(dcap) == 176, "orin_heap.dcap @176");
 _Static_assert(ORIN_HEAP_OFF(reserved0) == 184, "orin_heap.reserved0 @184");
 _Static_assert(ORIN_HEAP_OFF(stats) == 192, "orin_heap.stats @192");
-_Static_assert(ORIN_HEAP_OFF(reserved1) == 336, "orin_heap.reserved1 @336");
+_Static_assert(ORIN_HEAP_OFF(task) == 336, "orin_heap.task @336");
+_Static_assert(ORIN_HEAP_OFF(joined) == 344, "orin_heap.joined @344");
+_Static_assert(ORIN_HEAP_OFF(grants) == 352, "orin_heap.grants @352");
+_Static_assert(ORIN_HEAP_OFF(files) == 360, "orin_heap.files @360");
+_Static_assert(ORIN_HEAP_OFF(netbuf) == 368, "orin_heap.netbuf @368");
+_Static_assert(ORIN_HEAP_OFF(scratch) == 376, "orin_heap.scratch @376");
+_Static_assert(ORIN_HEAP_OFF(reserved1) == 384, "orin_heap.reserved1 @384");
 _Static_assert(ORIN_HEAP_OFF(probe) == 504, "orin_heap.probe @504");
 _Static_assert(ORIN_HEAP_OFF(sb) == 512 && sizeof(SbClass) == 16, "orin_heap.sb @512, 16 bytes per class (head @+0, n @+8)");
 _Static_assert(ORIN_HEAP_OFF(reserved2) == 784, "orin_heap.reserved2 @784");

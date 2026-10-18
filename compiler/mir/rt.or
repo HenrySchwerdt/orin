@@ -10,7 +10,7 @@
 // A new entry is added to `rtNames`, to `implied` when it is not always needed, and to the backends.
 
 import { Builtin } from "../hir";
-import { MProgram, MFunction, Instr, isAggTy } from "./mir";
+import { MProgram, MFunction, Instr, Operand, isAggTy } from "./mir";
 
 export const RT_OPT_UNWRAP: usize = 0;
 export const RT_RES_UNWRAP: usize = 1;
@@ -42,9 +42,39 @@ export const RT_BYTES_TO_STRING: usize = 26;
 export const RT_STRING_TO_BYTES: usize = 27;
 export const RT_STATS_REPORT: usize = 28;
 export const RT_LIVE_COUNT: usize = 29;
+// The task interface (ADR-0052 Addendum B section 3, R3e): the monitor operations of `sync.or` (R3e.1), then the entries of the later
+// steps (transfer R3e.2, lend and parThreads R3e.3, task R3e.4). The numbers are fixed here in R3e.0; an entry whose function is not in
+// the program (`rtIds` gives -1) falls back to the C function of the same operation (`l1Task`), so each step adds its module and nothing else.
+export const RT_MON_NEW: usize = 30;
+export const RT_MON_FREE: usize = 31;
+export const RT_MON_LOCK: usize = 32;
+export const RT_MON_UNLOCK: usize = 33;
+export const RT_MON_WAIT: usize = 34;
+export const RT_MON_NOTIFY_ALL: usize = 35;
+export const RT_MON_GET: usize = 36;
+export const RT_MON_SET: usize = 37;
+export const RT_MON_GROW: usize = 38;
+export const RT_MON_NOTIFY_ONE: usize = 39;
+export const RT_MON_WAIT_UNTIL: usize = 40;
+export const RT_TRANSFER_PUT: usize = 41;
+export const RT_TRANSFER_TAKE: usize = 42;
+export const RT_TRANSFER_DROP: usize = 43;
+export const RT_TRANSFER_COUNT: usize = 44;
+export const RT_LEND_PUT: usize = 45;
+export const RT_TASK_SPAWN: usize = 46;
+export const RT_TASK_JOIN: usize = 47;
+export const RT_TASK_MESSAGE: usize = 48;
+export const RT_TASK_WATCH: usize = 49;
+export const RT_TASK_TRAP_STR: usize = 50;
+export const RT_TASK_PAR_THREADS: usize = 51;
+export const RT_TASK_MAIN: usize = 52;       // the thread entry `void(void *)`, kept alive by a live taskSpawn
+export const RT_TASK_TRAP: usize = 53;       // the C name `orin_trap`
+export const RT_TASK_HEAP_RETIRE: usize = 54; // the C name `orin_rt_heap_exit`
+export const RT_CORE_PROBE_FN: usize = 55;   // `std:coreprobe`'s target of `fnAddr` (a `void(void *)` entry; hir/coreops.or `fnAddrEntries`)
+export const RT_LAST: usize = 55; // the highest entry number (RT_CORE_PROBE_FN): an entry table has RT_LAST + 1 slots
 
-// The qualified names of the entries, by number (the modules of runtime/core): one per entry, `RT_LIVE_COUNT` is the last.
-@Ensures(result.length == RT_LIVE_COUNT + 1)
+// The qualified names of the entries, by number (the modules of runtime/core): one per entry, `RT_LAST` is the last.
+@Ensures(result.length == RT_LAST + 1)
 export function rtNames(): string[] {
   return [
     "$rt/leaf.optUnwrap", "$rt/leaf.resUnwrap", "$rt/leaf.resUnwrapErr", "$rt/leaf.vUnwrap", "$rt/leaf.trapShape",
@@ -52,7 +82,12 @@ export function rtNames(): string[] {
     "$rt/rc.destroy", "$rt/rc.makeUniqueSlow", "$rt/heap.sbAlloc", "$rt/heap.sbFree", "$rt/heap.sbRealloc", "$rt/object.strAlloc",
     "$rt/object.arrayPushGrow", "$rt/str.strConcat", "$rt/str.strAppend", "$rt/str.strAppendSub", "$rt/str.strAppendUsize",
     "$rt/str.strAppendInt", "$rt/str.strPrepend", "$rt/array.arraySlice", "$rt/array.arrayConcat", "$rt/array.arrayExtend",
-    "$rt/array.bytesToString", "$rt/array.stringToBytes", "$rt/stats.statsReport", "$rt/stats.liveCount"
+    "$rt/array.bytesToString", "$rt/array.stringToBytes", "$rt/stats.statsReport", "$rt/stats.liveCount",
+    "$rt/sync.monNew", "$rt/sync.monFree", "$rt/sync.monLock", "$rt/sync.monUnlock", "$rt/sync.monWait", "$rt/sync.monNotifyAll",
+    "$rt/sync.monGet", "$rt/sync.monSet", "$rt/sync.monGrow", "$rt/sync.monNotifyOne", "$rt/sync.monWaitUntil",
+    "$rt/transfer.put", "$rt/transfer.take", "$rt/transfer.drop", "$rt/transfer.count", "$rt/lend.put",
+    "$rt/task.spawn", "$rt/task.join", "$rt/task.message", "$rt/task.watch", "$rt/task.trapStr", "$rt/task.parThreads",
+    "$rt/task.main", "$rt/task.trap", "$rt/task.heapRetire", "$rt/coreprobe.probeEntry"
   ];
 }
 
@@ -84,7 +119,55 @@ export function rtWraps(): RtWrap[] {
     RtWrap { entry: RT_STRING_TO_BYTES, name: "orin_string_to_bytes", ret: "o", params: ["o"] },
     RtWrap { entry: RT_STATS_REPORT, name: "orin_stats_report", ret: "v", params: [] },
     RtWrap { entry: RT_LIVE_COUNT, name: "orin_live_count", ret: "i64", params: [] },
+    RtWrap { entry: RT_CORE_PROBE_FN, name: "orin_probe_entry", ret: "v", params: ["p"] },
   ];
+}
+
+// The wrappers under C names that only the C unit tests of the runtime call (`runtime/core/tests/*.c` link the stub of
+// tools/rt_stub.sh): emitted, and their entries kept alive, only when the program is compiled with `--rt-wrappers` (`rtWrappersOn`).
+// Normal programs never have them, so `rtAlways` does not pull the task code into every binary (ADR-0052 Addendum B section 3). The C
+// monitor, transfer and task functions are still in the live runtime and define their own names until R3e.6, so these wrappers carry
+// the distinct prefix `orin_t_`: task_test.c built with -DORIN_TRANSFER_IN_ORIN calls the Orin functions through them (R3e.2: the four
+// transfer operations, R3e.3: the lend and the thread count), and the plain build keeps testing the C ones. At R3e.6 the C names move to the wrappers.
+export function rtTestWraps(): RtWrap[] {
+  return [
+    RtWrap { entry: RT_TRANSFER_PUT, name: "orin_t_transfer_put", ret: "u64", params: ["o"] },
+    RtWrap { entry: RT_TRANSFER_TAKE, name: "orin_t_transfer_take", ret: "o", params: ["u64"] },
+    RtWrap { entry: RT_TRANSFER_DROP, name: "orin_t_transfer_drop", ret: "v", params: ["u64"] },
+    RtWrap { entry: RT_TRANSFER_COUNT, name: "orin_t_transfer_count", ret: "u64", params: ["u64"] },
+    RtWrap { entry: RT_LEND_PUT, name: "orin_t_lend", ret: "u64", params: ["o"] },
+    RtWrap { entry: RT_TASK_PAR_THREADS, name: "orin_t_par_threads", ret: "u64", params: [] },
+  ];
+}
+
+// The marker `--rt-wrappers` leaves in `MProgram.inlineFns` (a backend hint list; no function has this name).
+export const RT_WRAPPERS_MARK: string = "$rt-wrappers";
+
+// True when the program was compiled with `--rt-wrappers`.
+export function rtWrappersOn(p: MProgram): bool {
+  for (const n of p.inlineFns) {
+    if (n == RT_WRAPPERS_MARK) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// The same program with the `--rt-wrappers` marker.
+export function withRtWrappers(p: MProgram): MProgram {
+  let fns = p.inlineFns;
+  fns.push(RT_WRAPPERS_MARK);
+  return MProgram { functions: p.functions, strings: p.strings, main: p.main, vtables: p.vtables, inlineFns: fns };
+}
+
+// True when entry `k` is a valid target of `fnAddr(k)`: its wrapper has the type `void(void *)` (hir/coreops.or `fnAddrEntries`).
+export function rtFnAddrOk(k: usize): bool {
+  for (const w of rtWraps()) {
+    if (w.entry == k) {
+      return w.ret == "v" && w.params.length == 1 && w.params[0] == "p";
+    }
+  }
+  return false;
 }
 
 // The entries of the string and array functions that no C code calls: the emitted code calls them directly and defines no wrapper
@@ -131,12 +214,49 @@ export function rtCold(name: string): bool {
       || name == "$rt/array.growItems" || name == "$rt/array.extendCopy";
 }
 
+// The L1 entry that the task or monitor operation `BTask(k)` (hir/taskops.or) calls, if it has one (ADR-0052 Addendum B section 3). A backend
+// emits a call of the Orin function when the program has the entry (`rtIds`), else the call of the C function `taskOpC(k)`, so
+// `l1Task` may name entries whose step has not landed yet. Wake sources 31..36 stay direct calls of L0.
+export function l1Task(k: usize): Option<usize> {
+  return match (k) {
+    0 => Some(RT_MON_NEW),
+    1 => Some(RT_MON_FREE),
+    2 => Some(RT_MON_LOCK),
+    3 => Some(RT_MON_UNLOCK),
+    4 => Some(RT_MON_WAIT),
+    5 => Some(RT_MON_NOTIFY_ALL),
+    6 => Some(RT_MON_GET),
+    7 => Some(RT_MON_SET),
+    8 => Some(RT_MON_GROW),
+    23 => Some(RT_MON_NOTIFY_ONE),
+    27 => Some(RT_MON_WAIT_UNTIL),
+    24 => Some(RT_ARRAY_NEW),
+    9 => Some(RT_TRANSFER_PUT),
+    10 => Some(RT_TRANSFER_TAKE),
+    11 => Some(RT_TRANSFER_DROP),
+    16 => Some(RT_TRANSFER_COUNT),
+    25 => Some(RT_LEND_PUT),
+    26 => Some(RT_TASK_PAR_THREADS),
+    12 => Some(RT_TASK_SPAWN),
+    13 => Some(RT_TASK_JOIN),
+    14 => Some(RT_TASK_MESSAGE),
+    28 => Some(RT_TASK_WATCH),
+    15 => Some(RT_TASK_TRAP_STR),
+    _ => None,
+  };
+}
+
 // The entries a live program always needs when `$rt` is loaded: the shape trap (the LLVM helpers and the C inlines call it) and
-// every entry with a wrapper (the C shells call those).
-export function rtAlways(): usize[] {
+// every entry with a wrapper (the C shells call those); with `--rt-wrappers` also the entries of the test wrappers.
+export function rtAlways(rtWrappers: bool): usize[] {
   let out: usize[] = [RT_TRAP_SHAPE];
   for (const w of rtWraps()) {
     out.push(w.entry);
+  }
+  if (rtWrappers) {
+    for (const w of rtTestWraps()) {
+      out.push(w.entry);
+    }
   }
   return out;
 }
@@ -177,10 +297,27 @@ export function rtLoaded(ids: int[]): bool {
   return ids[RT_TRAP_SHAPE] >= 0;
 }
 
+// The entries a live `BTask(k)` makes the emitted code call: its own, and for taskSpawn the thread entry as well.
+function taskImplied(k: usize): usize[] {
+  return match (l1Task(k)) {
+    Some(e) => k == 12 ? [e, RT_TASK_MAIN] : [e],
+    None => [],
+  };
+}
+
+// The entry `fnAddr` names, kept alive like the others (its wrapper is emitted whenever the entry is in the program).
+function fnAddrImplied(o: Operand): usize[] {
+  return match (o) {
+    OUsize(v) => [v.toUsize()],
+    OInt(v) => [v.toUsize()],
+    _ => [],
+  };
+}
+
 // The entries that instruction `ins` makes the emitted code call.
 function implied(ins: Instr): usize[] {
   return match (ins) {
-    IBuiltin(_, b, _) => match (b) {
+    IBuiltin(_, b, args) => match (b) {
       BOptUnwrap => [RT_OPT_UNWRAP, RT_V_UNWRAP],
       BResUnwrap => [RT_RES_UNWRAP, RT_V_UNWRAP],
       BResUnwrapErr => [RT_RES_UNWRAP_ERR, RT_V_UNWRAP],
@@ -188,6 +325,8 @@ function implied(ins: Instr): usize[] {
       BArrConcat => [RT_ARRAY_CONCAT],
       BBytesToString => [RT_BYTES_TO_STRING],
       BStringToBytes => [RT_STRING_TO_BYTES],
+      BTask(k) => taskImplied(k),
+      BCore(k) => k == 29 && args.length == 1 ? fnAddrImplied(args[0]) : [],
       _ => [],
     },
     IStrAppend(_, _) => [RT_STR_APPEND],

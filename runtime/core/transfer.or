@@ -1,0 +1,397 @@
+// $rt/transfer -- the transfer of values between task heaps, written in Orin (ADR-0052 Addendum B, step R3e.2).
+//
+// A transfer moves a value from one task to another: `put` detaches the value of a one-slot box the sender has just built and
+// publishes it in the slot table (a value in flight, owned by nobody) and returns a token; `take` claims the slot and hands the
+// receiver the box; `drop` ends a value in flight (frees it) or a lend (restores the counts it pinned, see lend.or). The value is
+// moved when every reference in its graph is the only one, deep-copied otherwise, so the receiver always gets a graph no other
+// task can reach; reference counts therefore stay non-atomic. `count` gives the moves and copies of this task (ORIN_STATS).
+// std:task reaches these through `BTask(9, 10, 11, 16)`; the backends call them in place of the C functions `orin_rt_transfer_put`,
+// `orin_rt_transfer_take`, `orin_rt_transfer_drop` and `orin_rt_transfer_count` (mir/rt.or `l1Task`), which stay in the live runtime
+// until R3e.6 (the C task code still uses them) and in the frozen snapshot for the seed. An object is its address as a `usize`.
+//
+// The slot table lives in the shared block (`sharedBase()`, words 0..3: pointer, n, cap, free head) and is read and written only
+// between the runtime lock and its release, so the C functions and these share one table. A slot is 32 bytes: box@0 (0 = free),
+// gen@8 (u32), next@12 (u32, the free list, 1-based), pins@16, npins@24. A slot with `pins` != 0 is a LEND (lend.or); a value in
+// flight has pins 0. A token is `gen << 32 | (index + 1)`; the generation makes a token that was taken, dropped or forged invalid.
+// No trap happens with the lock held, and no allocation either except in `publish` (which allocates before it takes the lock).
+//
+// Every walk over a graph is iterative with a work stack from `memAlloc` (an object graph can be a list 200,000 deep). The
+// layout is the frozen one (heap.or): rc@0 kind@8 tag@12; string len@16 cap@24 data@32; array len@16 cap@24 is_ref@32 items@40;
+// struct nslots@16 refmask@24 slots@32; kinds string 1, array 2, struct 3. A count of 0 or below is an immortal object or one
+// pinned by a lend: neither is counted. A pinned object has the top two bits 10, the owner's thread id in bits 32..61 and its
+// count below (docs/concurrency.md, "lending").
+
+import { load32, load64, store32, store64, memAlloc, memFree, memCopy, memRealloc, heapBase, sharedBase, plat, wadd, wsub, shl, shr, and, or } from "std:core";
+import { taskTrap } from "std:fsraw";
+import { PL_RUNTIME_LOCK, PL_RUNTIME_UNLOCK, PL_THREAD_ID } from "./plat";
+import { S_TRANSFER_MOVES, S_TRANSFER_COPIES, addAt } from "./heap";
+import { structNew, arrayNew, strAlloc } from "./object";
+import { retain, release } from "./rc";
+import { trapShape } from "./leaf";
+
+const T_PTR: usize = 0;            // the words of the shared block: the slot table, its slots in use, its capacity, the free head
+const T_N: usize = 8;
+const T_CAP: usize = 16;
+const T_FREE: usize = 24;
+const SLOT_SHIFT: usize = 5;       // a slot is 32 bytes
+const SIGN: usize = 9223372036854775808;
+const LOW32: usize = 4294967295;
+export const PIN_TAG: usize = 9223372036854775808;
+export const TID_LIMIT: usize = 1073741824;
+
+@Inline
+function lock(): void {
+  plat(PL_RUNTIME_LOCK, 0, 0, 0);
+}
+
+@Inline
+function unlock(): void {
+  plat(PL_RUNTIME_UNLOCK, 0, 0, 0);
+}
+
+// ---------------------------------------------------------------- pins (the count of an object lent by a task, lend.or)
+
+// True when the count `rc` is negative as a signed number (an immortal or a pinned object).
+@Inline
+export function isNeg(rc: usize): bool {
+  return rc >= SIGN;
+}
+
+// True when a negative count belongs to an object pinned by another task than `tid`: copied by a transfer, never shared.
+@Inline
+function pinnedForeign(rc: usize, tid: usize): bool {
+  return shr(rc, 62) == 2 && and(shr(rc, 32), 1073741823) != tid;
+}
+
+// ---------------------------------------------------------------- the slot table
+
+// The slot of token `tok` (the runtime lock is held), 0 when the token is not valid: taken or dropped already, never issued, forged.
+function lookup(tok: usize): usize {
+  const sh = sharedBase();
+  const i = and(wsub(tok, 1), LOW32);
+  if (tok == 0 || i >= load64(wadd(sh, T_N))) {
+    return 0;
+  }
+  const s = wadd(load64(wadd(sh, T_PTR)), shl(i, SLOT_SHIFT));
+  if (load64(s) == 0 || load32(wadd(s, 8)) != shr(tok, 32)) {
+    return 0;
+  }
+  return s;
+}
+
+// Release the slot `s` (the lock is held) to the free list.
+function freeSlot(s: usize): void {
+  const sh = sharedBase();
+  const i = shr(wsub(s, load64(wadd(sh, T_PTR))), SLOT_SHIFT);
+  store64(s, 0);
+  store64(wadd(s, 16), 0);
+  store64(wadd(s, 24), 0);
+  store32(wadd(s, 12), load64(wadd(sh, T_FREE)));
+  store64(wadd(sh, T_FREE), wadd(i, 1));
+}
+
+// The trap for a token that is not valid, with the lock released first.
+function badToken(): void {
+  unlock();
+  taskTrap("invalid transfer token (taken twice, dropped, or forged)");
+}
+
+// Publish `box` in a free slot: a value in flight when `pins` is 0, else a lend that pinned the `npins` objects at `pins`. Returns the
+// token. The table grows by doubling (256 slots at first); the new table is allocated before the lock is taken, so a failed allocation
+// traps without the lock held.
+export function publish(box: usize, pins: usize, npins: usize): usize {
+  const sh = sharedBase();
+  lock();
+  while (load64(wadd(sh, T_FREE)) == 0 && load64(wadd(sh, T_N)) == load64(wadd(sh, T_CAP))) {
+    const cap = load64(wadd(sh, T_CAP));
+    unlock();
+    const ncap = cap != 0 ? shl(cap, 1) : 256;
+    const t = memAlloc(shl(ncap, SLOT_SHIFT));
+    lock();
+    if (load64(wadd(sh, T_CAP)) == cap) {
+      const old = load64(wadd(sh, T_PTR));
+      if (old != 0) {
+        memCopy(t, old, shl(load64(wadd(sh, T_N)), SLOT_SHIFT));
+        memFree(old);
+      }
+      store64(wadd(sh, T_PTR), t);
+      store64(wadd(sh, T_CAP), ncap);
+    } else {
+      memFree(t);
+    }
+  }
+  let s: usize = 0;
+  const f = load64(wadd(sh, T_FREE));
+  if (f != 0) {
+    s = wadd(load64(wadd(sh, T_PTR)), shl(wsub(f, 1), SLOT_SHIFT));
+    store64(wadd(sh, T_FREE), load32(wadd(s, 12)));
+  } else {
+    const n = load64(wadd(sh, T_N));
+    s = wadd(load64(wadd(sh, T_PTR)), shl(n, SLOT_SHIFT));
+    store64(wadd(sh, T_N), wadd(n, 1));
+    store32(wadd(s, 8), 0);
+  }
+  const gen = and(wadd(load32(wadd(s, 8)), 1), LOW32);
+  store64(s, box);
+  store32(wadd(s, 8), gen);
+  store64(wadd(s, 16), pins);
+  store64(wadd(s, 24), npins);
+  const tok = or(shl(gen, 32), wadd(shr(wsub(s, load64(wadd(sh, T_PTR))), SLOT_SHIFT), 1));
+  unlock();
+  return tok;
+}
+
+// ---------------------------------------------------------------- uniqueness and copying
+
+// The children of the object `x` as (first slot address, count, all slots are references): the slots of a struct, the items of a
+// reference array, nothing for a string or a value array. The result is the count, `first` and `mask` are read back from the object
+// by the caller (see the loops below), so that no pair of values has to be returned.
+@Inline
+function childCount(x: usize): usize {
+  const kind = load32(wadd(x, 8));
+  if (kind == 3) {
+    return load32(wadd(x, 16));
+  }
+  if (kind == 2 && load64(wadd(x, 32)) != 0) {
+    return load64(wadd(x, 16));
+  }
+  return 0;
+}
+
+// Is every object reachable from `root` referenced exactly once (immortals excepted)? Then the graph has no other owner in this task
+// and can change hands without copying. An object pinned by another task makes the answer no (it is copied, never shared).
+// Iterative: a long list cannot overflow the stack.
+function graphUnique(root: usize, tid: usize): bool {
+  if (load64(root) != 1) {
+    return false;
+  }
+  let cap: usize = 64;
+  let sp: usize = 1;
+  let st = memAlloc(shl(cap, 3));
+  store64(st, root);
+  let ok = true;
+  while (sp != 0 && ok) {
+    sp = wsub(sp, 1);
+    const x = load64(wadd(st, shl(sp, 3)));
+    const n = childCount(x);
+    const isArr = load32(wadd(x, 8)) == 2;
+    const mask = isArr ? 0 : load64(wadd(x, 24));
+    const items = isArr ? load64(wadd(x, 40)) : wadd(x, 32);
+    let i: usize = 0;
+    while (i < n && ok) {
+      if (isArr || and(shr(mask, i), 1) == 1) {
+        const c = load64(wadd(items, shl(i, 3)));
+        if (c != 0) {
+          const rc = load64(c);
+          if (isNeg(rc)) {
+            if (pinnedForeign(rc, tid)) {
+              ok = false;
+            }
+          } else if (rc != 1) {
+            ok = false;
+          } else {
+            if (sp == cap) {
+              cap = shl(cap, 1);
+              st = memRealloc(st, shl(cap, 3));
+            }
+            store64(wadd(st, shl(sp, 3)), c);
+            sp = wadd(sp, 1);
+          }
+        }
+      }
+      i = wadd(i, 1);
+    }
+  }
+  memFree(st);
+  return ok;
+}
+
+// Queue the copy of the child `c` into the slot at `dst` (a slot of the copy being built), or store `c` as it is when it is null, an
+// immortal object or one pinned by this very task (shared, not counted). `jobs` is the buffer of (destination, source) pairs and `n` its
+// fill; the caller has made room (`cap` is its capacity); the new fill is returned.
+@Inline
+function queue(jobs: usize, n: usize, cap: usize, dst: usize, c: usize, tid: usize): usize {
+  if (c != 0) {
+    const rc = load64(c);
+    if (!isNeg(rc) || pinnedForeign(rc, tid)) {
+      store64(wadd(jobs, shl(n, 4)), dst);
+      store64(wadd(wadd(jobs, shl(n, 4)), 8), c);
+      return wadd(n, 1);
+    }
+  }
+  store64(dst, c);
+  return n;
+}
+
+// Deep copy of the graph at `root`: a string is copied byte for byte, a value array and the scalar slots of a struct as words, each
+// reference slot gets its own copy of the child (a job). Children of immortal or own-pinned objects are shared. Iterative.
+function deepCopy(root: usize, tid: usize): usize {
+  const cell = memAlloc(8);
+  let cap: usize = 64;
+  let jobs = memAlloc(shl(cap, 4));
+  store64(jobs, cell);
+  store64(wadd(jobs, 8), root);
+  let n: usize = 1;
+  while (n != 0) {
+    n = wsub(n, 1);
+    const dst = load64(wadd(jobs, shl(n, 4)));
+    const x = load64(wadd(wadd(jobs, shl(n, 4)), 8));
+    const kind = load32(wadd(x, 8));
+    let r: usize = 0;
+    if (kind == 1) {
+      const len = load64(wadd(x, 16));
+      r = strAlloc(len, len);
+      if (len != 0) {
+        memCopy(wadd(r, 32), wadd(x, 32), len);
+      }
+    } else if (kind == 2) {
+      const len = load64(wadd(x, 16));
+      const isRef = load64(wadd(x, 32));
+      r = arrayNew(len, isRef);
+      store64(wadd(r, 16), len);
+      if (isRef == 0) {
+        if (len != 0) {
+          memCopy(load64(wadd(r, 40)), load64(wadd(x, 40)), shl(len, 3));
+        }
+      } else {
+        if (wadd(n, len) > cap) {
+          cap = shl(wadd(n, len), 1);
+          jobs = memRealloc(jobs, shl(cap, 4));
+        }
+        const src = load64(wadd(x, 40));
+        const items = load64(wadd(r, 40));
+        let i: usize = 0;
+        while (i < len) {
+          n = queue(jobs, n, cap, wadd(items, shl(i, 3)), load64(wadd(src, shl(i, 3))), tid);
+          i = wadd(i, 1);
+        }
+      }
+    } else {
+      const ns = load32(wadd(x, 16));
+      const mask = load64(wadd(x, 24));
+      r = structNew(load32(wadd(x, 12)), ns, mask);
+      if (wadd(n, ns) > cap) {
+        cap = shl(wadd(n, ns), 1);
+        jobs = memRealloc(jobs, shl(cap, 4));
+      }
+      let i: usize = 0;
+      while (i < ns) {
+        const v = load64(wadd(wadd(x, 32), shl(i, 3)));
+        if (and(shr(mask, i), 1) == 1) {
+          n = queue(jobs, n, cap, wadd(wadd(r, 32), shl(i, 3)), v, tid);
+        } else {
+          store64(wadd(wadd(r, 32), shl(i, 3)), v);
+        }
+        i = wadd(i, 1);
+      }
+    }
+    store64(dst, r);
+  }
+  const out = load64(cell);
+  memFree(jobs);
+  memFree(cell);
+  return out;
+}
+
+// ---------------------------------------------------------------- the operations of std:task
+
+// Detach the value in `box` (a one-slot record the sender has just built and still owns, or a zero-slot record for a void value)
+// and publish it; returns the token. Moved when every reference in it is the only one, deep-copied otherwise. Either way the
+// receiver gets a graph no other task can reach.
+//
+// Box once: when the box itself is referenced only by the sender (rc == 1, the normal case: std:task builds it right before the call)
+// and its value is a scalar or a uniquely owned graph, the box itself is published: it is retained here (rc 2) and the sender's release
+// that follows the call brings it back to 1, the reference the token owns. No second box is allocated. This relies on the protocol of
+// the only caller, std:task (`putBox`): the sender releases its reference before the token can reach another task (putBox returns the
+// token only after the box died in it, and a token travels only through a monitor or a thread start, both of which order the sender's
+// release before the receiver's take). Otherwise (a shared box, which std:task never passes) a fresh box is built as before.
+export function put(box: usize): usize {
+  if (load32(wadd(box, 8)) != 3 || load32(wadd(box, 16)) > 1) {
+    trapShape();
+  }
+  const ns = load32(wadd(box, 16));
+  const refmask = load64(wadd(box, 24));
+  const slot0 = ns == 0 ? 0 : load64(wadd(box, 32));
+  // ns == 0: the box of a void value (ADR-0040), nothing to move
+  const scalar = ns == 0 || and(refmask, 1) == 0 || slot0 == 0;
+  const tid = plat(PL_THREAD_ID, 0, 0, 0);
+  if (load64(box) == 1 && (scalar || graphUnique(box, tid))) {
+    retain(box);
+    if (!scalar) {
+      addAt(wadd(heapBase(), S_TRANSFER_MOVES), 1);
+    }
+    return publish(box, 0, 0);
+  }
+  let out: usize = 0;
+  if (scalar) {
+    out = structNew(load32(wadd(box, 12)), ns, refmask);
+    if (ns != 0) {
+      store64(wadd(out, 32), slot0);
+    }
+  } else if (graphUnique(box, tid)) {
+    out = structNew(load32(wadd(box, 12)), 1, refmask);
+    store64(wadd(out, 32), slot0);
+    store64(wadd(box, 32), 0);
+    addAt(wadd(heapBase(), S_TRANSFER_MOVES), 1);
+  } else {
+    out = deepCopy(box, tid);
+    addAt(wadd(heapBase(), S_TRANSFER_COPIES), 1);
+  }
+  return publish(out, 0, 0);
+}
+
+// Claim the value in flight `tok`: the box the sender published, owned by the caller. A token that was taken, dropped or forged traps;
+// so does the token of a lend (a lend is only ended, by `drop`).
+export function take(tok: usize): usize {
+  lock();
+  const s = lookup(tok);
+  if (s == 0) {
+    badToken();
+  }
+  if (load64(wadd(s, 16)) != 0) {
+    unlock();
+    taskTrap("a lent value cannot be taken, only ended");
+  }
+  const b = load64(s);
+  freeSlot(s);
+  unlock();
+  return b;
+}
+
+// End a value in flight (frees it) or a lend (restores the counts it pinned and releases the lent box). Only the owner holds a lend token.
+export function drop(tok: usize): void {
+  lock();
+  const s = lookup(tok);
+  if (s == 0) {
+    badToken();
+  }
+  const b = load64(s);
+  const pins = load64(wadd(s, 16));
+  const np = load64(wadd(s, 24));
+  freeSlot(s);
+  unlock();
+  if (pins == 0) {
+    release(b);
+    return;
+  }
+  // a lend: every pinned object gets its own count back (the low 32 bits), then the buffer and the box go
+  let i: usize = 0;
+  while (i < np) {
+    const o = load64(wadd(pins, shl(i, 3)));
+    store64(o, and(load64(o), LOW32));
+    i = wadd(i, 1);
+  }
+  memFree(pins);
+  release(b);
+}
+
+// 0: the values moved by this task so far, 1: the values copied (ORIN_STATS `transfer_moves`, `transfer_copies`).
+export function count(which: usize): usize {
+  if (which == 0) {
+    return load64(wadd(heapBase(), S_TRANSFER_MOVES));
+  }
+  if (which == 1) {
+    return load64(wadd(heapBase(), S_TRANSFER_COPIES));
+  }
+  return 0;
+}
