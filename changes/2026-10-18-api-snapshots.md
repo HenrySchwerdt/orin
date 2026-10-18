@@ -1,0 +1,1 @@
+- **Committed std API snapshots (ADR-0056 C11).** `api/std/<module>.api.txt` records the public API of every public std module (`api/MODULES` marks frozen and experimental ones); `tools/check_api_snapshots.py` regenerates and diffs them in CI, `--update` rewrites them (docs/api-snapshots.md).
