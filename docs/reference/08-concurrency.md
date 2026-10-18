@@ -120,7 +120,7 @@ Tests: tests/concurrency/cancel_tokens.or.
 
 **TSK-15c. Network waits observe the token.** A task blocked in `accept`, `connect`, `recv` or `send` of `std:net` (including the readers
 `StreamReader.readExact` / `readUntil` and the `...Until` forms) returns when its token is set, within milliseconds, with
-`Err(NetError { kind: Cancelled })` (`RecvError(..)` / `FillError(..)` for `recv` and the readers); every later network call of
+`Err(NetError { kind: Cancelled })` (also for `recv` and the readers); every later network call of
 that task fails the same way without touching the socket. Not interrupted: name resolution (`getaddrinfo`; documented limitation), waits on
 channels, `join`, `select` and `sleep` (C2), and computation.
 Tests: tests/net/interrupt.or (via tools/test_net.sh), tests/std/net_test.or, tests/concurrency/cancel_storm.or.

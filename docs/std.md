@@ -698,7 +698,7 @@ function main(host: Host): void {
     useListen(net, "127.0.0.1", 8080, l => {               // narrowed: may listen on exactly 127.0.0.1:8080
       useListener(l, "127.0.0.1", 8080, 64, ln => {        // Err(NetError) if refused, in use, ...
         useAccepted(ln, milliseconds(1000), (s, peer) => { // Err(Timeout) if nobody came within 1 s
-          const r = recv(s, 4096, milliseconds(1000));     // RecvData(Bytes) | RecvEof | RecvTimeout | RecvReset | RecvError
+          const r = recv(s, 4096, milliseconds(1000));     // Result<Bytes, NetError>: Err(Closed) at EOF, Err(Timeout), ...
           sendAll(s, ..., milliseconds(1000));             // all bytes, whole-call deadline
         });
       });
@@ -719,17 +719,20 @@ function main(host: Host): void {
 | `useAccepted / withAccepted(ln, timeout: Duration, body: (Stream, Peer) => ..)` | accept (TCP_NODELAY), run body, close the stream; `Err(Timeout)` (`isTimeout`) |
 | `useConnection / withConnection(net, host, port, timeout: Duration, body: (Stream) => ..)` | connect, run body, close |
 | `useListenerNet`, `useConnectionBeside` | variants whose body also receives the `NetGrant` / the `Listener` again (a closure cannot capture a handle): client and server in one process |
-| `recv(s, maxBytes, timeout: Duration): RecvResult` | one wait, 1..min(maxBytes, 64 KiB) bytes, one copy into a fresh `u8[]` (never one string per byte) |
+| `recv(s, maxBytes, timeout: Duration): Result<Bytes, NetError>` | one wait, 1..min(maxBytes, 64 KiB) bytes, one copy into a fresh `u8[]` (never one string per byte); the end of the stream is `Err(Closed)` (`isClosed`), a wait that ran out `Err(Timeout)`, `maxBytes` 0 `Err(InvalidArgument)` |
 | `send(s, data, timeout: Duration)` / `sendAll(s, data, timeout: Duration)` | one attempt (partial write reported) / all bytes, deadline for the whole call |
 | `shutdownWrite(s)` | half-close (FIN); a graceful close is this, a bounded drain with `recv`, then the scope ends |
-| `StreamReader(cap)`: `readExact(s, n, ms)`, `readUntil(s, delim, limit, ms)`, `readSome`, `buffered`, `unread`, `take` | read-ahead buffer next to the stream (a stream cannot be stored); results `Filled | FillClosed | FillLimit | FillTimeout | FillError`; at most `cap` bytes are ever buffered, `readUntil` receives at most `limit - buffered` bytes at a time; the ms is a deadline for the whole call |
+| `StreamReader(cap)`: `readExact(s, n, ms)`, `readUntil(s, delim, limit, ms)`, `readSome`, `buffered`, `unread`, `take` | read-ahead buffer next to the stream (a stream cannot be stored); results `Result<Fill, NetError>` with `Fill = Filled | FillClosed | FillLimit` (a deadline that passed is `Err(Timeout)`, a reset `Err(Reset)`, a cancellation `Err(Cancelled)`); at most `cap` bytes are ever buffered, `readUntil` receives at most `limit - buffered` bytes at a time; the ms is a deadline for the whole call |
 | `recvUntil / sendUntil / sendAllUntil(s, .., deadline: Deadline)`, `StreamReader.readExactUntil / readDelimitedUntil`, `withAcceptedUntil`, `acceptDetachedUntil`, `withConnectionUntil / useConnectionUntil` | ADR-0017 Addendum D: the same operations on an ABSOLUTE `Deadline` (std:time) that any number of calls can share, so one deadline covers a whole exchange of many small reads and writes |
 | `withListenerNet`, `withConnectionBeside` | value-returning twins of `useListenerNet` / `useConnectionBeside` |
 | `monotonicMillis(s)` | monotonic clock via a live stream (deadlines without a clock grant); not `time.nowMillis` (the wall clock) |
 | `resolve(net, name): Result<string[], NetError>` | numeric addresses; the grant's scope must cover `name` |
 | `parsePeer(text): Result<Peer, NetError>` | `"1.2.3.4:5"` / `"[::1]:5"`; `Err(InvalidPeer)` with the byte offset for anything else (no port-0 sentinel) |
-| `NetError { kind, code, offset }`, `netErrorMessage(e)`, `netErrorFromCode(code)`, `isDenied / isTimeout / isReset(e)` | `NetErrorKind = Denied \| Closed \| Timeout \| Cancelled \| Reset \| InvalidArgument \| InvalidPeer \| Os`; `Cancelled` = the task's scope was cancelled while it waited (`Scope.cancel()` / `CancelToken` of std:task): accept, connect, recv and send wake at once, later calls fail at once; name resolution (`getaddrinfo`) is the one wait that is not interruptible |
+| `NetError { kind, code, offset }`, `netErrorMessage(e)`, `netErrorFromCode(code)`, `isDenied / isTimeout / isReset / isClosed / isCancelled(e)` | `NetErrorKind = Denied \| Closed \| Timeout \| Cancelled \| Reset \| InvalidArgument \| InvalidPeer \| Os`; `Cancelled` = the task's scope was cancelled while it waited (`Scope.cancel()` / `CancelToken` of std:task): accept, connect, recv and send wake at once, later calls fail at once; name resolution (`getaddrinfo`) is the one wait that is not interruptible |
 | `Peer { host, port }`, `portOf(ln)` | values |
+| `Accepted { peer }` | a connection on its way to another task (`@Sealed`: only `acceptDetached` makes one; the token is private) |
+
+The helpers behind the module (the wait clamp, the port and line scanners) are in `std:net/internal` (`library/std/net_internal.or`; not API). In docs and examples the module may be imported as a namespace (`import * as net from "std:net"`, ADR-0048 addendum); new names have no `net` prefix.
 
 **Security properties.** *Statically* (checker, MIR verifier): every network function needs a `NetGrant` / `Listener` /
 `Stream` first (E0470 missing, E0471 wrong family; this now holds for any function whose first parameter is a grant);
