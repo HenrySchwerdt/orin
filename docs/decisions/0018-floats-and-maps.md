@@ -49,15 +49,16 @@ locals, `orin_f2s`/`orin_s2f` for slots, generated C sets `#pragma STDC FP_CONTR
 ## Map<K, V>
 
 **Surface.** `Map<K, V>` is a built-in generic *value* type (copy-on-write like arrays and records;
-`const b = a; a.set(k, v);` leaves `b` unchanged). Keys: `int`, `usize`, `bool`, `string`; any other key type is
-E0400. Canonical constructor: **`new Map<K, V>()`** (JS-familiar; the type arguments may be omitted when the
+`const b = a; a.set(k, v);` leaves `b` unchanged). Keys: any `Hash` type (*amended 2026-10-18*, ADR-0034: the integer types, `bool`, `string`, records, unions, `Option`, `Result`, arrays and
+classes with `hash`; the original rule was `int`, `usize`, `bool`, `string` only); a key that can never be hashed (`float`, a function) is
+E0400, a composite containing one is E0475. Canonical constructor: **`new Map<K, V>()`** (JS-familiar; the type arguments may be omitted when the
 expected type is a `Map`, else E0407); `Map<K,V>.empty()` is not provided. API: `get(k): Option<V>`,
 `has(k): bool`, `set(k, v)` and `delete(k): bool` (mutating: the receiver must be a `let` place, like
 `push`), `size: usize` (a read-only field), `keys(): K[]`, `values(): V[]`, `entries(): MapEntry<K, V>[]` with
 `MapEntry<K, V> = { key: K; value: V; }`. Iteration order is insertion order; overwriting a key keeps its
 position, deleting and re-inserting moves it to the end. Maps are not comparable (`==` is E0410), `for..of`
-iterates `keys()`/`entries()` arrays, generic code over a *type parameter* key (`Map<K, V>` inside `f<K, V>`)
-is E0400 (the key class must be known), `V` may be anything.
+iterates `keys()`/`entries()` arrays, generic code over a *type parameter* key is accepted when the parameter is `K extends Hash` (ADR-0034; it was E0400 when this ADR
+was written), otherwise it is rejected; `V` may be anything.
 
 **Implementation: Orin prelude code, not a C object kind** (spec 19 R1/R3: keep the TCB small; the table is
 verifiable Orin over arrays and uses no new runtime object kind, no new RC/COW code and no new MIR). The
@@ -86,5 +87,6 @@ mechanism of ADR-0009 (`m = mapSet(m, k, v)` as a hoisted statement), so with th
 ## Consequences / limitations
 
 `std:math` functions are float-only (no int `abs`/`min`/`max` yet); `f32` literal and `int -> f32` conversions
-may double-round; no `%` on floats; no float patterns; `Map` keys are limited to four classes and generic
-`Map<K, V>` helpers with an open `K` are impossible until bounds exist. MIR v1.4 adds `MFloat`/`OFloat`.
+may double-round; no `%` on floats; no float patterns. *Amended 2026-10-18:* `Map` keys are no longer limited to four classes; any `Hash` key is accepted (ADR-0034: the
+integer types, `bool`, `string`, records, unions, `Option`, `Result`, arrays and classes with `hash`; `float`/functions are E0400 where
+the type is written, a composite containing one is E0475), and `Map<K, V>` helpers with `K extends Hash` work in generic code. MIR v1.4 adds `MFloat`/`OFloat`.

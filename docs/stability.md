@@ -20,8 +20,8 @@ decides from the tag suffix, [`.github/workflows/release.yml`](../.github/workfl
 without a suffix, such as `v1.0.0`, becomes a normal release.
 
 The first beta is `0.1.0-beta.1`, not `1.0.0-beta.1`, on purpose. The roadmap ties `1.0.0-beta` to the
-syntax and std freeze (milestone M4), which is not complete: language items such as generic methods
-([ADR-0040](decisions/0040-generic-methods-and-void-type-arguments.md)) are still landing. `0.1.0-beta.1` is a
+syntax and std freeze (milestone M4), which is not complete (see
+[ADR-0056](decisions/0056-syntax-and-std-freeze.md) for what is still open). `0.1.0-beta.1` is a
 pre-freeze beta.
 
 ## What the 0.x releases promise
@@ -61,7 +61,7 @@ short and in one place; this is it.
 
 | Feature | Where | State |
 |---|---|---|
-| `std:meta` (annotation-processor interface, ADR-0046 slice S3) | [std-meta.md](std-meta.md), [`library/std/meta.or`](../library/std/meta.or), `metacore.or`, `metajson.or` | Unstable; not yet called by the compiler. |
+| `std:meta` (annotation-processor interface, ADR-0046 slice S3) | [std-meta.md](std-meta.md), [`library/std/meta.or`](../library/std/meta.or), `metacore.or`, `metajson.or` | Experimental. The compiler already uses it: `orin expand` and the `.gen` companion modules run processors written against it (ADR-0046 slices S4-S6), but names and shapes may still change until promoted. |
 | OX markup (JSX-like syntax) and its providers `std:html`, `std:ox` | [ox.md](ox.md), [`library/std/ox.or`](../library/std/ox.or), [`library/std/html.or`](../library/std/html.or) | Experimental; provider details may change. |
 | `std:task` beyond the Gate 1 API | [concurrency.md](concurrency.md), [`library/std/task.or`](../library/std/task.or) | Stage 0, unstable. Gate 1 review decides what is frozen; additions beyond it stay experimental. |
 
