@@ -3,7 +3,7 @@
 // order (dependencies first), then declaration order.
 
 import { Span, Diagnostic, diag } from "../diag";
-import { Ident, Item, TypeDeclBody, DAlias, DRecord, DUnion, FieldDecl, VariantDecl, AnnotationKind } from "../syntax";
+import { Ident, Item, TypeDecl, TypeDeclBody, TypeExpr, TNamed, TArray, TFn, IFunction, IType, IConst, IInterface, DAlias, DRecord, DUnion, FieldDecl, VariantDecl, AnnotationKind } from "../syntax";
 import { Type, Builtin, FieldDef, RecordDef, UnionDef, VariantDef, Local, Function, VTable, taskOpFromName, coreOpFromName } from "../hir";
 import { LoadedProgram, ImportTarget, ImportUnit, ImportStd, StdModule, StdFs, StdProcess, StdClock, StdCore } from "../loader";
 import {
@@ -19,6 +19,121 @@ export type Collected = {
   unionSrc: UnionSrc[];
   diags: Diagnostic[];
 };
+
+// E0305: a record or a variant payload is stored in at most 64 slots (one per field / payload value); ADR-0056 6.9.
+const MAX_SLOTS: usize = 64;
+
+function slotLimitDiags(t: TypeDecl): Diagnostic[] {
+  let out: Diagnostic[] = [];
+  match (t.body) {
+    DRecord(fs) => {
+      if (fs.length > MAX_SLOTS) {
+        out.push(diag("E0305", t.name.span, "record `" + t.name.name + "` has " + fs.length.toString() + " fields; the limit is "
+          + MAX_SLOTS.toString()));
+      }
+    },
+    DUnion(vs) => {
+      for (const v of vs) {
+        if (v.payload.length > MAX_SLOTS) {
+          out.push(diag("E0305", v.span, "variant `" + v.name.name + "` has " + v.payload.length.toString() + " payload values; the limit is "
+            + MAX_SLOTS.toString()));
+        }
+      }
+    },
+    DAlias(_) => {},
+  }
+  return out;
+}
+
+// E0306: an exported declaration whose signature names a type declared in the same file without `export` (ADR-0056 6.9, MOD-7).
+function mentionsPrivate(t: TypeExpr, priv: string[], tparams: Ident[]): Option<Ident> {
+  match (t.kind) {
+    TNamed(id, args) => {
+      if (priv.some(n => n == id.name) && !tparams.some(p => p.name == id.name)) {
+        return Some(id);
+      }
+      for (const a of args) {
+        const r = mentionsPrivate(a, priv, tparams);
+        if (r.isSome()) { return r; }
+      }
+      return None;
+    },
+    TArray(e) => { return mentionsPrivate(e, priv, tparams); },
+    TFn(ps, r) => {
+      for (const p of ps) {
+        const m = mentionsPrivate(p.ty, priv, tparams);
+        if (m.isSome()) { return m; }
+      }
+      return mentionsPrivate(r, priv, tparams);
+    },
+  }
+}
+
+function leak(what: string, name: string, t: TypeExpr, tps: Ident[], priv: string[]): Diagnostic[] {
+  match (mentionsPrivate(t, priv, tps)) {
+    Some(id) => {
+      return [diag("E0306", id.span, "exported " + what + " `" + name + "` mentions the private type `" + id.name + "`; export `" + id.name + "` or keep the declaration private")];
+    },
+    None => { return []; },
+  }
+}
+
+function privField(rec: string, field: string, ui: usize, classes: ClassInfo[]): bool {
+  return classes.some(c => c.unit == ui && c.name == rec && c.fields.some(f => f.priv && f.name == field));
+}
+
+function privMethod(fn: string, ui: usize, classes: ClassInfo[]): bool {
+  return classes.some(c => c.unit == ui && c.methods.some(m => m.priv && fn == c.name + "." + m.name));
+}
+
+// `classes` (from lowerClasses) tell which fields and methods of a lowered class are private: those may mention private types.
+export function privacyLeakDiags(items: Item[], ui: usize, classes: ClassInfo[]): Diagnostic[] {
+  let out: Diagnostic[] = [];
+  let priv: string[] = [];
+  for (const item of items) {
+    match (item) {
+      IType(t) => { if (!t.exported) { priv.push(t.name.name); } },
+      _ => {},
+    }
+  }
+  if (priv.length == 0) { return out; }
+  const noParams: Ident[] = [];
+  for (const item of items) {
+    match (item) {
+      IFunction(f) => {
+        if (f.exported && !privMethod(f.name.name, ui, classes)) {
+          for (const p of f.params) { out = out.concat(leak("function", f.name.name, p.ty, f.typeParams, priv)); }
+          match (f.ret) { Some(r) => { out = out.concat(leak("function", f.name.name, r, f.typeParams, priv)); }, None => {} }
+        }
+      },
+      IType(t) => {
+        // an `@Sealed` type is opaque to importers (they can neither build nor change it), so its fields may name private types
+        if (t.exported && !t.annotations.some(a => match (a.kind) { ASealed => true, _ => false })) {
+          match (t.body) {
+            DAlias(a) => { out = out.concat(leak("type", t.name.name, a, t.typeParams, priv)); },
+            DRecord(fs) => { for (const f of fs) { if (!privField(t.name.name, f.name.name, ui, classes)) { out = out.concat(leak("type", t.name.name, f.ty, t.typeParams, priv)); } } },
+            DUnion(vs) => { for (const v of vs) { for (const p of v.payload) { out = out.concat(leak("type", t.name.name, p, t.typeParams, priv)); } } },
+          }
+        }
+      },
+      IConst(c) => {
+        if (c.exported) {
+          match (c.ty) { Some(ty) => { out = out.concat(leak("constant", c.name.name, ty, noParams, priv)); }, None => {} }
+        }
+      },
+      IInterface(k) => {
+        if (k.exported) {
+          for (const m of k.methods) {
+            for (const p of m.params) { out = out.concat(leak("interface", k.name.name, p.ty, noParams, priv)); }
+            match (m.ret) { Some(r) => { out = out.concat(leak("interface", k.name.name, r, noParams, priv)); }, None => {} }
+          }
+        }
+      },
+      _ => {},
+    }
+  }
+  return out;
+}
 
 type AddTypeOut = { names: Names; err: Option<Diagnostic>; };
 
@@ -278,6 +393,7 @@ export function collect(prog: LoadedProgram): Collected {
           }
         },
         IType(t) => {
+          for (const d of slotLimitDiags(t)) { diags.push(d); }
           if (t.annotations.some(a => match (a.kind) { ASealed => true, _ => false })) {
             sealed.push(unit.name + "." + t.name.name);
           }

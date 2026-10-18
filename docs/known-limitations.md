@@ -6,7 +6,7 @@
   default type arguments remain unsupported (generic methods are supported, ADR-0040).
 - Memory safety is not formally established; see architecture.md "Safety status".
 - Early exits from inside expressions (`?`, diverging match arms) may leak temporaries (safe, not
-  freed). Records/variants are limited to 64 slots.
+  freed). A record has at most 64 fields and a variant at most 64 payload values (E0305, a compile-time error; ADR-0056 6.9).
 - Orin-B had no hash maps; current compiler symbol tables use `Map` (for example `compiler/check/env.or`).
 - Closures (ADR-0011, self-hosted compiler only): capture by value only (no mutation of captured names,
   E0401; no recursive arrows, E0300); no `function` expressions, default/rest parameters or generic arrows;
