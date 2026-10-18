@@ -1,0 +1,142 @@
+// $rt/sync -- the monitor operations of `std:task`, written in Orin (ADR-0052 Addendum B, step R3e.1).
+//
+// A monitor is an L0 object (runtime/platform: a mutex, two condition queues and an array of 64-bit words readable and writable only
+// while the caller holds the mutex). `std:task` reaches it through eleven builtins (`monNew` .. `monWaitUntil`, hir/taskops.or 0..8, 23
+// and 27); the backends call these functions in place of the C forwarders `orin_mon_*` of runtime/core/orin_runtime.c (mir/rt.or
+// `l1Task`), which stay in the live runtime until R3e.6 and in the frozen snapshot for the seed. Every function is one `plat` call (a
+// direct call of the L0 function, hir/coreops.or) plus the test of its result: a failed L0 call is a trap with the message the C
+// forwarders had (`mon_check`), and a trap on a task thread ends that task only (taskTrap).
+//
+// The result of `plat` is the `int` of L0 sign-extended; L0 returns 0, a positive error code, or for `monitor_wait_until` the
+// positive WAIT_TIMEOUT (1). EINVAL (22) and ENOMEM (12) have the same value on every platform (orin_platform.h); EDEADLK does not (35
+// on Linux, 11 on macOS), and `monitor_lock` is the only function that can return it, so an error of `monLock` that is not EINVAL is
+// EDEADLK.
+
+import { load64, heapBase, plat, wadd } from "std:core";
+import { taskTrap } from "std:fsraw";
+import {
+  PL_MONITOR_NEW, PL_MONITOR_FREE, PL_MONITOR_LOCK, PL_MONITOR_UNLOCK, PL_MONITOR_WAIT, PL_MONITOR_WAIT_UNTIL, PL_MONITOR_NOTIFY,
+  PL_MONITOR_GET, PL_MONITOR_SET, PL_MONITOR_GROW
+} from "./plat";
+import { H_SCRATCH } from "./heap";
+
+const EINVAL: usize = 22;
+const ENOMEM: usize = 12;
+const INT64_MAX: usize = 9223372036854775807;
+
+// The trap for a non-zero result `rc` of a monitor call; `lock` is true for monitor_lock (see the file comment).
+function monFail(rc: usize, lock: bool): void {
+  if (rc == ENOMEM) {
+    taskTrap("out of memory");
+  }
+  if (lock && rc != EINVAL) {
+    taskTrap("monitor locked twice by the same task");
+  }
+  taskTrap("invalid monitor operation (stale handle, lock not held, or index out of range)");
+}
+
+// A monitor of `n` words, all 0, unlocked; its handle.
+@Inline
+export function monNew(n: usize): usize {
+  const h = plat(PL_MONITOR_NEW, n, 0, 0);
+  if (h == 0) {
+    taskTrap("cannot create a monitor (limit reached)");
+  }
+  return h;
+}
+
+// Release the monitor `m` (it must be unlocked, with no waiter).
+@Inline
+export function monFree(m: usize): void {
+  const rc = plat(PL_MONITOR_FREE, m, 0, 0);
+  if (rc != 0) {
+    monFail(rc, false);
+  }
+}
+
+// Lock `m`, blocking until it is free.
+@Inline
+export function monLock(m: usize): void {
+  const rc = plat(PL_MONITOR_LOCK, m, 0, 0);
+  if (rc != 0) {
+    monFail(rc, true);
+  }
+}
+
+// Unlock `m`.
+@Inline
+export function monUnlock(m: usize): void {
+  const rc = plat(PL_MONITOR_UNLOCK, m, 0, 0);
+  if (rc != 0) {
+    monFail(rc, false);
+  }
+}
+
+// Sleep on condition queue `c` (0 or 1) of the locked monitor `m` until it is notified (or spuriously): re-check the condition.
+@Inline
+export function monWait(m: usize, c: usize): void {
+  const rc = plat(PL_MONITOR_WAIT, m, c, 0);
+  if (rc != 0) {
+    monFail(rc, false);
+  }
+}
+
+// Wake every waiter of queue `c` of `m`.
+@Inline
+export function monNotifyAll(m: usize, c: usize): void {
+  const rc = plat(PL_MONITOR_NOTIFY, m, c, 1);
+  if (rc != 0) {
+    monFail(rc, false);
+  }
+}
+
+// Wake one waiter of queue `c` of `m`.
+@Inline
+export function monNotifyOne(m: usize, c: usize): void {
+  const rc = plat(PL_MONITOR_NOTIFY, m, c, 0);
+  if (rc != 0) {
+    monFail(rc, false);
+  }
+}
+
+// Timed wait on an absolute CLOCK_MONOTONIC deadline in milliseconds: 1 when the deadline passed, 0 when notified (or spuriously).
+@Inline
+export function monWaitUntil(m: usize, c: usize, deadline: usize): usize {
+  const rc = plat(PL_MONITOR_WAIT_UNTIL, m, c, deadline > INT64_MAX ? INT64_MAX : deadline);
+  if (rc == 1) {
+    return 1;
+  }
+  if (rc != 0) {
+    monFail(rc, false);
+  }
+  return 0;
+}
+
+// Word `i` of the locked monitor `m`. L0 writes it to the scratch word of this thread's heap block.
+@Inline
+export function monGet(m: usize, i: usize): usize {
+  const s = wadd(heapBase(), H_SCRATCH);
+  const rc = plat(PL_MONITOR_GET, m, i, s);
+  if (rc != 0) {
+    monFail(rc, false);
+  }
+  return load64(s);
+}
+
+// Set word `i` of the locked monitor `m` to `v`.
+@Inline
+export function monSet(m: usize, i: usize, v: usize): void {
+  const rc = plat(PL_MONITOR_SET, m, i, v);
+  if (rc != 0) {
+    monFail(rc, false);
+  }
+}
+
+// Grow the locked monitor `m` to `n` words (the new ones are 0).
+@Inline
+export function monGrow(m: usize, n: usize): void {
+  const rc = plat(PL_MONITOR_GROW, m, n, 0);
+  if (rc != 0) {
+    monFail(rc, false);
+  }
+}

@@ -4,13 +4,14 @@
 // with ORIN_STATS=1 it prints the one-line JSON report of the counters on stderr, with ORIN_STATS=sites (census builds) it prints
 // the census table first. The counters are the ones of the heap block (heap.or, `OrinStats`, 18 words from byte 192) of the exiting
 // thread plus the totals of the finished tasks, which the C runtime keeps in `g_fold` / `g_fold_live` and which Orin reaches through
-// the hooks HK_FOLD_STATS / HK_FOLD_LIVE under the runtime lock. The report is assembled by hand in a raw buffer (no Orin string is
+// the hooks HK_FOLD_STATS / HK_FOLD_LIVE under the runtime lock (`plat`). The report is assembled by hand in a raw buffer (no Orin string is
 // allocated: the counters must not change while they are read) and is byte for byte the one the C `stats_report` printed.
 // `liveCount` is `orin_live_count`: the balance of this thread's heap plus the finished tasks'. The census itself (the per-site
 // tables, their fold and report) stays C in runtime/core/orin_runtime.c and is reached through hooks (heap.or).
 
-import { load8, load64, store8, store64, memAlloc, memFree, memCopy, heapBase, cfg, hook, addrOf, wadd, wsub, shl } from "std:core";
-import { HK_GETENV, HK_LOCK, HK_UNLOCK, HK_WRITE_LINE, HK_FOLD_STATS, HK_FOLD_LIVE, HK_STATS_ON, HK_SITE_REPORT, LIVE } from "./heap";
+import { load8, load64, store8, store64, memAlloc, memFree, memCopy, heapBase, cfg, hook, plat, addrOf, wadd, wsub, shl } from "std:core";
+import { HK_FOLD_STATS, HK_FOLD_LIVE, HK_STATS_ON, HK_SITE_REPORT, LIVE } from "./heap";
+import { PL_RUNTIME_LOCK, PL_RUNTIME_UNLOCK, PL_GETENV, PL_WRITE_LINE } from "./plat";
 
 const STATS: usize = 192;             // OrinStats in the heap block
 const SIGN: usize = 9223372036854775808;
@@ -68,9 +69,9 @@ function putField(buf: usize, n: usize, key: string, v: usize): usize {
 
 // The balance of live objects: this thread's heap plus the finished tasks' (signed, as a word).
 export function liveCount(): usize {
-  hook(HK_LOCK, 0, 0, 0);
+  plat(PL_RUNTIME_LOCK, 0, 0, 0);
   const folded = load64(hook(HK_FOLD_LIVE, 0, 0, 0));
-  hook(HK_UNLOCK, 0, 0, 0);
+  plat(PL_RUNTIME_UNLOCK, 0, 0, 0);
   return wadd(load64(wadd(heapBase(), LIVE)), folded);
 }
 
@@ -78,7 +79,7 @@ export function liveCount(): usize {
 // (the sums, and the larger of the two peaks).
 export function statsReport(): void {
   const name = "ORIN_STATS";
-  const e = hook(HK_GETENV, wadd(addrOf(name), 32), 0, 0);
+  const e = plat(PL_GETENV, wadd(addrOf(name), 32), 0, 0);
   let sites = false;
   if (cfg(2) == 1 && cstrIs(e, "sites")) {
     sites = true;
@@ -89,7 +90,7 @@ export function statsReport(): void {
   }
   const t = memAlloc(144);
   memCopy(t, wadd(heapBase(), STATS), 144);
-  hook(HK_LOCK, 0, 0, 0);
+  plat(PL_RUNTIME_LOCK, 0, 0, 0);
   const g = hook(HK_FOLD_STATS, 0, 0, 0);
   let i: usize = 0;
   while (i < 18) {
@@ -103,7 +104,7 @@ export function statsReport(): void {
     }
     i = wadd(i, 1);
   }
-  hook(HK_UNLOCK, 0, 0, 0);
+  plat(PL_RUNTIME_UNLOCK, 0, 0, 0);
   const r = memAlloc(1024);
   let n = putStr(r, 0, "{\"orin_stats\":");
   n = putStr(r, n, hook(HK_STATS_ON, 0, 0, 0) == 1 ? "{\"counters\":\"all\"" : "{\"counters\":\"cold\"");
@@ -134,7 +135,7 @@ export function statsReport(): void {
     n = putU(r, n, live);
   }
   n = putStr(r, n, "}}");
-  hook(HK_WRITE_LINE, r, n, 0);
+  plat(PL_WRITE_LINE, 2, r, n);
   memFree(r);
   memFree(t);
 }

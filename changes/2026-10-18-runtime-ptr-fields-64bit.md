@@ -1,0 +1,1 @@
+- runtime: the pointer-holding ABI fields of `runtime/core/orin_runtime.h` (`OrinArray.items`, `FreeNode.next`, `SbClass.head`, `OrinHeap` free-list heads and `dstack`) are 8-byte words on every target (a union with a zero high half on 32-bit), so the runtime compiles for wasm32; layout and code on 64-bit hosts are unchanged (ADR-0055).

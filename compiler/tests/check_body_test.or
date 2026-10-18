@@ -1282,3 +1282,52 @@ function everyCheckedProgramHasBoundLocals(host: Host): void {
     },
   );
 }
+
+// `plat(k, ..)` and `fnAddr(k)` (ADR-0052 Addendum B section 2.1) select a function of a closed table: `k` must be a literal (a named
+// constant is inlined to its literal) naming a member of the table, else E0404. They are importable from `$rt/` only, so the
+// program is a user file that imports one `$rt/` file of the overlay.
+function checkedRt(fs: FsGrant, body: string): Result<Program, Diagnostic[]> {
+  const rt = "import { plat, fnAddr, sharedBase } from \"std:core\";\nconst THREAD_ID: usize = 3;\nexport function f(k: usize): usize {\n  return "
+      + body + ";\n}\n";
+  const main = "import { f } from \"$rt/neg.or\";\nfunction main(): void {\n  f(1);\n}\n";
+  const o = loadWithOverlay(
+    fs,
+    "/virt/a.or",
+    [SourceFile { path: "/virt/a.or", text: main }, SourceFile { path: "$rt/neg.or", text: rt }],
+  );
+  const none: Diagnostic[] = [];
+  return match (o.program) {
+    Some(p) => check(p, o.sm),
+    None => Err(none),
+  };
+}
+
+function rtCodeOf(fs: FsGrant, body: string): string {
+  const r = checkedRt(fs, body);
+  if (r.isOk()) {
+    return "ok";
+  }
+  const ds = r.unwrapErr();
+  return ds.length == 0 ? "load failed" : ds[0].code;
+}
+
+@Test
+function platAndFnAddrNeedALiteralFromTheTable(host: Host): void {
+  useFs(
+    host,
+    fs => {
+      assertEqString(rtCodeOf(fs, "plat(3, 0, 0, 0)"), "ok", "a literal in the table");
+      assertEqString(rtCodeOf(fs, "plat(THREAD_ID, 0, 0, 0)"), "ok", "a named constant is its literal");
+      assertEqString(rtCodeOf(fs, "plat(19, 1, 2, 3)"), "ok", "the last function of the table");
+      assertEqString(rtCodeOf(fs, "plat(k, 0, 0, 0)"), "E0404", "a computed k is a compile error");
+      assertEqString(rtCodeOf(fs, "plat(1 + 2, 0, 0, 0)"), "E0404", "an expression is not a literal");
+      assertEqString(rtCodeOf(fs, "plat(20, 0, 0, 0)"), "E0404", "k beyond the table");
+      assertEqString(rtCodeOf(fs, "plat(3, 0, 0)"), "E0404", "four arguments");
+      assertEqString(rtCodeOf(fs, "fnAddr(55)"), "ok", "the probe entry has a void(void *) wrapper");
+      assertEqString(rtCodeOf(fs, "fnAddr(k)"), "E0404", "a computed entry");
+      assertEqString(rtCodeOf(fs, "fnAddr(7)"), "E0404", "an entry that is not in fnAddrEntries");
+      assertEqString(rtCodeOf(fs, "sharedBase()"), "ok", "the shared block");
+      assertEqString(rtCodeOf(fs, "sharedBase() + plat(14, 0, 0, 0)"), "ok", "plat is an expression of usize");
+    },
+  );
+}

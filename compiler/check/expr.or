@@ -19,7 +19,7 @@ import {
 } from "../syntax";
 import {
   Type, HBlock, HStmt, Place, PlaceElem, HExpr, HExprKind, FieldInitH, Builtin, MutBuiltin, UnOp, HArm, HPattern,
-  BinOp, grantTypeName, kindType,
+  BinOp, grantTypeName, kindType, platOpCount, fnAddrEntries,
 } from "../hir";
 import {
   ClassInfo, MethodInfo, ValEnt, Inst, mapOrigin, parOrigin, mapGenType, isMapKeyType, EntRecord, EntUnion,
@@ -3095,6 +3095,48 @@ export class ExprChecker {
     return Ok(mk(XBuiltin(b, [r0]), TyUsize, span));
   }
 
+  // `plat(k, a, b, c)` and `fnAddr(k)` (hir/coreops.or 28, 29): `k` selects a function of a closed table and must be an integer literal
+  // (a named `const` is inlined to its literal) naming a member of it, so that no call is computed (ADR-0052 Addendum B section 2.1).
+  private coreLiteralK(
+    span: Span,
+    what: string,
+    b: Builtin,
+    op: usize,
+    args: Expr[],
+  ): Result<HExpr, Diagnostic> {
+    const a = this.argsExpect(span, what, args, builtinSig(b).params)?;
+    const k: int = match (a[0].kind) {
+      XInt(n) => n,
+      _ => -1,
+    };
+    if (k < 0) {
+      return Err(
+        diag("E0404", args[0].span, what + " needs an integer literal (or a named constant) as its first argument, not a computed value"),
+      );
+    }
+    const ku = k.toUsize();
+    let known = false;
+    if (op == 28) {
+      known = ku < platOpCount();
+    } else {
+      for (const e of fnAddrEntries()) {
+        if (e == ku) {
+          known = true;
+        }
+      }
+    }
+    if (!known) {
+      return Err(
+        diag(
+          "E0404",
+          args[0].span,
+          what + " has no entry " + k.toString() + (op == 28 ? " (the table of platform functions has " + platOpCount().toString() + ")" : " that has a C wrapper of type void(void *)"),
+        ),
+      );
+    }
+    return Ok(mk(XBuiltin(b, a), TyUsize, span));
+  }
+
   // `transitTake(token)`: its result is the record type expected at the call (an annotated local or a typed position).
   private callTake(
     span: Span,
@@ -3166,6 +3208,9 @@ export class ExprChecker {
       BCore(k) => {
         if (k == 12) {
           return this.coreAddrOf(span, what, b, args);
+        }
+        if (k == 28 || k == 29) {
+          return this.coreLiteralK(span, what, b, k, args);
         }
       },
       BGrantRevoke => {

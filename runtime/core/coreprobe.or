@@ -8,8 +8,20 @@
 
 import {
   load8, load32, load64, loadF64, store8, store32, store64, storeF64, memAlloc, memFree, memCopy, memSet, addrOf,
-  and, or, xor, shl, shr, expect, cfg, heapBase, memRealloc, memMove, memCmp, wadd, wsub, wmul, hook
+  and, or, xor, shl, shr, expect, cfg, heapBase, memRealloc, memMove, memCmp, wadd, wsub, wmul, hook, plat, fnAddr, sharedBase
 } from "std:core";
+import {
+  PL_THREAD_CREATE, PL_THREAD_JOIN, PL_THREAD_ID, PL_MONITOR_NEW, PL_MONITOR_FREE, PL_MONITOR_LOCK, PL_MONITOR_UNLOCK,
+  PL_MONITOR_WAIT_UNTIL, PL_MONITOR_NOTIFY, PL_MONITOR_GET, PL_MONITOR_SET, PL_MONITOR_GROW, PL_RUNTIME_LOCK, PL_RUNTIME_UNLOCK,
+  PL_CPU_COUNT, PL_GETENV, PL_WRITE_LINE
+} from "./plat";
+import { H_SCRATCH } from "./heap";
+
+// The target of `fnAddr` below: the thread entry `void(void *)` of the probe (mir/rt.or `RT_CORE_PROBE_FN`, entry 55, with the C-ABI wrapper
+// `orin_probe_entry`). It runs on a thread that L0 starts; the argument is the address of a word that it sets.
+export function probeEntry(cell: usize): void {
+  store64(cell, 42);
+}
 
 type Pair = { x: int; y: int; };
 
@@ -156,11 +168,47 @@ export function coreProbe(): string {
   memFree(y);
   memFree(x);
 
-  // hook: the runtime lock can be taken and released (hooks 1, 2), the totals of finished tasks have addresses (hooks 4, 5), and the
-  // build says whether the hot counters are on (hook 6: 0 or 1)
-  hook(1, 0, 0, 0);
-  hook(2, 0, 0, 0);
+  // hook: the totals of finished tasks have addresses (hooks 4, 5), and the build says whether the hot counters are on (hook 6: 0 or 1)
   out += line("hook", hook(4, 0, 0, 0) != 0 && hook(5, 0, 0, 0) != 0 && hook(6, 1, 2, 3) <= 1);
+
+  // sharedBase: a stable 8-aligned address, not the heap block; word 63 (byte 504, the reserved range) is ours, zero at first
+  const sh = sharedBase();
+  out += line("sharedBase", sh != 0 && sh == sharedBase() && sh / 8 * 8 == sh && sh != heapBase());
+  out += line("sharedBase zeroed", load64(sh + 504) == 0);
+  store64(sh + 504, 91);
+  out += line("sharedBase usable", load64(sh + 504) == 91 && load64(sharedBase() + 504) == 91);
+  store64(sh + 504, 0);
+
+  // fnAddr: the address of the C-ABI wrapper of the probe entry (55), a literal; stable and distinct from any data address
+  out += line("fnAddr", fnAddr(55) != 0 && fnAddr(55) == fnAddr(55) && fnAddr(55) != sh);
+
+  // plat: the L0 functions by table index (a literal); `thread_exit` and `exit` do not return and are exercised by the task tests
+  out += line("plat thread_id", plat(PL_THREAD_ID, 0, 0, 0) >= 1 && plat(PL_THREAD_ID, 0, 0, 0) == plat(PL_THREAD_ID, 0, 0, 0));
+  out += line("plat cpu_count", plat(PL_CPU_COUNT, 0, 0, 0) >= 1);
+  plat(PL_RUNTIME_LOCK, 0, 0, 0);
+  plat(PL_RUNTIME_UNLOCK, 0, 0, 0);
+  out += line("plat runtime_lock", true);
+  out += line("plat getenv", plat(PL_GETENV, addrOf("ORIN_CORE_PROBE_SURELY_UNSET") + 32, 0, 0) == 0);
+  const wl = "plat write_line";
+  plat(PL_WRITE_LINE, 1, addrOf(wl) + 32, 15);
+  const w = heapBase() + H_SCRATCH;
+  const m = plat(PL_MONITOR_NEW, 2, 0, 0);
+  out += line("plat monitor_new", m != 0);
+  out += line("plat monitor_lock", plat(PL_MONITOR_LOCK, m, 0, 0) == 0);
+  out += line("plat monitor_lock twice", plat(PL_MONITOR_LOCK, m, 0, 0) != 0);
+  out += line("plat monitor_set / get", plat(PL_MONITOR_SET, m, 1, 99) == 0 && plat(PL_MONITOR_GET, m, 1, w) == 0 && load64(w) == 99);
+  out += line("plat monitor_get range", plat(PL_MONITOR_GET, m, 5, w) != 0);
+  out += line("plat monitor_grow", plat(PL_MONITOR_GROW, m, 8, 0) == 0 && plat(PL_MONITOR_GET, m, 7, w) == 0 && load64(w) == 0);
+  out += line("plat monitor_wait_until", plat(PL_MONITOR_WAIT_UNTIL, m, 0, 0) == 1);
+  out += line("plat monitor_notify", plat(PL_MONITOR_NOTIFY, m, 0, 1) == 0 && plat(PL_MONITOR_NOTIFY, m, 1, 0) == 0);
+  out += line("plat monitor_unlock", plat(PL_MONITOR_UNLOCK, m, 0, 0) == 0 && plat(PL_MONITOR_UNLOCK, m, 0, 0) != 0);
+  out += line("plat monitor_free", plat(PL_MONITOR_FREE, m, 0, 0) == 0 && plat(PL_MONITOR_FREE, m, 0, 0) != 0);
+  const cell = memAlloc(8);
+  store64(cell, 0);
+  const th = plat(PL_THREAD_CREATE, fnAddr(55), cell, 0);
+  out += line("plat thread_create", th > 0);
+  out += line("plat thread_join", plat(PL_THREAD_JOIN, th, w, 0) == 0 && load64(w) == cell && load64(cell) == 42);
+  memFree(cell);
 
   memFree(c4);
   memFree(z);
