@@ -27,11 +27,11 @@ The examples below use the namespace form for bytes, encoding, html, path, json,
 | `std:net` | Orin, `library/std/net.or` over the network primitives of `std:fsraw` (L0: ADR-0033) | blocking TCP: `Listener`, `Stream` (resources), `connect`, `resolve`, `readExact`, `readUntil`, deadlines, half-close; takes a `NetGrant` first, narrowed by `useListen` / `useConnect`; **unstable** (ADR-0033, below) |
 | `std:seq` | Orin, `library/std/seq.or` | `range(lo, hi)`, `sum(xs)`, `sumBy(xs, f)`: pure aggregates for contracts and code; `orin verify --contracts` reads them as bounded quantifiers and recursive sums (ADR-0036) |
 | `std:text` | Orin, `library/std/text.or` | `trimBlankLines`, `dedent` (common indentation *prefix*, as Python's `textwrap.dedent`), `indentLines`, `normalizeNewlines`, `isBlankLine`, `leadingIndent`: pure byte-oriented text layout for diagnostics, documentation and CLIs (UTF-8 bytes are preserved; code points belong to `std:utf8`) |
-| `std:html` | Orin, `library/std/html.or` | `Html` (`@Sealed`), `escape`, `safeUrl`, `escapeUrl`, `renderAll`, `trustHtml`, `fromText`, `fragment`, `render`, `renderDocument`: HTML escaping and the URL-scheme rule; the OX provider `ox()` (`import ox from "std:html";`, ADR-0044); below, "std:html" |
-| `std:ox` | Orin, `library/std/ox.or` (types only) | `Markup<R>`, `Components<R>`, `AttrRule`, `Escape`: the protocol an OX provider's `ox()` returns (ADR-0044, docs/ox.md); below, "std:ox" |
-| `std:meta` | Orin, `library/std/meta.or` (re-exports `metacore.or`, `metajson.or`) | **unstable, ADR-0046 slice S3:** the pure processor interface: `Input` (annotated declarations, types, constants), the `Output` builder tree (`MDecl`/`MStmt`/`MExpr`/`MType`), `fresh`/`NameGen` hygiene and the stable JSON encoding of both; not yet called by the compiler; [API](std-meta.md) |
+| `std:html` | Orin, `library/std/html.or` | `Html` (`@Sealed`), `escape`, `safeUrl`, `escapeUrl`, `renderAll`, `trustHtml`, `fromText`, `fragment`, `render`, `renderDocument`: HTML escaping and the URL-scheme rule; the OX provider `ox()` (`import ox from "std:html";`, ADR-0044; **experimental**, with OX, see stability.md); below, "std:html" |
+| `std:ox` | Orin, `library/std/ox.or` (types only) | `Markup<R>`, `Components<R>`, `AttrRule`, `Escape`: the protocol an OX provider's `ox()` returns (ADR-0044, docs/ox.md; **experimental**); below, "std:ox" |
+| `std:meta` | Orin, `library/std/meta.or` (re-exports `metacore.or`, `metajson.or`) | **experimental, ADR-0046 slice S3:** the pure processor interface: `Input` (annotated declarations, types, constants), the `Output` builder tree (`MDecl`/`MStmt`/`MExpr`/`MType`), `fresh`/`NameGen` hygiene and the stable JSON encoding of both; **experimental** (listed in [stability.md](stability.md)); the compiler already runs processors written against it (`orin expand`, `.gen` companion modules, ADR-0046 S4-S6); [API](std-meta.md) |
 | `std:taskcore` | Orin, `library/std/taskcore.or` | the pure bookkeeping of `std:task` (`Ring` = one channel buffer, `Ledger` = one scope's task table), invariants and contracts, tested and mutated without threads; import `std:task` |
-| `std:task` | Orin, `library/std/task.or` over L0 thread / monitor primitives and a small temporary C interface (`std:fsraw`, internal) | **stage 0, unstable** (ADR-0017 Addendum A): `scope`, `spawn`, `TaskHandle.join`, bounded channels, grant delegation, `parallelMap`, the work-stealing fork/join pool `forkJoin` / `forkJoinUntil` / `parallelism`; see docs/concurrency.md |
+| `std:task` | Orin, `library/std/task.or` over L0 thread / monitor primitives and a small temporary C interface (`std:fsraw`, internal) | **Gate 1 API frozen at the std freeze, anything beyond it experimental** (stability.md; today still stage 0, ADR-0017 Addendum A): `scope`, `spawn`, `TaskHandle.join`, bounded channels, grant delegation, `parallelMap`, the work-stealing fork/join pool `forkJoin` / `forkJoinUntil` / `parallelism`; see docs/concurrency.md |
 | `parallel()` on arrays | Orin prelude (`library/collections/parallel.or`, loaded only for a file that calls it) over `std:task`'s pool | parallel array pipelines (ADR-0039): `map`, `filter`, `reduce`, `some`, `every`, `find`, `findIndex`, `toArray`; below, "Parallel pipelines" |
 | `std:test` | Orin, `library/std/test.or` | done (assertions for `@Test`, ADR-0024) |
 | `std:math` | Orin, `library/collections/math.or` (to move to `library/std/`) | done (ADR-0018) |
@@ -412,7 +412,9 @@ other and sizes add up).
   classes with `hash`; a key type parameter is `K extends Hash`). The generic collections of slice 2 are `Set<T extends Hash>`,
   `OrderedMap<K extends Ord, V>` and `MinHeap<T extends Ord>`. The names `SortedMap` and `PriorityQueue` of ADR-0034 §Consequences
   are taken by the specialised classes (`SortedMap<V>` with int keys, `PriorityQueue<T>` with an explicit `int` priority), so the generic
-  ones have their own names until the std freeze decides which names stay. The specialised classes remain and are not aliases: they
+  ones have their own names, and **these names are the frozen ones** (ADR-0034, Decision 2026-10-18: no renames before 1.0). The
+  frozen collection set is `Set<T extends Hash>`, `OrderedMap<K extends Ord, V>`, `MinHeap<T extends Ord>` plus the convenience types
+  `IntSet`, `StringSet`, `SortedMap<V>` (int keys), `SortedStringMap<V>` and `PriorityQueue<T>`. The specialised classes remain and are not aliases: they
   keep their direct `int` / `string` comparisons, which skip the derived `compare` dispatch of the generic code. `Deque<T>`, the values `V` and the
   queue elements of `PriorityQueue<T>` are generic.
 * A type parameter has one bound (ADR-0026): `V` of `OrderedMap` is unbounded, so its contracts cannot say "the value that comes back
@@ -698,7 +700,7 @@ function main(host: Host): void {
     useListen(net, "127.0.0.1", 8080, l => {               // narrowed: may listen on exactly 127.0.0.1:8080
       useListener(l, "127.0.0.1", 8080, 64, ln => {        // Err(NetError) if refused, in use, ...
         useAccepted(ln, milliseconds(1000), (s, peer) => { // Err(Timeout) if nobody came within 1 s
-          const r = recv(s, 4096, milliseconds(1000));     // RecvData(Bytes) | RecvEof | RecvTimeout | RecvReset | RecvError
+          const r = recv(s, 4096, milliseconds(1000));     // Result<Bytes, NetError>: Err(Closed) at EOF, Err(Timeout), ...
           sendAll(s, ..., milliseconds(1000));             // all bytes, whole-call deadline
         });
       });
@@ -719,17 +721,20 @@ function main(host: Host): void {
 | `useAccepted / withAccepted(ln, timeout: Duration, body: (Stream, Peer) => ..)` | accept (TCP_NODELAY), run body, close the stream; `Err(Timeout)` (`isTimeout`) |
 | `useConnection / withConnection(net, host, port, timeout: Duration, body: (Stream) => ..)` | connect, run body, close |
 | `useListenerNet`, `useConnectionBeside` | variants whose body also receives the `NetGrant` / the `Listener` again (a closure cannot capture a handle): client and server in one process |
-| `recv(s, maxBytes, timeout: Duration): RecvResult` | one wait, 1..min(maxBytes, 64 KiB) bytes, one copy into a fresh `u8[]` (never one string per byte) |
+| `recv(s, maxBytes, timeout: Duration): Result<Bytes, NetError>` | one wait, 1..min(maxBytes, 64 KiB) bytes, one copy into a fresh `u8[]` (never one string per byte); the end of the stream is `Err(Closed)` (`isClosed`), a wait that ran out `Err(Timeout)`, `maxBytes` 0 `Err(InvalidArgument)` |
 | `send(s, data, timeout: Duration)` / `sendAll(s, data, timeout: Duration)` | one attempt (partial write reported) / all bytes, deadline for the whole call |
 | `shutdownWrite(s)` | half-close (FIN); a graceful close is this, a bounded drain with `recv`, then the scope ends |
-| `StreamReader(cap)`: `readExact(s, n, ms)`, `readUntil(s, delim, limit, ms)`, `readSome`, `buffered`, `unread`, `take` | read-ahead buffer next to the stream (a stream cannot be stored); results `Filled | FillClosed | FillLimit | FillTimeout | FillError`; at most `cap` bytes are ever buffered, `readUntil` receives at most `limit - buffered` bytes at a time; the ms is a deadline for the whole call |
+| `StreamReader(cap)`: `readExact(s, n, ms)`, `readUntil(s, delim, limit, ms)`, `readSome`, `buffered`, `unread`, `take` | read-ahead buffer next to the stream (a stream cannot be stored); results `Result<Fill, NetError>` with `Fill = Filled | FillClosed | FillLimit` (a deadline that passed is `Err(Timeout)`, a reset `Err(Reset)`, a cancellation `Err(Cancelled)`); at most `cap` bytes are ever buffered, `readUntil` receives at most `limit - buffered` bytes at a time; the ms is a deadline for the whole call |
 | `recvUntil / sendUntil / sendAllUntil(s, .., deadline: Deadline)`, `StreamReader.readExactUntil / readDelimitedUntil`, `withAcceptedUntil`, `acceptDetachedUntil`, `withConnectionUntil / useConnectionUntil` | ADR-0017 Addendum D: the same operations on an ABSOLUTE `Deadline` (std:time) that any number of calls can share, so one deadline covers a whole exchange of many small reads and writes |
 | `withListenerNet`, `withConnectionBeside` | value-returning twins of `useListenerNet` / `useConnectionBeside` |
 | `monotonicMillis(s)` | monotonic clock via a live stream (deadlines without a clock grant); not `time.nowMillis` (the wall clock) |
 | `resolve(net, name): Result<string[], NetError>` | numeric addresses; the grant's scope must cover `name` |
 | `parsePeer(text): Result<Peer, NetError>` | `"1.2.3.4:5"` / `"[::1]:5"`; `Err(InvalidPeer)` with the byte offset for anything else (no port-0 sentinel) |
-| `NetError { kind, code, offset }`, `netErrorMessage(e)`, `netErrorFromCode(code)`, `isDenied / isTimeout / isReset(e)` | `NetErrorKind = Denied \| Closed \| Timeout \| Cancelled \| Reset \| InvalidArgument \| InvalidPeer \| Os`; `Cancelled` = the task's scope was cancelled while it waited (`Scope.cancel()` / `CancelToken` of std:task): accept, connect, recv and send wake at once, later calls fail at once; name resolution (`getaddrinfo`) is the one wait that is not interruptible |
+| `NetError { kind, code, offset }`, `netErrorMessage(e)`, `netErrorFromCode(code)`, `isDenied / isTimeout / isReset / isClosed / isCancelled(e)` | `NetErrorKind = Denied \| Closed \| Timeout \| Cancelled \| Reset \| InvalidArgument \| InvalidPeer \| Os`; `Cancelled` = the task's scope was cancelled while it waited (`Scope.cancel()` / `CancelToken` of std:task): accept, connect, recv and send wake at once, later calls fail at once; name resolution (`getaddrinfo`) is the one wait that is not interruptible |
 | `Peer { host, port }`, `portOf(ln)` | values |
+| `Accepted { peer }` | a connection on its way to another task (`@Sealed`: only `acceptDetached` makes one; the token is private) |
+
+The helpers behind the module (the wait clamp, the port and line scanners) are in `std:net/internal` (`library/std/net_internal.or`; not API). In docs and examples the module may be imported as a namespace (`import * as net from "std:net"`, ADR-0048 addendum); new names have no `net` prefix.
 
 **Security properties.** *Statically* (checker, MIR verifier): every network function needs a `NetGrant` / `Listener` /
 `Stream` first (E0470 missing, E0471 wrong family; this now holds for any function whose first parameter is a grant);
@@ -928,7 +933,7 @@ above; a pool lives for one call (worker threads are started per operation, abou
 ## Limitations
 
 * No floats/`Map`: `JNum` is `int`, no `std:math`, `std:map`, edge weights, `sleep`, fractional seconds.
-* Generic methods do not exist (E0460); `Graph<T>` has no edge weights and needs a caller-supplied tag.
+* `Graph<T>` has no edge weights and needs a caller-supplied tag.
 * Diagnostics print std types with their unit name (`$stdlib/graph.GraphId<int>`).
 * `std:clock` is importable but internal; so is `std:fsraw` (the raw open/close and grant primitives behind `std:fs` and `std:host`; only library code may import it).
 * `std:collections/internal` and `std:bytes/internal` (files `collections_internal.or`, `bytes_internal.or`) hold the contract helpers (`allTrue`, `isStrictlyIncreasing`, `isMinHeap4`, the B-tree shape and order checks, `allBytes`, ...) and the generated B-tree node types behind the public modules (ADR-0048 rule 7.3). They are not API and can change in any release; user code does not import them.

@@ -150,8 +150,9 @@ empty `${}` or two expressions in one is E0200.
 
 ## 4.9 Entry point
 
-**EXP-19.** The entry file of a program (the file given to `orin compile`/`check`, or a package's `entry`) defines `function main(): void`, optionally with
-one parameter `host: Host` (chapter 5). Any other signature (a result type, other parameters), or no `main`, is E0412.
+**EXP-19.** The entry file of a program (the file given to `orin compile`/`check`, or a package's `entry`) defines `main` in exactly one of two forms, and **this is the only place that lists them**: `function main(): void` (no authority) and
+`function main(host: Host): void` (chapter 5). Any other signature (a result type, other parameters, more than one parameter), or no `main`,
+is E0412; a grant-typed parameter such as `main(fs: FsGrant)` is E0472.
 - Tests: `tests/errors/e0412_missing_main.or`, `tests/errors/e0412_main_returns_int.or`, `tests/errors/e0412_main_with_params.or`,
   `tests/next/errors/e0412_main_host_and_more.or`, `tests/next/errors/e0472_main_fs_param.or`.
 

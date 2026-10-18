@@ -264,7 +264,7 @@ error (``error[E0410]: operands have different types `string` and `int` ``), and
 | npm, `require`, JS/Node interop | None. `import ... from "lodash"` is `error[E0301]: cannot find module`. Only your own modules and `std:*` (`fs`, `path`, `json`, `time`, `math`, `process`, `io`, `test`, `graph`). |
 | `async`/`await`, `Promise` | Not implemented. `async function` is ``error[E0200]: expected declaration, found `async` ``; `Promise` is an unknown type. Concurrency is designed as isolated tasks with `scope`/`spawn`/channels and no function colouring (ADR-0017), after the 1.0 core. |
 | Decorators, user annotations | The built-ins `@Test`, `@Deprecated`, `@Inline`, `@Sealed` and the contract clauses (`@Requires`, `@Ensures`, `@Invariant`, `@Decreases`, `@Rule`) exist. You can define your own annotation as a record type marked `@Annotation(function, field, ...)` and apply it with constant arguments (`@Route("/users", Get)`); it is checked metadata that does not change the generated code. A name that is not declared or imported as such a record is `error[E0408]: unknown annotation`. Processors that generate code from annotations are the later slices of ADR-0046. Decorators that wrap or replace a function do not exist. |
-| Generic methods | `class A { id<T>(x: T): T }` is `error[E0460]`. Use a generic function or a generic class (`class Box<T>`, ADR-0026). Generic functions and classes exist, with bounds `T extends I`. |
+| Generic methods | `class A { id<T>(x: T): T }` works (ADR-0040), with bounds `T extends I`. Only an **interface** method may not be generic (`error[E0460]`). |
 | Bit operators `& \| ^ ~ << >>` | Reserved for after 1.0 (ADR-0016): `6 & 3` is a syntax error today. No bit tricks on integers yet; `\|` already means union in type position. |
 | 128-bit integers | `i128`/`u128` are `E0431` until post-1.0. |
 | `number \| string`, untagged unions, intersection types | Tagged unions (1.9). No `&` in types. |
@@ -343,7 +343,7 @@ the compiler; `orin explain <code>` has a short description of the more common c
 | `export function f` / `import { f } from "./m"` | the same; `./dir` imports `dir/module.or` |
 | `fs.readFileSync(p)` (throws) | `readFile(fs, p)` returns `Result<string, string>`; the `fs` grant comes from `main(host: Host)` (no ambient file access, ADR-0027) |
 | `@decorator` | built-in `@Test`, `@Deprecated`, `@Inline` only |
-| `function f<T>(x: T)`, `class Box<T>` | the same; generic methods do not exist |
+| `function f<T>(x: T)`, `class Box<T>` | the same; class methods may be generic too (not interface methods, E0460) |
 | `(x: number) => number` (function type) | `(x: int) => int` |
 
 ## 4. Where to read more

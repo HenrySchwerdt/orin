@@ -1,10 +1,10 @@
-# std:meta -- the processor interface (unstable, ADR-0046)
+# std:meta -- the processor interface (experimental, ADR-0046)
 
 `import { Input, Output, fn, param, named, ret, call, fresh } from "std:meta";`
 
-**Unstable.** This is slice S3 of [ADR-0046](decisions/0046-typed-annotation-processors.md). The module is pure
-data plus builders and a JSON codec; the compiler uses it for companion modules (S4) and runs processors written against it (S5).
-Names and shapes may change until S4/S5 land.
+**Experimental** (the list in [stability.md](stability.md)). This is slice S3 of [ADR-0046](decisions/0046-typed-annotation-processors.md).
+The module is pure data plus builders and a JSON codec; the compiler uses it for companion modules (S4) and runs processors written
+against it (S5, S6), so it is in use today, but it is not frozen: names and shapes may change in any release until it is promoted.
 
 It is pure: no grants, no I/O, no global state. The source is `library/std/metacore.or` (model and builders),
 `library/std/metajson.or` (codec) and `library/std/meta.or` (re-exports both; import this one). `std:metacore` and

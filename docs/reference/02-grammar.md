@@ -102,7 +102,7 @@ elements, record fields, variant payloads, name lists, match arms); a leading or
 **GRM-6.** In a class body `public`, `private` and `static` are modifiers only when an identifier follows them (a field
 or method may still be named `static`). A field has a type and an optional initialiser; a static field is E0408.
 `constructor(...)` is recognised by its name without modifiers. Inheritance (`extends` on a class) parses but is E0408
-in the checker; an interface may not have fields (E0408), bodies (E0408), generic methods (E0408) or `extends` (E0408).
+in the checker; an interface may not have fields (E0408), bodies (E0408), generic methods (E0460, ADR-0040) or `extends` (E0408).
 - Tests: `tests/next/run/class_private_fields.or`, `tests/next/run/class_static_methods.or`,
   `tests/next/run/class_param_properties.or`, `tests/next/errors/e0408_class_extends.or`,
   `tests/next/errors/e0408_interface_field.or`, `tests/next/errors/e0408_interface_default_method.or`,

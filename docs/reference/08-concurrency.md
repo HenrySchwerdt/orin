@@ -16,14 +16,13 @@ network waits of 8.6) are not guaranteed.
 ## 8.1 Tasks and scopes
 
 **TSK-1. Structured scopes.** `scope(body: (s: Scope) => R): R` runs `body(s)`, then joins every task spawned in `s`, then
-returns the result of `body`. `scopeDo` is the `void` flavour (a generic result cannot be `void`; ADR-0040 will lift this, see
-README). A task never outlives its scope.
+returns the result of `body`. `R` may be `void` (ADR-0040); `scopeDo` is a `@Deprecated` wrapper kept for one release. A task never outlives its scope.
 Tests: tests/next/run/task_scope_exit_join.or, tests/next/run/task_spawn_join.or, tests/next/run/task_many.or.
 
-**TSK-2. Spawn and join.** `spawn(s, f: () => T): TaskHandle<T>` starts `f` as a task; `spawnDo` takes a `void` closure and
-returns `TaskHandle<bool>`. `h.join()` waits and returns the result. These are free functions because generic methods do not
-exist yet (E0460).
-Tests: tests/next/run/task_spawn_join.or, tests/next/run/task_many.or, tests/next/errors/e0460_interface_generic_method.or.
+**TSK-2. Spawn and join.** `s.spawn(f: () => T): TaskHandle<T>` is a generic method of `Scope` (ADR-0040); it starts `f` as a task, and
+`T` may be `void`. `h.join()` waits and returns the result. The free functions `spawn(s, f)` and `spawnDo` are `@Deprecated`
+wrappers kept for one release. `select` and the other generic operations that take several receivers remain free functions.
+Tests: tests/next/run/task_spawn_join.or, tests/next/run/task_many.or, tests/next/run/generic_methods.or.
 
 **TSK-3. Join once.** A second `join` of one handle, a `spawn` on a scope that has ended, and any use of a released channel
 trap at run time.
@@ -120,7 +119,7 @@ Tests: tests/concurrency/cancel_tokens.or.
 
 **TSK-15c. Network waits observe the token.** A task blocked in `accept`, `connect`, `recv` or `send` of `std:net` (including the readers
 `StreamReader.readExact` / `readUntil` and the `...Until` forms) returns when its token is set, within milliseconds, with
-`Err(NetError { kind: Cancelled })` (`RecvError(..)` / `FillError(..)` for `recv` and the readers); every later network call of
+`Err(NetError { kind: Cancelled })` (also for `recv` and the readers); every later network call of
 that task fails the same way without touching the socket. Not interrupted: name resolution (`getaddrinfo`; documented limitation), waits on
 channels, `join`, `select` and `sleep` (C2), and computation.
 Tests: tests/net/interrupt.or (via tools/test_net.sh), tests/std/net_test.or, tests/concurrency/cancel_storm.or.
@@ -180,6 +179,5 @@ Tests: tests/next/run/par_float_reduce.or, tests/next/run/par_ops.or.
 - W0481 is covered only as a side effect (`// warns: W0481 W0481` in tests/next/run/par_ops.or); no test isolates the
   unsigned-`+` no-warning case.
 - E0482 for a non-constant zero capacity is a run-time trap; the trap test is tests/std/expect_trap/task_capacity_zero.or only.
-- Generic-method forms (`s.spawn(f)`) are not available; landing in PR (pending), ADR-0040.
 - Absence of deadlock detection, the cancellation of channel waits and of a scope by a trapped task (Gate 1 C2) and a `timeout` arm
   for `select` are not implemented, so there is nothing to test.

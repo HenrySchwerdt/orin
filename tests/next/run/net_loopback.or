@@ -5,25 +5,37 @@ import { milliseconds } from "std:time";
 import { Bytes, fromString, fromArray } from "std:bytes";
 import {
   NetGrant, Listener, Stream, useListenerNet, useAccepted, useConnection, useConnectionBeside, useListen, useConnect, withConnect, portOf, recv, sendAll,
-  shutdownWrite, StreamReader, RecvResult, Fill, isTimeout, isDenied, resolve, monotonicMillis, netErrorMessage
+  shutdownWrite, StreamReader, Fill, NetError, isClosed, isTimeout, isReset, isDenied, resolve, monotonicMillis, netErrorMessage
 } from "std:net";
 
 function say(label: string, ok: bool): void {
   console.log(label + ": " + (ok ? "ok" : "FAIL"));
 }
 
-function kind(r: RecvResult): string {
+function kind(r: Result<Bytes, NetError>): string {
   return match (r) {
-    RecvData(b) => "data " + b.length().toString(),
-    RecvEof => "eof",
-    RecvTimeout => "timeout",
-    RecvReset => "reset",
-    RecvError(e) => "error " + netErrorMessage(e)
+    Ok(b) => "data " + b.length().toString(),
+    Err(e) => isClosed(e) ? "eof" : isTimeout(e) ? "timeout" : isReset(e) ? "reset" : "error " + netErrorMessage(e)
   };
 }
 
 function text(b: Bytes): string {
   return b.toRawString();
+}
+
+// the Fill of a read; an error reads as FillLimit (callers that care check isErr)
+function fillOf(r: Result<Fill, NetError>): Fill {
+  return match (r) {
+    Ok(f) => f,
+    Err(e) => FillLimit
+  };
+}
+
+function isErr(r: Result<Fill, NetError>): bool {
+  return match (r) {
+    Ok(f) => false,
+    Err(e) => true
+  };
 }
 
 function serve(ln: Listener, net: NetGrant): void {
@@ -40,7 +52,7 @@ function serve(ln: Listener, net: NetGrant): void {
       console.log("recv cap 4: " + kind(r1));
       let rd = new StreamReader(1024);
       const line = rd.readUntil(s, fromString("\r\n"), 100, milliseconds(1000));
-      match (line) {
+      match (fillOf(line)) {
         Filled(b) => { console.log("line: " + text(b).length.toString()); },
         _ => { console.log("line: FAIL"); }
       }
@@ -51,7 +63,7 @@ function serve(ln: Listener, net: NetGrant): void {
       say("waited", monotonicMillis(s) - t0 >= 40);
       // the client half-closes: EOF after the remaining bytes
       const rest = rd.readExact(s, 4, milliseconds(1000));
-      match (rest) {
+      match (fillOf(rest)) {
         Filled(b) => { console.log("rest: " + text(b)); },
         FillClosed(b) => { console.log("rest closed: " + text(b)); },
         _ => { console.log("rest: FAIL"); }
@@ -69,8 +81,8 @@ function serve(ln: Listener, net: NetGrant): void {
     useAccepted(ln2, milliseconds(1000), (s: Stream, peer) => {
       let rd = new StreamReader(64);
       const f = rd.readUntil(s, fromString("\n"), 5, milliseconds(500));
-      match (f) {
-        FillLimit => { console.log("limit: ok"); },
+      match (fillOf(f)) {
+        FillLimit => { console.log(isErr(f) ? "limit: FAIL" : "limit: ok"); },
         _ => { console.log("limit: FAIL"); }
       }
       say("buffered at most the limit", rd.buffered().length() <= 5);

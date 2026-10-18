@@ -48,7 +48,7 @@ export { f, Point } from "./other";      // re-export (used in module.or)
 - Generic type parameters (`type X<T>`, `function f<T>`) are parsed but rejected
   (E0408) in Orin-B (the self-hosted compiler accepts them, see ADR-0007; Stage 0 does not). Built-in generic types: `T[]`, `Option<T>`, `Result<T, E>`.
 - Top-level `const` initializers must be a literal (`int` possibly negated, `string`, `bool`).
-- Entry point: the entry file must contain `function main(): void`.
+- Entry point: the entry file defines `function main(): void` or `function main(host: Host): void` (the forms and errors are in [reference/04](reference/04-expressions-statements.md), EXP-19).
 - Duplicate names in one module → E0304. Declaration order does not matter at top level
   (functions and types may be mutually recursive).
 
@@ -98,8 +98,11 @@ e;                                // expression statement
   the next token cannot start an expression (`) ] } , ; . ? :` or EOF); otherwise it starts a
   conditional expression (ADR-0003).
 - Arithmetic on `int`/`usize` is checked: overflow, underflow, division/modulo by zero trap.
-- `==`/`!=` only on `int`, `usize`, `bool`, `string` (both sides same type).
-  `< <= > >=` only on `int`, `usize`. `&& || !` only on `bool`. `+` also concatenates two strings.
+- `==`/`!=` need both sides of the same type with an `Eq` instance (ADR-0034): the integer types, `bool`, `string`, `float`/`f32`
+  (IEEE) natively, and records, unions, `Option`, `Result`, arrays and classes (with `equals` or `implements Eq`) structurally; a type
+  with a function or `Map` component, or a class without an instance, is E0410. `< <= > >=` need an `Ord` instance: the integer types
+  and floats natively, and `bool`, `string` (byte-wise), records, unions, `Option`, `Result`, arrays and classes (with `compare`) by
+  derivation. `&& || !` only on `bool`. `+` also concatenates two strings.
 - Calls: `f(args)` for functions; `Name(args)` for variant construction; nullary variant is
   just `Name`.
 - `e?` requires `e: Result<T, E>` inside a function returning `Result<U, E>` (same `E`); the

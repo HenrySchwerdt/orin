@@ -34,8 +34,8 @@ disagrees with the implementation, this reference follows the implementation and
   verified against `orin2` when the chapter was written.
 - **Gaps.** A rule that has no test is not listed with an invented one; it goes in the chapter's section
   **Gaps: rules without a test**, together with behaviour that is stated in a guide but pinned by nothing.
-- **Pending features.** Generic methods and `void` as a type argument (ADR-0040) are marked *landing in PR (pending)*; the
-  reference describes the behaviour on `main` (E0460, `Do` flavours of generic functions) until that PR merges.
+- **Generic methods.** Generic methods and `void` as a type argument (ADR-0040) are implemented and described in chapter 3
+  (TYP-20, TYP-20a). The one rule to remember: an **interface** method may not be generic (E0460); class methods may.
 - **Checking.** `python3 tools/check_reference.py` verifies that every test path cited in `docs/reference/*.md` exists. It does
   not run the tests; the suites do that (`tools/run_tests.py`, `tools/ci_local.sh`).
 
@@ -43,11 +43,11 @@ disagrees with the implementation, this reference follows the implementation and
 
 Places where a guide, ADR or spec text disagrees with what the compiler does. The reference follows the compiler.
 
-1. **Equality and ordering.** `docs/bootstrap-subset.md` section 5 allows `==` only on `int`, `usize`, `bool`, `string` and `<`
-   only on `int`/`usize`. The compiler (ADR-0034) derives `Eq`/`Ord`/`Hash` structurally for all fixed-width integers, records,
+1. **Equality and ordering (resolved in the guide).** `docs/bootstrap-subset.md` now states the rule below; it once allowed `==` only on
+   `int`, `usize`, `bool`, `string` and `<` only on `int`/`usize`. The compiler (ADR-0034) derives `Eq`/`Ord`/`Hash` structurally for all fixed-width integers, records,
    unions, `Option`, `Result`, arrays and classes with the methods; types with a float component are excluded (E0475, and `==`
    on them is E0410). See chapter 3.
-2. **`Map` keys.** ADR-0018 limits keys to `int`, `usize`, `bool`, `string`; the compiler accepts any `Hash` key (E0475 otherwise).
+2. **`Map` keys (resolved in the guide).** ADR-0018 once limited keys to `int`, `usize`, `bool`, `string`; the compiler accepts any `Hash` key (E0475 otherwise), and ADR-0018 now says so.
 3. **Lexical list of the bootstrap subset** allows only `0x` hex and omits `&`, `...`, `==>` and `@` from the punctuation; the lexer
    also accepts `0X` and leading zeros in decimals. Chapter 1 lists the real set.
 4. **Annotations.** `docs/contracts.md` says any other `@Name` is E0408 and that user annotations are post-1.0. User-defined
@@ -60,10 +60,9 @@ Places where a guide, ADR or spec text disagrees with what the compiler does. Th
    `docs/bootstrap-subset.md` still describes E0408 as "feature not supported in Orin-B".
 8. **`tests/parse_edge`** names (`err0100_bad_float`, `err0200_fn_arrow_expr`) are historical; the files no longer produce
    those codes, and the corpus asserts nothing by name.
-9. **Generic methods.** `docs/concurrency.md` and `docs/std.md` explain several API shapes (free functions, `Do` flavours) by
-   E0460 (no generic methods). ADR-0040 changes this; pending, see above.
-10. **Entry point.** `docs/bootstrap-subset.md` line 51 says the entry file must contain `function main(): void`; the compiler also
-    accepts `main(host: Host): void`. A grant-typed parameter is E0472, any other parameter or result type is E0412.
+9. **Generic methods (resolved).** ADR-0040 is implemented; `docs/concurrency.md` and `docs/std.md` no longer explain API shapes by
+   E0460, which now rejects only generic interface methods.
+10. **Entry point (resolved).** The accepted `main` forms are stated once, in EXP-19; `docs/bootstrap-subset.md` points there.
 
 ## Maintenance
 
