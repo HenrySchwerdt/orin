@@ -1,0 +1,266 @@
+// Inputs for tools/test_verify_contracts.py: loop invariants on `for (const x of xs)` (ADR-0053 Addendum A).
+//   * the `@Invariant` before a `for .. of` loop may use the pseudo-variable `loopIndex`: the position in the array of
+//     the iteration the invariant is about (0 on entry, `xs.length` after the loop, `i + 1` after the iteration `i`);
+//   * inside the body the verifier knows `x == xs[i]` and `0 <= i < xs.length` for that position `i`;
+//   * a wrong invariant is never VERIFIED; a loop with `break` / `continue` gets no invariant (as for `while`).
+//   * the invariant is not a run-time check.
+
+// expect: count_pos loop-invariant VERIFIED
+// expect: count_pos loop-invariant VERIFIED
+// expect: count_pos ensures VERIFIED
+// expect: all_nonneg loop-invariant VERIFIED
+// expect: all_nonneg loop-invariant VERIFIED
+// expect: all_nonneg ensures VERIFIED
+// expect: last_of loop-invariant VERIFIED
+// expect: last_of loop-invariant VERIFIED
+// expect: last_of loop-invariant VERIFIED
+// expect: last_of loop-invariant VERIFIED
+// expect: last_of ensures VERIFIED
+// expect: last_of ensures VERIFIED
+// expect: is_sorted loop-invariant VERIFIED
+// expect: is_sorted loop-invariant VERIFIED
+// expect: is_sorted loop-invariant VERIFIED
+// expect: is_sorted loop-invariant VERIFIED
+// expect: is_sorted loop-invariant VERIFIED
+// expect: is_sorted loop-invariant VERIFIED
+// expect: is_sorted ensures VERIFIED
+// expect: is_sorted_wrong loop-invariant VERIFIED
+// expect: is_sorted_wrong loop-invariant VERIFIED
+// expect: is_sorted_wrong ensures REFUTED
+// expect: nested loop-invariant VERIFIED
+// expect: nested loop-invariant VERIFIED
+// expect: nested loop-invariant VERIFIED
+// expect: nested loop-invariant VERIFIED
+// expect: nested ensures VERIFIED
+// expect: wrong_entry loop-invariant REFUTED
+// expect: wrong_entry loop-invariant UNKNOWN
+// expect: wrong_entry ensures UNKNOWN
+// expect: wrong_step loop-invariant VERIFIED
+// expect: wrong_step loop-invariant UNKNOWN
+// expect: wrong_step ensures REFUTED
+// expect: wrong_claim loop-invariant VERIFIED
+// expect: wrong_claim loop-invariant VERIFIED
+// expect: wrong_claim ensures REFUTED
+// expect: wrong_exit loop-invariant VERIFIED
+// expect: wrong_exit loop-invariant UNKNOWN
+// expect: wrong_exit ensures REFUTED
+// expect: wrong_elem loop-invariant VERIFIED
+// expect: wrong_elem loop-invariant UNKNOWN
+// expect: wrong_elem ensures REFUTED
+// expect: with_break ensures UNKNOWN
+// expect: find_pos loop-invariant VERIFIED
+// expect: find_pos loop-invariant VERIFIED
+// expect: find_pos ensures VERIFIED
+// expect: find_pos ensures VERIFIED
+// expect: pos_wrong loop-invariant VERIFIED
+// expect: pos_wrong loop-invariant UNKNOWN
+// expect: pos_wrong ensures REFUTED
+// expect: main call-precondition VERIFIED
+// expect: main call-precondition VERIFIED
+
+import { range } from "std:seq";
+
+// The count never exceeds the number of iterations so far.
+@Ensures(result <= xs.length)
+function count_pos(xs: int[]): usize {
+  let n: usize = 0;
+  @Invariant(n <= loopIndex)
+  for (const x of xs) {
+    if (x > 0) {
+      n += 1;
+    }
+  }
+  return n;
+}
+
+// The invariant speaks about the prefix seen so far; the early `return false` uses the element fact.
+@Ensures(result == xs.every(x => x >= 0))
+function all_nonneg(xs: int[]): bool {
+  @Invariant(range(0, loopIndex).every(j => xs[j] >= 0))
+  for (const x of xs) {
+    if (x < 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// `last` follows the previous element.
+@Ensures(xs.length > 0 ==> result == xs[xs.length - 1])
+@Ensures(xs.length == 0 ==> result == 0)
+function last_of(xs: int[]): int {
+  let last = 0;
+  @Invariant(loopIndex == 0 ==> last == 0)
+  @Invariant(loopIndex > 0 ==> last == xs[loopIndex - 1])
+  for (const x of xs) {
+    last = x;
+  }
+  return last;
+}
+
+// The same sortedness check as `marksOrdered` of compiler/check.
+@Ensures(result == range(1, xs.length).every(i => xs[i - 1] <= xs[i]))
+function is_sorted(xs: int[]): bool {
+  let prev = 0;
+  let seen = false;
+  @Invariant(seen == (loopIndex > 0))
+  @Invariant(loopIndex > 0 ==> prev == xs[loopIndex - 1])
+  @Invariant(range(1, loopIndex).every(i => xs[i - 1] <= xs[i]))
+  for (const x of xs) {
+    if (seen && prev > x) {
+      return false;
+    }
+    prev = x;
+    seen = true;
+  }
+  return true;
+}
+
+// Wrong: `prev != 0` hides a descent from 0 (REFUTED with xs = [0, -1]).
+@Ensures(result == range(1, xs.length).every(i => xs[i - 1] <= xs[i]))
+function is_sorted_wrong(xs: int[]): bool {
+  let prev = 0;
+  @Invariant(loopIndex > 0 ==> prev == xs[loopIndex - 1])
+  for (const x of xs) {
+    if (prev > x && prev != 0) {
+      return false;
+    }
+    prev = x;
+  }
+  return true;
+}
+
+// Two nested loops: each invariant sees its own `loopIndex`.
+@Requires(xs.every(x => x >= 0) && ys.every(y => y >= 0))
+@Ensures(result >= 0)
+function nested(xs: int[], ys: int[]): int {
+  let t = 0;
+  @Invariant(t >= 0 && loopIndex <= xs.length)
+  for (const x of xs) {
+    @Invariant(t >= 0 && loopIndex <= ys.length)
+    for (const y of ys) {
+      t += x + y;
+    }
+  }
+  return t;
+}
+
+// Wrong: entry. `n == loopIndex + 1` does not hold at index 0.
+@Ensures(result <= xs.length)
+function wrong_entry(xs: int[]): usize {
+  let n: usize = 0;
+  @Invariant(n == loopIndex + 1)
+  for (const x of xs) {
+    n += 1;
+  }
+  return n;
+}
+
+// Wrong: not preserved. `n += 2` breaks `n <= loopIndex`.
+@Ensures(result <= xs.length)
+function wrong_step(xs: int[]): usize {
+  let n: usize = 0;
+  @Invariant(n <= loopIndex)
+  for (const x of xs) {
+    n += 2;
+  }
+  return n;
+}
+
+// Wrong: the claim does not follow (not every element is positive).
+@Ensures(result == xs.length)
+function wrong_claim(xs: int[]): usize {
+  let n: usize = 0;
+  @Invariant(n <= loopIndex)
+  for (const x of xs) {
+    if (x > 0) {
+      n += 1;
+    }
+  }
+  return n;
+}
+
+// Wrong: the position after the loop is `xs.length`, not less.
+@Requires(xs.length > 0)
+@Ensures(result == 0)
+function wrong_exit(xs: int[]): usize {
+  let n: usize = 0;
+  @Invariant(loopIndex < xs.length)
+  for (const x of xs) {
+    n += 1;
+  }
+  return n;
+}
+
+// Wrong: the body only knows the element at the position, not an arbitrary one.
+@Ensures(result >= 0)
+function wrong_elem(xs: int[]): int {
+  let t = 0;
+  @Invariant(t >= 0)
+  for (const x of xs) {
+    t += x;
+  }
+  return t;
+}
+
+// `break`: the invariant is not used (the loop's effect is not modelled); the claim stays unproved.
+@Ensures(result <= xs.length)
+function with_break(xs: int[]): usize {
+  let n: usize = 0;
+  @Invariant(n <= loopIndex)
+  for (const x of xs) {
+    if (x < 0) {
+      break;
+    }
+    n += 1;
+  }
+  return n;
+}
+
+// A counter the body increments once, as its last statement, is the position: the invariant may speak about `i` (so
+// sources that cannot use `loopIndex` yet still get the element facts).
+@Ensures(result.isSome() ==> result.unwrap() < xs.length && xs[result.unwrap()] == v)
+@Ensures(result.isNone() ==> xs.every(x => x != v))
+function find_pos(xs: int[], v: int): Option<usize> {
+  let i: usize = 0;
+  @Invariant(range(0, i).every(j => xs[j] != v))
+  for (const x of xs) {
+    if (x == v) {
+      return Some(i);
+    }
+    i += 1;
+  }
+  return None;
+}
+
+// Wrong: the counter is not the position (it only counts the positive elements): no hidden relation, so the claim
+// about `xs[i]` is not proved.
+@Ensures(result.isSome() ==> xs[result.unwrap()] > 0)
+function pos_wrong(xs: int[]): Option<usize> {
+  let i: usize = 0;
+  @Invariant(i <= xs.length)
+  for (const x of xs) {
+    if (x > 0) {
+      i += 1;
+    }
+  }
+  return xs.length > 0 ? Some(i) : None;
+}
+
+function main(): void {
+  const xs = [3, 1, 2];
+  count_pos(xs);
+  all_nonneg(xs);
+  last_of(xs);
+  is_sorted(xs);
+  is_sorted_wrong(xs);
+  nested(xs, xs);
+  wrong_entry(xs);
+  wrong_step(xs);
+  wrong_claim(xs);
+  wrong_exit(xs);
+  wrong_elem(xs);
+  with_break(xs);
+  find_pos(xs, 1);
+  pos_wrong(xs);
+}
