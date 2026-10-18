@@ -11,7 +11,7 @@ import {
   MType, MLocal, Operand, Instr, SwitchCase, Terminator, MBlock, MFunction, MProgram, isInlineFn,
   slotWords, RT_OPT_UNWRAP, RT_RES_UNWRAP, RT_RES_UNWRAP_ERR, RT_V_UNWRAP, RT_ASSERT_FACT, RT_ASSERT_ARRAY,
   RT_STRUCT_NEW, RT_ARRAY_NEW, RT_STR_APPEND, RT_STR_APPEND_SUB, RT_STR_APPEND_USIZE, RT_STR_APPEND_INT, RT_STR_PREPEND,
-  RT_ARRAY_EXTEND, RtWrap, rtSig, rtCold, l1Builtin, l1Task,
+  RT_ARRAY_EXTEND, RtWrap, rtSig, rtCold, l1Builtin, l1Task, RT_LAST, instrInRange,
 } from "../../mir";
 import { refMask, inoutArgOk, targetsBelow, linesOfBlocks } from "../c";
 import { u, isRefT, isUsizeT, isFloatT, isAggT, zeroOf, lty, attrTy, paramTy } from "./text";
@@ -330,6 +330,8 @@ function buildAgg(p: string, ty: string, ws: string[]): R {
 // The function being emitted is one of the program and of the symbol table; its parameters are declared locals.
 @Invariant(this.fi < this.prog.functions.length && this.syms.count() == this.prog.functions.length)
 @Invariant(this.f.paramCount <= this.f.locals.length)
+@Invariant(this.syms.rtSlots() == RT_LAST + 1)
+@Invariant(this.syms.vtables() == this.prog.vtables.length)
 export class LlvmFunctionEmitter {
   private syms: LlvmSymbols;
   private prog: MProgram;
@@ -340,6 +342,9 @@ export class LlvmFunctionEmitter {
   private facts: bool;
 
   // `facts`: the `--assert-facts` build, which checks every `IForward` against the slot it was forwarded from.
+  @Requires(fi < prog.functions.length && syms.count() == prog.functions.length)
+  @Requires(syms.vtables() == prog.vtables.length)
+  @Requires(prog.functions[fi].paramCount <= prog.functions[fi].locals.length)
   constructor(syms: LlvmSymbols, prog: MProgram, fi: usize, facts: bool) {
     this.syms = syms;
     this.prog = prog;
@@ -543,6 +548,7 @@ export class LlvmFunctionEmitter {
   }
 
   // An unwrap builtin: the Orin function of `$rt` (entry `k`) when the program has it, else the C runtime function `cfn`.
+  @Requires(k <= RT_LAST)
   private unwrapL1(p: string, k: usize, cfn: string, a0: string, rt: MType): R {
     const sym = this.syms.l1(k);
     return sym != "" ? unwrapR(p, sym, a0, rt, true) : unwrapR(p, cfn, a0, rt, false);
@@ -709,6 +715,7 @@ export class LlvmFunctionEmitter {
         : "";
   }
 
+  @Requires(d < this.f.locals.length)
   private binaryI(p: string, d: usize, op: BinOp, a: Operand, b: Operand): string {
     const t = this.opTy(a);
     if (isFloatT(t)) {
@@ -803,6 +810,7 @@ export class LlvmFunctionEmitter {
 
   // The call of the string / array function that the L1 entry `k` replaces, on the loaded values `vals`: the Orin function of `$rt`
   // (objects converted to address words and the result back) when the module has it, else the C runtime function. The result is a ptr.
+  @Requires(k <= RT_LAST)
   private rtCallL(p: string, k: usize, vals: string[]): R {
     const sym = this.syms.l1(k);
     const w = rtSig(k).unwrap();
@@ -1206,6 +1214,7 @@ export class LlvmFunctionEmitter {
 
   // ---------------------------------------------------------------- instructions
 
+  @Requires(d.isNone() || d.unwrap() < this.f.locals.length)
   private builtinInstr(p: string, d: Option<usize>, b: Builtin, args: Operand[]): string {
     const pre = this.loadsOf(p, args);
     const agg: Option<usize> = args.length > 0 ? this.aggLocal(args[0]) : None;
@@ -1235,6 +1244,7 @@ export class LlvmFunctionEmitter {
   }
 
   @Requires(f < this.prog.functions.length && inoutArgOk(this.prog, f, args))
+  @Requires(d.isNone() || d.unwrap() < this.f.locals.length)
   private callI(p: string, d: Option<usize>, f: usize, args: Operand[]): string {
     const pre = this.loadsOf(p, args);
     const callee = this.prog.functions[f];
@@ -1280,6 +1290,7 @@ export class LlvmFunctionEmitter {
   // Closure (docs/mir.md v1.3): struct { code pointer (scalar slot 0), environment (reference slot 1) }; the
   // environment is a struct of the captured values (the nullary singleton when nothing is captured).
   @Requires(f < this.prog.functions.length)
+  @Requires(d < this.f.locals.length)
   private closureI(p: string, d: usize, f: usize, caps: Operand[]): string {
     let s = this.loadsOf(p, caps);
     let env = p + "e";
@@ -1336,6 +1347,7 @@ export class LlvmFunctionEmitter {
   // Interface value (docs/mir.md v1.5, ADR-0019): struct { vtable pointer (scalar slot 0), boxed value
   // (reference slot 1) }; the vtable is the constant table `@orin_vtN`.
   @Requires(vt < this.syms.vtables())
+  @Requires(d < this.f.locals.length)
   private ifaceI(p: string, d: usize, vt: usize, v: Operand): string {
     let s = this.loadsOf(p, [v]);
     const n = p + "n";
@@ -1383,6 +1395,7 @@ export class LlvmFunctionEmitter {
         };
   }
 
+  @Requires(d < this.f.locals.length)
   private arrayNewI(p: string, d: usize, isRef: bool, es: Operand[]): string {
     let s = this.loadsOf(p, es);
     const n = p + "n";
@@ -1410,6 +1423,8 @@ export class LlvmFunctionEmitter {
   }
 
   // `x = f(x, os..)` for the string / array function of the L1 entry `k` (the first argument is the local `x`, which the call consumes).
+  @Requires(k <= RT_LAST)
+  @Requires(x < this.f.locals.length)
   private rtStmt(p: string, x: usize, k: usize, os: Operand[]): string {
     let s = "  " + p + "x = load ptr, ptr %l" + u(x) + "\n";
     let vals: string[] = [p + "x"];
@@ -1423,6 +1438,7 @@ export class LlvmFunctionEmitter {
     return s + r.text + this.st(x, r.val);
   }
 
+  @Requires(instrInRange(this.prog, this.f.locals.length, i))
   private instrI(p: string, i: Instr): string {
     return match (i) {
       ICopy(d, o) => this.ld(p, 0, o) + this.st(d, ov(p, 0, o)),
@@ -1514,6 +1530,7 @@ export class LlvmFunctionEmitter {
     };
   }
 
+  @Requires(d < this.f.locals.length)
   private moveI(p: string, d: usize, s: usize): string {
     return "  " + p + "r = load ptr, ptr %l" + u(s) + "\n" + this.st(d, p + "r");
   }
@@ -1748,6 +1765,7 @@ export class LlvmFunctionEmitter {
 // the module declares.
 @Requires(fi < prog.functions.length
     && syms.count() == prog.functions.length
+    && syms.vtables() == prog.vtables.length
     && trapsIndexed(prog, syms))
 @Ensures(result.startsWith("define internal ")
     && result.includes(" @" + syms.name(fi) + "(")
@@ -1760,6 +1778,7 @@ export function emitLlvmFunction(syms: LlvmSymbols, prog: MProgram, fi: usize): 
 // `emitLlvmFunction`, and with `facts` (`--assert-facts`) a call of `orin_assert_fact` after every `IForward`.
 @Requires(fi < prog.functions.length
     && syms.count() == prog.functions.length
+    && syms.vtables() == prog.vtables.length
     && trapsIndexed(prog, syms))
 @Ensures(result.startsWith("define internal ")
     && result.includes(" @" + syms.name(fi) + "(")

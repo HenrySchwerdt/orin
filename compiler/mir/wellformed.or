@@ -65,8 +65,51 @@ export function dstOf(ins: Instr): Option<usize> {
   };
 }
 
-// Every local an instruction defines or uses (destinations, source locals, local operands).
+// Every local an instruction defines or uses (destinations, source locals, local operands). The ensures lists the locals that are
+// fields of the instruction itself (not inside an operand).
 @Ensures(dstOf(i).isNone() || result.includes(dstOf(i).unwrap()))
+@Ensures(match (i) {
+  ICopy(d, _) => result.includes(d),
+  IMove(d, s) => result.includes(d) && result.includes(s),
+  IBorrow(d, s) => result.includes(d) && result.includes(s),
+  IDup(d, _) => result.includes(d),
+  IRelease(x) => result.includes(x),
+  IUnary(d, _, _) => result.includes(d),
+  IBinary(d, _, _, _) => result.includes(d),
+  ICall(d, _, _) => (d.isNone() || result.includes(d.unwrap())),
+  IBuiltin(d, _, _) => (d.isNone() || result.includes(d.unwrap())),
+  IStrAppend(x, _) => result.includes(x),
+  IStrPrepend(x, _) => result.includes(x),
+  IStrAppendNum(x, _, _) => result.includes(x),
+  IStrAppendSub(x, _, _, _) => result.includes(x),
+  IArrayExtend(x, _) => result.includes(x),
+  IStructNew(d, _, _) => result.includes(d),
+  INullary(d, _) => result.includes(d),
+  ITag(d, _) => result.includes(d),
+  IGetField(d, _, _) => result.includes(d),
+  ISetField(x, _, _) => result.includes(x),
+  IShapeCheck(x, _) => result.includes(x),
+  IGetFieldU(d, _, _) => result.includes(d),
+  ISetFieldU(x, _, _) => result.includes(x),
+  ITakeField(d, x, _) => result.includes(d) && result.includes(x),
+  IPutField(x, _, s) => result.includes(x) && result.includes(s),
+  IMakeUnique(x) => result.includes(x),
+  IArrayNew(d, _, _) => result.includes(d),
+  IArrayGet(d, _, _) => result.includes(d),
+  IArraySet(x, _, _) => result.includes(x),
+  IArrayGetU(d, _, _) => result.includes(d),
+  IArraySetU(x, _, _) => result.includes(x),
+  IArrayTake(d, x, _) => result.includes(d) && result.includes(x),
+  IArrayPut(x, _, s) => result.includes(x) && result.includes(s),
+  IArrayPush(x, _) => result.includes(x),
+  IArrayPop(d, x) => result.includes(d) && result.includes(x),
+  IForward(d, s, _, _) => result.includes(d) && result.includes(s),
+  IClosure(d, _, _) => result.includes(d),
+  ICallIndirect(d, _, _) => (d.isNone() || result.includes(d.unwrap())),
+  IIface(d, _, _) => result.includes(d),
+  ICallVirtual(d, _, _, _) => (d.isNone() || result.includes(d.unwrap())),
+  _ => true,
+})
 export function instrLocals(i: Instr): usize[] {
   return match (i) {
     ICopy(d, o) => [d].concat(operandLocals(o)),
@@ -238,6 +281,12 @@ function strBelow(o: Operand, n: usize): bool {
 }
 
 // The function (`ICall`, `IClosure`) or vtable (`IIface`) an instruction names is in range.
+@Ensures(result ==> match (i) {
+  ICall(_, g, _) => g < nFns,
+  IClosure(_, g, _) => g < nFns,
+  IIface(_, vt, _) => vt < nVts,
+  _ => true,
+})
 function calleeBelow(i: Instr, nFns: usize, nVts: usize): bool {
   return match (i) {
     ICall(_, g, _) => g < nFns,
@@ -249,6 +298,7 @@ function calleeBelow(i: Instr, nFns: usize, nVts: usize): bool {
 
 // Instruction `i` of a function with `n` locals in program `p` mentions only locals, string literals, functions and
 // vtables that exist.
+@Ensures(result ==> instrLocals(i).every(l => l < n) && calleeBelow(i, p.functions.length, p.vtables.length))
 export function instrInRange(p: MProgram, n: usize, i: Instr): bool {
   return instrLocals(i).every(l => l < n)
       && instrOperands(i).every(o => strBelow(o, p.strings.length))
@@ -256,6 +306,7 @@ export function instrInRange(p: MProgram, n: usize, i: Instr): bool {
 }
 
 // Terminator `t` of `f` in program `p` continues only in blocks of `f` and reads only locals and strings that exist.
+@Ensures(result ==> successors(t).every(s => s < f.blocks.length) && termLocals(t).every(l => l < f.locals.length))
 export function termInRange(p: MProgram, f: MFunction, t: Terminator): bool {
   return successors(t).every(s => s < f.blocks.length)
       && termLocals(t).every(l => l < f.locals.length)
@@ -347,6 +398,7 @@ export function isWellFormedFunction(p: MProgram, f: MFunction): bool {
 
 // Every function of `p` is well-formed, `main` is one of them and every vtable entry is a function.
 @Ensures(result ==> p.main < p.functions.length)
+@Ensures(result ==> p.functions.every(f => isWellFormedFunction(p, f)))
 export function isWellFormedProgram(p: MProgram): bool {
   return p.main < p.functions.length
       && p.vtables.every(v => v.funcs.every(g => g < p.functions.length))
