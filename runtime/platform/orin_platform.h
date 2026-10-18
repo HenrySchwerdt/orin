@@ -373,6 +373,40 @@ int orin_platform_file_exists(const char *path, size_t plen);
 int orin_platform_dir_list(const char *path, size_t plen, void (*each)(void *ctx, const char *name, size_t len, int is_dir),
                            void *ctx);
 
+/*@ requires (flen == 0 || from[0..flen-1] readable) && (tlen == 0 || to[0..tlen-1] readable);
+    ensures either path contains a NUL byte ==> \result == ORIN_PLATFORM_EINVAL and the file system is untouched;
+    ensures \result == 0 ==> rename(2): `to` now names what `from` named and `from` no longer exists; an existing `to` (a file,
+            or an empty directory when `from` is a directory) was replaced atomically, no reader sees neither or both;
+            symbolic links are not followed (a link is renamed, not its target);
+    ensures \result != 0 ==> errno-style code (ENOENT, EACCES, EISDIR, ENOTDIR, ENOTEMPTY, EXDEV, ...), nothing changed;
+    assigns \fs; */
+int orin_platform_file_rename(const char *from, size_t flen, const char *to, size_t tlen);
+
+/*@ requires plen == 0 || path[0..plen-1] readable;
+    ensures path contains a NUL byte ==> \result == ORIN_PLATFORM_EINVAL and the file system is untouched;
+    ensures \result == 0 ==> unlink(2): the name `path` (a file or a symbolic link, not its target) was removed;
+    ensures \result != 0 ==> errno-style code (ENOENT, EACCES, EPERM or EISDIR for a directory, ...), nothing changed;
+    assigns \fs; */
+int orin_platform_file_remove(const char *path, size_t plen);
+
+/*@ requires plen == 0 || path[0..plen-1] readable;
+    ensures path contains a NUL byte ==> \result == ORIN_PLATFORM_EINVAL and the file system is untouched;
+    ensures \result == 0 ==> rmdir(2): the empty directory `path` was removed;
+    ensures \result != 0 ==> errno-style code (ENOENT, ENOTDIR, ENOTEMPTY, EACCES, EBUSY, ...), nothing changed;
+    assigns \fs; */
+int orin_platform_dir_remove(const char *path, size_t plen);
+
+/*@ requires (plen == 0 || path[0..plen-1] readable) && (dlen == 0 || data[0..dlen-1] readable);
+    ensures path contains a NUL byte ==> \result == ORIN_PLATFORM_EINVAL and the file system is untouched;
+    ensures \result == 0 ==> a temporary file "<path>.orin-tmp-<pid>-<n>" in the directory of `path` was created exclusively,
+            written with exactly data[0..dlen-1], fsync'ed, closed and renamed over `path`, then the directory was fsync'ed
+            (best effort); `path` holds either its old contents or all of `data`, never a mix, even across a crash;
+            a symbolic link at `path` is replaced, not followed; the new file has mode 0666 & ~umask;
+    ensures \result != 0 ==> errno-style code (ENOENT for a missing directory, EACCES, ENOSPC, ...); `path` is untouched and the
+            temporary file was removed (a crash can leave it behind);
+    assigns \fs; */
+int orin_platform_file_write_atomic(const char *path, size_t plen, const char *data, size_t dlen);
+
 /* ---------------------------------------------------------------- file streams (ADR-0025)
  * An open file for incremental reading and writing (the substrate of the resource handle `File` of
  * std:fs). `orin_platform_stream` is an opaque OS handle owned by the caller between open and close

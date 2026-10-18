@@ -1082,6 +1082,92 @@ OrinObj *orin_fs_list_dir(int64_t gh, OrinObj *path) {
     return orin_variant1(0, 1, ORIN_SLOT(arr));
 }
 
+/* The entry variant of fs_check for the operations that act on a NAME (rename, remove, atomic replace): the final component is
+ * NOT resolved, so a symbolic link is renamed / removed / replaced itself and never its target. The directory part is
+ * resolved and must lie in the scope, and so must the entry (checked lexically, `base` has no '/' or dots after
+ * normalisation). Always a write (a read-only grant is refused). Same result convention as fs_check. */
+static int fs_check_entry(int64_t gh, OrinObj *path, char *eff, int *scoped) {
+    Grant *g = grant_ref(gh, GK_FS);
+    *scoped = 0;
+    if (g->denied) return DEN_POLICY;
+    if (g->readonly) return DEN_RDONLY;
+    if (!g->scope) return 0;
+    if (g->empty) return DEN_SCOPE;
+    char abs[CAP_PATH + 1], dir[CAP_PATH + 1];
+    int64_t al = orin_platform_path_absolute(orin_str_data(path), (size_t)orin_str_len(path), abs, sizeof abs);
+    if (al <= 0) return DEN_RESOLVE;
+    if (!orin_platform_path_within(g->scope, g->slen, abs, (size_t)al)) return DEN_SCOPE;
+    size_t cut = (size_t)al;
+    while (cut > 0 && abs[cut - 1] != '/') cut--;
+    if (cut == 0 || cut == (size_t)al) return DEN_RESOLVE; /* no name: the root */
+    int64_t dl = orin_platform_path_real(abs, cut > 1 ? cut - 1 : 1, dir, CAP_PATH + 1);
+    if (dl <= 0) return DEN_RESOLVE;
+    size_t bl = (size_t)al - cut, at = dl == 1 ? 0 : (size_t)dl;
+    if (at + 1 + bl > CAP_PATH) return DEN_RESOLVE;
+    orin_platform_mem_copy(eff, dir, at);
+    eff[at] = '/';
+    orin_platform_mem_copy(eff + at + 1, abs + cut, bl);
+    eff[at + 1 + bl] = 0;
+    if (!orin_platform_path_within(g->rscope, g->rlen, eff, at + 1 + bl)) return DEN_SCOPE;
+    *scoped = 1;
+    return 0;
+}
+
+/* rename(from, to): Result<void, string>. POSIX rename: an existing `to` is replaced atomically. Both names are checked as
+ * writes by fs_check_entry. Err text: "cannot rename '<from>': <reason>" -- always the `from` path, also when the refusal is
+ * about `to`. */
+OrinObj *orin_fs_rename(int64_t gh, OrinObj *from, OrinObj *to) {
+    OrinString *f = (OrinString *)from, *t = (OrinString *)to;
+    char ef[CAP_PATH + 1], et[CAP_PATH + 1];
+    int sf, st = 0, den = fs_check_entry(gh, from, ef, &sf);
+    if (!den) den = fs_check_entry(gh, to, et, &st);
+    if (den) return err_msg("cannot rename", from, den_text(den));
+    int rc = orin_platform_file_rename(sf ? ef : f->data, sf ? strlen_(ef) : f->len, st ? et : t->data,
+                                       st ? strlen_(et) : t->len);
+    if (rc == ORIN_PLATFORM_ENOMEM) orin_trap("out of memory");
+    if (rc) return err_result("cannot rename", from, rc);
+    return orin_ok_void();
+}
+
+/* removeFile(path): unlink of a file or symbolic link (the link, not its target); a directory is an Err (EISDIR / EPERM).
+ * removeDir(path): rmdir of an EMPTY directory (ENOTEMPTY otherwise). Err text: "cannot remove '<path>': <reason>". */
+OrinObj *orin_fs_remove_file(int64_t gh, OrinObj *path) {
+    OrinString *p = (OrinString *)path;
+    char eff[CAP_PATH + 1];
+    int scoped, den = fs_check_entry(gh, path, eff, &scoped);
+    if (den) return err_msg("cannot remove", path, den_text(den));
+    int rc = scoped ? orin_platform_file_remove(eff, strlen_(eff)) : orin_platform_file_remove(p->data, p->len);
+    if (rc == ORIN_PLATFORM_ENOMEM) orin_trap("out of memory");
+    if (rc) return err_result("cannot remove", path, rc);
+    return orin_ok_void();
+}
+
+OrinObj *orin_fs_remove_dir(int64_t gh, OrinObj *path) {
+    OrinString *p = (OrinString *)path;
+    char eff[CAP_PATH + 1];
+    int scoped, den = fs_check_entry(gh, path, eff, &scoped);
+    if (den) return err_msg("cannot remove", path, den_text(den));
+    int rc = scoped ? orin_platform_dir_remove(eff, strlen_(eff)) : orin_platform_dir_remove(p->data, p->len);
+    if (rc == ORIN_PLATFORM_ENOMEM) orin_trap("out of memory");
+    if (rc) return err_result("cannot remove", path, rc);
+    return orin_ok_void();
+}
+
+/* writeFileAtomic(path, data): the data is written to a temporary file next to `path`, fsync'ed and renamed over it, so a
+ * reader (or a crash) sees the old contents or all the new ones. Unlike writeFile, a symbolic link at `path` is replaced, not
+ * followed. Err text: "cannot write '<path>': <reason>"; `path` is untouched on Err. */
+OrinObj *orin_fs_write_file_atomic(int64_t gh, OrinObj *path, OrinObj *data) {
+    OrinString *p = (OrinString *)path, *d = (OrinString *)data;
+    char eff[CAP_PATH + 1];
+    int scoped, den = fs_check_entry(gh, path, eff, &scoped);
+    if (den) return err_msg("cannot write", path, den_text(den));
+    int rc = scoped ? orin_platform_file_write_atomic(eff, strlen_(eff), d->data, d->len)
+                    : orin_platform_file_write_atomic(p->data, p->len, d->data, d->len);
+    if (rc == ORIN_PLATFORM_ENOMEM) orin_trap("out of memory");
+    if (rc) return err_result("cannot write", path, rc);
+    return orin_ok_void();
+}
+
 /* ---------------------------------------------------------------- file resources (ADR-0025) */
 
 enum { FILE_SLOTS = 256 };

@@ -221,6 +221,13 @@ static void t_stale(void) {
     (void)orin_fs_exists(g, S("/"));
 }
 static void t_wrong_kind(void) { (void)orin_process_args(g_fs); }
+static void t_mut_forged(void) { (void)orin_fs_rename(0x12345, S("/a"), S("/b")); }
+static void t_mut_stale(void) {
+    int64_t g = orin_cap_acquire(g_host, 1);
+    orin_cap_revoke(g);
+    (void)orin_fs_remove_file(g, S("/a"));
+}
+static void t_mut_wrong_kind(void) { (void)orin_fs_write_file_atomic(orin_cap_acquire(g_host, 2), S("/a"), S("x")); }
 static void t_double_revoke(void) {
     int64_t g = orin_cap_acquire(g_host, 4);
     orin_cap_revoke(g);
@@ -503,6 +510,96 @@ static void test_net_handles(void) {
     while (nkeep) orin_release(keep[--nkeep]);
 }
 
+/* ---- rename / remove / atomic write through the grant layer (C4 primitives) ---- */
+static int read_back(const char *path, char *out, size_t cap) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    size_t n = fread(out, 1, cap, f);
+    fclose(f);
+    return (int)n;
+}
+static int exists_(const char *path) { return access(path, F_OK) == 0; }
+static int is_err(OrinObj *r, const char *msg) { return orin_tag(r) == 1 && streq(ORIN_REF(orin_res_unwrap_err(r)), msg); }
+#define R(op, ...) K(orin_fs_##op(__VA_ARGS__))
+static void test_fs_mutation(void) {
+    char buf[64];
+    unsetenv("ORIN_DENY");
+    int64_t host = orin_cap_host_root(), fs = orin_cap_acquire(host, 1);
+    CHECK(system("rm -rf /tmp/orin_rt_mut && mkdir -p /tmp/orin_rt_mut/in/sub /tmp/orin_rt_mut/out && "
+                 "echo secret > /tmp/orin_rt_mut/out/s.txt && echo hi > /tmp/orin_rt_mut/in/a.txt && "
+                 "ln -s ../out /tmp/orin_rt_mut/in/esc && ln -s a.txt /tmp/orin_rt_mut/in/lnk") == 0);
+    int64_t in = orin_cap_narrow(fs, 0, S("/tmp/orin_rt_mut/in"));
+    /* ungranted-scope (full) grant: rename, remove, atomic write */
+    CHECK(orin_tag(R(write_file_atomic, fs, S("/tmp/orin_rt_mut/f1"), S("v1"))) == 0);
+    CHECK(read_back("/tmp/orin_rt_mut/f1", buf, sizeof buf) == 2 && memcmp(buf, "v1", 2) == 0);
+    CHECK(orin_tag(R(write_file_atomic, fs, S("/tmp/orin_rt_mut/f1"), S("v22"))) == 0);
+    CHECK(read_back("/tmp/orin_rt_mut/f1", buf, sizeof buf) == 3);
+    CHECK(orin_tag(R(rename, fs, S("/tmp/orin_rt_mut/f1"), S("/tmp/orin_rt_mut/f2"))) == 0);
+    CHECK(!exists_("/tmp/orin_rt_mut/f1") && exists_("/tmp/orin_rt_mut/f2"));
+    CHECK(is_err(R(rename, fs, S("/tmp/orin_rt_mut/f1"), S("/tmp/orin_rt_mut/f3")),
+                 "cannot rename '/tmp/orin_rt_mut/f1': No such file or directory"));
+    CHECK(orin_tag(R(remove_file, fs, S("/tmp/orin_rt_mut/f2"))) == 0 && !exists_("/tmp/orin_rt_mut/f2"));
+    CHECK(is_err(R(remove_file, fs, S("/tmp/orin_rt_mut/f2")), "cannot remove '/tmp/orin_rt_mut/f2': No such file or directory"));
+    CHECK(orin_tag(R(remove_file, fs, S("/tmp/orin_rt_mut/in/sub"))) == 1); /* a directory is not a file */
+    CHECK(is_err(R(remove_dir, fs, S("/tmp/orin_rt_mut/in")), "cannot remove '/tmp/orin_rt_mut/in': Directory not empty"));
+    CHECK(orin_tag(R(remove_dir, fs, S("/tmp/orin_rt_mut/in/sub"))) == 0 && !exists_("/tmp/orin_rt_mut/in/sub"));
+    CHECK(orin_tag(R(remove_dir, fs, S("/tmp/orin_rt_mut/in/a.txt"))) == 1);
+    CHECK(is_err(R(write_file_atomic, fs, S("/tmp/orin_rt_mut/nodir/x"), S("z")),
+                 "cannot write '/tmp/orin_rt_mut/nodir/x': No such file or directory"));
+    /* scoped grant: inside works, outside / traversal / links out are refused with the usual texts */
+    CHECK(orin_tag(R(write_file_atomic, in, S("/tmp/orin_rt_mut/in/new.txt"), S("n"))) == 0);
+    CHECK(orin_tag(R(rename, in, S("/tmp/orin_rt_mut/in/new.txt"), S("/tmp/orin_rt_mut/in/new2.txt"))) == 0);
+    CHECK(exists_("/tmp/orin_rt_mut/in/new2.txt") && !exists_("/tmp/orin_rt_mut/in/new.txt"));
+    CHECK(is_err(R(rename, in, S("/tmp/orin_rt_mut/in/new2.txt"), S("/tmp/orin_rt_mut/out/stolen.txt")),
+                 "cannot rename '/tmp/orin_rt_mut/in/new2.txt': outside the granted file scope"));
+    CHECK(is_err(R(rename, in, S("/tmp/orin_rt_mut/out/s.txt"), S("/tmp/orin_rt_mut/in/s.txt")),
+                 "cannot rename '/tmp/orin_rt_mut/out/s.txt': outside the granted file scope"));
+    CHECK(orin_tag(R(rename, in, S("/tmp/orin_rt_mut/in/new2.txt"), S("/tmp/orin_rt_mut/in/esc/e.txt"))) == 1); /* through a link out */
+    CHECK(!exists_("/tmp/orin_rt_mut/out/e.txt") && exists_("/tmp/orin_rt_mut/in/new2.txt"));
+    CHECK(orin_tag(R(rename, in, S("/tmp/orin_rt_mut/in/../out/s.txt"), S("/tmp/orin_rt_mut/in/x"))) == 1);
+    CHECK(orin_tag(R(remove_file, in, S("/tmp/orin_rt_mut/out/s.txt"))) == 1 && exists_("/tmp/orin_rt_mut/out/s.txt"));
+    CHECK(orin_tag(R(remove_file, in, S("/tmp/orin_rt_mut/in/esc/s.txt"))) == 1 && exists_("/tmp/orin_rt_mut/out/s.txt"));
+    CHECK(orin_tag(R(write_file_atomic, in, S("/tmp/orin_rt_mut/in/esc/n.txt"), S("x"))) == 1 && !exists_("/tmp/orin_rt_mut/out/n.txt"));
+    CHECK(orin_tag(R(remove_dir, in, S("/tmp/orin_rt_mut/in"))) == 1); /* the scope root itself lies outside via its parent */
+    CHECK(orin_tag(R(remove_dir, in, S("/"))) == 1 && orin_tag(R(remove_file, in, S("/"))) == 1);
+    /* a link is removed / replaced itself, never its target (also a link that leaves the scope) */
+    CHECK(orin_tag(R(remove_file, in, S("/tmp/orin_rt_mut/in/lnk"))) == 0 && !exists_("/tmp/orin_rt_mut/in/lnk") && exists_("/tmp/orin_rt_mut/in/a.txt"));
+    CHECK(orin_tag(R(remove_file, in, S("/tmp/orin_rt_mut/in/esc"))) == 0 && !exists_("/tmp/orin_rt_mut/in/esc") && exists_("/tmp/orin_rt_mut/out/s.txt"));
+    CHECK(system("ln -s ../out/s.txt /tmp/orin_rt_mut/in/out_link") == 0);
+    CHECK(orin_tag(R(write_file_atomic, in, S("/tmp/orin_rt_mut/in/out_link"), S("mine"))) == 0);
+    CHECK(read_back("/tmp/orin_rt_mut/out/s.txt", buf, sizeof buf) == 7 && memcmp(buf, "secret\n", 7) == 0);
+    CHECK(read_back("/tmp/orin_rt_mut/in/out_link", buf, sizeof buf) == 4 && memcmp(buf, "mine", 4) == 0);
+    /* dot segments are normalised before the check */
+    CHECK(orin_tag(R(write_file_atomic, in, S("/tmp/orin_rt_mut/in/../in/dot.txt"), S("d"))) == 0 && exists_("/tmp/orin_rt_mut/in/dot.txt"));
+    /* read-only grant refuses all of them */
+    int64_t ro = orin_cap_narrow(in, 1, S(""));
+    CHECK(is_err(R(rename, ro, S("/tmp/orin_rt_mut/in/a.txt"), S("/tmp/orin_rt_mut/in/b.txt")), "cannot rename '/tmp/orin_rt_mut/in/a.txt': the file grant is read-only"));
+    CHECK(is_err(R(remove_file, ro, S("/tmp/orin_rt_mut/in/a.txt")), "cannot remove '/tmp/orin_rt_mut/in/a.txt': the file grant is read-only"));
+    CHECK(is_err(R(remove_dir, ro, S("/tmp/orin_rt_mut/in/a")), "cannot remove '/tmp/orin_rt_mut/in/a': the file grant is read-only"));
+    CHECK(is_err(R(write_file_atomic, ro, S("/tmp/orin_rt_mut/in/a.txt"), S("x")), "cannot write '/tmp/orin_rt_mut/in/a.txt': the file grant is read-only"));
+    CHECK(exists_("/tmp/orin_rt_mut/in/a.txt") && !exists_("/tmp/orin_rt_mut/in/b.txt"));
+    /* a disjoint grant reaches nothing */
+    int64_t disjoint = orin_cap_narrow(in, 0, S("/tmp/orin_rt_mut/out"));
+    CHECK(orin_tag(R(remove_file, disjoint, S("/tmp/orin_rt_mut/out/s.txt"))) == 1 && exists_("/tmp/orin_rt_mut/out/s.txt"));
+    /* forged / stale / wrong-family grants trap */
+    CHECK(trap_code(t_mut_forged) == 101 && trap_code(t_mut_stale) == 101 && trap_code(t_mut_wrong_kind) == 101);
+    /* the host policy */
+    setenv("ORIN_DENY", "fs", 1);
+    int64_t dhost = orin_cap_host_root(), denied = orin_cap_acquire(dhost, 1);
+    CHECK(is_err(R(rename, denied, S("/tmp/orin_rt_mut/a"), S("/tmp/orin_rt_mut/b")), "cannot rename '/tmp/orin_rt_mut/a': denied by the host policy (ORIN_DENY)"));
+    CHECK(is_err(R(remove_file, denied, S("/x")), "cannot remove '/x': denied by the host policy (ORIN_DENY)"));
+    CHECK(is_err(R(remove_dir, denied, S("/x")), "cannot remove '/x': denied by the host policy (ORIN_DENY)"));
+    CHECK(is_err(R(write_file_atomic, denied, S("/x"), S("")), "cannot write '/x': denied by the host policy (ORIN_DENY)"));
+    orin_cap_revoke(denied); orin_cap_revoke(dhost);
+    unsetenv("ORIN_DENY");
+    /* nothing is left behind in the directory by any of the above */
+    CHECK(system("! ls /tmp/orin_rt_mut /tmp/orin_rt_mut/in | grep -q orin-tmp") == 0);
+    orin_cap_revoke(disjoint); orin_cap_revoke(ro); orin_cap_revoke(in); orin_cap_revoke(fs); orin_cap_revoke(host);
+    CHECK(system("rm -rf /tmp/orin_rt_mut") == 0);
+    while (nkeep) orin_release(keep[--nkeep]);
+}
+#undef R
+
 #undef S
 #undef orin_fs_read_file
 #undef orin_fs_write_file
@@ -634,6 +731,7 @@ int main(int argc, char **argv) {
     test_bulk();
     test_list_dir();
     test_grants();
+    test_fs_mutation();
     test_net_handles();
     if (failures) return 1;
     printf("ok\n");

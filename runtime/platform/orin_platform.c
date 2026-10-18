@@ -353,6 +353,89 @@ int orin_platform_dir_list(const char *path, size_t plen, void (*each)(void *ctx
     return err;
 }
 
+int orin_platform_file_rename(const char *from, size_t flen, const char *to, size_t tlen) {
+    int err = 0;
+    char *a = path_copy(from, flen, &err);
+    if (!a) return err;
+    char *b = path_copy(to, tlen, &err);
+    if (!b) {
+        orin_platform_free(a);
+        return err;
+    }
+    errno = 0;
+    int r = rename(a, b);
+    err = r ? (errno ? errno : EIO) : 0;
+    orin_platform_free(a);
+    orin_platform_free(b);
+    return err;
+}
+
+int orin_platform_file_remove(const char *path, size_t plen) {
+    int err = 0;
+    char *p = path_copy(path, plen, &err);
+    if (!p) return err;
+    errno = 0;
+    err = unlink(p) ? (errno ? errno : EIO) : 0;
+    orin_platform_free(p);
+    return err;
+}
+
+int orin_platform_dir_remove(const char *path, size_t plen) {
+    int err = 0;
+    char *p = path_copy(path, plen, &err);
+    if (!p) return err;
+    errno = 0;
+    err = rmdir(p) ? (errno ? errno : EIO) : 0;
+    orin_platform_free(p);
+    return err;
+}
+
+/* Atomic replace: the data goes to "<path>.orin-tmp-<pid>-<n>" (created exclusively in the target's directory, so the rename
+ * cannot cross a file system), is fsync'ed, and is renamed over the target; the directory is fsync'ed best effort. */
+int orin_platform_file_write_atomic(const char *path, size_t plen, const char *data, size_t dlen) {
+    static unsigned long counter;
+    int err = 0;
+    char *p = path_copy(path, plen, &err);
+    if (!p) return err;
+    char *t = (char *)orin_platform_alloc(plen + 48);
+    if (!t) {
+        orin_platform_free(p);
+        return ORIN_PLATFORM_ENOMEM;
+    }
+    int fd = -1;
+    for (int attempt = 0; attempt < 100 && fd < 0; attempt++) {
+        snprintf(t, plen + 48, "%s.orin-tmp-%ld-%lu", p, (long)getpid(), __atomic_fetch_add(&counter, 1, __ATOMIC_RELAXED));
+        errno = 0;
+        fd = open(t, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0666);
+        if (fd < 0 && errno != EEXIST) break;
+    }
+    if (fd < 0) err = errno ? errno : EIO;
+    for (size_t off = 0; fd >= 0 && !err && off < dlen;) {
+        ssize_t k = write(fd, data + off, dlen - off);
+        if (k > 0) off += (size_t)k;
+        else if (k < 0 && errno != EINTR) err = errno;
+        else if (k == 0) err = EIO;
+    }
+    if (fd >= 0 && !err && fsync(fd)) err = errno ? errno : EIO;
+    if (fd >= 0 && close(fd) && !err) err = errno ? errno : EIO;
+    if (fd >= 0 && !err && rename(t, p)) err = errno ? errno : EIO;
+    if (fd >= 0 && err) unlink(t);
+    if (!err) {
+        size_t cut = plen;
+        while (cut > 0 && p[cut - 1] != '/') cut--;
+        if (cut > 1) cut--; /* the directory without its trailing slash; "/" stays */
+        if (cut > 0) p[cut] = 0;
+        int dfd = open(cut > 0 ? p : ".", O_RDONLY | O_CLOEXEC);
+        if (dfd >= 0) {
+            (void)fsync(dfd);
+            (void)close(dfd);
+        }
+    }
+    orin_platform_free(t);
+    orin_platform_free(p);
+    return err;
+}
+
 /* ---------------------------------------------------------------- file streams */
 
 struct orin_platform_stream {

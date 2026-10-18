@@ -587,6 +587,10 @@ OrinObj *orin_fs_read_file(int64_t fs, OrinObj *path);                 /* Result
 OrinObj *orin_fs_write_file(int64_t fs, OrinObj *path, OrinObj *data); /* Result<void,string> */
 int64_t orin_fs_exists(int64_t fs, OrinObj *path);  /* 1 present, 0 absent, -100001..-100004 the grant refused the query */
 OrinObj *orin_fs_list_dir(int64_t fs, OrinObj *path); /* Result<string[],string> */
+OrinObj *orin_fs_rename(int64_t fs, OrinObj *from, OrinObj *to);  /* Result<void,string>; replaces `to` atomically */
+OrinObj *orin_fs_remove_file(int64_t fs, OrinObj *path);        /* Result<void,string>; unlink (a link itself, never a directory) */
+OrinObj *orin_fs_remove_dir(int64_t fs, OrinObj *path);         /* Result<void,string>; rmdir (empty directories only) */
+OrinObj *orin_fs_write_file_atomic(int64_t fs, OrinObj *path, OrinObj *data); /* Result<void,string>; temp file + fsync + rename */
 OrinObj *orin_process_args(int64_t proc); /* new string[] (without program name) */
 
 /* ---------------------------------------------------------------- capability grants (ADR-0021 Stage A, ADR-0027)
