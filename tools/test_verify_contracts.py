@@ -48,7 +48,7 @@ def check(cond, what):
         print("FAIL " + what)
 
 
-def run(orinc, *args, case):
+def run(orinc, *args, case, env=None):
     """`orin verify --contracts ARGS` with the working directory build/verify_contracts/CASE: the verifier writes its
     solver queries to build/contracts-vc/ under the working directory, so cases running at the same time need their own.
     Paths in ARGS are relative to ROOT."""
@@ -56,7 +56,7 @@ def run(orinc, *args, case):
     os.makedirs(cwd, exist_ok=True)
     args = [os.path.join(ROOT, a) if a.endswith(".or") else a for a in args]
     return subprocess.run([orinc, "verify", "--contracts"] + args, cwd=cwd, stdout=subprocess.PIPE,
-                          stderr=subprocess.PIPE, timeout=600)
+                          stderr=subprocess.PIPE, timeout=600, env=dict(os.environ, **env) if env else None)
 
 
 def check_file(orinc, path):
@@ -179,6 +179,68 @@ def check_extras(orinc):
     for bad in (["--timeout-ms", "0"], ["--timeout-ms", "x"], ["--retry-ms"], ["--rlimit", "-1"]):
         r = run(orinc, *bad, "tests/contracts/verify_basic.or", case="_extras")
         check(r.returncode == 2 and b"error: " + bad[0].encode() in r.stderr, "bad %s is a usage error" % bad)
+    out += check_cache(orinc)
+    return out
+
+
+def check_cache(orinc):
+    """The persistent answer cache (`--cache-dir`, `--cache-unknown`), `--solver-stats` and the thread count (docs/contracts.md, performance)."""
+    out = []
+    check = lambda cond, what: out.append((bool(cond), what))  # noqa: E731
+    src = "tests/contracts/verify_data.or"  # sat (with models) and unsat answers
+
+    def key(r):
+        return sorted((x["function"], x["kind"], x["line"], x["clause"], x["status"], x["reason"], tuple(x["counterexample"])) for x in json.loads(r.stdout.decode())["results"])
+
+    def stat(r):
+        m = re.search(rb"solver: (\d+) queries solved \((\d+) from the cache, (\d+) by the solver\)", r.stderr)
+        return tuple(int(v) for v in m.groups()) if m else None
+
+    work = os.path.join(ROOT, "build", "verify_contracts", "_cache")
+    shutil.rmtree(work, ignore_errors=True)
+    cache = os.path.join(work, "answers")
+    plain = run(orinc, "--format=json", src, case="_cache")
+    # a cold cache solves everything and stores it; a warm one answers every query and changes nothing, on one thread and on four
+    cold = run(orinc, "--format=json", "--solver-stats", "--cache-dir", cache, src, case="_cache", env={"ORIN_THREADS": "4"})
+    check(key(cold) == key(plain), "cache: a cold cache changes a result")
+    n, hits, ran = stat(cold) or (0, -1, -1)
+    check(n > 0 and hits == 0 and ran == n, "cache: cold run statistics %r" % (stat(cold),))
+    check(len(os.listdir(cache)) > 0 and not any(f.startswith(".tmp") for f in os.listdir(cache)), "cache: entries stored")
+    for threads in ("1", "4"):
+        warm = run(orinc, "--format=json", "--solver-stats", "--cache-dir", cache, src, case="_cache", env={"ORIN_THREADS": threads})
+        check(key(warm) == key(plain), "cache: a warm cache (ORIN_THREADS=%s) changes a result (counterexamples included)" % threads)
+        w = stat(warm) or (0, 0, -1)
+        check(w[0] > 0 and w[2] == 0 and w[1] == w[0], "cache: warm run (ORIN_THREADS=%s) statistics %r" % (threads, stat(warm)))
+    # the limits are part of the key
+    other = run(orinc, "--format=json", "--solver-stats", "--cache-dir", cache, "--timeout-ms", "3999", src, case="_cache")
+    check(key(other) == key(plain) and (stat(other) or (0, 1, 0))[1] == 0, "cache: another time limit must not hit")
+    # a solver that only says `unknown`: not stored without --cache-unknown (it depends on the machine), stored with it
+    fake = os.path.join(work, "fake_z3.sh")
+    os.makedirs(work, exist_ok=True)
+    with open(fake, "w") as f:
+        f.write('#!/bin/sh\ncase "$1" in --version) echo "Z3 fake 1.0"; exit 0;; esac\ncat > /dev/null\necho unknown\n')
+    os.chmod(fake, 0o755)
+    ucache = os.path.join(work, "unknown")
+    for _ in (1, 2):
+        r = run(orinc, "--format=json", "--solver-stats", "--z3", fake, "--cache-dir", ucache, src, case="_cache")
+        check(all(x["status"] == "UNKNOWN" for x in json.loads(r.stdout.decode())["results"] if x["kind"] != "decreases") and (stat(r) or (0, 1, 0))[1] == 0,
+              "cache: unknown answers are not stored by default")
+    run(orinc, "--format=json", "--z3", fake, "--cache-dir", ucache, "--cache-unknown", src, case="_cache")
+    r = run(orinc, "--format=json", "--solver-stats", "--z3", fake, "--cache-dir", ucache, "--cache-unknown", src, case="_cache")
+    s = stat(r) or (0, 0, 1)
+    check(s[0] > 0 and s[2] == 0, "cache: --cache-unknown stores unknown answers %r" % (s,))
+    # another solver version is another key
+    with open(fake, "w") as f:
+        f.write('#!/bin/sh\ncase "$1" in --version) echo "Z3 fake 2.0"; exit 0;; esac\ncat > /dev/null\necho unknown\n')
+    r = run(orinc, "--format=json", "--solver-stats", "--z3", fake, "--cache-dir", ucache, "--cache-unknown", src, case="_cache")
+    check((stat(r) or (0, 1, 0))[1] == 0, "cache: another solver version must not hit")
+    # a missing solver stays UNKNOWN with a cache directory, and nothing is stored for it
+    gone = os.path.join(work, "gone")
+    r = run(orinc, "--format=json", "--z3", "/nonexistent/z3", "--cache-dir", gone, "--cache-unknown", src, case="_cache")
+    check(all(x["status"] == "UNKNOWN" for x in json.loads(r.stdout.decode())["results"] if x["kind"] != "decreases") and not os.path.isdir(gone),
+          "cache: a missing solver gives UNKNOWN and stores nothing")
+    r = run(orinc, "--cache-dir", case="_cache")
+    check(r.returncode == 2 and b"--cache-dir" in r.stderr, "cache: --cache-dir without a directory is a usage error")
     return out
 
 

@@ -31,7 +31,7 @@ import { Program } from "../hir";
 import { LoadedProgram } from "../loader";
 import { isSyntacticallyTrivial, inferPurity, allFunctions } from "../check";
 import { writeFile, readFile, fsErrorMessage } from "std:fs";
-import { shellRun, mapOrderedProcess } from "../util";
+import { shellRun } from "../util";
 import { parallelism } from "std:task";
 import { Res, QWarn, Report, assumptionsFor } from "./report";
 import { replyValues } from "./sx";
@@ -393,27 +393,80 @@ function queryText(g: Gen, base: string[], pc: string[], goal: string, probes: P
 // the solver (a task has one grant, and a function's proofs need the file system and the process), so a query without
 // an answer is written to its file and answered `pending` (a Solved whose `values` are its file base and its key); the
 // asker passes these up in `miss`, the driver solves them in parallel, enters the answers here, and runs the functions
-// that asked again. An answer depends on the text of its query only, so the results do not depend on the number of
-// threads.
+// that asked again. An answer depends on the text of its query (and the time limit it ran under) only, so the results do
+// not depend on the number of threads. The answers are also what makes a query asked twice (the same text under the same
+// limit) run once; they are dropped when a run of rounds ends (runRounds), so they do not pile up over the whole program.
 type Oracle = { z3: string; lim: SolverLimits; deferred: bool; answers: Map<string, Result<Solved, string>>; };
 
 // The solver budget of one run (`orin verify --contracts --timeout-ms N --retry-ms N --rlimit N`). `timeoutMs` is the wall
 // time of the first query of an obligation; `retryMs` the wall time of the bounded-search retry after an `unknown`
 // (rawProve), 0 = no retry; `rlimit` is z3's deterministic resource limit (0 = none), applied to both queries on top of
 // the wall time, so that a query that runs out of it gives `unknown` on every machine.
-export type SolverLimits = { timeoutMs: int; retryMs: int; rlimit: int; };
+// `cacheDir` (`--cache-dir DIR`, "" = off) is the directory of the persistent answer cache (docs/contracts.md, performance):
+// an answer is stored under the SHA-256 of the solver version, the limits and the query text, so a hit is exactly the answer
+// the solver gave to that very query. Only `sat` and `unsat` are stored, `unknown` and `timeout` too with `cacheUnknown`
+// (`--cache-unknown`): they depend on the load of the machine that gave them. `stats` (`--solver-stats`) prints what the
+// solver was asked and what the cache answered to stderr.
+export type SolverLimits = { timeoutMs: int; retryMs: int; rlimit: int; cacheDir: string; cacheUnknown: bool; stats: bool; };
 
 export function defaultSolverLimits(): SolverLimits {
-  return SolverLimits { timeoutMs: 4000, retryMs: 1000, rlimit: 0 };
+  return SolverLimits { timeoutMs: 4000, retryMs: 1000, rlimit: 0, cacheDir: "", cacheUnknown: false, stats: false };
 }
 
 const PENDING: string = "pending";
+const VC_DIR: string = "build/contracts-vc";
+const SOLVE_SH: string = "build/contracts-vc/solve.sh";
+const STATS_LOG: string = "build/contracts-vc/stats.log";
 
-function solverCommand(z3: string, lim: SolverLimits, base: string): string {
-  const ms = base.endsWith("b") ? lim.retryMs : lim.timeoutMs;
+// `s` as one word for `sh` (single quotes, a quote in it closed and escaped).
+function shQuote(s: string): string {
+  return "'" + s.split("'").join("'\\''") + "'";
+}
+
+// The wall time of the query `base` (the retry of the bounded search is the one called `...b`).
+function queryMs(lim: SolverLimits, base: string): int {
+  return base.endsWith("b") ? lim.retryMs : lim.timeoutMs;
+}
+
+// The script that runs one query: `sh solve.sh BASE MS HARD RLIMIT` runs the solver on BASE.smt2, leaves its output in
+// BASE.out and writes `<exit status> <run|hit>` to BASE.rc. With a cache directory the script first looks the query up
+// under the SHA-256 of (version, limits, text), and stores a fresh answer there (atomically, by rename) when the solver
+// ran to the end (exit status 0 or 1) and the answer may be kept. The script never fails itself: a missing solver is
+// the exit status 127 in BASE.rc.
+function solveScript(z3: string, lim: SolverLimits, version: string): string {
+  let t = "#!/bin/sh\n# written by `orin verify --contracts`: sh solve.sh BASE MS HARD RLIMIT\nb=$1; ms=$2; hard=$3; rl=$4\nx=\nif [ \"$rl\" -gt 0 ]; then x=\"rlimit=$rl\"; fi\n";
+  const run = z3 + " -in -t:$ms -T:$hard $x < \"$b.smt2\" > \"$b.out\" 2>&1";
+  if (lim.cacheDir == "") {
+    return t + run + "\nprintf '%s run\\n' $? | tee -a " + STATS_LOG + " > \"$b.rc\"\n";
+  }
+  const keep = lim.cacheUnknown ? "true" : "[ \"$first\" = unsat ] || [ \"$first\" = sat ]";
+  t += "c=" + shQuote(lim.cacheDir) + "\n";
+  t += "if command -v sha256sum >/dev/null 2>&1; then h() { sha256sum | cut -d' ' -f1; }; else h() { shasum -a 256 | cut -d' ' -f1; }; fi\n";
+  t += "k=$( { printf '%s\\n' " + shQuote("orin-verify-cache-1 " + version) + "\" $ms $hard $rl\"; cat \"$b.smt2\"; } | h )\n";
+  t += "if [ -n \"$k\" ] && [ -f \"$c/$k\" ] && cp \"$c/$k\" \"$b.out\" 2>/dev/null; then printf '0 hit\\n' | tee -a " + STATS_LOG + " > \"$b.rc\"; exit 0; fi\n";
+  t += run + "\nrc=$?\n";
+  t += "first=$(head -n 1 \"$b.out\" 2>/dev/null)\n";
+  t += "if [ -n \"$k\" ] && { [ $rc -eq 0 ] || [ $rc -eq 1 ]; } && { " + keep + "; }; then mkdir -p \"$c\" 2>/dev/null && cp \"$b.out\" \"$c/.tmp.$k.$$\" 2>/dev/null && mv \"$c/.tmp.$k.$$\" \"$c/$k\" 2>/dev/null; fi\n";
+  t += "printf '%s run\\n' $rc | tee -a " + STATS_LOG + " > \"$b.rc\"\n";
+  return t;
+}
+
+function solveArgs(lim: SolverLimits, base: string): string {
+  const ms = queryMs(lim, base);
   const hard = (ms + 999) / 1000 + 2;
-  const rl = lim.rlimit > 0 ? " rlimit=" + lim.rlimit.toString() : "";
-  return z3 + " -in -t:" + ms.toString() + " -T:" + hard.toString() + rl + " < " + base + ".smt2 > " + base + ".out 2>&1";
+  return base + " " + ms.toString() + " " + hard.toString() + " " + lim.rlimit.toString();
+}
+
+// The exit status the script recorded for `base`, or -1.
+function recordedRc(fs: FsGrant, base: string): int {
+  const r = readFile(fs, base + ".rc");
+  if (r.isErr()) {
+    return -1;
+  }
+  const t = r.unwrap();
+  const sp = t.indexOf(" ");
+  const n = parseInt(sp.isSome() ? t.substring(0, sp.unwrap()) : t.trim());
+  return n.isSome() ? n.unwrap() : -1;
 }
 
 // The answer in `base.out` after the solver ran with exit status `rc`.
@@ -435,15 +488,18 @@ function readAnswer(fs: FsGrant, z3: string, base: string, rc: int): Result<Solv
   return Err("solver answered: " + first);
 }
 
+// The key of an answer: what it depends on besides the solver and its fixed options.
+function answerKey(lim: SolverLimits, base: string, text: string): string {
+  return queryMs(lim, base).toString() + "|" + lim.rlimit.toString() + "\n" + text;
+}
+
 function solve(fs: FsGrant, proc: ProcessGrant, or: Oracle, fi: usize, qn: usize, tag: string, query: string): Result<Solved, string> {
-  const base = "build/contracts-vc/f" + fi.toString() + "q" + qn.toString() + tag;
+  const base = VC_DIR + "/f" + fi.toString() + "q" + qn.toString() + tag;
   const text = prelude() + query;
-  const key = base + "\n" + text;
-  if (or.deferred) {
-    const known = or.answers.get(key);
-    if (known.isSome()) {
-      return known.unwrap();
-    }
+  const key = answerKey(or.lim, base, text);
+  const known = or.answers.get(key);
+  if (known.isSome()) {
+    return known.unwrap();
   }
   const w = writeFile(fs, base + ".smt2", text);
   if (w.isErr()) {
@@ -452,23 +508,41 @@ function solve(fs: FsGrant, proc: ProcessGrant, or: Oracle, fi: usize, qn: usize
   if (or.deferred) {
     return Ok(Solved { status: PENDING, values: [base, key] });
   }
-  return readAnswer(fs, or.z3, base, shellRun(proc, solverCommand(or.z3, or.lim, base)));
+  shellRun(proc, "sh " + SOLVE_SH + " " + solveArgs(or.lim, base));
+  return readAnswer(fs, or.z3, base, recordedRc(fs, base));
 }
 
-// Solves the missed queries (pairs of file base and key) on all threads and enters the answers.
+// Solves the missed queries (pairs of file base and key) on all threads and enters the answers. A query that was missed
+// twice (several functions asked the same text) is solved once. The queries go to `xargs -P`, which hands the next one
+// to the first free worker (a query that runs into its time limit does not hold up the ones behind it).
 function solveMissing(fs: FsGrant, proc: ProcessGrant, or0: Oracle, miss: string[]): Oracle {
   let or = or0;
   const n = miss.length / 2;
-  let cmds: string[] = [];
+  let first = new Map<string, usize>();
+  let lines: string[] = [];
   let j: usize = 0;
   while (j < n) {
-    cmds.push(solverCommand(or0.z3, or0.lim, miss[2 * j]));
+    if (!first.has(miss[2 * j + 1])) {
+      first.set(miss[2 * j + 1], j);
+      lines.push(solveArgs(or0.lim, miss[2 * j]));
+    }
     j += 1;
   }
-  const rcs = mapOrderedProcess(proc, n, (k, pg) => shellRun(pg, cmds[k]));
+  const list = VC_DIR + "/round.lst";
+  const w = writeFile(fs, list, lines.join("\n") + "\n");
+  if (w.isOk()) {
+    shellRun(proc, "xargs -P " + parallelism().toString() + " -L 1 sh " + SOLVE_SH + " < " + list);
+  }
   let k: usize = 0;
   while (k < n) {
-    or.answers.set(miss[2 * k + 1], readAnswer(fs, or0.z3, miss[2 * k], rcs[k]));
+    const f = first.get(miss[2 * k + 1]);
+    if (f.isSome() && f.unwrap() == k) {
+      let ans: Result<Solved, string> = Err("cannot write " + list);
+      if (w.isOk()) {
+        ans = readAnswer(fs, or0.z3, miss[2 * k], recordedRc(fs, miss[2 * k]));
+      }
+      or.answers.set(miss[2 * k + 1], ans);
+    }
     k += 1;
   }
   return or;
@@ -1146,7 +1220,9 @@ function verifyFn(fs: FsGrant, proc: ProcessGrant, rt0: Rt, f: Fn): Rt {
       }
       // The unrolled paths only serve to find a real counterexample; with an abstraction on every path of the
       // function (g.approxReason) none can be one, so they are not solved.
-      if (covered || g.approxReason() != "") {
+      // Nor when its counterexample would not be trusted anyway (obligApprox is known before the solver answers): the
+      // answer could only be `unsat` or `unknown`, and neither is reported for an unrolled obligation.
+      if (covered || g.approxReason() != "" || o.approx != "" || taintOf(g, base, o.pc, o.goal) != "") {
         statuses[id] = "COVERED";
       } else {
         const raw = rawProve(fs, proc, rt.or, rt.fi, rt.qn, g, base, o.pc, o.goal, en.probes);
@@ -1400,6 +1476,8 @@ function runRounds(fs: FsGrant, proc: ProcessGrant, p: Prog, or0: Oracle, idxs: 
     }
     open = again;
   }
+  // Nothing asks again for these answers (the functions are final): they are not kept for the rest of the program.
+  or.answers = new Map<string, Result<Solved, string>>();
   return Rounds { res: done, or: or };
 }
 
@@ -1557,7 +1635,10 @@ function privateInvariants(fs: FsGrant, proc: ProcessGrant, p: Prog, or0: Oracle
   // The extra runs get an eighth of the time budget (at least 250 ms) of a query and no bounded-search retry: a proof that the invariants make
   // possible is found quickly or not at all, and a query that times out leaves the result as it was.
   const qms = or.lim.timeoutMs / 8 > 250 ? or.lim.timeoutMs / 8 : (or.lim.timeoutMs < 250 ? or.lim.timeoutMs : 250);
-  or = Oracle { z3: or.z3, lim: SolverLimits { timeoutMs: qms, retryMs: 0, rlimit: or.lim.rlimit }, deferred: or.deferred, answers: or.answers };
+  let lim2 = or.lim;
+  lim2.timeoutMs = qms;
+  lim2.retryMs = 0;
+  or = Oracle { z3: or.z3, lim: lim2, deferred: or.deferred, answers: or.answers };
   const rb = runRounds(fs, proc, p3, or, bIdx, false);
   or = rb.or;
   let better: usize[] = [];      // positions in `cand` (and in `rb.res`)
@@ -1694,8 +1775,21 @@ function privateInvariants(fs: FsGrant, proc: ProcessGrant, p: Prog, or0: Oracle
 
 export function verifyContracts(fs: FsGrant, proc: ProcessGrant, prog: LoadedProgram, sm: SourceMap, hir: Program, z3: string, lim: SolverLimits): Report {
   const p = buildProg(prog, sm, hir);
-  shellRun(proc, "mkdir -p build/contracts-vc");
-  const or = Oracle { z3: z3, lim: lim, deferred: parallelism() > 1, answers: new Map<string, Result<Solved, string>>() };
+  shellRun(proc, "mkdir -p " + VC_DIR + " && rm -f " + VC_DIR + "/*.rc " + STATS_LOG);
+  let version = "";
+  if (lim.cacheDir != "") {
+    shellRun(proc, z3 + " --version > " + VC_DIR + "/z3.version 2>&1");
+    const vr = readFile(fs, VC_DIR + "/z3.version");
+    version = vr.isOk() ? vr.unwrap().trim() : "";
+  }
+  // Without a solver version the answers cannot be tied to a solver: no cache.
+  let lim1 = lim;
+  if (lim.cacheDir != "" && version == "") {
+    lim1.cacheDir = "";
+  }
+  // (a script that cannot be written leaves every query "could not be run": UNKNOWN, never a result)
+  writeFile(fs, SOLVE_SH, solveScript(z3, lim1, version));
+  const or = Oracle { z3: z3, lim: lim1, deferred: parallelism() > 1, answers: new Map<string, Result<Solved, string>>() };
   // Functions without clauses are still analysed (their calls of contracted functions are proof obligations);
   // if they are outside the fragment nothing is reported for them.
   let todo: usize[] = [];
@@ -1717,6 +1811,9 @@ export function verifyContracts(fs: FsGrant, proc: ProcessGrant, prog: LoadedPro
     for (const w of r.warns) {
       warns.push(w);
     }
+  }
+  if (lim.stats) {
+    shellRun(proc, "cat " + STATS_LOG + " 2>/dev/null | awk '{ n++; if ($2 == \"hit\") h++ } END { printf \"solver: %d queries solved (%d from the cache, %d by the solver)\\n\", n, h, n - h }' >&2");
   }
   return Report { results: results, warnings: warns };
 }
