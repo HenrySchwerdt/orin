@@ -18,7 +18,7 @@ import {
 import { Gen, Obl, SortR, sortOf, opaqueSort } from "./gen";
 import { bareOf } from "./scope";
 import {
-  Var, Chk, TR, St, Ret, Ex, Fn, Cls, Prog, Cx, lineOf, clauseText, srcText, lit, inKind, guarded, concat, concatChk, unionUsize, andAll,
+  cyclicMk, Var, Chk, TR, St, Ret, Ex, Fn, Cls, Prog, Cx, lineOf, clauseText, srcText, lit, inKind, guarded, concat, concatChk, unionUsize, andAll,
   noChks, noExp, lookupVar, prefix, tailFrom, mk, sortS, tyOf, fresh, freshFree, typeFact, arrLen, arrData, arrMk, arrSel, inBounds, isSomeT, isOkT,
   recField, mapHas, mapSize, mapFact, tfOf, assignedIn, hasJump, rootOf, isThisExpr, clausesOfList, exprOf, hasClauses, valKey
 } from "./ctx";
@@ -145,9 +145,6 @@ export function setPlace(g0: Gen, st0: St, cx: Cx, place: Expr, val: string, vt:
             return Err("unknown record `" + bareOf(rn) + "`");
           }
           const d = rd.unwrap();
-          if (cx.p.tab.isCyclic("r:" + rn)) {
-            return Err("the fields of the recursive type `" + bareOf(rn) + "` are not modelled");
-          }
           const fi = fieldIndex(d, fld.name);
           if (fi.isNone()) {
             return Err("no field `" + fld.name + "` on `" + bareOf(rn) + "`");
@@ -166,6 +163,10 @@ export function setPlace(g0: Gen, st0: St, cx: Cx, place: Expr, val: string, vt:
           while (i < d.fields.length) {
             args.push(i == fi.unwrap() ? val : recField(so.s, d.fields[i], bt.t));
             i += 1;
+          }
+          if (cx.p.tab.isCyclic("r:" + rn)) {
+            const cm = cyclicMk(g, cx, bt.vt, so.s, d.fields, args)?;
+            return setPlace(cm.g, st, cx, b, cm.name, bt.vt);
           }
           const nv = "(mk" + so.s + " " + args.join(" ") + ")";
           return setPlace(g, st, cx, b, nv, bt.vt);
@@ -1611,7 +1612,7 @@ function havocVars(g0: Gen, cx: Cx, vars: Var[], names: string[]): Result<HV, st
       match (tv.vt) {
         VRec(rn) => {
           const rd = cx.p.tab.findRec(rn);
-          if (rd.isSome() && !cx.p.tab.isCyclic("r:" + rn)) {
+          if (rd.isSome()) {
             const so = sortS(g, cx, tv.vt)?;
             g = so.g;
             const d = rd.unwrap();
@@ -1636,7 +1637,8 @@ function havocVars(g0: Gen, cx: Cx, vars: Var[], names: string[]): Result<HV, st
               }
               i += 1;
             }
-            const f2 = fresh(g, cx, tv.vt, "(mk" + so.s + " " + args.join(" ") + ")")?;
+            const f2r = cx.p.tab.isCyclic("r:" + rn) ? cyclicMk(g, cx, tv.vt, so.s, d.fields, args) : fresh(g, cx, tv.vt, "(mk" + so.s + " " + args.join(" ") + ")");
+            const f2 = f2r?;
             g = f2.g;
             out[ti.unwrap()] = Var { name: "this", term: f2.name, vt: tv.vt };
             touched.push("this." + flds.join(", this."));

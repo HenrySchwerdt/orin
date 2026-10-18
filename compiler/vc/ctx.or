@@ -9,8 +9,8 @@ import {
   ECall, ETry, EArray, ERecord, ENew, ETemplate, EUnary, EBinary, ECond, EMember, EIndex, EIdent, EThis, EMatch, BExpr, BBlock,
   CRequires, CEnsures, CInvariant, CDecreases, CRule
 } from "../syntax";
-import { VT, VInt, VStr, VBad, VArr, VOpt, VRes, VMap, VRec, intLo, intHi, resolveTy, resolveTyP, fieldTyOf, RecDef, Tab, fieldIndex } from "./vt";
-import { Gen, SortR, sortOf } from "./gen";
+import { VT, VInt, VStr, VBad, VArr, VOpt, VRes, VMap, VRec, VUni, intLo, intHi, resolveTy, resolveTyP, fieldTyOf, payloadTy, RecDef, Tab, fieldIndex } from "./vt";
+import { Gen, SortR, sortOf, opaqueSort } from "./gen";
 import { scopeKey, entryKey, AMBIG } from "./scope";
 
 export const I64_MIN: string = "(- 9223372036854775808)";
@@ -287,6 +287,134 @@ export function fresh(g0: Gen, cx: Cx, vt: VT, term: string): Result<Fresh, stri
   return Ok(Fresh { g: g, name: name });
 }
 
+// A value of the recursive record or class `vt` (sort `sn`, gen.or) with the field terms `args` (in the order of
+// `fields`): a fresh constant whose accessors equal them, stated as facts. No constructor function and no quantified
+// axiom: the record exists in every execution (any field values make a record), so the facts are definitions.
+// Inside a quantifier body the arguments may mention the bound variables, so the value is the application of an
+// uninterpreted function `sn.mkq` of the arguments instead, and the facts about it are made inside the body (the
+// quantifier takes the facts made while its body was translated, `takeFactsFrom`, and states them per instance).
+export function cyclicMk(g0: Gen, cx: Cx, vt: VT, sn: string, fields: string[], args: string[]): Result<Fresh, string> {
+  let g = g0;
+  let name = "";
+  if (cx.inQ) {
+    let sorts: string[] = [];
+    match (vt) {
+      VRec(rn) => {
+        const rd = cx.p.tab.findRec(rn);
+        if (rd.isSome()) {
+          let i: usize = 0;
+          while (i < rd.unwrap().fields.length) {
+            const ps = partSortS(g, cx, fieldTyOf(cx.p.tab, rd.unwrap(), i));
+            g = ps.g;
+            sorts.push(ps.s);
+            i += 1;
+          }
+        }
+      },
+      _ => {}
+    }
+    if (sorts.length != args.length || args.length == 0) {
+      return Err("a value of the recursive type `" + sn + "` built inside a quantifier body");
+    }
+    const fname = sn + ".mkq";
+    if (!g.hasFun(fname)) {
+      g.registerFun(fname);
+      g.declare("(declare-fun " + fname + " (" + sorts.join(" ") + ") " + sn + ")");
+    }
+    name = "(" + fname + " " + args.join(" ") + ")";
+  } else {
+    name = g.next("v");
+    g.declare("(declare-const " + name + " " + sn + ")");
+  }
+  let i: usize = 0;
+  while (i < fields.length && i < args.length) {
+    g.assert("(= (" + sn + "." + fields[i] + " " + name + ") " + args[i] + ")");
+    if (!cx.inQ && g.mentionsTaint(args[i])) {
+      g.taint(name);
+    }
+    i += 1;
+  }
+  return Ok(Fresh { g: g, name: name });
+}
+
+// A variant value `V(args)` of the recursive union `vt` (sort `sn`): a fresh constant with the variant's tag `k` and
+// payload accessors `sn.V.i` equal to the arguments; inside a quantifier body an uninterpreted function `sn.V.mkq` of
+// the arguments (see `cyclicMk`).
+export function cyclicVariant(g0: Gen, cx: Cx, vt: VT, sn: string, k: usize, vname: string, args: string[]): Result<Fresh, string> {
+  let g = g0;
+  let name = "";
+  if (cx.inQ) {
+    let sorts: string[] = [];
+    match (vt) {
+      VUni(un) => {
+        const u = cx.p.tab.findUni(un);
+        if (u.isSome()) {
+          for (const v of u.unwrap().variants) {
+            if (v.name == vname) {
+              for (const pt of v.payload) {
+                const ps = partSortS(g, cx, payloadTy(cx.p.tab, u.unwrap(), pt));
+                g = ps.g;
+                sorts.push(ps.s);
+              }
+            }
+          }
+        }
+      },
+      _ => {}
+    }
+    if (sorts.length != args.length || args.length == 0) {
+      return Err("a variant of the recursive union `" + sn + "` built inside a quantifier body");
+    }
+    const fname = sn + "." + vname + ".mkq";
+    if (!g.hasFun(fname)) {
+      g.registerFun(fname);
+      g.declare("(declare-fun " + fname + " (" + sorts.join(" ") + ") " + sn + ")");
+    }
+    name = "(" + fname + " " + args.join(" ") + ")";
+  } else {
+    name = g.next("v");
+    g.declare("(declare-const " + name + " " + sn + ")");
+  }
+  g.assert("(= (" + sn + ".tag " + name + ") " + k.toString() + ")");
+  let i: usize = 0;
+  while (i < args.length) {
+    g.assert("(= (" + sn + "." + vname + "." + i.toString() + " " + name + ") " + args[i] + ")");
+    if (!cx.inQ && g.mentionsTaint(args[i])) {
+      g.taint(name);
+    }
+    i += 1;
+  }
+  return Ok(Fresh { g: g, name: name });
+}
+
+// The sort of a field or payload type: an unsupported type is the opaque sort (as in gen.or).
+function partSortS(g0: Gen, cx: Cx, t: VT): SortR {
+  const r = sortS(g0, cx, t);
+  return match (r) {
+    Ok(x) => x,
+    Err(_) => opaqueSort(g0)
+  };
+}
+
+// A value of a recursive union is of one of its variants: its tag (gen.or) is the index of one ("" for any other type).
+// Stated for the values that arise, like the other well-formedness facts, not as an axiom over the sort.
+export function tagRange(g0: Gen, cx: Cx, vt: VT, term: string): Result<Fresh, string> {
+  let g = g0;
+  return match (vt) {
+    VUni(un) => {
+      const u = cx.p.tab.findUni(un);
+      if (u.isNone() || !cx.p.tab.isCyclic("u:" + un)) {
+        return Ok(Fresh { g: g, name: "" });
+      }
+      const so = sortS(g, cx, vt)?;
+      g = so.g;
+      const tag = "(" + so.s + ".tag " + term + ")";
+      return Ok(Fresh { g: g, name: "(and (<= 0 " + tag + ") (< " + tag + " " + u.unwrap().variants.length.toString() + "))" });
+    },
+    _ => Ok(Fresh { g: g, name: "" })
+  };
+}
+
 // Facts every value of the type satisfies (its range).
 export function typeFact(vt: VT, term: string): Option<string> {
   return match (vt) {
@@ -364,6 +492,10 @@ export function wfOf(g0: Gen, cx: Cx, term: string, vt: VT, depth: usize): Resul
       // quantifier over all keys (which slows every query that has a map in it).
       return Ok(WF { g: g, f: "(>= " + mapSize(so.s, term) + " 0)" });
     },
+    VUni(un) => {
+      const tr = tagRange(g, cx, vt, term)?;
+      return Ok(WF { g: tr.g, f: tr.name });
+    },
     VRec(rn) => {
       const rd = cx.p.tab.findRec(rn);
       if (rd.isNone() || cx.p.tab.isCyclic("r:" + rn)) {
@@ -432,6 +564,13 @@ export function tfOf(g0: Gen, cx: Cx, vt: VT, term: string): Result<TFR, string>
       const so = sortS(g, cx, vt)?;
       g = so.g;
       out.push(tfChk("(>= " + mapSize(so.s, term) + " 0)"));
+    },
+    VUni(_) => {
+      const tr = tagRange(g, cx, vt, term)?;
+      g = tr.g;
+      if (tr.name != "") {
+        out.push(tfChk(tr.name));
+      }
     },
     _ => {}
   }
