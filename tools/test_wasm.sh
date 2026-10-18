@@ -44,7 +44,7 @@ for W in wasm32 wasm64; do
   ! grep -q '\.t\(bss\|data\)\|thread_local' build/wasm/runtime-$W.s || { echo "test_wasm: the runtime has thread-local data outside orin_tls ($W)" >&2; exit 1; }
 done
 echo "[wasm] the RtTask layout orin_platform_thread_exit reads (trapped at 8, msg at 24; fixed-width fields, so the same on both widths) still matches runtime/core/orin_runtime.c"
-grep -Pzq 'uint64_t tok;[^\n]*\n\s*int trapped;[^\n]*\n\s*uint64_t done_mon;[^\n]*\n\s*char msg\[TASK_MSG\];' runtime/core/orin_runtime.c ||
+grep -Pzq 'uint64_t tok;[^\n]*\n\s*uint64_t trapped;[^\n]*\n\s*uint64_t done_mon;[^\n]*\n\s*char msg\[TASK_MSG \+ 1\];' runtime/core/orin_runtime.c ||
   { echo "test_wasm: RtTask changed: adapt orin_platform_thread_exit in runtime/platform/orbit/orin_platform_orbit.c" >&2; exit 1; }
 for T in wasm64-orbit wasm32-orbit; do
   echo "[wasm] conformance suites as $T modules"

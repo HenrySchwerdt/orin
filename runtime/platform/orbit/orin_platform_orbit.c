@@ -355,8 +355,8 @@ int orin_platform_thread_join(int64_t h, void **arg) {
 }
 /* A task trapped (the runtime has recorded its message): WebAssembly cannot unwind to the join, so the module ends. */
 void orin_platform_thread_exit(void) {
-    const char *p = g_cur ? (const char *)g_thr[g_cur - 1].arg : NULL; /* RtTask: tok, trapped, done_mon, msg[480] (orin_runtime.c) */
-    fatal("a task trapped: ", p && *(const int *)(p + 8) == 1 ? p + 24 : "(no message)", 101); /* the instance ends: see ADR-0055 */
+    const char *p = g_cur ? (const char *)g_thr[g_cur - 1].arg : NULL; /* RtTask: tok, trapped, done_mon (u64 each), msg[481] (orin_runtime.c, task.or) */
+    fatal("a task trapped: ", p && *(const uint64_t *)(p + 8) == 1 ? p + 24 : "(no message)", 101); /* the instance ends: see ADR-0055 */
 }
 
 typedef struct {

@@ -1,8 +1,46 @@
-// $rt/task -- the task interface of `std:task`, written in Orin (ADR-0052 Addendum B). This file holds `parThreads` (step R3e.3); step
-// R3e.4 adds the task record, spawn, join, message, watch, the thread entry and the trap.
+// $rt/task -- the task interface of `std:task`, written in Orin (ADR-0052 Addendum B, steps R3e.3 and R3e.4).
+//
+// A task is an operating-system thread with its own heap (ADR-0017). `spawn` makes the task record (`RtTask`, 512 bytes of raw memory,
+// never the small-block cache: the joiner frees it on another thread) and starts the thread at `main`; `main` claims the body (a closure
+// in a transfer box), runs it, retires the heap and publishes the end; `join` waits for the thread and keeps its record as the task
+// joined last (`message` reads the trap message from it; it is freed at the next join and when the heap retires). A trap on a task
+// thread (`trap`, the function behind the C name `orin_trap`) records the message, retires the heap, publishes the end and ends the
+// thread with `thread_exit` (forced unwinding of every frame between the trap and the thread entry, risk 3 of the ADR); a trap on the
+// main thread prints `trap: <message>` on stderr and exits with status 101. The trap path allocates nothing (the line buffer is in the
+// shared block, the message goes into the task record) and holds no lock when it ends the thread; a failure inside it is an exit.
+//
+// The record, in bytes: tok@0 (the transfer token of the body), trapped@8 (1 when the task ended on a trap), done_mon@16 (the monitor
+// of `watch`, 0 = none), message@24 (480 bytes and a NUL). The thread-local state is in the heap block: `task` (H_TASK, the address
+// of the record of this thread, 0 on the main thread) and `joined` (H_JOINED). The C-named wrappers (`orin_trap`, the test wrappers)
+// are made by the backends (mir/rt.or); the C task functions stay in the live runtime until R3e.6.
 
-import { load8, addrOf, plat, wadd, wmul } from "std:core";
-import { PL_GETENV, PL_CPU_COUNT } from "./plat";
+import {
+  load8, load64, store8, store64, memAlloc, memFree, memCopy, heapBase, sharedBase, cfg, hook, plat, fnAddr, addrOf, wadd, wmul, shl
+} from "std:core";
+import { transitTake, transitDrop, taskTrap } from "std:fsraw";
+import {
+  PL_THREAD_CREATE, PL_THREAD_JOIN, PL_THREAD_EXIT, PL_MONITOR_LOCK, PL_MONITOR_UNLOCK, PL_MONITOR_SET, PL_MONITOR_NOTIFY,
+  PL_RUNTIME_LOCK, PL_RUNTIME_UNLOCK, PL_WRITE_LINE, PL_EXIT, PL_GETENV, PL_CPU_COUNT
+} from "./plat";
+import {
+  H_TASK, H_JOINED, H_SCRATCH, DSTACK, DCAP, FL_STRUCT, FL_ARRAY, FL_N, LIVE, SB, S_ALLOC_STRING, S_TASKS_SPAWNED, addAt,
+  HK_FOLD_STATS, HK_FOLD_LIVE, HK_REVOKE_GRANTS, HK_CLOSE_FILES, HK_FREE_NETBUF, HK_SITE_FOLD
+} from "./heap";
+import { strAlloc } from "./object";
+
+const E_TASK_MAIN: usize = 52;   // the entry number of `main` (mir/rt.or RT_TASK_MAIN): `fnAddr` takes the address of its C-ABI wrapper
+
+const TASK_SIZE: usize = 512;    // the task record
+const T_TOK: usize = 0;
+const T_TRAPPED: usize = 8;
+const T_DONE: usize = 16;
+const T_MSG: usize = 24;
+const MSG_MAX: usize = 480;      // the longest trap message (a longer one is cut)
+const TRAPLINE: usize = 512;     // the line buffer of the process trap in the shared block (orin_shared.trapline, 512 bytes)
+
+type Thunk = () => void;
+// The unit of transfer of `std:task` (`Box<Thunk>`): a one-field record holding the body of the task.
+type TaskBox = { v: Thunk; };
 
 // The number of worker threads of a parallel pipeline (ADR-0039): the environment variable ORIN_THREADS when it is a number from 1 to
 // 1024, otherwise the processors online. Results never depend on it (fixed chunks, combined in chunk order). `std:task` reaches this
@@ -29,4 +67,210 @@ export function parThreads(): usize {
     }
   }
   return plat(PL_CPU_COUNT, 0, 0, 0);
+}
+
+// ---------------------------------------------------------------- the end of a task
+
+// Return the free list at `lp` (head) and its length word at `np` to the allocator. A node holds the address of the next one in its first
+// word (heap.or); a node may have come from another thread's heap.
+function drainList(lp: usize, np: usize): void {
+  let n = load64(lp);
+  while (n != 0) {
+    const next = load64(n);
+    memFree(n);
+    n = next;
+  }
+  store64(lp, 0);
+  store64(np, 0);
+}
+
+// A task's heap ends (the C `orin_rt_heap_exit`): close what the task left open, free the buffers it holds, return the free lists and the
+// small-block cache to the allocator, and fold its counters into the process totals (what ORIN_STATS prints). The grants, the files and
+// the network buffer are C tables until R3c: the hooks reach them. Allocates nothing; the order is the one of the C function.
+export function heapRetire(): void {
+  const h = heapBase();
+  hook(HK_REVOKE_GRANTS, 0, 0, 0);
+  hook(HK_CLOSE_FILES, 0, 0, 0);
+  hook(HK_FREE_NETBUF, 0, 0, 0);
+  const j = load64(wadd(h, H_JOINED));
+  if (j != 0) {
+    memFree(j);
+    store64(wadd(h, H_JOINED), 0);
+  }
+  const d = load64(wadd(h, DSTACK));
+  if (d != 0) {
+    memFree(d);
+  }
+  store64(wadd(h, DSTACK), 0);
+  store64(wadd(h, DCAP), 0);
+  if (cfg(0) == 1) {
+    let c: usize = 0;
+    while (c < 9) {
+      drainList(wadd(wadd(h, FL_STRUCT), shl(c, 3)), wadd(wadd(h, FL_N), shl(c, 3)));
+      c = wadd(c, 1);
+    }
+    drainList(wadd(h, FL_ARRAY), wadd(wadd(h, FL_N), 72));
+    c = 0;
+    while (c <= 16) {
+      const q = wadd(wadd(h, SB), shl(c, 4));
+      drainList(q, wadd(q, 8));
+      c = wadd(c, 1);
+    }
+  }
+  plat(PL_RUNTIME_LOCK, 0, 0, 0);
+  const live = hook(HK_FOLD_LIVE, 0, 0, 0);
+  store64(live, wadd(load64(live), load64(wadd(h, LIVE))));
+  const g = hook(HK_FOLD_STATS, 0, 0, 0);
+  let i: usize = 0;
+  while (i < 18) {
+    const o = shl(i, 3);
+    const a = load64(wadd(g, o));
+    const b = load64(wadd(wadd(h, S_ALLOC_STRING), o));
+    if (i == 10 || i == 11) {
+      store64(wadd(g, o), b > a ? b : a);
+    } else {
+      store64(wadd(g, o), wadd(a, b));
+    }
+    i = wadd(i, 1);
+  }
+  if (cfg(2) == 1) {
+    hook(HK_SITE_FOLD, 0, 0, 0);
+  }
+  plat(PL_RUNTIME_UNLOCK, 0, 0, 0);
+}
+
+// The task `t` is over (its heap is gone): publish it for a timed join (`watch`): word 1 of the monitor becomes 1 and queue 0 is notified.
+// Only L0 calls, no check of their results (as before); the joiner frees the monitor after the join.
+function signalDone(t: usize): void {
+  const m = load64(wadd(t, T_DONE));
+  if (m != 0) {
+    plat(PL_MONITOR_LOCK, m, 0, 0);
+    plat(PL_MONITOR_SET, m, 1, 1);
+    plat(PL_MONITOR_NOTIFY, m, 0, 1);
+    plat(PL_MONITOR_UNLOCK, m, 0, 0);
+  }
+}
+
+// ---------------------------------------------------------------- spawn, main, join
+
+// Start a task that runs the body in the transfer box `tok` (a `Box<() => void>` published by std:task). Returns the thread handle.
+export function spawn(tok: usize): usize {
+  const t = memAlloc(TASK_SIZE);
+  store64(wadd(t, T_TOK), tok);
+  store64(wadd(t, T_TRAPPED), 0);
+  store64(wadd(t, T_DONE), 0);
+  store8(wadd(t, T_MSG), 0);
+  const h = plat(PL_THREAD_CREATE, fnAddr(E_TASK_MAIN), t, 0);
+  if (h == 0) {
+    memFree(t);
+    transitDrop(tok);
+    taskTrap("cannot start a task (thread limit reached)");
+  }
+  addAt(wadd(heapBase(), S_TASKS_SPAWNED), 1);
+  return h;
+}
+
+// Claim the body and run it. A function of its own so that the box (and the closure it holds) is released before the heap retires.
+function run(tok: usize): void {
+  const b: TaskBox = transitTake(tok);
+  b.v();
+}
+
+// The thread entry (the C-ABI wrapper `orin_task_main`, `fnAddr`): `t` is the record `spawn` made. The body runs with the record
+// published in the heap block (`trap` finds it there); at the end the heap retires and the end is signalled. The block word is cleared
+// before the retire, so a trap inside the retire is a trap of a thread that is not a task (an exit), never a second retire.
+export function main(t: usize): void {
+  store64(wadd(heapBase(), H_TASK), t);
+  run(load64(wadd(t, T_TOK)));
+  store64(wadd(heapBase(), H_TASK), 0);
+  heapRetire();
+  signalDone(t);
+}
+
+// Wait for the task of handle `h` to end. 0: it returned; 1: it trapped (its message is kept for `message`). The record of the task
+// joined before is freed here; this one is freed at the next join or when this thread's heap retires.
+export function join(h: usize): usize {
+  const s = wadd(heapBase(), H_SCRATCH);
+  store64(s, 0);
+  if (plat(PL_THREAD_JOIN, h, s, 0) != 0) {
+    taskTrap("invalid task handle (joined twice, or forged)");
+  }
+  const t = load64(s);
+  const prev = load64(wadd(heapBase(), H_JOINED));
+  if (prev != 0) {
+    memFree(prev);
+  }
+  store64(wadd(heapBase(), H_JOINED), t);
+  return load64(wadd(t, T_TRAPPED));
+}
+
+// The trap message of the task joined last by this thread, as a new string (empty when the task did not trap).
+export function message(): usize {
+  const t = load64(wadd(heapBase(), H_JOINED));
+  let n: usize = 0;
+  if (t != 0) {
+    while (n < MSG_MAX && load8(wadd(wadd(t, T_MSG), n)) != 0) {
+      n = wadd(n, 1);
+    }
+  }
+  const s = strAlloc(n, n);
+  if (n != 0) {
+    memCopy(wadd(s, 32), wadd(t, T_MSG), n);
+  }
+  return s;
+}
+
+// Called by a task on its own thread (std:task `spawn`): word 1 of monitor `m` becomes 1 and queue 0 is notified when the task ends.
+export function watch(m: usize): void {
+  const t = load64(wadd(heapBase(), H_TASK));
+  if (t != 0) {
+    store64(wadd(t, T_DONE), m);
+  }
+}
+
+// ---------------------------------------------------------------- the trap
+
+// End the program or the task with the message at `p`: its length is the number of bytes before the first NUL, at most `limit`. On a
+// task thread (the heap block names a record) the message goes into the record, the heap retires, the end is signalled and the thread
+// exits; the joiner traps with the message. On the main thread `trap: <message>` is written to stderr (one line, the buffer is in the
+// shared block: no allocation) and the process exits with status 101. Never returns.
+function trapAt(p: usize, limit: usize): void {
+  let n: usize = 0;
+  while (n < limit && load8(wadd(p, n)) != 0) {
+    n = wadd(n, 1);
+  }
+  const t = load64(wadd(heapBase(), H_TASK));
+  if (t != 0) {
+    if (n > 479) {
+      n = 479;
+    }
+    if (n != 0) {
+      memCopy(wadd(t, T_MSG), p, n);
+    }
+    store8(wadd(wadd(t, T_MSG), n), 0);
+    store64(wadd(t, T_TRAPPED), 1);
+    store64(wadd(heapBase(), H_TASK), 0);
+    heapRetire();
+    signalDone(t);
+    plat(PL_THREAD_EXIT, 0, 0, 0);
+  }
+  const b = wadd(sharedBase(), TRAPLINE);
+  const pre = "trap: ";
+  memCopy(b, wadd(addrOf(pre), 32), 6);
+  if (n != 0) {
+    memCopy(wadd(b, 6), p, n);
+  }
+  plat(PL_WRITE_LINE, 2, b, wadd(6, n));
+  plat(PL_EXIT, 101, 0, 0);
+}
+
+// `orin_trap(msg)`: `msg` is a C string. Every checked failure of generated code and of the runtime ends here.
+export function trap(msg: usize): void {
+  trapAt(msg, MSG_MAX);
+}
+
+// `std:task`'s `taskTrap(msg)`: the trap with the Orin string `msg` (cut to 479 bytes, and at a NUL byte, as the C function did).
+export function trapStr(msg: usize): void {
+  const len = load64(wadd(msg, 16));
+  trapAt(wadd(msg, 32), len > 479 ? 479 : len);
 }

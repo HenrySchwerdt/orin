@@ -93,7 +93,7 @@ export function rtNames(): string[] {
 
 // An entry that the C shells of the runtime call under its C name (`orin_struct_new` ...): the emitted code defines a wrapper
 // of that name (a C function, an LLVM function) that casts the C types to words and calls the entry. `ret` and `params` are
-// the C types: "o" an `OrinObj *`, "p" a `void *`, "u32", "u64", "i64", "v" (no result). The prototypes stay in
+// the C types: "o" an `OrinObj *`, "p" a `void *`, "s" a `const char *`, "u32", "u64", "i64", "v" (no result), "x" (no result, never returns: `orin_trap`). The prototypes stay in
 // runtime/core/orin_runtime.h; a program without the L1 entries (`--c-builtins`) links the frozen C runtime that defines them.
 export type RtWrap = { entry: usize; name: string; ret: string; params: string[]; };
 
@@ -120,6 +120,10 @@ export function rtWraps(): RtWrap[] {
     RtWrap { entry: RT_STATS_REPORT, name: "orin_stats_report", ret: "v", params: [] },
     RtWrap { entry: RT_LIVE_COUNT, name: "orin_live_count", ret: "i64", params: [] },
     RtWrap { entry: RT_CORE_PROBE_FN, name: "orin_probe_entry", ret: "v", params: ["p"] },
+    // the trap (ADR-0052 R3e.4): every checked failure of generated code and of the C shells calls `orin_trap`; the wrapper never returns
+    RtWrap { entry: RT_TASK_TRAP, name: "orin_trap", ret: "x", params: ["s"] },
+    // the thread entry of a task: its address is taken by `fnAddr` (task.spawn); the wrapper is emitted when the program has task.main
+    RtWrap { entry: RT_TASK_MAIN, name: "orin_task_main", ret: "v", params: ["p"] },
   ];
 }
 
@@ -128,7 +132,8 @@ export function rtWraps(): RtWrap[] {
 // Normal programs never have them, so `rtAlways` does not pull the task code into every binary (ADR-0052 Addendum B section 3). The C
 // monitor, transfer and task functions are still in the live runtime and define their own names until R3e.6, so these wrappers carry
 // the distinct prefix `orin_t_`: task_test.c built with -DORIN_TRANSFER_IN_ORIN calls the Orin functions through them (R3e.2: the four
-// transfer operations, R3e.3: the lend and the thread count), and the plain build keeps testing the C ones. At R3e.6 the C names move to the wrappers.
+// transfer operations, R3e.3: the lend and the thread count, R3e.4: the task functions and the heap retire), and the plain build keeps
+// testing the C ones. At R3e.6 the C names move to the wrappers.
 export function rtTestWraps(): RtWrap[] {
   return [
     RtWrap { entry: RT_TRANSFER_PUT, name: "orin_t_transfer_put", ret: "u64", params: ["o"] },
@@ -137,6 +142,12 @@ export function rtTestWraps(): RtWrap[] {
     RtWrap { entry: RT_TRANSFER_COUNT, name: "orin_t_transfer_count", ret: "u64", params: ["u64"] },
     RtWrap { entry: RT_LEND_PUT, name: "orin_t_lend", ret: "u64", params: ["o"] },
     RtWrap { entry: RT_TASK_PAR_THREADS, name: "orin_t_par_threads", ret: "u64", params: [] },
+    RtWrap { entry: RT_TASK_SPAWN, name: "orin_t_task_spawn", ret: "u64", params: ["u64"] },
+    RtWrap { entry: RT_TASK_JOIN, name: "orin_t_task_join", ret: "u64", params: ["u64"] },
+    RtWrap { entry: RT_TASK_MESSAGE, name: "orin_t_task_message", ret: "o", params: [] },
+    RtWrap { entry: RT_TASK_WATCH, name: "orin_t_task_watch", ret: "v", params: ["u64"] },
+    RtWrap { entry: RT_TASK_TRAP_STR, name: "orin_t_trap_str", ret: "x", params: ["o"] },
+    RtWrap { entry: RT_TASK_HEAP_RETIRE, name: "orin_t_heap_retire", ret: "v", params: [] },
   ];
 }
 
@@ -247,11 +258,13 @@ export function l1Task(k: usize): Option<usize> {
 }
 
 // The entries a live program always needs when `$rt` is loaded: the shape trap (the LLVM helpers and the C inlines call it) and
-// every entry with a wrapper (the C shells call those); with `--rt-wrappers` also the entries of the test wrappers.
+// every entry with a wrapper (the C shells call those) but the task entry (a live `taskSpawn` keeps it); with `--rt-wrappers` also the entries of the test wrappers.
 export function rtAlways(rtWrappers: bool): usize[] {
   let out: usize[] = [RT_TRAP_SHAPE];
   for (const w of rtWraps()) {
-    out.push(w.entry);
+    if (w.entry != RT_TASK_MAIN) {
+      out.push(w.entry);
+    }
   }
   if (rtWrappers) {
     for (const w of rtTestWraps()) {
