@@ -189,7 +189,7 @@ The test runner understands `// flags: --check-contracts` and `// stderr: text` 
 (`tools/run_tests.py`; for an error test `// stderr:` is matched against the compiler's output, which pins the
 text of an E0416 message).
 
-## `orin verify --contracts [--format=json] [--z3 PATH] [--timeout-ms N] [--retry-ms N] [--rlimit N] [--strict] entry.or` (phase 2, ADR-0031 B/C, ADR-0036)
+## `orin verify --contracts [--format=json] [--z3 PATH] [--timeout-ms N] [--retry-ms N] [--rlimit N] [--cache-dir DIR [--cache-unknown]] [--solver-stats] [--strict] entry.or` (phase 2, ADR-0031 B/C, ADR-0036)
 
 Generates verification conditions and discharges them with z3 (`z3 -in`, SMT-LIB 2; install with
 `pip install z3-solver` or your package manager). Query files are kept in `build/contracts-vc/` (`qN.smt2`, the solver's
@@ -213,6 +213,30 @@ tests/contracts/verify_int_widths.or needs about 2.3 s and turns UNKNOWN at 2 s 
 the load of the machine; `--rlimit` does not, but z3 counts resource units unevenly (about 1.5 million per second on solved
 queries, much fewer on a query stuck in quantifier instantiation, which then runs to the wall time), so it is a cap for
 reproducible runs, not a replacement for the wall time.
+
+**Performance.** Where the time goes (measured on the compiler modules `syntax`, `check`, `verify`, z3 4.8.12): over 90 % of
+the wall time is z3 (the verifier's own work, the VC generation, is a few seconds per module; starting z3 is about 15 ms
+of a query that takes 50 to 150 ms to parse 100 KB to 2 MB of text). About 1 query in 12 runs into its time limit,
+and those few cost half of all the z3 time (a query that ends in `unknown` or `timeout` takes the full 4 s, or 6 s when
+the soft limit is not honoured and the hard limit of z3 ends it); a query is almost never identical to another one (the
+text contains the whole context of its function). The run therefore does less and waits less:
+
+- *Scheduling.* The queries of a round go to `xargs -P` (one worker per thread, `ORIN_THREADS`, default the CPU count), which
+  hands the next query to the first free worker; before, a worker had a fixed share of the queries, and the one that drew the
+  slow queries made the others wait. A query that several functions ask (same text, same limit) runs once. Each query is
+  run by `build/contracts-vc/solve.sh` (written by the verifier; exit status and where the answer came from are in `qN.rc`).
+- *Unrolled obligations.* The obligations found by unrolling a loop only serve to find a real counterexample. They are no
+  longer asked when the counterexample could not be trusted anyway (`approx` of the obligation or a value known only through a
+  callee's contract, see "Statuses and abstraction"): `unsat` and `unknown` are not reported for them.
+- *Answer cache* (`--cache-dir DIR`, off by default). An answer is stored in `DIR/<sha256>` under the SHA-256 of the z3 version
+  (`z3 --version`), the time limit, the `rlimit` and the whole query text, so a hit is exactly the answer z3 gave to that very
+  text; a changed function, a changed contract of a callee (it is part of the text), another z3 or another limit is a miss. Only `sat`
+  and `unsat` are stored (always right). `unknown` and a hard timeout say something about the machine and its load, not about
+  the query, so they are stored only with `--cache-unknown`; that makes a rerun skip the timeouts too (the largest part of
+  the time) at the price that a timeout stays a timeout until the entry is deleted or the limit changes. The cache is
+  safe to share between runs and threads (entries are written to a temporary name and renamed; it needs `sha256sum` or
+  `shasum`) and is never cleaned: delete the directory to start over. `--solver-stats` prints
+  `solver: N queries solved (H from the cache, S by the solver)` to stderr.
 
 ### What is reported
 
