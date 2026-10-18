@@ -1,0 +1,291 @@
+// Axioms for the array and string methods the core translation (expr.or) does not model exactly: `sort`, `find`,
+// `findIndex`, `reduce` on arrays, `split`, `indexOf`, `startsWith`, `endsWith`, `includes` on strings. Each method is
+// either exact (`find`, `findIndex`: the first match, defined by the predicate) or a *partial* description of the real
+// result (`sort`, `reduce`, `split`, `indexOf`): the result is a fresh constant constrained by facts that every real
+// execution satisfies, and the constant is tainted (a counterexample that depends on it is not trusted). Facts are sound
+// by construction: each one is stated in the comment above it and follows from the runtime (runtime/core/orin_runtime.c
+// for the string methods, library/collections/array.or for the array methods).
+//
+// expr.or calls in through one hook per receiver type (`trArrayMethodX`, `trStringMethodX`) and passes its own `tr`, so
+// this file does not import expr.or (import cycles are rejected).
+
+import { Expr, EArrow, AExpr, ABlock } from "../syntax";
+import { VT, VInt, VBool, VStr, VArr, VOpt, concrete, vtEq } from "./vt";
+import { Gen } from "./gen";
+import { Var, Chk, TR, Cx, Fresh, lineOf, srcText, andAll, concatChk, mk, noExp, sortS, freshFree, arrLen, arrSel, inBounds, isSomeT } from "./ctx";
+
+// `tr` of expr.or, handed in by the hook.
+export type TrFn = (g: Gen, vars: Var[], cx: Cx, e: Expr, exp: VT) => Result<TR, string>;
+
+function oblChk(kind: string, what: string, line: usize, clause: string, goal: string): Chk {
+  return Chk { oblig: true, kind: kind, what: what, line: line, clause: clause, goal: goal };
+}
+
+function hasObl(cs: Chk[]): bool {
+  for (const c of cs) {
+    if (c.oblig) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// --------------------------------------------------------------------------------------------- lambdas
+
+type Lam = { param: string; body: Expr; };
+
+function lamOf1(e: Expr): Result<Lam, string> {
+  return match (e.kind) {
+    EArrow(ps, _, body) => {
+      if (ps.length != 1) {
+        return Err("function argument has " + ps.length.toString() + " parameter(s), expected 1");
+      }
+      return match (body) {
+        AExpr(b) => Ok(Lam { param: ps[0].name.name, body: b }),
+        ABlock(_) => Err("a function argument with a block body is not supported")
+      };
+    },
+    _ => Err("a function argument must be a lambda written at the call")
+  };
+}
+
+// The predicate of `find` / `findIndex` at an element term, as two facts-guarded formulas: `pos` holds only when the
+// body is true, `neg` only when it is false. Facts about the calls inside the body (their `@Ensures`) are hypotheses of
+// both, so a call whose contract does not hold only makes the formula weaker, never wrong.
+type Pred = { g: Gen; pos: string; neg: string; };
+
+function predAt(g0: Gen, vars: Var[], cx: Cx, lam: Lam, el: VT, term: string, trf: TrFn): Result<Pred, string> {
+  let g = g0;
+  const n0 = g.factCount();
+  let vars2 = vars;
+  vars2.push(Var { name: lam.param, term: term, vt: el });
+  const qcx = Cx { p: cx.p, unit: cx.unit, f: cx.f, res: cx.res, ens: cx.ens, body: cx.body, olds: cx.olds, ret: cx.ret, inQ: true, text: cx.text };
+  const b = trf(g, vars2, qcx, lam.body, VBool)?;
+  g = b.g;
+  const facts = g.takeFactsFrom(n0);
+  if (!vtEq(b.vt, VBool)) {
+    return Err("the function argument must return bool");
+  }
+  if (hasObl(b.chks) && cx.body) {
+    return Err("an index, `unwrap` or call precondition inside a function argument is not supported in code");
+  }
+  if (facts.length == 0) {
+    return Ok(Pred { g: g, pos: b.t, neg: "(not " + b.t + ")" });
+  }
+  const fs = andAll(facts);
+  return Ok(Pred { g: g, pos: "(=> " + fs + " " + b.t + ")", neg: "(=> " + fs + " (not " + b.t + "))" });
+}
+
+// ------------------------------------------------------------------------------------------------- arrays
+
+// The array methods beyond `get`, `includes`, `concat`, `slice`, `indexOf`, `join`, `every`, `some`, `map`, `filter`.
+// `r` is the receiver, `el` its element type.
+export function trArrayMethodX(g0: Gen, vars: Var[], cx: Cx, r: TR, el: VT, name: string, args: Expr[], e: Expr, trf: TrFn): Result<TR, string> {
+  let g = g0;
+  const so = sortS(g, cx, r.vt)?;
+  g = so.g;
+  if (name == "sort" && args.length == 1) {
+    // `sort(cmp)` is a stable merge sort: a permutation of the receiver (library/collections/array.or). Stated: the
+    // same length, and the same set of elements (every element of the result is one of the receiver and vice versa).
+    // The order is not stated (it depends on `cmp`).
+    if (cx.inQ) {
+      return Err("`sort` inside a quantifier body");
+    }
+    const out = freshFree(g, cx, r.vt)?;
+    g = out.g;
+    g.taint(out.name);
+    const q = g.next("q");
+    const p = g.next("q");
+    g.assert("(= " + arrLen(so.s, out.name) + " " + arrLen(so.s, r.t) + ")");
+    g.assert("(forall ((" + q + " Int)) (=> " + inBounds(so.s, out.name, q) + " (exists ((" + p + " Int)) (and " + inBounds(so.s, r.t, p) + " (= " + arrSel(so.s, r.t, p) + " " + arrSel(so.s, out.name, q) + ")))))");
+    const q2 = g.next("q");
+    const p2 = g.next("q");
+    g.assert("(forall ((" + p2 + " Int)) (=> " + inBounds(so.s, r.t, p2) + " (exists ((" + q2 + " Int)) (and " + inBounds(so.s, out.name, q2) + " (= " + arrSel(so.s, out.name, q2) + " " + arrSel(so.s, r.t, p2) + ")))))");
+    return mk(g, out.name, r.vt, r.chks);
+  }
+  if ((name == "findIndex" || name == "find") && args.length == 1) {
+    // `find(p)` / `findIndex(p)`: the first element for which `p` holds, or None when there is none (library/collections/array.or).
+    if (cx.inQ) {
+      return Err("`" + name + "` inside a quantifier body");
+    }
+    const lam = lamOf1(args[0])?;
+    const wantIdx = name == "findIndex";
+    const rt = wantIdx ? VOpt(VInt("usize")) : VOpt(el);
+    const os = sortS(g, cx, rt)?;
+    g = os.g;
+    const o = freshFree(g, cx, rt)?;
+    g = o.g;
+    const some = isSomeT(os.s, o.name);
+    const q = g.next("q");
+    const j = g.next("q");
+    let i = "(val" + os.s + " " + o.name + ")";
+    if (!wantIdx) {
+      i = g.next("q");
+    }
+    const atI = arrSel(so.s, r.t, i);
+    const pi = predAt(g, vars, cx, lam, el, atI, trf)?;
+    g = pi.g;
+    const pj = predAt(g, vars, cx, lam, el, arrSel(so.s, r.t, j), trf)?;
+    g = pj.g;
+    const pq = predAt(g, vars, cx, lam, el, arrSel(so.s, r.t, q), trf)?;
+    g = pq.g;
+    const before = "(forall ((" + j + " Int)) (=> (and (<= 0 " + j + ") (< " + j + " " + i + ")) " + pj.neg + "))";
+    let found = "(and " + inBounds(so.s, r.t, i) + " " + pi.pos + " " + before + ")";
+    if (!wantIdx) {
+      found = "(exists ((" + i + " Int)) (and " + found + " (= " + atI + " (val" + os.s + " " + o.name + "))))";
+    }
+    g.assert("(=> " + some + " " + found + ")");
+    g.assert("(=> (not " + some + ") (forall ((" + q + " Int)) (=> " + inBounds(so.s, r.t, q) + " " + pq.neg + ")))");
+    return mk(g, o.name, rt, r.chks);
+  }
+  if (name == "reduce" && args.length == 2) {
+    // `reduce(f, init)`: a fold with a function the model does not unfold. Stated: an empty receiver gives `init`.
+    if (cx.inQ) {
+      return Err("`reduce` inside a quantifier body");
+    }
+    const init = trf(g, vars, cx, args[1], noExp())?;
+    g = init.g;
+    const ut = concrete(init.vt);
+    const out = freshFree(g, cx, ut)?;
+    g = out.g;
+    g.taint(out.name);
+    g.assert("(=> (= " + arrLen(so.s, r.t) + " 0) (= " + out.name + " " + init.t + "))");
+    return mk(g, out.name, ut, concatChk(r.chks, init.chks));
+  }
+  return Err("array method `" + name + "` is not supported");
+}
+
+// ------------------------------------------------------------------------------------------------ strings
+
+// `s.startsWith(t)`, `s.endsWith(t)`, `s.includes(t)`: uninterpreted functions of the two strings (`strSw`, `strEw`,
+// `strIn`), so the same call gives the same answer everywhere (a test in the body and the same test in a contract
+// agree). Axioms, each a property of the runtime (orin_str_starts_with / ends_with / includes): for all a, b and each P
+//  - P(a, b) implies a is at least as long as b;
+//  - an empty b gives true, and so does b equal to a;
+//  - P(a, b) with a and b of the same length implies a == b (the whole of a is b);
+//  - a prefix or a suffix is also a substring: startsWith / endsWith imply includes.
+// Being functions of the strings, they need no fresh constant and work inside a quantifier body. The axioms are
+// declarations (always asserted), not lemmas: the bounded counterexample search drops lemmas, and these do not follow
+// from any definition.
+export function strPredTerm(g0: Gen, name: string, s: string, t: string): Fresh {
+  let g = g0;
+  if (!g.hasFun("strSw")) {
+    g.registerFun("strSw");
+    // only about well-formed strings (wfOf): the datatype also has values such as (mkStr 0 5) that no string is,
+    // and an axiom about every value of the sort would be inconsistent with them
+    const wf = "(and (>= (slen a) 0) (=> (= (slen a) 0) (= (sid a) 0)) (>= (slen b) 0) (=> (= (slen b) 0) (= (sid b) 0)))";
+    const fns = ["strSw", "strEw", "strIn"];
+    for (const f of fns) {
+      g.declare("(declare-fun " + f + " (Str Str) Bool)");
+      const app = "(" + f + " a b)";
+      g.declare("(assert (forall ((a Str) (b Str)) (! (=> " + wf + " (and (=> " + app + " (>= (slen a) (slen b))) (=> (or (= (slen b) 0) (= a b)) " + app + ") (=> (and " + app + " (= (slen a) (slen b))) (= a b)))) :pattern (" + app + "))))");
+    }
+    g.declare("(assert (forall ((a Str) (b Str)) (! (=> (strSw a b) (strIn a b)) :pattern ((strSw a b)))))");
+    g.declare("(assert (forall ((a Str) (b Str)) (! (=> (strEw a b) (strIn a b)) :pattern ((strEw a b)))))");
+  }
+  const f = name == "startsWith" ? "strSw" : (name == "endsWith" ? "strEw" : "strIn");
+  return Fresh { g: g, name: "(" + f + " " + s + " " + t + ")" };
+}
+
+// The string methods beyond `charCodeAt`, `charAt`, `substring`, `startsWith`, `endsWith`, `includes`, `trim`.
+// `r` is the receiver. The caller has noted the assumption A-STR.
+export function trStringMethodX(g0: Gen, vars: Var[], cx: Cx, r: TR, name: string, args: Expr[], e: Expr, trf: TrFn): Result<TR, string> {
+  let g = g0;
+  const len = "(slen " + r.t + ")";
+  if (name == "split" && args.length == 1) {
+    // `s.split(sep)` (orin_str_split): traps when `sep` is empty; otherwise the pieces between the occurrences of `sep`
+    // (non-overlapping, left to right). Stated, for a non-empty `sep`:
+    //  - at least one piece; at most `length` + 1 pieces;
+    //  - every piece is a string no longer than `s`, and no longer than `s` minus `sep` when there is more than one piece
+    //    (each separator takes `sep.length` bytes away from the pieces);
+    //  - a single piece is `s` itself (no occurrence), which is the case when `s` is shorter than `sep`;
+    //  - two pieces: their lengths and one separator add up to `s`; three pieces: likewise with two separators.
+    if (cx.inQ) {
+      return Err("`split` inside a quantifier body");
+    }
+    const sep = trf(g, vars, cx, args[0], VStr)?;
+    g = sep.g;
+    g.noteStr("derive");
+    const at = VArr(VStr);
+    const as = sortS(g, cx, at)?;
+    g = as.g;
+    const out = freshFree(g, cx, at)?;
+    g = out.g;
+    g.taint(out.name);
+    const slen = "(slen " + sep.t + ")";
+    const n = arrLen(as.s, out.name);
+    const q = g.next("q");
+    const piece = arrSel(as.s, out.name, q);
+    const nonEmptySep = "(> " + slen + " 0)";
+    const e0 = arrSel(as.s, out.name, "0");
+    const e1 = arrSel(as.s, out.name, "1");
+    const e2 = arrSel(as.s, out.name, "2");
+    g.assert("(=> " + nonEmptySep + " (and (>= " + n + " 1) (<= (- " + n + " 1) " + len + ")))");
+    g.assert("(=> " + nonEmptySep + " (forall ((" + q + " Int)) (=> " + inBounds(as.s, out.name, q) + " (and (>= (slen " + piece + ") 0) (=> (= (slen " + piece + ") 0) (= (sid " + piece + ") 0)) (<= (slen " + piece + ") " + len + ") (=> (>= " + n + " 2) (<= (slen " + piece + ") (- " + len + " " + slen + ")))))))");
+    g.assert("(=> (and " + nonEmptySep + " (< " + len + " " + slen + ")) (and (= " + n + " 1) (= " + e0 + " " + r.t + ")))");
+    g.assert("(=> (and " + nonEmptySep + " (= " + n + " 1)) (= " + e0 + " " + r.t + "))");
+    g.assert("(=> (and " + nonEmptySep + " (= " + n + " 2)) (= " + len + " (+ (slen " + e0 + ") (slen " + e1 + ") " + slen + ")))");
+    g.assert("(=> (and " + nonEmptySep + " (= " + n + " 3)) (= " + len + " (+ (slen " + e0 + ") (slen " + e1 + ") (slen " + e2 + ") " + slen + " " + slen + ")))");
+    const clause = "split separator is not empty: `" + srcText(cx.text, e) + "`";
+    return mk(g, out.name, at, concatChk(concatChk(r.chks, sep.chks), [oblChk("bounds", "split", lineOf(cx.text, e.span.start), clause, nonEmptySep)]));
+  }
+  if (name == "indexOf" && args.length == 1) {
+    // `s.indexOf(x)` (orin_str_index_of): the first position of `x`, or None. Stated: an empty `x` is found at 0, a
+    // `x` longer than `s` is not found, and a position leaves room for `x`. Which occurrence is not stated.
+    if (cx.inQ) {
+      return Err("`indexOf` inside a quantifier body");
+    }
+    const x = trf(g, vars, cx, args[0], VStr)?;
+    g = x.g;
+    g.noteStr("derive");
+    const ot = VOpt(VInt("usize"));
+    const os = sortS(g, cx, ot)?;
+    g = os.g;
+    const o = freshFree(g, cx, ot)?;
+    g = o.g;
+    g.taint(o.name);
+    const xl = "(slen " + x.t + ")";
+    const pos = "(val" + os.s + " " + o.name + ")";
+    g.assert("(=> (< " + len + " " + xl + ") (not " + isSomeT(os.s, o.name) + "))");
+    g.assert("(=> (= " + xl + " 0) (and " + isSomeT(os.s, o.name) + " (= " + pos + " 0)))");
+    g.assert("(=> " + isSomeT(os.s, o.name) + " (and (<= 0 " + pos + ") (<= (+ " + pos + " " + xl + ") " + len + ")))");
+    return mk(g, o.name, ot, concatChk(r.chks, x.chks));
+  }
+  return Err("string method `" + name + "` is not supported");
+}
+
+// --------------------------------------------------------------------------------------- literal contents
+
+// The longest literal whose bytes are stated (longer ones are messages, not codes or keywords; stating them would only
+// make the queries bigger).
+const LIT_CHR_MAX: usize = 16;
+
+// The bytes of a literal as facts about `chr` (the byte at a position of a string's contents, `charCodeAt`): a literal's
+// id stands for its contents (gen.or: equal ids, equal contents; distinct literals have distinct ids), so
+// `chr(id, k)` is byte k of the text. Stated only once `chr` exists (a function that reads no byte needs none of it),
+// as declarations, so that they also hold outside the quantifier body a literal may first occur in.
+export function litChrFacts(g0: Gen, text: string, name: string): Gen {
+  let g = g0;
+  if (!g.hasFun("chr") || text.length == 0 || text.length > LIT_CHR_MAX) {
+    return g;
+  }
+  let k: usize = 0;
+  while (k < text.length) {
+    g.declare("(assert (= (chr (sid " + name + ") " + k.toString() + ") " + text.charCodeAt(k).toString() + "))");
+    k += 1;
+  }
+  return g;
+}
+
+// `litChrFacts` of every literal seen so far: called when `chr` is declared.
+export function allLitChrFacts(g0: Gen): Gen {
+  let g = g0;
+  const texts = g.litTextList();
+  const names = g.litConsts();
+  let i: usize = 0;
+  while (i < texts.length && i < names.length) {
+    g = litChrFacts(g, texts[i], names[i]);
+    i += 1;
+  }
+  return g;
+}

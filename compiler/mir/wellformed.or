@@ -49,6 +49,7 @@ export function dstOf(ins: Instr): Option<usize> {
     INullary(d, _) => Some(d),
     ITag(d, _) => Some(d),
     IGetField(d, _, _) => Some(d),
+    IGetFieldU(d, _, _) => Some(d),
     ITakeField(d, _, _) => Some(d),
     IArrayNew(d, _, _) => Some(d),
     IArrayGet(d, _, _) => Some(d),
@@ -87,6 +88,9 @@ export function instrLocals(i: Instr): usize[] {
     ITag(d, o) => [d].concat(operandLocals(o)),
     IGetField(d, o, _) => [d].concat(operandLocals(o)),
     ISetField(x, _, v) => [x].concat(operandLocals(v)),
+    IShapeCheck(x, _) => [x],
+    IGetFieldU(d, o, _) => [d].concat(operandLocals(o)),
+    ISetFieldU(x, _, v) => [x].concat(operandLocals(v)),
     ITakeField(d, x, _) => [d, x],
     IPutField(x, _, s) => [x, s],
     IMakeUnique(x) => [x],
@@ -129,6 +133,9 @@ export function instrOperands(i: Instr): Operand[] {
     ITag(_, o) => [o],
     IGetField(_, o, _) => [o],
     ISetField(_, _, v) => [v],
+    IShapeCheck(_, _) => [],
+    IGetFieldU(_, o, _) => [o],
+    ISetFieldU(_, _, v) => [v],
     ITakeField(_, _, _) => [],
     IPutField(_, _, _) => [],
     IMakeUnique(_) => [],
@@ -178,6 +185,12 @@ function termOperands(t: Terminator): Operand[] {
 
 // Number of blocks a terminator can continue in (`successors(t).length`), and the `k`-th of them (`successors(t)[k]`):
 // the allocation-free way to walk the successors, for the loops that run for every block of every function.
+@Ensures(match (t) {
+  TGoto(_) => result == 1,
+  TBranch(_, _, _) => result == 2,
+  TSwitch(_, cases, _) => result == cases.length + 1,
+  _ => result == 0,
+})
 export function succCount(t: Terminator): usize {
   return match (t) {
     TGoto(_) => 1,
@@ -189,6 +202,12 @@ export function succCount(t: Terminator): usize {
 }
 
 @Requires(k < succCount(t))
+@Ensures(match (t) {
+  TGoto(a) => result == a,
+  TBranch(_, a, b) => result == (k == 0 ? a : b),
+  TSwitch(_, cases, d) => result == (k < cases.length ? cases[k].target : d),
+  _ => result == 0,
+})
 export function succAt(t: Terminator, k: usize): usize {
   return match (t) {
     TGoto(a) => a,
@@ -308,6 +327,7 @@ export function spansComplete(blocks: MBlock[]): bool {
 // ---------------------------------------------------------------- functions and programs
 
 // The parameter table is consistent: the parameters are locals and there is one mode per parameter.
+@Ensures(result == (f.paramCount <= f.locals.length && f.paramOwned.length == f.paramCount))
 export function paramsWellFormed(f: MFunction): bool {
   return f.paramCount <= f.locals.length && f.paramOwned.length == f.paramCount;
 }
@@ -315,6 +335,7 @@ export function paramsWellFormed(f: MFunction): bool {
 // `f` is structurally well-formed in `p`: consistent parameters, an entry block, one span per instruction, every block id,
 // local, string, function and vtable index it mentions in range. The verifier's well-formedness check implies this
 // (`compiler/verify`), the lowering produces it (`compiler/lower`).
+@Ensures(result ==> f.paramCount <= f.locals.length && f.paramOwned.length == f.paramCount && f.blocks.length > 0)
 export function isWellFormedFunction(p: MProgram, f: MFunction): bool {
   return paramsWellFormed(f)
       && f.blocks.length > 0
@@ -325,6 +346,7 @@ export function isWellFormedFunction(p: MProgram, f: MFunction): bool {
 }
 
 // Every function of `p` is well-formed, `main` is one of them and every vtable entry is a function.
+@Ensures(result ==> p.main < p.functions.length)
 export function isWellFormedProgram(p: MProgram): bool {
   return p.main < p.functions.length
       && p.vtables.every(v => v.funcs.every(g => g < p.functions.length))

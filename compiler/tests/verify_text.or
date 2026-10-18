@@ -25,7 +25,7 @@ import { ProcessGrant } from "std:process";
 import { MProgram, MFunction, MType, MLocal, MBlock, Instr, Terminator, Operand, SwitchCase, MVTable, noSpan, spanSuffix } from "../mir";
 import { Span } from "../diag";
 import { Builtin, UnOp, BinOp, taskOpFromName } from "../hir";
-import { verify, VerifyReport, accessFacts } from "../verify";
+import { verify, VerifyReport, accessFacts, fieldFacts } from "../verify";
 import { readFile, fsErrorMessage } from "std:fs";
 import { args, exit } from "std:process";
 
@@ -282,6 +282,11 @@ function withDst(d: usize, rhs: string): Instr {
     if (dot < 0) { die("bad getfield `" + rhs + "`"); }
     return IGetField(d, operand(between(rest, 0, dot)), num(tail(rest, dot + 1)).toUsize());
   }
+  if (w == "getfieldu") {
+    const dot = find(rest, ".");
+    if (dot < 0) { die("bad getfieldu `" + rhs + "`"); }
+    return IGetFieldU(d, operand(between(rest, 0, dot)), num(tail(rest, dot + 1)).toUsize());
+  }
   if (w == "forward") {
     const p = rest.split(", ");
     if (p.length != 2) { die("bad forward `" + rhs + "`"); }
@@ -370,6 +375,16 @@ function instr(line: string): Instr {
       return ISetField(r[0], r[1], operand(p[1]));
     }
     return IPutField(r[0], r[1], lcl(p[1]));
+  }
+  if (line.startsWith("shapecheck ")) {
+    const r = slotRef(tail(line, 11));
+    return IShapeCheck(r[0], r[1]);
+  }
+  if (line.startsWith("setfieldu ")) {
+    const p = tail(line, 10).split(" = ");
+    if (p.length != 2) { die("bad unchecked field store `" + line + "`"); }
+    const r = slotRef(p[0]);
+    return ISetFieldU(r[0], r[1], operand(p[1]));
   }
   if (line.startsWith("arrayset ") || line.startsWith("arrayput ")) {
     const p = tail(line, 9).split(" = ");
@@ -608,8 +623,9 @@ function runOne(name: string, lines: string[], facts: bool): void {
   console.log(out);
 }
 
-// `--facts`: instead of the verdict, the fact that justifies each unchecked array access (rule U1), one line per program:
-//   <name> FACTS <fN:bB:iI:kind> ...      kind: none, dominated-by-check, interval or both
+// `--facts`: instead of the verdict, the fact that justifies each unchecked array access (rule U1) and struct slot access (rule U6),
+// one line per program:
+//   <name> FACTS <fN:bB:iI:kind> ...      kind: none, dominated-by-check, interval or both; field-none or field-checked (U6)
 function factsOne(name: string, lines: string[]): void {
   const prog = parseProgram(lines);
   let out = name + "\tFACTS";
@@ -627,6 +643,9 @@ function factsOne(name: string, lines: string[]): void {
       const kind = k == 0 ? "none" : k == 1 ? "dominated-by-check" : k == 2 ? "interval" : "both";
       out += "\tf" + fi.toString() + ":b" + fs[q].toString() + ":i" + fs[q + 1].toString() + ":" + kind;
       q += 3;
+    }
+    for (const x of fieldFacts(prog, f, reached)) {
+      out += "\tf" + fi.toString() + ":b" + x.block.toString() + ":i" + x.instr.toString() + ":" + (x.ok ? "field-checked" : "field-none");
     }
     fi += 1;
   }
