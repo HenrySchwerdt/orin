@@ -44,7 +44,7 @@ A `VERIFIED` contract result names the assumptions its proof used (JSON `assumpt
 results and conversions are in range of their type on returning paths; contracts are over unbounded integers), **A-DIV**,
 **A-PARTIAL** (termination is not proved), **A-CALL** (the contracts of called functions hold; recursion assumes its own),
 **A-PURE** (a function the purity analysis finds pure is a deterministic function of its arguments), **A-INV** (class and
-record invariants hold on entry to public methods and for parameters and results of those types), **A-FRAME** (a method
+record invariants hold on entry to public methods, on entry to private methods whose every call proves them, and for parameters and results of those types), **A-FRAME** (a method
 writes only the fields its body writes), **A-LOOP** (the loop invariants used hold; each is proved), **A-STR** (strings are
 modelled by length), **A-MAP** (map sizes are axiomatised). The texts and the soundness reasoning are in docs/contracts.md and
 ADR-0036. Not an assumption but a limit: a write to a public field of a class from outside the class can break an invariant that

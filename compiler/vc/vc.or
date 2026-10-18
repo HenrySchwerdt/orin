@@ -23,7 +23,7 @@ import { ProcessGrant } from "std:process";
 import { SourceMap } from "../diag";
 import {
   Ident, FunctionDecl, Param, TypeExpr, Block, Stmt, Expr, ContractClause,
-  IFunction, IClass, IType, IConst, ClassDecl, MField, MCtor, MMethod, MethodDecl, CtorDecl,
+  IFunction, IClass, IInterface, IType, IConst, ClassDecl, MField, MCtor, MMethod, MethodDecl, CtorDecl,
   TypeDecl, DAlias, DRecord, DUnion,
   CRequires, CEnsures, CInvariant, CDecreases, CRule
 } from "../syntax";
@@ -77,7 +77,7 @@ function unitFns(u: string, file: string, text: string, d: FunctionDecl): Fn {
   return Fn {
     key: qualKey(u, d.name.name), disp: d.name.name, sym: d.name.name, name: d.name.name, unit: u, file: file, text: text, cls: "", kind: 0, priv: false, generic: d.typeParams.length > 0,
     pnames: names, ptys: tys, pacc: acc, ret: d.ret, body: d.body, contracts: d.contracts, span: d.span, pure: false, mutating: false,
-    frame: [], frameAll: false, line: lineOf(text, d.span.start), params: d.params, verify: !u.startsWith("$"), tparams: identNames(d.typeParams)
+    frame: [], frameAll: false, line: lineOf(text, d.span.start), params: d.params, verify: !u.startsWith("$"), tparams: identNames(d.typeParams), ainv: false
   };
 }
 
@@ -93,7 +93,7 @@ function methodFn(u: string, file: string, text: string, c: ClassDecl, m: Method
   return Fn {
     key: qualKey(u, c.name.name) + "." + m.name.name, disp: c.name.name + "." + m.name.name, sym: c.name.name + "." + m.name.name, name: m.name.name, unit: u, file: file, text: text, cls: qualKey(u, c.name.name), kind: m.isStatic ? 2 : 1, priv: m.priv,
     generic: m.typeParams.length > 0 || c.typeParams.length > 0, pnames: names, ptys: tys, pacc: acc, ret: m.ret, body: m.body, contracts: m.contracts,
-    span: m.span, pure: false, mutating: false, frame: [], frameAll: false, line: lineOf(text, m.span.start), params: m.params, verify: !u.startsWith("$"), tparams: concatNames(identNames(c.typeParams), identNames(m.typeParams))
+    span: m.span, pure: false, mutating: false, frame: [], frameAll: false, line: lineOf(text, m.span.start), params: m.params, verify: !u.startsWith("$"), tparams: concatNames(identNames(c.typeParams), identNames(m.typeParams)), ainv: false
   };
 }
 
@@ -111,7 +111,7 @@ function ctorFn(u: string, file: string, text: string, c: ClassDecl, k: CtorDecl
   return Fn {
     key: qualKey(u, c.name.name) + ".constructor", disp: c.name.name + ".constructor", sym: c.name.name + ".constructor", name: "constructor", unit: u, file: file, text: text, cls: qualKey(u, c.name.name), kind: 3, priv: false, generic: c.typeParams.length > 0,
     pnames: names, ptys: tys, pacc: acc, ret: None, body: k.body, contracts: k.contracts, span: k.span, pure: false, mutating: false,
-    frame: [], frameAll: false, line: lineOf(text, k.span.start), params: ps, verify: !u.startsWith("$"), tparams: identNames(c.typeParams)
+    frame: [], frameAll: false, line: lineOf(text, k.span.start), params: ps, verify: !u.startsWith("$"), tparams: identNames(c.typeParams), ainv: false
   };
 }
 
@@ -143,7 +143,7 @@ function classInfo(u: string, file: string, text: string, c: ClassDecl, ctor: Op
       _ => {}
     }
   }
-  return Cls { name: qualKey(u, c.name.name), unit: u, file: file, text: text, fields: fields, ftys: ftys, finit: finit, invs: clausesOfList(c.contracts, 4), generic: c.typeParams.length > 0, ctor: ctor, tparams: identNames(c.typeParams) };
+  return Cls { name: qualKey(u, c.name.name), unit: u, file: file, text: text, fields: fields, ftys: ftys, finit: finit, invs: clausesOfList(c.contracts, 4), generic: c.typeParams.length > 0, ctor: ctor, tparams: identNames(c.typeParams), cstart: c.span.start, cend: c.span.end };
 }
 
 // Count of a name in a map (0 when absent).
@@ -266,6 +266,9 @@ function buildProg(prog: LoadedProgram, sm: SourceMap, hir: Program): Prog {
         IClass(c) => {
           tab.addRec(recOfClass(u.name, c, f.text));
         },
+        IInterface(d) => {
+          tab.addIface(qualKey(u.name, d.name.name));
+        },
         IConst(c) => {
           consts.push(ConstInfo { key: qualKey(u.name, c.name.name), name: c.name.name, unit: u.name, decl: c, text: f.text });
         },
@@ -338,7 +341,7 @@ function buildProg(prog: LoadedProgram, sm: SourceMap, hir: Program): Prog {
   const scopes = buildScopes(prog);
   tab.setScope(scopes.types);
   const sealed = sealTab(tab);
-  let p = Prog { tab: sealed, fns: fns, fnIx: fnIx, fnCount: fnCount, classes: classes, clsIx: clsIx, consts: consts, mutNames: mutNames, vscope: scopes.vals };
+  let p = Prog { tab: sealed, fns: fns, fnIx: fnIx, fnCount: fnCount, classes: classes, clsIx: clsIx, consts: consts, mutNames: mutNames, vscope: scopes.vals, sites: new Map<string, bool>(), verified: new Map<string, bool>() };
   return computeFrames(p);
 }
 
@@ -350,7 +353,12 @@ function prelude(): string {
     + "(define-fun trem ((a Int) (b Int)) Int (- a (* b (tdiv a b))))\n";
 }
 
-type Rt = { p: Prog; or: Oracle; fi: usize; qn: usize; out: Res[]; warns: QWarn[]; miss: string[]; };
+// `sites`: the `invariant-site` obligations found (see `privateInvariants`); `sitesOnly`: prove only those, report nothing.
+type Rt = { p: Prog; or: Oracle; fi: usize; qn: usize; out: Res[]; warns: QWarn[]; miss: string[]; sites: Site[]; sitesOnly: bool; };
+
+// A call of the private method `callee` at source position `pos` of the function `caller`, and whether the class invariants
+// were proved at that call.
+type Site = { callee: string; caller: string; pos: string; ok: bool; };
 
 // A value the counterexample shows: `label = value`, shown when its guard holds (an element only below the
 // length, a payload only when present).
@@ -706,7 +714,7 @@ function assumeInvariants(rt: Rt, f: Fn, en0: Entry): Entry {
   for (const v of en.vars) {
     match (v.vt) {
       VRec(_) => {
-        if (v.name == "this" && (f.priv || f.kind == 3)) {
+        if (v.name == "this" && (f.priv || f.kind == 3) && !f.ainv) {
           continue;
         }
         const iv = valueInvariants(en.g, en.cx, v.vt, v.term);
@@ -1095,8 +1103,12 @@ function verifyFn(fs: FsGrant, proc: ProcessGrant, rt0: Rt, f: Fn): Rt {
   let id: usize = 0;
   while (id < obls.length) {
     const o = obls[id];
-    const wanted = o.kind == "call-precondition" || o.kind == "loop-invariant" || reportSafety;
-    if (!wanted) {
+    const isSite = o.kind == "invariant-site";
+    const wanted = isSite ? !o.exact : (o.kind == "loop-invariant" || (!rt.sitesOnly && (o.kind == "call-precondition" || reportSafety)));
+    if (!isSite && !o.exact && rt.p.verified.has(f.key + "|" + keys[id])) {
+      statuses[id] = "VERIFIED";
+      verdicts[id] = Verdict { status: "VERIFIED", reason: "", cex: [] };
+    } else if (!wanted) {
       statuses[id] = "SKIPPED";
     } else if (!o.exact) {
       const raw = rawProve(fs, proc, rt.or, rt.fi, rt.qn, g, base, o.pc, o.goal, en.probes);
@@ -1106,6 +1118,19 @@ function verifyFn(fs: FsGrant, proc: ProcessGrant, rt0: Rt, f: Fn): Rt {
       statuses[id] = verdicts[id].status;
     }
     id += 1;
+  }
+  // The call sites of private methods that assume the class invariants.
+  id = 0;
+  while (id < obls.length) {
+    const o = obls[id];
+    if (o.kind == "invariant-site" && !o.exact) {
+      const sv = depsVerdict(g, statuses, o.deps, verdicts[id]);
+      rt.sites.push(Site { callee: o.what, caller: f.key, pos: o.clause, ok: statuses[id] != "SKIPPED" && sv.status == "VERIFIED" });
+    }
+    id += 1;
+  }
+  if (rt.sitesOnly) {
+    return rt;
   }
   id = 0;
   while (id < obls.length) {
@@ -1206,7 +1231,9 @@ function verifyFn(fs: FsGrant, proc: ProcessGrant, rt0: Rt, f: Fn): Rt {
         }
       }
     }
-    if (failure != "") {
+    if (rt.p.verified.has(f.key + "|" + t.kind + "|" + t.line.toString() + "|" + t.text)) {
+      rt = pushRes(rt, f, t.line, t.kind, t.text, Verdict { status: "VERIFIED", reason: "", cex: [] }, []);
+    } else if (failure != "") {
       rt = pushRes(rt, f, t.line, t.kind, t.text, unknownV(failure), []);
     } else {
       const pr = proveRets(fs, proc, rt.or, rt.fi, rt.qn, g, base, goals, statuses, en.probes);
@@ -1333,40 +1360,34 @@ function qualityChecks(fs: FsGrant, proc: ProcessGrant, rt0: Rt, f: Fn, en: Entr
 
 // What proving one function yields; the driver puts these together in function order. `miss`: the queries that had no
 // answer yet (then the rest is not final).
-type FnRes = { out: Res[]; warns: QWarn[]; miss: string[]; };
+type FnRes = { out: Res[]; warns: QWarn[]; miss: string[]; sites: Site[]; };
 
 // Functions are independent: query files are named after the function index (f<fi>q<n>), and nothing but the
 // read-only program and the answers of the solver is shared.
-function verifyOne(fs: FsGrant, proc: ProcessGrant, p: Prog, or: Oracle, fi: usize): FnRes {
-  const rt = verifyFn(fs, proc, Rt { p: p, or: or, fi: fi, qn: 0, out: [], warns: [], miss: [] }, p.fns[fi]);
-  return FnRes { out: rt.out, warns: rt.warns, miss: rt.miss };
+function verifyOne(fs: FsGrant, proc: ProcessGrant, p: Prog, or: Oracle, fi: usize, sitesOnly: bool): FnRes {
+  const rt = verifyFn(fs, proc, Rt { p: p, or: or, fi: fi, qn: 0, out: [], warns: [], miss: [], sites: [], sitesOnly: sitesOnly }, p.fns[fi]);
+  return FnRes { out: rt.out, warns: rt.warns, miss: rt.miss, sites: rt.sites };
 }
 
-export function verifyContracts(fs: FsGrant, proc: ProcessGrant, prog: LoadedProgram, sm: SourceMap, hir: Program, z3: string, lim: SolverLimits): Report {
-  const p = buildProg(prog, sm, hir);
-  shellRun(proc, "mkdir -p build/contracts-vc");
-  let or = Oracle { z3: z3, lim: lim, deferred: parallelism() > 1, answers: new Map<string, Result<Solved, string>>() };
-  // Functions without clauses are still analysed (their calls of contracted functions are proof obligations);
-  // if they are outside the fragment nothing is reported for them.
-  let todo: usize[] = [];
+type Rounds = { res: FnRes[]; or: Oracle; };
+
+// Proves the functions `idxs` (indexes into `p.fns`). Rounds: a function that asked a query without an answer is run again
+// after the queries of the round are solved; one that asked none is final. Without deferring there is one round.
+function runRounds(fs: FsGrant, proc: ProcessGrant, p: Prog, or0: Oracle, idxs: usize[], sitesOnly: bool): Rounds {
+  let or = or0;
   let done: FnRes[] = [];
   let open: usize[] = [];
   let i: usize = 0;
-  while (i < p.fns.length) {
-    if (p.fns[i].verify) {
-      open.push(todo.length);
-      todo.push(i);
-      done.push(FnRes { out: [], warns: [], miss: [] });
-    }
+  while (i < idxs.length) {
+    open.push(i);
+    done.push(FnRes { out: [], warns: [], miss: [], sites: [] });
     i += 1;
   }
-  // Rounds: a function that asked a query without an answer is run again after the queries of the round are solved;
-  // one that asked none is final. Without deferring there is one round.
   while (open.length > 0) {
     let again: usize[] = [];
     let miss: string[] = [];
     for (const k of open) {
-      const r = verifyOne(fs, proc, p, or, todo[k]);
+      const r = verifyOne(fs, proc, p, or, idxs[k], sitesOnly);
       if (r.miss.length == 0) {
         done[k] = r;
       } else {
@@ -1374,14 +1395,322 @@ export function verifyContracts(fs: FsGrant, proc: ProcessGrant, prog: LoadedPro
         miss = concat(miss, r.miss);
       }
     }
-      if (miss.length > 0) {
+    if (miss.length > 0) {
       or = solveMissing(fs, proc, or, miss);
     }
     open = again;
   }
+  return Rounds { res: done, or: or };
+}
+
+// ------------------------------------------------------------------------------ invariants in private methods
+
+// A private method may be called in the middle of an update of its object, so a class invariant is neither assumed on entry
+// nor proved at the end of it (ADR-0031 B8). That leaves the contracts of a private method that need an invariant (the bound
+// of an index, say) UNKNOWN or REFUTED. This pass lets such a method assume the invariants on entry when it can show that
+// no call can reach it in a state that breaks them:
+//   - the candidates are the private instance methods of a class with invariants that have a result that is not VERIFIED;
+//   - a candidate is eligible when every mention of its name in the text of its class (the declaration aside) is a call
+//     at which the verifier proved the invariants of the receiver (an `invariant-site` obligation: hidden, proved in the
+//     state at the call). A mention the verifier did not see as a call (a contract, a closure, a function value, a call
+//     that was outside the fragment) makes the method not eligible;
+//   - a site proved in a caller that itself assumes the invariants (a candidate) counts only while that caller stays
+//     eligible: the set of methods that assume them is the greatest set closed under this (an induction on the depth of the
+//     call stack: the entry of every call chain is a public method or a constructor, which prove or assume them as before).
+// For an eligible method the results of the run with the invariants assumed replace those that were not VERIFIED; a result
+// that was VERIFIED stays as it was. Other methods are unchanged.
+
+function isIdChar(c: int): bool {
+  return (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95 || c == 36;
+}
+
+function hasUnproved(r: FnRes): bool {
+  for (const x of r.out) {
+    if (x.status != "VERIFIED") {
+      return true;
+    }
+  }
+  return false;
+}
+
+// The distinct source positions of the sites of `callee` among `sites`.
+function sitePositions(sites: Site[], callee: string): string[] {
+  let out: string[] = [];
+  for (const s of sites) {
+    if (s.callee == callee && !out.includes(s.pos)) {
+      out.push(s.pos);
+    }
+  }
+  return out;
+}
+
+// Were the invariants proved at every site of `callee` at `pos` that `sites` lists?
+function sitesHold(sites: Site[], callee: string, pos: string): bool {
+  let seen = false;
+  for (const s of sites) {
+    if (s.callee == callee && s.pos == pos) {
+      seen = true;
+      if (!s.ok) {
+        return false;
+      }
+    }
+  }
+  return seen;
+}
+
+function sameResults(a: Res[], b: Res[]): bool {
+  if (a.length != b.length) {
+    return false;
+  }
+  let i: usize = 0;
+  while (i < a.length) {
+    if (a[i].kind != b[i].kind || a[i].line != b[i].line || a[i].clause != b[i].clause || a[i].fn != b[i].fn) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+// How many times `name` occurs as a whole word in `text`, and how many of those look like a call `.name(`.
+type Words = { all: usize; calls: usize; };
+
+function wordsOf(text0: string, name: string): Words {
+  let text = text0;
+  let w = Words { all: 0, calls: 0 };
+  let go = true;
+  while (go) {
+    const ix = text.indexOf(name);
+    if (ix.isNone()) {
+      go = false;
+    } else {
+      const i = ix.unwrap();
+      const end = i + name.length;
+      const before = i == 0 ? 0 : text.charCodeAt(i - 1);
+      const after = end >= text.length ? 0 : text.charCodeAt(end);
+      if (!isIdChar(before) && !isIdChar(after)) {
+        w.all += 1;
+        if (before == 46 && after == 40) {
+          w.calls += 1;
+        }
+      }
+      text = text.substring(i + 1, text.length);
+    }
+  }
+  return w;
+}
+
+function privateInvariants(fs: FsGrant, proc: ProcessGrant, p: Prog, or0: Oracle, todo: usize[], done0: FnRes[]): Rounds {
+  let done = done0;
+  let or = or0;
+  // The candidates: private methods of a class with invariants that have a result that is not VERIFIED, and whose name is
+  // used in the class only as `.name(` (besides the declaration).
+  let cand: usize[] = [];        // positions in `todo`
+  let sites = new Map<string, bool>();
+  let k: usize = 0;
+  while (k < todo.length) {
+    const f = p.fns[todo[k]];
+    k += 1;
+    if (f.kind != 1 || !f.priv || f.generic || f.cls == "") {
+      continue;
+    }
+    const co = p.clsIx.get(f.cls);
+    if (co.isNone()) {
+      continue;
+    }
+    const cls = p.classes[co.unwrap()];
+    if (cls.invs.length == 0 || cls.generic || !hasUnproved(done[k - 1])) {
+      continue;
+    }
+    const w = wordsOf(cls.text.substring(cls.cstart, cls.cend), f.name);
+    if (w.all < 1 || w.calls != w.all - 1) {
+      continue;
+    }
+    cand.push(k - 1);
+    sites.set(f.key, true);
+  }
+  if (cand.length == 0) {
+    return Rounds { res: done, or: or };
+  }
+  // Run B: the candidates with the invariants assumed on entry. Only those that gain a proof are worth the rest.
+  let p3 = p;
+  p3.sites = sites;
+  let bIdx: usize[] = [];
+  for (const c of cand) {
+    const fc = p.fns[todo[c]];
+    p3.fns[todo[c]].ainv = true;
+    bIdx.push(todo[c]);
+    // what the first run proved is not proved again (a key is known only when every result with it is VERIFIED)
+    let bad: string[] = [];
+    for (const x of done[c].out) {
+      if (x.status != "VERIFIED") {
+        bad.push(x.kind + "|" + x.line.toString() + "|" + x.clause);
+      }
+    }
+    for (const x of done[c].out) {
+      const key = x.kind + "|" + x.line.toString() + "|" + x.clause;
+      if (x.status == "VERIFIED" && !bad.includes(key)) {
+        p3.verified.set(fc.key + "|" + key, true);
+      }
+    }
+  }
+  // The extra runs get an eighth of the time budget (at least 250 ms) of a query and no bounded-search retry: a proof that the invariants make
+  // possible is found quickly or not at all, and a query that times out leaves the result as it was.
+  const qms = or.lim.timeoutMs / 8 > 250 ? or.lim.timeoutMs / 8 : (or.lim.timeoutMs < 250 ? or.lim.timeoutMs : 250);
+  or = Oracle { z3: or.z3, lim: SolverLimits { timeoutMs: qms, retryMs: 0, rlimit: or.lim.rlimit }, deferred: or.deferred, answers: or.answers };
+  const rb = runRounds(fs, proc, p3, or, bIdx, false);
+  or = rb.or;
+  let better: usize[] = [];      // positions in `cand` (and in `rb.res`)
+  let bi: usize = 0;
+  while (bi < cand.length) {
+    const r0 = done[cand[bi]].out;
+    const r1 = rb.res[bi].out;
+    if (sameResults(r0, r1)) {
+      let gain = false;
+      let ri: usize = 0;
+      while (ri < r0.length) {
+        if (r0[ri].status != "VERIFIED" && r1[ri].status == "VERIFIED") {
+          gain = true;
+        }
+        ri += 1;
+      }
+      if (gain) {
+        better.push(bi);
+      }
+    }
+    bi += 1;
+  }
+  if (better.length == 0) {
+    return Rounds { res: done, or: or };
+  }
+  let bSites: Site[] = [];
+  for (const b of better) {
+    for (const s of rb.res[b].sites) {
+      bSites.push(s);
+    }
+  }
+  // Run A: the call sites, in every function of these classes that mentions one of the methods (each as it is analysed: a
+  // private method without the invariants). A call in a function that is not analysed would go unseen.
+  let p2 = p;
+  let sitesA = new Map<string, bool>();
+  let groups: string[] = [];
+  let names: string[] = [];
+  for (const b of better) {
+    const f = p.fns[todo[cand[b]]];
+    sitesA.set(f.key, true);
+    names.push(f.cls + "|" + f.name);
+    if (!groups.includes(f.cls)) {
+      groups.push(f.cls);
+    }
+  }
+  p2.sites = sitesA;
+  let aIdx: usize[] = [];
+  k = 0;
+  while (k < p.fns.length) {
+    const f = p.fns[k];
+    k += 1;
+    if (!groups.includes(f.cls)) {
+      continue;
+    }
+    if (!f.verify) {
+      return Rounds { res: done, or: or };
+    }
+    const body = f.text.substring(f.span.start, f.span.end);
+    let mentions = false;
+    for (const n of names) {
+      if (n.startsWith(f.cls + "|") && wordsOf(body, n.substring(f.cls.length + 1, n.length)).all > 0) {
+        mentions = true;
+      }
+    }
+    if (mentions) {
+      aIdx.push(k - 1);
+    }
+  }
+  const ra = runRounds(fs, proc, p2, or, aIdx, true);
+  or = ra.or;
+  let aSites: Site[] = [];
+  for (const r of ra.res) {
+    for (const s of r.sites) {
+      aSites.push(s);
+    }
+  }
+  // Eligibility: every mention is a call that was seen.
+  let inE: bool[] = [];          // by position in `better`
+  for (const b of better) {
+    const f = p.fns[todo[cand[b]]];
+    const cls = p.classes[p.clsIx.get(f.cls).unwrap()];
+    const words = wordsOf(cls.text.substring(cls.cstart, cls.cend), f.name).all;
+    inE.push(sitePositions(aSites, f.key).length == words - 1);
+  }
+  let changed = true;
+  while (changed) {
+    changed = false;
+    let ci: usize = 0;
+    while (ci < better.length) {
+      if (inE[ci]) {
+        const m = p.fns[todo[cand[better[ci]]]];
+        let ok = true;
+        for (const s of aSites) {
+          if (s.callee == m.key) {
+            // the caller of the site: the same call in the run of a caller that assumes the invariants, or in run A
+            let callerAssumes = false;
+            let cj: usize = 0;
+            while (cj < better.length) {
+              if (inE[cj] && p.fns[todo[cand[better[cj]]]].key == s.caller) {
+                callerAssumes = true;
+              }
+              cj += 1;
+            }
+            if (!(callerAssumes ? sitesHold(bSites, m.key, s.pos) : s.ok)) {
+              ok = false;
+            }
+          }
+        }
+        if (!ok) {
+          inE[ci] = false;
+          changed = true;
+        }
+      }
+      ci += 1;
+    }
+  }
+  let ci: usize = 0;
+  while (ci < better.length) {
+    if (inE[ci]) {
+      const c = cand[better[ci]];
+      let merged: Res[] = [];
+      let ri: usize = 0;
+      while (ri < done[c].out.length) {
+        const r0 = done[c].out[ri];
+        merged.push(r0.status == "VERIFIED" ? r0 : rb.res[better[ci]].out[ri]);
+        ri += 1;
+      }
+      done[c] = FnRes { out: merged, warns: done[c].warns, miss: [], sites: [] };
+    }
+    ci += 1;
+  }
+  return Rounds { res: done, or: or };
+}
+
+export function verifyContracts(fs: FsGrant, proc: ProcessGrant, prog: LoadedProgram, sm: SourceMap, hir: Program, z3: string, lim: SolverLimits): Report {
+  const p = buildProg(prog, sm, hir);
+  shellRun(proc, "mkdir -p build/contracts-vc");
+  const or = Oracle { z3: z3, lim: lim, deferred: parallelism() > 1, answers: new Map<string, Result<Solved, string>>() };
+  // Functions without clauses are still analysed (their calls of contracted functions are proof obligations);
+  // if they are outside the fragment nothing is reported for them.
+  let todo: usize[] = [];
+  let i: usize = 0;
+  while (i < p.fns.length) {
+    if (p.fns[i].verify) {
+      todo.push(i);
+    }
+    i += 1;
+  }
+  const r1 = runRounds(fs, proc, p, or, todo, false);
+  const r2 = privateInvariants(fs, proc, p, r1.or, todo, r1.res);
   let results: Res[] = [];
   let warns: QWarn[] = [];
-  for (const r of done) {
+  for (const r of r2.res) {
     for (const x of r.out) {
       results.push(x);
     }
