@@ -151,7 +151,7 @@ def check_extras(orinc):
     check(all(x["status"] != "VERIFIED" for x in seen), "verify_try: a wrong claim is VERIFIED: %r" % [x["function"] for x in seen if x["status"] == "VERIFIED"])
     # `for .. of` invariants (`loopIndex`): a wrong claim is never VERIFIED, and a wrong invariant is not VERIFIED on both obligations.
     rep = json.loads(run(orinc, "--format=json", "tests/contracts/verify_forof.or", case="_extras").stdout.decode())
-    wrong = {"is_sorted_wrong", "wrong_entry", "wrong_step", "wrong_claim", "wrong_exit", "wrong_elem", "with_break"}
+    wrong = {"is_sorted_wrong", "wrong_entry", "wrong_step", "wrong_claim", "wrong_exit", "wrong_elem", "with_break", "pos_wrong"}
     seen = [x for x in rep["results"] if x["function"] in wrong and x["kind"] == "ensures"]
     check({x["function"] for x in seen} == wrong, "verify_forof: wrong claims not all reported: %r" % sorted(wrong - {x["function"] for x in seen}))
     check(all(x["status"] != "VERIFIED" for x in seen), "verify_forof: a wrong claim is VERIFIED: %r" % [x["function"] for x in seen if x["status"] == "VERIFIED"])

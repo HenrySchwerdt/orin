@@ -1094,7 +1094,7 @@ export function execStmts(g0: Gen, st0: St, cx: Cx, stmts: Stmt[], top: bool): R
           st = r.st;
         } else {
           const stBefore = st;
-          const r = execLoop(g, st, cx, true, Some(c), None, None, b, pending, s.span)?;
+          const r = execLoop(g, st, cx, true, Some(c), None, None, b, pending, s.span, stmts, k - 1)?;
           g = r.g;
           for (const x of r.rets) {
             rets.push(x);
@@ -1148,7 +1148,7 @@ export function execStmts(g0: Gen, st0: St, cx: Cx, stmts: Stmt[], top: bool): R
           st = r.st;
         } else {
           const stBefore = st;
-          const r = execLoop(g, st, cx, false, None, Some(id), Some(e), b, pending, s.span)?;
+          const r = execLoop(g, st, cx, false, None, Some(id), Some(e), b, pending, s.span, stmts, k - 1)?;
           g = r.g;
           for (const x of r.rets) {
             rets.push(x);
@@ -1550,6 +1550,15 @@ function inferCounter(st: St, cond: Expr, body: Block, mods: string[]): Option<C
 
 // An invariant at the variables `vars`: the term and the well-definedness of its clause.
 function invAt(g: Gen, cx: Cx, vars: Var[], inv: LInv): Result<Cl, string> {
+  if (inv.clause.isNone() && inv.ctr.unwrap().i0 == "=") {
+    // the counter of a `for .. of` loop equals the position of the iteration
+    const cv = lookupVar(vars, inv.ctr.unwrap().name);
+    const ix = lookupVar(vars, "loopIndex");
+    if (cv.isNone() || ix.isNone()) {
+      return Err("counter not in scope");
+    }
+    return Ok(Cl { g: g, t: "(= " + cv.unwrap().term + " " + ix.unwrap().term + ")", wd: wdOf(noChks()), tf: "true" });
+  }
   const pc = cxPlain(cx);
   if (inv.clause.isSome()) {
     const ex = exprOf(inv.clause.unwrap());
@@ -1576,6 +1585,64 @@ function withIndex(vars: Var[], at: string): Var[] {
     return vars;
   }
   return vars.concat([Var { name: "loopIndex", term: at, vt: VInt("usize") }]);
+}
+
+// `for (const x of xs) { ..; k += 1; }` with `let k = 0` before the loop: a counter the body only increments, once, as its
+// last statement. The verifier proposes `k == position` (a hidden invariant, proved like a user invariant) so that the
+// loop invariants can speak about `k` (sources that may not use `loopIndex` yet).
+function forOfCounter(outer: Stmt[], at: usize, body: Block, name: string, elem: string): bool {
+  if (name.startsWith("this.") || name == elem || body.stmts.length == 0) {
+    return false;
+  }
+  // `let name = 0` earlier in the same block, with nothing writing `name` between it and the loop
+  let zero = false;
+  let j = at < outer.length ? at : outer.length;
+  while (j > 0) {
+    j -= 1;
+    let done = false;
+    match (outer[j].kind) {
+      SLet(_, id, _, init) => {
+        if (id.name == name) {
+          done = true;
+          match (init.kind) {
+            EInt(z) => { zero = z == 0; },
+            _ => {}
+          }
+        }
+      },
+      _ => {
+        const w = incrementsStmt(outer[j], name);
+        if (!(w.isSome() && w.unwrap() == 0)) {
+          done = true;
+        }
+      }
+    }
+    if (done) {
+      break;
+    }
+  }
+  if (!zero) {
+    return false;
+  }
+  const n = body.stmts.length;
+  const isInc = match (body.stmts[n - 1].kind) {
+    SAssign(target, op, value) => isIdentNamed(target, name) && match (op) {
+      OpAddAssign => isOne(value),
+      _ => false
+    },
+    _ => false
+  };
+  if (!isInc) {
+    return false;
+  }
+  let pre: Stmt[] = [];
+  let i: usize = 0;
+  while (i + 1 < n) {
+    pre.push(body.stmts[i]);
+    i += 1;
+  }
+  const r = incrementsOf(pre, name);
+  return r.isSome() && r.unwrap() == 0;
 }
 
 type HV = { g: Gen; vars: Var[]; touched: string[]; };
@@ -1666,7 +1733,7 @@ function modifiedNames(cx: Cx, st: St, body: Block): string[] {
   return out;
 }
 
-function execLoop(g0: Gen, st0: St, cx: Cx, isWhile: bool, cond: Option<Expr>, iterVar: Option<Ident>, iterExpr: Option<Expr>, body: Block, pending: ContractClause[], span: Span): Result<Ex, string> {
+function execLoop(g0: Gen, st0: St, cx: Cx, isWhile: bool, cond: Option<Expr>, iterVar: Option<Ident>, iterExpr: Option<Expr>, body: Block, pending: ContractClause[], span: Span, outer: Stmt[], at: usize): Result<Ex, string> {
   let g = g0;
   let st = st0;
   const line = lineOf(cx.text, span.start);
@@ -1702,6 +1769,13 @@ function execLoop(g0: Gen, st0: St, cx: Cx, isWhile: bool, cond: Option<Expr>, i
           invs.push(LInv { label: clauseText(cx.text, c), clause: Some(c), ctr: None, line: lineOf(cx.text, c.span.start) });
         },
         _ => {}
+      }
+    }
+    if (!isWhile) {
+      for (const nm of mods) {
+        if (forOfCounter(outer, at, body, nm, iterVar.unwrap().name)) {
+          invs.push(LInv { label: "inferred position counter `" + nm + "`", clause: None, ctr: Some(Ctr { name: nm, bound: iterExpr.unwrap(), incl: false, i0: "=" }), line: line });
+        }
       }
     }
     if (isWhile) {
