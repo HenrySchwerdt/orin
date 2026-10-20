@@ -266,7 +266,10 @@ typedef struct OrinHeap {
     uint64_t files;                         /* @360  the open-file table of this task (R3c) */
     uint64_t netbuf;                        /* @368  the per-task network buffer (C4) */
     uint64_t scratch;                       /* @376  scratch word: the out parameter of L0 calls (thread_join, monitor_get) */
-    uint64_t reserved1[15];                 /* @384  up to 504 */
+    uint64_t children;                      /* @384  the registry of the tasks this thread started and has not joined: first node (C2, runtime/core/task.or) */
+    uint64_t children_tail;                 /* @392  its last node */
+    uint64_t trapping;                      /* @400  1 once this thread is running the cleanup of a trap (a trap inside it is an exit) */
+    uint64_t reserved1[12];                 /* @408  up to 504 */
     uint64_t probe;                         /* @504  std:coreprobe scratch word */
     SbClass sb[SB_CLASSES + 1];             /* @512  small-block cache by 16-byte class 0..16: list head, length */
     uint64_t reserved2[30];                 /* @784  up to 1024 */
@@ -280,11 +283,15 @@ enum { ORIN_SHARED_WORDS = 128 };
 typedef struct OrinShared {
     uint64_t transfer[4];   /* @0    transfer slot table: pointer, n, cap, free head */
     uint64_t flight[4];     /* @32   grant flight table: pointer, n, cap, free head (R3e.5) */
-    uint64_t reserved[56];  /* @64   up to 512 */
+    uint64_t main_doomed;   /* @64   1 once the main thread is trapping: every task is a descendant of it (C2) */
+    uint64_t trap_seq;      /* @72   the number of task traps published so far (C2: the primary failure of a scope is the first) */
+    uint64_t waiters;       /* @80   the first task record of the list of tasks blocked in a monitor wait (C2) */
+    uint64_t reserved[53];  /* @88   up to 512 */
     char trapline[512];     /* @512  line buffer of the process trap (the main thread only, which is about to exit) */
 } OrinShared;
 extern OrinShared orin_shared;
-_Static_assert(offsetof(OrinShared, transfer) == 0 && offsetof(OrinShared, flight) == 32 && offsetof(OrinShared, reserved) == 64 &&
+_Static_assert(offsetof(OrinShared, transfer) == 0 && offsetof(OrinShared, flight) == 32 && offsetof(OrinShared, main_doomed) == 64 &&
+                   offsetof(OrinShared, trap_seq) == 72 && offsetof(OrinShared, waiters) == 80 && offsetof(OrinShared, reserved) == 88 &&
                    offsetof(OrinShared, trapline) == 512 && sizeof(OrinShared) == ORIN_SHARED_WORDS * 8,
                "orin_shared: transfer @0, flight @32, trap line @512, 128 words");
 /* The counters keep their name: `orin_stats.retains++` in the inline functions below and in generated code. */
@@ -308,7 +315,9 @@ _Static_assert(ORIN_HEAP_OFF(grants) == 352, "orin_heap.grants @352");
 _Static_assert(ORIN_HEAP_OFF(files) == 360, "orin_heap.files @360");
 _Static_assert(ORIN_HEAP_OFF(netbuf) == 368, "orin_heap.netbuf @368");
 _Static_assert(ORIN_HEAP_OFF(scratch) == 376, "orin_heap.scratch @376");
-_Static_assert(ORIN_HEAP_OFF(reserved1) == 384, "orin_heap.reserved1 @384");
+_Static_assert(ORIN_HEAP_OFF(children) == 384 && ORIN_HEAP_OFF(children_tail) == 392 && ORIN_HEAP_OFF(trapping) == 400,
+               "orin_heap.children @384, children_tail @392, trapping @400");
+_Static_assert(ORIN_HEAP_OFF(reserved1) == 408, "orin_heap.reserved1 @408");
 _Static_assert(ORIN_HEAP_OFF(probe) == 504, "orin_heap.probe @504");
 _Static_assert(ORIN_HEAP_OFF(sb) == 512 && sizeof(SbClass) == 16, "orin_heap.sb @512, 16 bytes per class (head @+0, n @+8)");
 _Static_assert(ORIN_HEAP_OFF(reserved2) == 784, "orin_heap.reserved2 @784");

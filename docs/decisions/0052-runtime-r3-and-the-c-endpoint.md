@@ -324,7 +324,10 @@ C until R3f). The four L0-shaped hooks are removed once `plat` replaces them (R3
 |---:|---|
 | 0..3 | transfer slot table: pointer, `n`, `cap`, free head (`g_tr*`) |
 | 4..7 | grant flight table: pointer, `n`, `cap`, free head (`g_gf*`, step R3e.5) |
-| 8..63 | reserved |
+| 8 | `main_doomed`: 1 once the main thread is trapping (C2) |
+| 9 | `trap_seq`: the number of task traps published (C2) |
+| 10 | `waiters`: first task record of the tasks blocked in a monitor wait (C2) |
+| 11..63 | reserved |
 | 64..127 | line buffer of the process trap (512 bytes; used only by the main thread, which is about to exit, so it needs no lock; the trap path allocates nothing) |
 
 `orin_shared` is defined in `orin_runtime.c` like `orin_heap` and listed in `bootstrap/seed/runtime/core-only-symbols.txt`; R3f makes the backends emit it.

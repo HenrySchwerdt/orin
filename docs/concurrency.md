@@ -43,7 +43,7 @@ ch.tx.close();  ch.rx.close();                // end of stream / cancellation; c
 | `TaskHandle<T>.joinUntil(deadline): Result<T, TaskError>`, `.joinTimeout(clock, timeout)` | C1: `Err(Timeout)` if the task has not ended; the handle stays valid. Otherwise exactly `join()` (a panicked task still traps the joiner) |
 | `select<T>(rxs): Result<Selected<T>, TaskError>`, `selectUntil(rxs, deadline)`, `selectTimeout(clock, rxs, timeout)` | C1: the first ready receiver in array order wins; `Selected<T> = { index: usize; value: T }`. Closed and drained receivers are skipped; `Err(Closed)` when all are. One value type for all receivers (use a variant for different kinds). Free functions (they take an array of receivers, not a receiver) |
 | `sleep(clock, timeout): Result<void, TaskError>`, `sleepUntil(deadline): void` | C1: blocks at least that long on the monotonic clock; never early |
-| `TaskError = { kind: TaskErrorKind }`, `TaskErrorKind = Timeout \| Closed \| ClockUnavailable \| InvalidDuration`, `taskErrorMessage(e)` | ADR-0048 section 3.1; `Timeout` is outcome `Deadline` and `Closed` is outcome `Closed` of ADR-0017 Addendum B (`Cancelled` joins in C2) |
+| `TaskError = { kind: TaskErrorKind }`, `TaskErrorKind = Timeout \| Closed \| ClockUnavailable \| InvalidDuration`, `taskErrorMessage(e)` | ADR-0048 section 3.1; `Timeout` is outcome `Deadline` and `Closed` is outcome `Closed` of ADR-0017 Addendum B (`Cancelled` joins when channel waits observe tokens) |
 | `Scope.token(): CancelToken`, `Scope.cancel(): bool`, `Scope.isCancelled(): bool`, `CancelToken.cancel(): bool`, `.isCancelled(): bool`, `isCancelled(): bool` | C3: the cancellation token of a scope (a wake source of L0). `cancel()` is true when this call set it; it is permanent. The token is a copyable value a task may capture (the Scope itself cannot be, E0481). Every task of the scope, and of scopes nested in its tasks, blocked in a `std:net` accept / connect / recv / send wakes with `Err(Cancelled)`; the free `isCancelled()` is the cooperative check of the calling task. A token kept after its scope ended is stale: `cancel()` false, `isCancelled()` false. Channel waits do not observe it yet (C2). See "Gate 1, C3" |
 | `parallelMap(xs, f, parts): B[]` | `xs.map(f)` computed by `parts` tasks over contiguous chunks, results in order |
 | `forkJoin(chunks, workers, body): R[]`, `forkJoinUntil(chunks, workers, body, hit): R[]`, `parallelism(): usize` | the work-stealing fork/join pool behind `parallel()` on arrays (ADR-0039), see "Fork/join pool and lending" |
@@ -74,10 +74,36 @@ returned or sent (E0450-E0452). Grants are delegated (`spawnFs` ... `spawnNet`),
 **Panics.** A trap on a task thread ends that task only (the runtime records the message, closes the task's grants and
 files, releases monitors it held, folds its counters, and exits the thread). `join` turns it into a trap of the joiner with
 the message `task panicked: <message>` (a panic that crossed two tasks reads `task panicked: task panicked: ...`). A panic
-in a task nobody joined is reported when its scope ends, after all other tasks have ended: **no panic is lost**. Documented
-limits: a task that traps does not unwind, so what it allocated is leaked (exit status and message are unaffected; the
-leak shows in `live_objs_at_exit`), and a panic in the **body** of a scope (not in a task) is not unwound either: tasks
-still running keep running until the process ends. `process.exit` in a task ends the whole process; it flushes stdout and the files open in the exiting task, not those open in other tasks (the exit hook can only see its own thread's file table). With per-task regions (ADR-0038) the leak of a trapped task disappears: the whole region is freed when the task ends.
+in a task nobody joined is reported when its scope ends, after all other tasks have ended: **no panic is lost**. A task that
+traps does not unwind its own frames, so what it allocated is leaked (exit status and message are unaffected; the leak shows
+in `live_objs_at_exit`; with per-task regions (ADR-0038) it will disappear). `process.exit` in a task ends the whole process; it
+flushes stdout and the files open in the exiting task, not those open in other tasks (the exit hook can only see its own thread's file table).
+
+**Trap-safe cleanup (C2).** A trap, in a task or in the main thread, in the body of a scope or anywhere else, never leaves behind
+a task that the trapping thread started. `runtime/core/task.or` keeps, per thread, the registry of the tasks that thread started and
+has not joined (every `spawn` enters it, `join` leaves it), and a trap does this before it is reported:
+
+1. *the trapping task cancels its scope* (the token its siblings share, see `Scope.cancel`), after its own cleanup is done and its trap
+   has its rank (below): siblings stop at their next checkpoint (`isCancelled()`, `std:net` waits);
+2. *its children are cancelled and joined*: the scope token of every live child is set, every descendant blocked in a monitor wait
+   (`recv` / `send` / `select` / `sleep` / `joinUntil` on a channel, a scope waiting for its tasks) is woken and **ends at once**
+   (`task cancelled: a task that started it trapped`; it runs the same cleanup for its own children, so the whole subtree ends), and the
+   thread joins all of them. This holds on the main thread too: the process exits with status 101 only after every task is joined, so
+   their output is complete;
+3. *the trap is reported*: `join` of the trapped task (or the end of its scope) traps with its message; on the main thread
+   `trap: <message>` is written to stderr first, then the cleanup runs.
+
+A descendant ends on a trap of an ancestor at its next monitor wait; it is not killed in the middle of a computation. A descendant that
+computes without waiting and without checking `isCancelled()` is waited for (the cleanup joins it), as in any cooperative cancellation,
+and a trap while the cleanup runs is an exit. A task that ended this way is a cancellation, not a failure of its own.
+
+*Primary and secondary failures.* The task that trapped first is the **primary** failure and its message is the report. A child
+that traps on its own while its parent is being unwound is a **secondary** failure: its message is appended to the task's message
+(`...\nalso trapped while cleaning up: <message>`) or, on the main thread, written as a line of its own after `trap: <message>`. When
+several tasks of one scope trap, `join` (and the end of the scope) reports the one whose trap happened first, not the first one in spawn
+order, and appends the message of the one it joined (`<primary>\nalso trapped: <message>`). Documented limits: the order of two traps
+is the order in which they were published (after their own cleanup), and only the failure being joined and the failures of tasks not yet
+joined are listed, not every one.
 
 **Scopes.** `scope` joins what is left when its body returns. The scope's task table lives in a monitor; joining an entry
 claims it exactly once, so a task is never joined twice. `spawn` on a scope that has ended traps. A task body that captures
@@ -182,8 +208,8 @@ heaps, send transfers ownership"). L0 thread and monitor primitives stay C: cont
 model threads); a proof would need a concurrency-aware C verifier and an OS model.
 
 What the argument does **not** claim: absence of deadlock (a program whose tasks all wait hangs; there is no detection), fairness,
-bounded memory under a slow consumer beyond the channel capacity, cancellation, or that a trapped task frees what it
-allocated.
+bounded memory under a slow consumer beyond the channel capacity, cancellation of pure computation (a task that never waits and never
+checks `isCancelled()` is not interrupted, also not by the cleanup of a trap), or that a trapped task frees what it allocated.
 
 ## Tests
 
@@ -197,6 +223,7 @@ allocated.
 | `tests/concurrency/timed_waits.or`, `timed_join_panic.or` | C1: timeouts fire and never early, values arriving before the deadline, buffered value at an expired deadline, `Closed`, full-channel `sendTimeout`, `select` (ready channel, tie, skipping closed channels, all closed, woken by a send and by closes, timeout), `sleep` lower bound, `joinTimeout` on a blocked task (then a later `join`), a trapped task ends a timed join. Plain, TSan, ASan |
 | `tests/concurrency/cancel_tokens.or`, `cancel_storm.or` | C3: token semantics (once, permanent, seen by the body and by tasks spawned later), 200 rounds of stale tokens against reused slots, nesting (inner does not reach up, outer reaches every depth, 40 levels), a task cancelling its scope; storms: 12 rounds x 24 tasks blocked in accept / recv with 4 concurrent cancellers, 8 x 3 tasks in nested scopes, 16 tasks spawned into a cancelled scope. Plain, TSan, ASan |
 | `tests/net/interrupt.or` (`tools/test_net.sh` section 7) | C3: a task blocked in accept, recv, send and connect (to a listener whose queue swallows the SYN) wakes within a bound with `Cancelled`, not `Timeout`; a cancelled scope fails new calls at once; nested scopes; one deadline over many small reads (`readExactUntil`, `recvUntil` loop), over a non-reading peer (`sendAllUntil`) and over a hanging connect (`withConnectionUntil`). Plain and ThreadSanitizer |
+| `tests/next/run/task_trap_*.or` (6) and `tests/concurrency/trap_unwind.or` | C2: a task that traps cancels and joins its children (they see the cancellation and finish their output first), a trap in the body of a scope on the main thread does the same, a trapping child cancels its siblings, descendants blocked in a channel that nobody will ever serve end instead of hanging the trap (two levels deep), the first of two traps is the primary failure whatever the join order, a secondary failure is reported after the primary one; 30 rounds of spinners, waiters and nested scopes under ThreadSanitizer and ASan |
 | `runtime/core/tests/task_test.c` (98 checks) | transfer (move, copy, shared children, immortals, scalars, a 200,000-deep chain), 64 tasks, trap in a task, ping-pong, cross-heap frees, grants moved and per task, invalid handles |
 | `runtime/platform/tests/platform_test.c` (+54 checks, 795 in all) | thread / monitor contracts, errors, mutual exclusion, condition queues, a thread dying with a lock held, concurrent stdout |
 | `tests/concurrency/stress_tasks.or`, `stress_messages.or`, `panic_chain.or`, `panic_many.or`, `move_counts.or` | 3,000 live tasks, a tree of 255 scopes, 20,000 short tasks (23,254 tasks in all), 40,000 messages through one channel with 8 producers and 4 consumers, 20,000 ping-pong round trips, structured messages checked on arrival; a panic crossing three tasks and 300 simultaneous unjoined panics (exit status 101, no hang or crash under the sanitizers); no live object at exit (`ORIN_STATS`); what the default build moves and what it copies |
@@ -338,8 +365,8 @@ interrupted. A scope nested deeper than 33 levels has no token of its own.
 
 ## Not in stage 0 (and where it goes)
 
-`async` / `await` (ADR-0017: only if blocking tasks prove insufficient); cancellation beyond `rx.close()` and cooperative
-sibling cancellation at the scope boundary (C2; timeouts, `select` and `sleep` are C1, above); a M:N scheduler (a task is a thread: thousands fine,
+`async` / `await` (ADR-0017: only if blocking tasks prove insufficient); cancellation of channel waits by `Scope.cancel()` (the waits
+end only by the channel, a deadline, or the trap of an ancestor, "Trap-safe cleanup" above; timeouts, `select` and `sleep` are C1, above); a M:N scheduler (a task is a thread: thousands fine,
 hundreds of thousands not; the L1 scheduler of ADR-0017 is future work and std:task's `Ledger` / `Ring` logic is the part
 that carries over); deadlock detection; `Shared<T>` for read-only sharing (post-1.0 option of ADR-0017); per-task regions
 (ADR-0038); a real `std:net` server with one task per connection (std:net had not landed on `main`; the CPU-parallel example

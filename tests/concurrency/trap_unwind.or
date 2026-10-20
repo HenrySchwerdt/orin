@@ -1,0 +1,67 @@
+// exit: 101
+// Trap-safe cleanup under the sanitizers (C2): 30 rounds, run by 30 driver tasks in 15 waves of 2. A round starts a scope whose body spawns
+// workers of three kinds and then traps: 3 spinners (stop at `isCancelled`), 2 waiters (blocked in a channel nobody sends to, so only the
+// wake-up that a trapping ancestor gives ends them) and a nester (a scope of its own whose only task waits in that channel too). The
+// round runs in a task of its own; its trap becomes the trap of its driver, and the trap of a driver cancels the main scope.
+// What must hold: every spinner sees the cancellation and reports it before its round ends (the main task counts 90 reports), no waiter
+// or nester is left behind (nothing hangs: the run has a time limit), no race (ThreadSanitizer), no use of freed memory (ASan), and the
+// process ends with the trap of a driver, status 101, "trap: task panicked: task panicked: ...", no panic lost.
+import { scope, spawn, channel, isCancelled, Sender } from "std:task";
+
+const SPINNERS: int = 3;
+
+// One round: SPINNERS spinners, 2 waiters, 1 nester; then the body traps. `seen` gets one value per spinner that saw the cancellation.
+function round(k: int, seen: Sender<int>): int {
+  return scope(w => {
+    const quiet = channel<int>(1);
+    let i = 0;
+    while (i < SPINNERS) {
+      const id = i;
+      spawn(w, () => {
+        while (!isCancelled()) {
+        }
+        seen.send(k * 10 + id);
+        return 0;
+      });
+      i += 1;
+    }
+    spawn(w, () => quiet.rx.recv().unwrap());
+    spawn(w, () => quiet.rx.recv().unwrap());
+    spawn(w, () => {
+      return scope(v => {
+        spawn(v, () => quiet.rx.recv().unwrap());
+        return quiet.rx.recv().unwrap();
+      });
+    });
+    const none: Option<int> = None;
+    return none.unwrap() + k;
+  });
+}
+
+function main(): void {
+  console.log("start");
+  const seen = channel<int>(1000);
+  scope(s => {
+    let wave = 0;
+    while (wave < 15) {
+      let d = 0;
+      while (d < 2) {
+        const k = wave * 2 + d;
+        spawn(s, () => {
+          // the round runs in a task of its own; its trap is the driver's own trap
+          return scope(r => spawn(r, () => round(k, seen.tx)).join());
+        });
+        d += 1;
+      }
+      // both drivers of the wave announce through their spinners: wait for all of them (SPINNERS per round)
+      let got = 0;
+      while (got < 2 * SPINNERS) {
+        seen.rx.recv();
+        got += 1;
+      }
+      wave += 1;
+    }
+    console.log("30 rounds unwound: " + (30 * SPINNERS).toString() + " spinners saw the cancellation");
+  });
+  console.log("unreachable");
+}

@@ -10,32 +10,71 @@
 // shared block, the message goes into the task record) and holds no lock when it ends the thread; a failure inside it is an exit.
 //
 // The record, in bytes: tok@0 (the transfer token of the body), trapped@8 (1 when the task ended on a trap), done_mon@16 (the monitor
-// of `watch`, 0 = none), message@24 (480 bytes and a NUL). The thread-local state is in the heap block: `task` (H_TASK, the address
-// of the record of this thread, 0 on the main thread) and `joined` (H_JOINED). The C-named wrappers (`orin_trap`, the test wrappers)
-// are made by the backends (mir/rt.or); the C task functions stay in the live runtime until R3e.6.
+// of `watch`, 0 = none), message@24 (480 bytes and a NUL), and from 512 the fields of the trap-safe cleanup (C2, below). The
+// thread-local state is in the heap block: `task` (H_TASK, the address of the record of this thread, 0 on the main thread), `joined`
+// (H_JOINED) and the registry of children (H_CHILDREN). The C-named wrappers (`orin_trap`, the test wrappers) are made by the
+// backends (mir/rt.or); the C task functions stay in the live runtime until R3e.6.
+//
+// TRAP-SAFE CLEANUP (C2, docs/concurrency.md "Panics"). A trap never leaves a task behind that the trapping thread started:
+//  * Every `spawn` enters the new task in the REGISTRY of the spawning thread (a list of nodes in the heap block, in spawn order), and
+//    `join` removes it. The registry is therefore exactly the set of live, unjoined children; the scopes of std:task need not know.
+//  * A task that traps CANCELS ITS SCOPE (it signals the token that was bound to the spawner when it was started, once its children are
+//    joined and its trap has its rank), so siblings stop at their next checkpoint (`isCancelled`, network waits).
+//  * The thread that traps (task or main) then UNWINDS its children before it ends: it is DOOMED (a flag in its record, or in the
+//    shared block for the main thread), every token of a live child is cancelled, every descendant that waits in a monitor
+//    (channel `recv` / `send` / `select`, a scope waiting for its tasks) is woken and ends with "task cancelled" at once, and the
+//    thread joins every child of the registry. A doomed task ends at its next monitor wait (`waitBegin` / `waitEnd`, called by
+//    `monWait` / `monWaitUntil` of sync.or) and runs this same cleanup for its own children, so the whole subtree is cancelled and joined
+//    before the trap is reported to the joiner or the process exits. A task that ended this way is not a failure of its own
+//    (flag `T_FLAGS`); a child that trapped while it was being unwound is a SECONDARY failure.
+//  * PRIMARY AND SECONDARY failures: the message of the task that trapped is the primary one. A secondary failure found while
+//    unwinding is appended to it (a task) or printed after it (the main thread, one line each). When several children of one scope
+//    trap, `join` reports the one that trapped first (`T_SEQ`, the order in which traps were published), with the message of the
+//    joined task appended, whatever the order in which they are joined.
+//  Not interrupted: a descendant that computes without ever waiting or checking `isCancelled()`; the cleanup waits for it.
 
 import {
-  load8, load64, store8, store64, memAlloc, memFree, memCopy, heapBase, sharedBase, cfg, hook, plat, fnAddr, addrOf, wadd, wmul, shl
+  load8, load64, store8, store64, memAlloc, memFree, memCopy, memMove, heapBase, sharedBase, cfg, hook, plat, fnAddr, addrOf, wadd, wmul, shl
 } from "std:core";
 import { transitTake, transitDrop, taskTrap } from "std:fsraw";
 import {
   PL_THREAD_CREATE, PL_THREAD_JOIN, PL_THREAD_EXIT, PL_MONITOR_LOCK, PL_MONITOR_UNLOCK, PL_MONITOR_SET, PL_MONITOR_NOTIFY,
-  PL_RUNTIME_LOCK, PL_RUNTIME_UNLOCK, PL_WRITE_LINE, PL_EXIT, PL_GETENV, PL_CPU_COUNT
+  PL_RUNTIME_LOCK, PL_RUNTIME_UNLOCK, PL_WRITE_LINE, PL_EXIT, PL_GETENV, PL_CPU_COUNT, PL_WAKE_SIGNAL, PL_WAKE_BOUND
 } from "./plat";
 import {
-  H_TASK, H_JOINED, H_SCRATCH, DSTACK, DCAP, FL_STRUCT, FL_ARRAY, FL_N, LIVE, SB, S_ALLOC_STRING, S_TASKS_SPAWNED, addAt,
+  H_TASK, H_JOINED, H_SCRATCH, H_CHILDREN, H_CHILDREN_TAIL, H_TRAPPING, DSTACK, DCAP, FL_STRUCT, FL_ARRAY, FL_N, LIVE, SB, S_ALLOC_STRING, S_TASKS_SPAWNED, addAt,
   HK_FOLD_STATS, HK_FOLD_LIVE, HK_REVOKE_GRANTS, HK_CLOSE_FILES, HK_FREE_NETBUF, HK_SITE_FOLD
 } from "./heap";
 import { strAlloc } from "./object";
 
 const E_TASK_MAIN: usize = 52;   // the entry number of `main` (mir/rt.or RT_TASK_MAIN): `fnAddr` takes the address of its C-ABI wrapper
 
-const TASK_SIZE: usize = 512;    // the task record
+const TASK_SIZE: usize = 640;    // the task record
 const T_TOK: usize = 0;
 const T_TRAPPED: usize = 8;
 const T_DONE: usize = 16;
 const T_MSG: usize = 24;
 const MSG_MAX: usize = 480;      // the longest trap message (a longer one is cut)
+// (C2) the fields after the message; all of them are read and written under the runtime lock unless noted
+const T_PARENT: usize = 512;     // the record of the task that started this one, 0 = the main thread (never changes after spawn)
+const T_SCOPE: usize = 520;      // the cancellation token that was bound to the spawner when this task was started (never changes)
+const T_KILL: usize = 528;       // 1 once this task is trapping or was cancelled by an ancestor's trap: its descendants are doomed
+const T_SEQ: usize = 536;        // 0, or the rank of this task's trap among the published traps (1 = the first); set once, last
+const T_FLAGS: usize = 544;      // 1 when the task ended because an ancestor trapped (a cancellation, not a failure of its own)
+const T_WM: usize = 552;         // the monitor the task waits in, and its condition queue (while T_WAITING = 1)
+const T_WQ: usize = 560;
+const T_WNEXT: usize = 568;      // the list of waiting tasks (head: shared word SH_WAITERS)
+const T_WPREV: usize = 576;
+const T_POKED: usize = 584;      // 1 once the wait that is registered was already woken by a doomed ancestor
+const T_WAITING: usize = 592;
+// the shared words (byte offsets in orin_shared) and the registry nodes
+const SH_MAIN_DOOMED: usize = 64;
+const SH_TRAP_SEQ: usize = 72;
+const SH_WAITERS: usize = 80;
+const NODE_SIZE: usize = 32;     // a registry node: next@0, handle@8 (the thread), rec@16 (the task record)
+const N_NEXT: usize = 0;
+const N_HANDLE: usize = 8;
+const N_REC: usize = 16;
 const TRAPLINE: usize = 512;     // the line buffer of the process trap in the shared block (orin_shared.trapline, 512 bytes)
 
 type Thunk = () => void;
@@ -97,6 +136,14 @@ export function heapRetire(): void {
     memFree(j);
     store64(wadd(h, H_JOINED), 0);
   }
+  let nd = load64(wadd(h, H_CHILDREN));
+  while (nd != 0) { // children nobody joined (their records are not freed here: the threads may still run)
+    const nx = load64(wadd(nd, N_NEXT));
+    memFree(nd);
+    nd = nx;
+  }
+  store64(wadd(h, H_CHILDREN), 0);
+  store64(wadd(h, H_CHILDREN_TAIL), 0);
   const d = load64(wadd(h, DSTACK));
   if (d != 0) {
     memFree(d);
@@ -160,14 +207,56 @@ export function spawn(tok: usize): usize {
   store64(wadd(t, T_TRAPPED), 0);
   store64(wadd(t, T_DONE), 0);
   store8(wadd(t, T_MSG), 0);
+  store64(wadd(t, T_PARENT), load64(wadd(heapBase(), H_TASK)));
+  store64(wadd(t, T_SCOPE), plat(PL_WAKE_BOUND, 0, 0, 0));
+  store64(wadd(t, T_KILL), 0);
+  store64(wadd(t, T_SEQ), 0);
+  store64(wadd(t, T_FLAGS), 0);
+  store64(wadd(t, T_WAITING), 0);
+  const nd = memAlloc(NODE_SIZE);
   const h = plat(PL_THREAD_CREATE, fnAddr(E_TASK_MAIN), t, 0);
   if (h == 0) {
     memFree(t);
+    memFree(nd);
     transitDrop(tok);
     taskTrap("cannot start a task (thread limit reached)");
   }
-  addAt(wadd(heapBase(), S_TASKS_SPAWNED), 1);
+  store64(wadd(nd, N_NEXT), 0);
+  store64(wadd(nd, N_HANDLE), h);
+  store64(wadd(nd, N_REC), t);
+  const hb = heapBase();
+  const tail = load64(wadd(hb, H_CHILDREN_TAIL));
+  if (tail == 0) {
+    store64(wadd(hb, H_CHILDREN), nd);
+  } else {
+    store64(wadd(tail, N_NEXT), nd);
+  }
+  store64(wadd(hb, H_CHILDREN_TAIL), nd);
+  addAt(wadd(hb, S_TASKS_SPAWNED), 1);
   return h;
+}
+
+// Take the node of the thread `h` out of the registry (when it is there) and free it.
+function unregister(h: usize): void {
+  const hb = heapBase();
+  let prev: usize = 0;
+  let n = load64(wadd(hb, H_CHILDREN));
+  while (n != 0 && load64(wadd(n, N_HANDLE)) != h) {
+    prev = n;
+    n = load64(wadd(n, N_NEXT));
+  }
+  if (n != 0) {
+    const next = load64(wadd(n, N_NEXT));
+    if (prev == 0) {
+      store64(wadd(hb, H_CHILDREN), next);
+    } else {
+      store64(wadd(prev, N_NEXT), next);
+    }
+    if (next == 0) {
+      store64(wadd(hb, H_CHILDREN_TAIL), prev);
+    }
+    memFree(n);
+  }
 }
 
 // Claim the body and run it. A function of its own so that the box (and the closure it holds) is released before the heap retires.
@@ -196,12 +285,17 @@ export function join(h: usize): usize {
     taskTrap("invalid task handle (joined twice, or forged)");
   }
   const t = load64(s);
+  unregister(h);
   const prev = load64(wadd(heapBase(), H_JOINED));
   if (prev != 0) {
     memFree(prev);
   }
   store64(wadd(heapBase(), H_JOINED), t);
-  return load64(wadd(t, T_TRAPPED));
+  const trapped = load64(wadd(t, T_TRAPPED));
+  if (trapped != 0) {
+    primaryFirst(t);
+  }
+  return trapped;
 }
 
 // The trap message of the task joined last by this thread, as a new string (empty when the task did not trap).
@@ -228,12 +322,285 @@ export function watch(m: usize): void {
   }
 }
 
+// ---------------------------------------------------------------- cleanup after a trap (C2)
+
+// The task `t` or an ancestor of it trapped (or was cancelled by a trap), or the main thread is trapping. Under the runtime lock.
+function isDoomed(t: usize): bool {
+  let x = t;
+  while (x != 0) {
+    if (load64(wadd(x, T_KILL)) != 0) {
+      return true;
+    }
+    x = load64(wadd(x, T_PARENT));
+  }
+  return load64(wadd(sharedBase(), SH_MAIN_DOOMED)) != 0;
+}
+
+// The number of bytes before the NUL of the message of the record `t`.
+function msgLen(t: usize): usize {
+  let n: usize = 0;
+  while (n < 479 && load8(wadd(wadd(t, T_MSG), n)) != 0) {
+    n = wadd(n, 1);
+  }
+  return n;
+}
+
+// Append `n` bytes at `p` to the message of the record `t` (cut at 479 bytes).
+function msgAppend(t: usize, p: usize, n: usize): void {
+  const at = msgLen(t);
+  let k = n;
+  if (wadd(at, k) > 479) {
+    k = 479 - at;
+  }
+  if (k != 0) {
+    memCopy(wadd(wadd(t, T_MSG), at), p, k);
+  }
+  store8(wadd(wadd(t, T_MSG), wadd(at, k)), 0);
+}
+
+// Append the Orin string `s` to the message of the record `t`.
+function msgAppendStr(t: usize, s: usize): void {
+  msgAppend(t, wadd(s, 32), load64(wadd(s, 16)));
+}
+
+// The task `t` is blocked in monitor `m`, queue `c`: enter it in the list of waiting tasks. Under the runtime lock.
+function waitRegister(t: usize, m: usize, c: usize): void {
+  const sh = sharedBase();
+  const head = load64(wadd(sh, SH_WAITERS));
+  store64(wadd(t, T_WM), m);
+  store64(wadd(t, T_WQ), c);
+  store64(wadd(t, T_POKED), 0);
+  store64(wadd(t, T_WNEXT), head);
+  store64(wadd(t, T_WPREV), 0);
+  if (head != 0) {
+    store64(wadd(head, T_WPREV), t);
+  }
+  store64(wadd(sh, SH_WAITERS), t);
+  store64(wadd(t, T_WAITING), 1);
+}
+
+// Take the task `t` out of the list of waiting tasks (when it is in it). Under the runtime lock.
+function waitUnregister(t: usize): void {
+  if (load64(wadd(t, T_WAITING)) != 0) {
+    const p = load64(wadd(t, T_WPREV));
+    const n = load64(wadd(t, T_WNEXT));
+    if (p == 0) {
+      store64(wadd(sharedBase(), SH_WAITERS), n);
+    } else {
+      store64(wadd(p, T_WNEXT), n);
+    }
+    if (n != 0) {
+      store64(wadd(n, T_WPREV), p);
+    }
+    store64(wadd(t, T_WAITING), 0);
+  }
+}
+
+// The calling task ends because an ancestor trapped (its wait in the locked monitor `m` is abandoned: `m` is unlocked first). It is not a
+// failure of its own: flag T_FLAGS, no rank in the order of traps, its scope is not cancelled (the trap of the ancestor cancels it anyway).
+function dieDoomed(m: usize): void {
+  if (m != 0) {
+    plat(PL_MONITOR_UNLOCK, m, 0, 0);
+  }
+  const t = load64(wadd(heapBase(), H_TASK));
+  store64(wadd(heapBase(), H_TASK), 0);
+  store64(wadd(heapBase(), H_TRAPPING), 1);
+  const msg = "task cancelled: a task that started it trapped";
+  store8(wadd(t, T_MSG), 0);
+  msgAppendStr(t, addrOf(msg));
+  store64(wadd(t, T_TRAPPED), 1);
+  store64(wadd(t, T_FLAGS), 1);
+  unwindChildren(t);
+  heapRetire();
+  signalDone(t);
+  plat(PL_THREAD_EXIT, 0, 0, 0);
+}
+
+// Called by `monWait` / `monWaitUntil` (sync.or) with the monitor `m` locked, before the L0 wait: a task whose ancestor trapped ends here;
+// any other task registers itself as waiting in `m`, queue `c`, so that the cleanup of a trapping ancestor can wake it.
+export function waitBegin(m: usize, c: usize): void {
+  const t = load64(wadd(heapBase(), H_TASK));
+  if (t != 0) {
+    plat(PL_RUNTIME_LOCK, 0, 0, 0);
+    const d = isDoomed(t);
+    if (!d) {
+      waitRegister(t, m, c);
+    }
+    plat(PL_RUNTIME_UNLOCK, 0, 0, 0);
+    if (d) {
+      dieDoomed(m);
+    }
+  }
+}
+
+// Called after the L0 wait (`m` locked again): leave the list of waiting tasks; a task whose ancestor trapped meanwhile ends here.
+export function waitEnd(m: usize): void {
+  const t = load64(wadd(heapBase(), H_TASK));
+  if (t != 0) {
+    plat(PL_RUNTIME_LOCK, 0, 0, 0);
+    waitUnregister(t);
+    const d = isDoomed(t);
+    plat(PL_RUNTIME_UNLOCK, 0, 0, 0);
+    if (d) {
+      dieDoomed(m);
+    }
+  }
+}
+
+// The task `t` (0 = the main thread) is trapping: doom its descendants and wake those that wait in a monitor, so that they end.
+function doom(t: usize): void {
+  const sh = sharedBase();
+  plat(PL_RUNTIME_LOCK, 0, 0, 0);
+  if (t != 0) {
+    store64(wadd(t, T_KILL), 1);
+  } else {
+    store64(wadd(sh, SH_MAIN_DOOMED), 1);
+  }
+  plat(PL_RUNTIME_UNLOCK, 0, 0, 0);
+  let more = true;
+  while (more) {
+    plat(PL_RUNTIME_LOCK, 0, 0, 0);
+    let w = load64(wadd(sh, SH_WAITERS));
+    let found: usize = 0;
+    while (w != 0 && found == 0) {
+      if (load64(wadd(w, T_POKED)) == 0 && isDoomed(w)) {
+        found = w;
+      } else {
+        w = load64(wadd(w, T_WNEXT));
+      }
+    }
+    let m: usize = 0;
+    let q: usize = 0;
+    if (found != 0) {
+      store64(wadd(found, T_POKED), 1);
+      m = load64(wadd(found, T_WM));
+      q = load64(wadd(found, T_WQ));
+    }
+    plat(PL_RUNTIME_UNLOCK, 0, 0, 0);
+    if (found != 0) {
+      // the waiter holds `m` until it sleeps, so the notification cannot get lost between its test and its wait; results ignored
+      plat(PL_MONITOR_LOCK, m, 0, 0);
+      plat(PL_MONITOR_NOTIFY, m, q, 1);
+      plat(PL_MONITOR_UNLOCK, m, 0, 0);
+    } else {
+      more = false;
+    }
+  }
+}
+
+// A child of the trapping thread `t` (0 = the main thread) trapped on its own while it was being unwound: a secondary failure, appended to
+// the message of `t` or, on the main thread, written as a line of its own after the primary one.
+function secondary(t: usize, r: usize): void {
+  const pre = "also trapped while cleaning up: ";
+  const pl = load64(wadd(addrOf(pre), 16));
+  if (t != 0) {
+    const at = msgLen(t);
+    if (at < 479) {
+      store8(wadd(wadd(t, T_MSG), at), 10);
+      store8(wadd(wadd(t, T_MSG), at + 1), 0);
+    }
+    msgAppendStr(t, addrOf(pre));
+    msgAppend(t, wadd(r, T_MSG), msgLen(r));
+  } else {
+    const b = wadd(sharedBase(), TRAPLINE);
+    memCopy(b, wadd(addrOf(pre), 32), pl);
+    const n = msgLen(r);
+    memCopy(wadd(b, pl), wadd(r, T_MSG), n);
+    plat(PL_WRITE_LINE, 2, b, wadd(pl, n));
+  }
+}
+
+// Cancel and join every child of the calling thread that is still in its registry. `t` is the record of this thread (0 = main).
+function unwindChildren(t: usize): void {
+  doom(t);
+  const hb = heapBase();
+  let n = load64(wadd(hb, H_CHILDREN));
+  while (n != 0) {
+    const tok = load64(wadd(load64(wadd(n, N_REC)), T_SCOPE));
+    if (tok != 0) {
+      plat(PL_WAKE_SIGNAL, tok, 0, 0);
+    }
+    n = load64(wadd(n, N_NEXT));
+  }
+  n = load64(wadd(hb, H_CHILDREN));
+  while (n != 0) {
+    const next = load64(wadd(n, N_NEXT));
+    store64(wadd(hb, H_CHILDREN), next);
+    if (next == 0) {
+      store64(wadd(hb, H_CHILDREN_TAIL), 0);
+    }
+    const s = wadd(hb, H_SCRATCH);
+    store64(s, 0);
+    plat(PL_THREAD_JOIN, load64(wadd(n, N_HANDLE)), s, 0);
+    const r = load64(s);
+    if (r != 0) {
+      if (load64(wadd(r, T_TRAPPED)) != 0 && load64(wadd(r, T_FLAGS)) == 0) {
+        secondary(t, r);
+      }
+      memFree(r);
+    }
+    memFree(n);
+    n = next;
+  }
+}
+
+// The task `t` publishes its trap: its rank among the traps (under the runtime lock), after its message is final.
+function publish(t: usize): void {
+  const sh = sharedBase();
+  plat(PL_RUNTIME_LOCK, 0, 0, 0);
+  const k = wadd(load64(wadd(sh, SH_TRAP_SEQ)), 1);
+  store64(wadd(sh, SH_TRAP_SEQ), k);
+  store64(wadd(t, T_SEQ), k);
+  plat(PL_RUNTIME_UNLOCK, 0, 0, 0);
+}
+
+// The record `t`, just joined by this thread, trapped. If a task of the same scope that this thread has not joined yet trapped before it,
+// that is the primary failure: the message of `t` becomes its message, followed by the message of `t` as a secondary one.
+function primaryFirst(t: usize): void {
+  const tseq = load64(wadd(t, T_SEQ));
+  if (tseq != 0) {
+    plat(PL_RUNTIME_LOCK, 0, 0, 0);
+    let best: usize = 0;
+    let bestSeq = tseq;
+    let n = load64(wadd(heapBase(), H_CHILDREN));
+    while (n != 0) {
+      const r = load64(wadd(n, N_REC));
+      const q = load64(wadd(r, T_SEQ));
+      if (q != 0 && q < bestSeq && load64(wadd(r, T_SCOPE)) == load64(wadd(t, T_SCOPE))) {
+        best = r;
+        bestSeq = q;
+      }
+      n = load64(wadd(n, N_NEXT));
+    }
+    if (best != 0) {
+      const pre = "\nalso trapped: ";
+      const pl = load64(wadd(addrOf(pre), 16));
+      const pm = msgLen(best);
+      const off = wadd(pm, pl);
+      let keep = msgLen(t);
+      if (wadd(off, keep) > 479) {
+        keep = off < 479 ? 479 - off : 0;
+      }
+      let end = pm;
+      if (keep != 0) {
+        memMove(wadd(wadd(t, T_MSG), off), wadd(t, T_MSG), keep);
+        memCopy(wadd(wadd(t, T_MSG), pm), wadd(addrOf(pre), 32), pl);
+        end = wadd(off, keep);
+      }
+      memCopy(wadd(t, T_MSG), wadd(best, T_MSG), pm);
+      store8(wadd(wadd(t, T_MSG), end), 0);
+    }
+    plat(PL_RUNTIME_UNLOCK, 0, 0, 0);
+  }
+}
+
 // ---------------------------------------------------------------- the trap
 
 // End the program or the task with the message at `p`: its length is the number of bytes before the first NUL, at most `limit`. On a
-// task thread (the heap block names a record) the message goes into the record, the heap retires, the end is signalled and the thread
-// exits; the joiner traps with the message. On the main thread `trap: <message>` is written to stderr (one line, the buffer is in the
-// shared block: no allocation) and the process exits with status 101. Never returns.
+// task thread (the heap block names a record) the message goes into the record, the scope of the task is cancelled, the children are
+// cancelled and joined (C2), the heap retires, the end is signalled and the thread exits; the joiner traps with the message. On the main
+// thread `trap: <message>` is written to stderr (one line, the buffer is in the shared block: no allocation), the children are
+// cancelled and joined, and the process exits with status 101. A trap inside the cleanup is an exit. Never returns.
 function trapAt(p: usize, limit: usize): void {
   let n: usize = 0;
   while (n < limit && load8(wadd(p, n)) != 0) {
@@ -250,6 +617,13 @@ function trapAt(p: usize, limit: usize): void {
     store8(wadd(wadd(t, T_MSG), n), 0);
     store64(wadd(t, T_TRAPPED), 1);
     store64(wadd(heapBase(), H_TASK), 0);
+    store64(wadd(heapBase(), H_TRAPPING), 1);
+    unwindChildren(t);
+    publish(t);
+    const tok = load64(wadd(t, T_SCOPE)); // after the rank: a sibling that traps because of this trap ranks after it
+    if (tok != 0) {
+      plat(PL_WAKE_SIGNAL, tok, 0, 0);
+    }
     heapRetire();
     signalDone(t);
     plat(PL_THREAD_EXIT, 0, 0, 0);
@@ -261,6 +635,10 @@ function trapAt(p: usize, limit: usize): void {
     memCopy(wadd(b, 6), p, n);
   }
   plat(PL_WRITE_LINE, 2, b, wadd(6, n));
+  if (load64(wadd(heapBase(), H_TRAPPING)) == 0) {
+    store64(wadd(heapBase(), H_TRAPPING), 1);
+    unwindChildren(0);
+  }
   plat(PL_EXIT, 101, 0, 0);
 }
 

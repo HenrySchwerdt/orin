@@ -141,7 +141,7 @@ separator is raised through `process.exit(101)` after printing the same message.
     | `memMove(dst, src, n)` (R3d.0) | `orin_platform_mem_move` (ranges may overlap) |
     | `memCmp(a, b, n) -> int` (R3d.0) | `orin_platform_mem_cmp` normalised to -1, 0 or 1 (unsigned bytes) |
     | `hook(k, a, b, c: usize) -> usize` (R3d.5) | a call of the C runtime function `orin_core_hook(k, a, b, c)` (`runtime/core/orin_runtime.c`; the numbers are the `HK_*` constants of `runtime/core/heap.or`): the services that are still C when the Orin runtime needs them, namely `getenv`, one line on stderr, the runtime lock, the address of the totals of finished tasks (`g_fold`, `g_fold_live`), whether the hot counters are built in, and the allocation-site census hooks. Not pure; reachable like the other core operations only from `$rt/` |
-    | `plat(k, a, b, c: usize) -> usize` (R3e.0) | a direct call of the L0 function `orin_platform_<name>` that the closed table of 20 functions (`platOpName` in `compiler/hir/coreops.or`; threads 0..3, monitors 4..13, process 14..19; named `PL_*` in `runtime/core/plat.or`) lists at index `k`, which must be a literal or a named constant below 20 (else E0404). Arguments are words (pointers are addresses; `thread_create` takes the `fnAddr` of a `void(void *)` entry), the result is the `int` / `int64_t` / pointer of L0 as a word (a C `int` sign-extended), 0 for a void function. Not pure, may write any memory, may not return (`thread_exit`, `exit`). The LLVM declarations carry no `readnone` / `readonly` / `argmemonly` / `nounwind`, and `tools/check_platform_boundary.sh` lints that and `orin_platform.h`; it replaces the L0-shaped hooks (R3e.1) |
+    | `plat(k, a, b, c: usize) -> usize` (R3e.0) | a direct call of the L0 function `orin_platform_<name>` that the closed table of 22 functions (`platOpName` in `compiler/hir/coreops.or`; threads 0..3, monitors 4..13, process 14..19, wake sources 20..21 (C2); named `PL_*` in `runtime/core/plat.or`) lists at index `k`, which must be a literal or a named constant below 22 (else E0404). Arguments are words (pointers are addresses; `thread_create` takes the `fnAddr` of a `void(void *)` entry), the result is the `int` / `int64_t` / pointer of L0 as a word (a C `int` sign-extended), 0 for a void function. Not pure, may write any memory, may not return (`thread_exit`, `exit`). The LLVM declarations carry no `readnone` / `readonly` / `argmemonly` / `nounwind`, and `tools/check_platform_boundary.sh` lints that and `orin_platform.h`; it replaces the L0-shaped hooks (R3e.1) |
     | `fnAddr(k: usize) -> usize` (R3e.0) | the address of the C-ABI wrapper (`orin_probe_entry`, later the task thread entry) of the L1 entry number `k` of `compiler/mir/rt.or`, a literal naming an entry of `fnAddrEntries()` (wrapper type `void(void *)`); pure |
     | `sharedBase() -> usize` (R3e.0) | address of the process-wide zero-initialised block `orin_shared` (`OrinShared`, 128 words, a plain global; layout "R3e.0" below); executables only; pure |
 
@@ -255,7 +255,10 @@ separator is raised through `process.exit(101)` after printing the same message.
     | 360 | 8 | `files` | `g_files` (R3c) | reserved for the open-file table (`H_FILES`) |
     | 368 | 8 | `netbuf` | `t_netbuf` (C4) | the per-task network buffer (`H_NETBUF`) |
     | 376 | 8 | `scratch` | | the out parameter of L0 calls (`thread_join`, `monitor_get`; `H_SCRATCH`) |
-    | 384 | 120 | reserved | | up to 504 |
+    | 384 | 8 | `children` | | (C2) the registry of the tasks this thread started and has not joined: first node (`H_CHILDREN`) |
+    | 392 | 8 | `children_tail` | | its last node (`H_CHILDREN_TAIL`) |
+    | 400 | 8 | `trapping` | | 1 once this thread runs the cleanup of a trap; a trap inside it is an exit (`H_TRAPPING`) |
+    | 408 | 96 | reserved | | up to 504 |
     | 504 | 8 | `probe` | | scratch word of `std:coreprobe` |
     | 512 | 272 | `sb[17]` (`{head, n}` pairs, 16 bytes each) | `sb_list`, `sb_cnt` (u32) | small-block cache by 16-byte class 0..16 (`SB_MAX` 256): list head @+0, length @+8, cap `SB_CAP` = 2^15 |
     | 784 | 240 | reserved | | up to 1024 bytes (128 words) |
@@ -267,7 +270,7 @@ separator is raised through `process.exit(101)` after printing the same message.
   - **R3e.0 / R3e.1 the task interface starts (done, ADR-0052 Addendum B).** Three core operations (`plat`, `fnAddr`, `sharedBase`, table above) and
     the shared block `orin_shared`, a plain global defined in `orin_runtime.c` and listed in `bootstrap/seed/runtime/core-only-symbols.txt`
     (the legacy world never references it). Layout, pinned by `_Static_assert`s on `OrinShared` in `orin_runtime.h`: words 0..3 the transfer
-    slot table (pointer, `n`, `cap`, free head), 4..7 the grant flight table (R3e.5), 8..63 reserved, 64..127 (byte 512) the line buffer of
+    slot table (pointer, `n`, `cap`, free head), 4..7 the grant flight table (R3e.5), 8 `main_doomed`, 9 `trap_seq`, 10 `waiters` (C2), 11..63 reserved, 64..127 (byte 512) the line buffer of
     the process trap (the main thread only). Everything but the trap line is read and written only between `plat(RUNTIME_LOCK)` and
     `plat(RUNTIME_UNLOCK)`. `runtime/core/sync.or` holds the eleven monitor operations of `std:task` (`monNew` .. `monWaitUntil`, one `plat`
     call plus the failure test each); the backends call them in place of the C forwarders `orin_mon_*` through `l1Task` in `compiler/mir/rt.or`

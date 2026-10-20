@@ -1811,16 +1811,17 @@ uint64_t orin_rt_par_threads(void) { return par_threads(); }
 /* ---------------------------------------------------------------- tasks */
 
 enum { TASK_MSG = 480 };
-/* The task record (512 bytes), shared with runtime/core/task.or: tok@0, trapped@8, done_mon@16, message@24 (480 bytes and a NUL). The trap
+/* The task record (640 bytes), shared with runtime/core/task.or: tok@0, trapped@8, done_mon@16, message@24 (480 bytes and a NUL), the C2 cleanup fields from 512 (task.or). The trap
  * (an Orin function now) writes it through the heap block word `task` (orin_heap.task, @336), which is how it finds the task of a thread. */
 typedef struct {
     uint64_t tok;       /* the transfer token of the task body (a closure) */
     uint64_t trapped;   /* written by the task thread, read after the join */
     uint64_t done_mon;  /* monitor whose word 1 becomes 1 when the task ends, by return or trap (orin_rt_task_watch); 0 = none */
     char msg[TASK_MSG + 1]; /* the trap message */
+    uint64_t cleanup[16];   /* @512 the fields of the trap-safe cleanup (parent, scope token, kill, rank, flags, wait list; task.or), all 0 here */
 } RtTask;
-_Static_assert(offsetof(RtTask, trapped) == 8 && offsetof(RtTask, done_mon) == 16 && offsetof(RtTask, msg) == 24 && sizeof(RtTask) == 512,
-               "RtTask: tok @0, trapped @8, done_mon @16, message @24, 512 bytes (runtime/core/task.or)");
+_Static_assert(offsetof(RtTask, trapped) == 8 && offsetof(RtTask, done_mon) == 16 && offsetof(RtTask, msg) == 24 && offsetof(RtTask, cleanup) == 512 && sizeof(RtTask) == 640,
+               "RtTask: tok @0, trapped @8, done_mon @16, message @24, cleanup @512, 640 bytes (runtime/core/task.or)");
 #define t_task (*(RtTask **)&orin_heap.task) /* the task this thread runs, NULL on the main thread */
 static __thread char t_joined_msg[TASK_MSG + 1];       /* message of the task joined last by this thread */
 
@@ -1894,6 +1895,7 @@ uint64_t orin_rt_task_spawn(uint64_t tok) {
     t->trapped = 0;
     t->done_mon = 0;
     t->msg[0] = 0;
+    for (int i = 0; i < 16; i++) t->cleanup[i] = 0;
     int64_t h = orin_platform_thread_create(task_main, t);
     if (!h) {
         orin_platform_free(t);
